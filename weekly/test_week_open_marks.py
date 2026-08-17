@@ -283,15 +283,13 @@ def test_process_overdue_empty_parks_without_ask(tmp_path, monkeypatch):
     assert mark["ask_pending"] is False
 
 
-def test_sunday_close_script_exists_and_mentions_bridge():
+def test_sunday_close_is_plugin_clock_not_cron():
+    clock = Path(__file__).with_name("weekly_clock.py")
+    assert clock.is_file()
+    text = clock.read_text(encoding="utf-8")
+    assert "leftover_ran" in text
+    assert "last_sunday_close_week" in text
+    assert "last_sunday_generate_week" in text
+    assert "_previous_week_key" in text
     script = Path(__file__).resolve().parents[3] / "scripts" / "weekly-sunday-close.sh"
-    assert script.is_file()
-    text = script.read_text(encoding="utf-8")
-    assert "generate_week" in text
-    assert "close_week" in text
-    assert "process_overdue_week_marks" in text
-    assert "Weekly UI" in text
-    # Monday missed-catch-up must not empty-close the new ISO week.
-    assert "HERMES_WEEKLY_SUNDAY_CLOSE_FORCE" in text
-    assert "skip current-week close" in text
-    assert "weekday() != 6" in text
+    assert not script.exists()

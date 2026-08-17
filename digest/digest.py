@@ -433,11 +433,31 @@ def maybe_run_digest_clock(
         _clock_action_lock.release()
 
 
+def _weekly_clock_leftover_flag(local: datetime, need_leftover: bool) -> bool:
+    """Pass leftover_ran after 23:55 Sunday so close can retry once leftover already ran."""
+    sunday_close = local.weekday() == 6 and (local.hour, local.minute) >= (23, 55)
+    return bool(need_leftover) or sunday_close
+
+
+def _maybe_run_weekly_clock(local: datetime, leftover_ran: bool = False) -> dict[str, Any]:
+    """Sunday generate/close after leftover so stale cron next_run cannot empty-close Monday."""
+    try:
+        weekly_dir = _mymemory / "weekly"
+        if str(weekly_dir) not in sys.path:
+            sys.path.insert(0, str(weekly_dir))
+        import weekly_clock as _weekly_clock
+
+        return _weekly_clock.maybe_run(local, leftover_ran=leftover_ran)
+    except Exception as exc:
+        _log(f"weekly clock failed: {exc}")
+        return {"outcome": "error", "error": str(exc)}
+
+
 def _run_digest_clock_once(
     now: datetime | None = None,
     tz: Any = None,
 ) -> dict[str, Any]:
-    """Fire leftover extract and/or gated merge for at most one due civil tick."""
+    """Fire leftover extract and/or gated merge, then the Sunday weekly clock."""
     zone = tz or digest_clock.digest_clock_tz()
     local = digest_clock._as_local(now or datetime.now(zone), zone)
     today = local.date().isoformat()
@@ -468,6 +488,9 @@ def _run_digest_clock_once(
             state = _load_state()
             state["next_clock_at"] = upcoming.isoformat()
             _save_state(state)
+        payload["weekly"] = _maybe_run_weekly_clock(
+            local, leftover_ran=_weekly_clock_leftover_flag(local, need_leftover)
+        )
         return payload
 
     leftover_n = 0
@@ -526,6 +549,9 @@ def _run_digest_clock_once(
     payload["leftover"] = leftover_n
     payload["outcome"] = "ran"
     payload["block_count"] = block_count
+    payload["weekly"] = _maybe_run_weekly_clock(
+        local, leftover_ran=_weekly_clock_leftover_flag(local, need_leftover)
+    )
     return payload
 
 
@@ -3632,55 +3658,6 @@ def _rerun_workers_after_commit_failure(
         else:
             new_details.append(by_type[worker_type])
     return new_event, new_details
-
-
-def _compress_daily_if_needed(daily_path: Path, *, soft_threshold: int = 15) -> bool:
-    """One post-commit soft compress attempt when block count ≥ soft_threshold."""
-    if not daily_path.exists():
-        return False
-    try:
-        text_d = daily_path.read_text(encoding="utf-8")
-    except OSError:
-        return False
-    blocks = _daily_blocks(text_d)
-    if len(blocks) < soft_threshold:
-        return False
-    changed = False
-    kept: list[dict[str, Any]] = []
-    for block in blocks:
-        try:
-            imp = int(block.get("importance", IMPORTANCE_DEFAULT))
-        except (TypeError, ValueError):
-            imp = IMPORTANCE_DEFAULT
-        status = str(block.get("status") or "").strip().lower()
-        if status == "dropped" or imp < 0:
-            changed = True
-            continue
-        kept.append(block)
-    _log(
-        f"soft compress attempt path={daily_path.name} count={len(blocks)} "
-        f"threshold={soft_threshold} changed={changed}"
-    )
-    if not changed or not kept:
-        return True
-    rendered = "\n\n".join(
-        _render_digest_block(
-            {k: v for k, v in block.items() if k != "body"},
-            str(block.get("body", "")).strip(),
-        )
-        for block in kept
-    )
-    candidate = rendered.rstrip() + "\n" if rendered.strip() else ""
-    if _validate_digest_file(candidate):
-        _log(f"soft compress aborted validation path={daily_path.name}")
-        return True
-    try:
-        _unused, wrap_phrase = split_daily_wrapup(text_d)
-        del _unused
-        _rewrite_daily_file(daily_path, join_daily_wrapup(candidate, wrap_phrase))
-    except OSError as exc:
-        _log(f"soft compress write failed path={daily_path.name}: {exc}")
-    return True
 
 
 def _phase1_prompt(

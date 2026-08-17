@@ -114,3 +114,28 @@ def test_clamp_wrapup_phrase_keeps_first_sentence():
     assert digest.clamp_wrapup_phrase("") == ""
     long_two = "First thread closed. Second sentence should drop."
     assert digest.clamp_wrapup_phrase(long_two) == "First thread closed."
+
+
+def test_build_wrapup_prompt_lists_every_event_predicate():
+    dedup = load_plugin_module("dedup_prompt.py", "memory_digest_wrapup_prompt_test")
+    prompt = dedup.build_wrapup_prompt(
+        [
+            {
+                "id": "mem-e1",
+                "type": "event",
+                "predicate": "user_requested_recipe_ingredients",
+            },
+            {
+                "id": "mem-e2",
+                "type": "event",
+                "predicate": "user_requested_progressive_recall_procedure",
+            },
+            {"id": "mem-f1", "type": "fact", "entity": "Gabby"},
+        ]
+    )
+    assert "Events that must appear" in prompt
+    assert "user_requested_recipe_ingredients" in prompt
+    assert "user_requested_progressive_recall_procedure" in prompt
+    assert "2–4 word" in prompt or "2-4 word" in prompt
+    assert "### Today events" in prompt
+    assert "submit_day_wrapup" in prompt

@@ -207,17 +207,51 @@ def render_typed_board(prefix: str, blocks: Iterable[Mapping[str, Any]]) -> str:
 
 WRAPUP_RULES = """## Day wrap-up
 
-Write one English-dominant medium phrase that names today's thread across
-the typed arrays below. Not a paragraph. Not YAML. Not a list.
+Write one English-dominant medium phrase (not a paragraph, not YAML, not a
+bullet list). Call submit_day_wrapup with { "phrase": "..." } only.
 
-Call submit_day_wrapup with { "phrase": "..." } only. Max 120 characters.
-One clause; do not add a second sentence.
+Every event on the board must be mentioned — a 2–4 word label each, joined
+with commas or "and". Same-thread events can share a short cluster, but none
+may be omitted. Other types (fact/procedure/decision) may color the clause
+only after every event is named.
+
+Max 120 characters. One clause: at most one period, at the end. No second
+sentence (code keeps only the first).
 """
+
+
+def _wrapup_event_checklist(blocks: Iterable[Mapping[str, Any]]) -> str:
+    """Force every event predicate into the prompt so the phrase cannot drop a thread."""
+    lines: list[str] = []
+    for block in blocks:
+        if str(block.get("type") or "").strip().lower() != "event":
+            continue
+        label = (
+            str(block.get("predicate") or "").strip()
+            or str(block.get("entity") or "").strip()
+            or str(block.get("id") or "").strip()
+        )
+        if label:
+            lines.append(f"- {label}")
+    if not lines:
+        return ""
+    return (
+        "## Events that must appear\n"
+        "Each bullet needs a 2–4 word mention in the one phrase.\n\n"
+        + "\n".join(lines)
+        + "\n"
+    )
 
 
 def build_wrapup_prompt(blocks: Iterable[Mapping[str, Any]]) -> str:
     """Reuse typed JSON arrays so wrap-up sees the same board as Phase 2, not YAML."""
-    return WRAPUP_RULES + "\n" + render_typed_board("Today", blocks)
+    cards = list(blocks)
+    checklist = _wrapup_event_checklist(cards)
+    parts = [WRAPUP_RULES]
+    if checklist:
+        parts.append(checklist)
+    parts.append(render_typed_board("Today", cards))
+    return "\n".join(parts)
 
 
 def _render_blocks(label: str, blocks: Iterable[Mapping[str, Any]]) -> str:

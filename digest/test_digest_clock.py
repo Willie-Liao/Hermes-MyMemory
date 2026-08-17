@@ -29,7 +29,9 @@ NEW_YORK = ZoneInfo("America/New_York")
 
 
 def _load_digest():
-    return load_plugin_module("digest.py", "memory_digest_clock_test")
+    digest = load_plugin_module("digest.py", "memory_digest_clock_test")
+    digest._maybe_run_weekly_clock = lambda *a, **k: {"outcome": "stubbed"}
+    return digest
 
 
 def test_digest_clock_tz_falls_back_on_invalid_name():
@@ -319,3 +321,38 @@ def test_clock_leftover_then_one_phase2_when_over_gate(tmp_path, monkeypatch):
     digest.maybe_run_digest_clock(now=now, sync=True)
     assert leftover == ["s1", "s2"]
     assert phase2 == ["p2"]
+
+
+def test_clock_weekly_hook_after_leftover(tmp_path, monkeypatch):
+    digest = load_plugin_module("digest.py", "memory_digest_clock_weekly_hook")
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    daily_dir = tmp_path / "memories" / "staging" / "daily"
+    daily_dir.mkdir(parents=True)
+    (daily_dir / "2026-08-16.md").write_text(_card_yaml(10), encoding="utf-8")
+    monkeypatch.setattr(digest, "hermes_local_today_str", lambda: "2026-08-16")
+    monkeypatch.setattr(
+        digest.digest_clock, "digest_clock_tz", lambda **_k: SHANGHAI
+    )
+    order: list = []
+    monkeypatch.setattr(
+        digest,
+        "_maybe_run_digest",
+        lambda session_key, reason, force=False, sync=False: order.append("leftover"),
+    )
+    monkeypatch.setattr(digest, "run_day_wrapup", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        digest,
+        "_maybe_run_weekly_clock",
+        lambda local, leftover_ran=False: order.append(("weekly", leftover_ran))
+        or {"outcome": "ok"},
+    )
+    state_path = tmp_path / "memories" / "staging" / ".digest-state.json"
+    state_path.write_text(
+        json.dumps({"sessions": {"s1": {"session_id": "s1"}}}),
+        encoding="utf-8",
+    )
+    now = datetime(2026, 8, 16, 23, 55, tzinfo=SHANGHAI)
+    digest.maybe_run_digest_clock(now=now, sync=True)
+    assert order[0] == "leftover"
+    assert ("weekly", True) in order
+    assert order.index("leftover") < order.index(("weekly", True))

@@ -1,41 +1,23 @@
-# Sunday weekly update + close
+# Sunday weekly generate + close
 
-Hermes no-agent cron job **`weekly-sunday-close`** runs at **`58 23 * * 0`** (Sunday 23:58, `config.yaml` timezone, typically `Asia/Shanghai`) so it stays three minutes after digest leftover extract at 23:55.
+Sunday automation lives in the MyMemory **plugin clock**, not Hermes cron. The digest civil thread (`start_digest_clock_thread`) already wakes at 08/12/16/20/23:55 in `config.yaml` `timezone:` (typically `Asia/Shanghai`). `weekly_clock.maybe_run` rides that loop.
 
 ## What it does
 
-1. **Sunday only:** `generate_week` for the current ISO week (`reason=update`) via `bridge_cli.py`
-2. **Sunday only:** `close_week` for the current ISO week
-3. Silent `process_overdue_week_marks(kick_generate=False)` for older open weeks (no chat A/B ask) — also runs on non-Sunday catch-up
-4. Prints a notify line on stdout (job `deliver` is **`local`** so Weixin delivery failures cannot leave the run looking unfinished)
+1. **Sunday 16:00:** `generate_week` for the current ISO week, start Weekly UI + Cloudflare tunnel, send the `/weekly ui` phone link via the live Weixin `adapter.send` (same adapter cron used after job stdout; prefetch cannot push).
+2. **Sunday 23:55:** after digest leftover extract, `close_week` for that ISO week.
+3. **Monday+ catch-up:** generate then close only the **ISO week that just ended**. Never close the new Monday week.
 
-Script: `~/.hermes/scripts/weekly-sunday-close.sh` (repo: `hermes-home/scripts/weekly-sunday-close.sh`).
+State keys in `memories/staging/.weekly-state.json`: `last_sunday_generate_week`, `last_sunday_close_week`. Idempotent per week.
 
-### Why the Sunday gate exists
+Chat id: `WEEKLY_BRIEF_WEIXIN_TO` or `plugins.entries.MyMemory.weekly_brief_weixin` in `config.yaml`. Gateway must be up with Weixin connected. Send failure is logged; generate is kept.
 
-If the gateway restarts after Sunday 23:58, Hermes may re-fire this job as a “missed” catch-up on **Monday**. Without a gate, blank `close_week` targets the **new** ISO week and can empty-close it. Non-Sunday runs skip current-week generate/close and only run overdue catch-up.
+## Why cron was removed
 
-Manual smoke on a weekday:
+A stale `jobs.json` `next_run_at` made Hermes treat Sunday close as missed and catch-up-run it. On Sunday that closed the **current** week. Plugin clock catch-up cannot target the new Monday week.
 
-```bash
-HERMES_WEEKLY_SUNDAY_CLOSE_FORCE=1 hermes cron run weekly-sunday-close
-```
-
-## Operator commands
-
-Job name: `weekly-sunday-close` (created via `hermes cron create`; id on this host may differ).
-
-```bash
-hermes cron list
-hermes cron run weekly-sunday-close   # manual smoke
-hermes cron pause weekly-sunday-close
-hermes cron resume weekly-sunday-close
-```
+There is no `weekly-sunday-close` / `weekly-brief-runner-sunday` job and no `HERMES_WEEKLY_SUNDAY_CLOSE_FORCE`.
 
 ## Edits after auto-close
 
 Use Weekly UI (`/weekly ui`) → Reopen the week, edit, then Close again. Chat no longer injects a “Weekly close note” A/B prompt.
-
-## Job bookkeeping
-
-If `next_run_at` stays stuck in the past (e.g. after a delivery/interrupt race), Hermes may keep replaying this job as “missed.” Prefer `deliver: local`. After a bad stick, bump `next_run_at` to the next Sunday 23:55 so daytime catch-up does not close the current week early on Sunday either.

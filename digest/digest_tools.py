@@ -942,8 +942,8 @@ def submit_day_wrapup_schema() -> dict[str, Any]:
     return _schema(
         "submit_day_wrapup",
         (
-            "Submit one English-dominant medium phrase naming today's thread. "
-            "Not a paragraph. No YAML. No extra card fields."
+            "Submit one English-dominant medium phrase that mentions every "
+            "event (2–4 word labels, commas or and). Not a paragraph. No YAML."
         ),
         {
             "phrase": {
