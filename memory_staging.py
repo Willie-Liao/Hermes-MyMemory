@@ -448,6 +448,8 @@ def patch_daily_block_status(
         except OSError:
             continue
 
+        _fences, wrap_phrase = digest.split_daily_wrapup(original)
+        del _fences
         rendered_blocks: list[str] = []
         replaced = False
         for _line_no, raw_frontmatter, block_body in digest._frontmatter_blocks(original):
@@ -467,7 +469,13 @@ def patch_daily_block_status(
             replaced = True
 
         if replaced:
-            path.write_text("\n\n".join(rendered_blocks).rstrip() + "\n", encoding="utf-8")
+            path.write_text(
+                digest.join_daily_wrapup(
+                    "\n\n".join(rendered_blocks).rstrip() + "\n",
+                    wrap_phrase,
+                ),
+                encoding="utf-8",
+            )
             return True
 
     return False
@@ -506,6 +514,8 @@ def patch_daily_block_valid_to(
         except OSError:
             continue
 
+        _fences, wrap_phrase = digest.split_daily_wrapup(original)
+        del _fences
         rendered_blocks: list[str] = []
         replaced = False
         for _line_no, raw_frontmatter, block_body in digest._frontmatter_blocks(original):
@@ -524,7 +534,13 @@ def patch_daily_block_valid_to(
             replaced = True
 
         if replaced:
-            path.write_text("\n\n".join(rendered_blocks).rstrip() + "\n", encoding="utf-8")
+            path.write_text(
+                digest.join_daily_wrapup(
+                    "\n\n".join(rendered_blocks).rstrip() + "\n",
+                    wrap_phrase,
+                ),
+                encoding="utf-8",
+            )
             return True
 
     return False
@@ -548,6 +564,8 @@ def remove_daily_block(hermes_home: Path, block_id: str) -> dict[str, Any] | Non
         except OSError:
             continue
 
+        _fences, wrap_phrase = digest.split_daily_wrapup(original)
+        del _fences
         kept: list[str] = []
         snapshot: dict[str, Any] | None = None
         block_index = 0
@@ -575,7 +593,13 @@ def remove_daily_block(hermes_home: Path, block_id: str) -> dict[str, Any] | Non
         if snapshot is None:
             continue
         if kept:
-            path.write_text("\n\n".join(kept).rstrip() + "\n", encoding="utf-8")
+            path.write_text(
+                digest.join_daily_wrapup(
+                    "\n\n".join(kept).rstrip() + "\n",
+                    wrap_phrase,
+                ),
+                encoding="utf-8",
+            )
         else:
             # Unlink empty daily — do not leave a 0-byte stub that fakes sources.
             path.unlink(missing_ok=True)
@@ -609,6 +633,8 @@ def restore_daily_block(
         return False
 
     digest = _load_digest_helpers()
+    _fences, wrap_phrase = digest.split_daily_wrapup(existing)
+    del _fences
     blocks: list[str] = []
     for _line_no, raw_frontmatter, block_body in digest._frontmatter_blocks(existing):
         try:
@@ -638,9 +664,15 @@ def restore_daily_block(
         blocks.insert(idx, rendered)
 
     if not blocks:
-        path.write_text(rendered.rstrip() + "\n", encoding="utf-8")
+        path.write_text(
+            digest.join_daily_wrapup(rendered.rstrip() + "\n", wrap_phrase),
+            encoding="utf-8",
+        )
         return True
-    path.write_text("\n\n".join(blocks).rstrip() + "\n", encoding="utf-8")
+    path.write_text(
+        digest.join_daily_wrapup("\n\n".join(blocks).rstrip() + "\n", wrap_phrase),
+        encoding="utf-8",
+    )
     return True
 
 

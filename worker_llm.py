@@ -96,6 +96,8 @@ def _worker_llm_lane(plugin: str, purpose: str) -> str | None:
     if plug == "memory-digest":
         if why.startswith("digest-phase1"):
             return "phase1"
+        if why.startswith("digest-wrapup"):
+            return "wrapup"
         if why.startswith("digest-dedup"):
             return "phase2"
         return None
@@ -108,7 +110,7 @@ def _plugin_worker_runtime(plugin: str, purpose: str = "") -> dict[str, str]:
     """Optional model/provider from config.yaml plugins.entries.<plugin>.
 
     Overlay: entry.model/provider, then worker_llm.<lane> for phase1 / phase2 /
-    weekly when the purpose matches.
+    wrapup / weekly when the purpose matches.
     """
     name = str(plugin or "").strip()
     if not name:
@@ -713,22 +715,28 @@ def run_worker_llm_oneshot(
         reasoning = (
             getattr(usage, "completion_tokens_details", None) if usage is not None else None
         )
+        usage_fields = {
+            "input_tokens": _usage_int(usage, "prompt_tokens"),
+            "output_tokens": _usage_int(usage, "completion_tokens"),
+            "cache_read_tokens": _usage_int(details, "cached_tokens"),
+            "cache_write_tokens": 0,
+            "reasoning_tokens": _usage_int(reasoning, "reasoning_tokens"),
+            "total_tokens": _usage_int(usage, "total_tokens"),
+        }
         record_worker_usage(
             {
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "plugin": plugin,
                 "purpose": purpose,
                 "model": model,
-                "input_tokens": _usage_int(usage, "prompt_tokens"),
-                "output_tokens": _usage_int(usage, "completion_tokens"),
-                "cache_read_tokens": _usage_int(details, "cached_tokens"),
-                "cache_write_tokens": 0,
-                "reasoning_tokens": _usage_int(reasoning, "reasoning_tokens"),
-                "total_tokens": _usage_int(usage, "total_tokens"),
+                **usage_fields,
                 "cost_usd": 0.0,
                 "api_calls": 1,
             }
         )
+        captured.update(usage_fields)
+        captured["finish_reason"] = getattr(choice, "finish_reason", None)
+        captured["max_tokens"] = max_tokens
         return captured
 
 

@@ -191,6 +191,32 @@ def test_patch_daily_block_status_with_body_leaves_other_blocks(tmp_path):
     assert "replace me" not in text
 
 
+def test_patch_daily_block_status_preserves_day_wrapup(tmp_path):
+    ms = _load_memory_staging()
+    daily = tmp_path / "memories" / "staging" / "daily"
+    daily.mkdir(parents=True)
+    path = daily / "2026-08-15.md"
+    path.write_text(
+        "---\nid: mem-a\ntype: fact\nconfidence: high\nstatus: candidate\n"
+        "sources: [session:s1]\n---\nkeep body\n\n"
+        "## Day wrap-up\nXiaohongshu infographic as HTML cards\n",
+        encoding="utf-8",
+    )
+    ok = ms.patch_daily_block_status(
+        tmp_path,
+        "mem-a",
+        status="rejected",
+        timestamp_field="discarded_at",
+        timestamp_value="2026-08-15T12:00:00",
+    )
+    assert ok is True
+    text = path.read_text(encoding="utf-8")
+    assert text.rstrip().endswith("Xiaohongshu infographic as HTML cards")
+    assert "## Day wrap-up" in text
+    assert "keep body" in text
+    assert "status: rejected" in text
+
+
 def _write_daily_block_with_valid_to(
     hermes_home: Path,
     *,

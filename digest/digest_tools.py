@@ -937,6 +937,25 @@ def submit_operations_schema() -> dict[str, Any]:
     )
 
 
+def submit_day_wrapup_schema() -> dict[str, Any]:
+    """Force one medium phrase so 23:55 wrap-up cannot dump a paragraph or YAML."""
+    return _schema(
+        "submit_day_wrapup",
+        (
+            "Submit one English-dominant medium phrase naming today's thread. "
+            "Not a paragraph. No YAML. No extra card fields."
+        ),
+        {
+            "phrase": {
+                "type": "string",
+                "description": "One line, at most 120 characters",
+                "maxLength": 120,
+            }
+        },
+        ["phrase"],
+    )
+
+
 def patch_operations_schema() -> dict[str, Any]:
     return _schema(
         "patch_operations",

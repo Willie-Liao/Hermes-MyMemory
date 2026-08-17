@@ -6,9 +6,10 @@ Plugin hooks (CLI + gateway):
     (assistant replies in that window are included; there is no assistant floor)
   - on_session_finalize — digest session-boundary leftovers when the same
     user-count floor is met
-  - plugin clock — Phase 2 at 08:00/12:00/16:00/20:00/23:55 in config.yaml
+  -     plugin clock — Phase 2 at 08:00/12:00/16:00/20:00/23:55 in config.yaml
     ``timezone:`` (same IANA chain as Hermes cron) only if today's daily
     file has more than 25 cards; 23:55 also force-extracts leftover chat
+    then refreshes the ``## Day wrap-up`` trailer (day ticks only re-attach it)
 
 Progress is one cursor: the session bookmark (``last_digest_message_id``).
 Never calls the memory tool — write_file/patch to staging only.
@@ -129,6 +130,11 @@ MAX_RETRY_ERROR_CHARS = 800
 # Clear a stuck in-flight flag if the worker never finished (e.g. gateway crash).
 IN_FLIGHT_STALE_SECONDS = 600
 
+# Civil-day catalog line after YAML fences — not a fifth memory type.
+DAY_WRAPUP_HEADING = "## Day wrap-up"
+MAX_WRAPUP_CHARS = 120
+_WRAPUP_HEADING_RE = re.compile(r"(?m)^## Day wrap-up[ \t]*\n?")
+
 # Cap on blocks in a committed daily staging file.
 MAX_BLOCKS_PER_FILE = 30
 # Importance (0–5 stored): digest write assigns 1–5 at create time; 0 is decay/drop.
@@ -209,6 +215,9 @@ MAX_RELATED = 10
 MAX_SUPERSEDES = 8
 # Phase-2 oneshot dumps four typed op slots in one tool call; 2048 truncates.
 ONESHOT_DIGEST_MAX_TOKENS = 8192
+# Wrap-up is one short phrase; keep reasoning room without a 8k completion.
+ONESHOT_WRAPUP_MAX_TOKENS = 2048
+_WRAPUP_SENTENCE_END = re.compile(r"[.!?]")
 WORKER_ARTIFACT_FILENAMES = {
     "event": "event-result.json",
     "fact": "fact-result.json",
@@ -462,6 +471,7 @@ def _run_digest_clock_once(
         return payload
 
     leftover_n = 0
+    payload["wrapup"] = False
     if need_leftover:
         for session_key in session_keys:
             _maybe_run_digest(
@@ -501,6 +511,13 @@ def _run_digest_clock_once(
                 state = _load_state()
                 state["phase2_in_flight"] = False
                 _save_state(state)
+
+    if need_leftover and block_count > 0:
+        try:
+            run_day_wrapup(daily_path)
+            payload["wrapup"] = True
+        except Exception as exc:
+            _log(f"digest clock wrapup failed: {exc}")
 
     with _digest_lock:
         state = _load_state()
@@ -878,7 +895,8 @@ def _normalize_digest_content(
 
 
 def _frontmatter_blocks(content: str) -> list[tuple[int, str, str]]:
-    lines = content.splitlines()
+    fences, _phrase = split_daily_wrapup(content)
+    lines = fences.splitlines()
     blocks: list[tuple[int, str, str]] = []
     idx = 0
 
@@ -1064,12 +1082,12 @@ def _validate_block(
             for idx, item in enumerate(involves):
                 if isinstance(item, Mapping):
                     tag = str(item.get("entity", "")).strip()
-                if not tag:
+                    if not tag:
                         errors.append(
                             f"line {line_no}: involves[{idx}] requires non-empty entity"
                         )
-                elif primary_entity and tag == primary_entity:
-                    errors.append(
+                    elif primary_entity and tag == primary_entity:
+                        errors.append(
                             f"line {line_no}: involves must not repeat primary entity "
                             f"{primary_entity!r}"
                         )
@@ -1487,13 +1505,111 @@ def _validate_related_target_types(
     return errors
 
 
+def split_daily_wrapup(content: str) -> tuple[str, str]:
+    """Peel ``## Day wrap-up`` so fence parsers never treat the phrase as a body.
+
+    Last heading wins. Phrase is the first non-empty line after it (medium
+    length, not a paragraph). Missing trailer → empty phrase.
+    """
+    text = content or ""
+    matches = list(_WRAPUP_HEADING_RE.finditer(text))
+    if not matches:
+        return text, ""
+    mark = matches[-1]
+    fences = text[: mark.start()].rstrip()
+    if fences:
+        fences += "\n"
+    rest = text[mark.end() :].strip()
+    phrase = rest.splitlines()[0].strip() if rest else ""
+    return fences, phrase
+
+
+def join_daily_wrapup(fences: str, phrase: str) -> str:
+    """Re-attach a clamped wrap-up after fences so Phase-2 rewrite cannot drop it."""
+    body = (fences or "").rstrip()
+    cleaned = " ".join(str(phrase or "").split())
+    if len(cleaned) > MAX_WRAPUP_CHARS:
+        cleaned = cleaned[:MAX_WRAPUP_CHARS].rstrip()
+    if not cleaned:
+        return body + ("\n" if body else "")
+    if body:
+        return f"{body}\n\n{DAY_WRAPUP_HEADING}\n{cleaned}\n"
+    return f"{DAY_WRAPUP_HEADING}\n{cleaned}\n"
+
+
+def clamp_wrapup_phrase(raw: str) -> str:
+    """Keep a medium catalog line: blank and multi-sentence dumps must not land."""
+    cleaned = " ".join(str(raw or "").split())
+    if not cleaned:
+        return ""
+    ends = list(_WRAPUP_SENTENCE_END.finditer(cleaned))
+    if len(ends) > 1:
+        cleaned = cleaned[: ends[0].end()].strip()
+    if len(cleaned) > MAX_WRAPUP_CHARS:
+        cleaned = cleaned[:MAX_WRAPUP_CHARS].rstrip()
+    return cleaned
+
+
+def run_day_wrapup(daily_path: Path | str) -> dict[str, Any]:
+    """Refresh ``## Day wrap-up`` once at 23:55 from typed JSON cards, never YAML."""
+    path = Path(daily_path)
+    if not path.exists():
+        return {"outcome": "skipped", "reason": "missing"}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return {"outcome": "skipped", "reason": str(exc)}
+    blocks = _daily_blocks(text)
+    if not blocks:
+        return {"outcome": "skipped", "reason": "empty"}
+    prompt = digest_dedup_prompt.build_wrapup_prompt(blocks)
+    capture = _invoke_digest_oneshot_tool(
+        prompt,
+        "cli",
+        purpose="digest-wrapup",
+        force_tool_name="submit_day_wrapup",
+    )
+    if capture.get("failed"):
+        return {
+            "outcome": "failed",
+            "error": str(capture.get("error") or capture.get("final_response") or ""),
+        }
+    _name, args = digest_tools.parse_tool_args_from_result(capture)
+    raw = ""
+    if isinstance(args, Mapping):
+        raw = str(args.get("phrase") or "")
+    phrase = clamp_wrapup_phrase(raw)
+    if not phrase:
+        return {"outcome": "failed", "error": "blank wrap-up phrase"}
+    fences, _old = split_daily_wrapup(text)
+    _rewrite_daily_file(path, join_daily_wrapup(fences, phrase))
+    extra = {
+        k: capture.get(k)
+        for k in (
+            "input_tokens",
+            "output_tokens",
+            "reasoning_tokens",
+            "total_tokens",
+            "finish_reason",
+            "max_tokens",
+        )
+        if k in capture
+    }
+    return {"outcome": "written", "phrase": phrase, **extra}
+
+
 def _append_daily_digest(daily_path: Path, content: str) -> None:
     daily_path.parent.mkdir(parents=True, exist_ok=True)
-    prefix = ""
-    if daily_path.exists() and daily_path.read_text(encoding="utf-8").strip():
-        prefix = "\n\n"
-    with daily_path.open("a", encoding="utf-8") as f:
-        f.write(prefix + content.rstrip() + "\n")
+    existing = ""
+    if daily_path.exists():
+        existing = daily_path.read_text(encoding="utf-8")
+    fences, phrase = split_daily_wrapup(existing)
+    chunk = content.rstrip() + "\n"
+    if fences.strip():
+        combined = fences.rstrip() + "\n\n" + chunk
+    else:
+        combined = chunk
+    _rewrite_daily_file(daily_path, join_daily_wrapup(combined, phrase))
 
 
 def _content_hash(text: str) -> str:
@@ -2014,10 +2130,14 @@ def _invoke_digest_oneshot_tool(
     del platform, allowed_tool_names, max_iterations
     name = str(force_tool_name or "").strip()
     schema = None
+    budget = ONESHOT_DIGEST_MAX_TOKENS
     if name == "submit_operations":
         schema = digest_tools.submit_operations_schema()
     elif name == "patch_operations":
         schema = digest_tools.patch_operations_schema()
+    elif name == "submit_day_wrapup":
+        schema = digest_tools.submit_day_wrapup_schema()
+        budget = ONESHOT_WRAPUP_MAX_TOKENS
     try:
         return run_worker_llm_oneshot(
             prompt,
@@ -2025,7 +2145,7 @@ def _invoke_digest_oneshot_tool(
             purpose=purpose or "digest-dedup",
             force_tool_name=name or None,
             tool_schema=schema,
-            max_tokens=ONESHOT_DIGEST_MAX_TOKENS,
+            max_tokens=budget,
         )
     except Exception as exc:
         return {
@@ -2541,7 +2661,9 @@ def _commit_candidate_once(
                     + "; ".join(soft_errors[:5])
                 )
             execution_log.transition("candidate_validated")
-            _rewrite_daily_file(daily_path, candidate)
+            _fences, wrap_phrase = split_daily_wrapup(before)
+            del _fences
+            _rewrite_daily_file(daily_path, join_daily_wrapup(candidate, wrap_phrase))
             replacement_succeeded = True
             try:
                 execution_log.transition("committed")
@@ -3553,7 +3675,9 @@ def _compress_daily_if_needed(daily_path: Path, *, soft_threshold: int = 15) -> 
         _log(f"soft compress aborted validation path={daily_path.name}")
         return True
     try:
-        _rewrite_daily_file(daily_path, candidate)
+        _unused, wrap_phrase = split_daily_wrapup(text_d)
+        del _unused
+        _rewrite_daily_file(daily_path, join_daily_wrapup(candidate, wrap_phrase))
     except OSError as exc:
         _log(f"soft compress write failed path={daily_path.name}: {exc}")
     return True
@@ -4736,6 +4860,7 @@ def _collect_printed_ids_and_manifest(
 
     by_anchor: dict[str, _Agg] = {}
     by_day: dict[str, dict[str, Any]] = {}
+    wrap_by_day: dict[str, str] = {}
     printed: list[str] = []
     printed_set: set[str] = set()
 
@@ -4755,6 +4880,14 @@ def _collect_printed_ids_and_manifest(
         else:
             day_key = entry.path.stem
 
+        if day_key not in wrap_by_day:
+            try:
+                _fences, wrap_phrase = split_daily_wrapup(
+                    entry.path.read_text(encoding="utf-8")
+                )
+            except OSError:
+                wrap_phrase = ""
+            wrap_by_day[day_key] = wrap_phrase
         day_row = by_day.setdefault(
             day_key,
             {"n": 0, "types": {}, "event_ids": [], "standalone": []},
@@ -4819,7 +4952,11 @@ def _collect_printed_ids_and_manifest(
         row = by_day[day_key]
         type_bits = " ".join(f"{k}:{v}" for k, v in sorted(row["types"].items()))
         events = ",".join(row["event_ids"][:12]) or "(none)"
-        lines.append(f"- {day_key} · {row['n']} blocks · {type_bits} · events={events}")
+        line = f"- {day_key} · {row['n']} blocks · {type_bits} · events={events}"
+        wrap_phrase = str(wrap_by_day.get(day_key) or "").strip()
+        if wrap_phrase:
+            line += f" · {wrap_phrase}"
+        lines.append(line)
         if row["standalone"]:
             shown = ", ".join(row["standalone"][:12])
             more = "" if len(row["standalone"]) <= 12 else ", …"

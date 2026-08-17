@@ -198,6 +198,9 @@ def test_worker_llm_lanes_override_by_purpose(tmp_path, monkeypatch):
                 "        phase2:",
                 "          provider: kimi-coding",
                 "          model: kimi-k2.6",
+                "        wrapup:",
+                "          provider: xiaomi",
+                "          model: mimo-v2.5",
                 "    memory-weekly:",
                 "      provider: xiaomi",
                 "      model: mimo-v2.5",
@@ -246,6 +249,10 @@ def test_worker_llm_lanes_override_by_purpose(tmp_path, monkeypatch):
     wl.run_worker_llm("hi", plugin="memory-digest", purpose="digest-dedup-patch")
     assert seen["kwargs"]["model"] == "kimi-k2.6"
     assert seen["kwargs"]["provider"] == "kimi-coding"
+
+    wl.run_worker_llm("hi", plugin="memory-digest", purpose="digest-wrapup")
+    assert seen["kwargs"]["model"] == "mimo-v2.5"
+    assert seen["kwargs"]["provider"] == "xiaomi"
 
     wl.run_worker_llm("hi", plugin="memory-digest", purpose="recall_router")
     assert seen["kwargs"]["model"] == "mimo-v2.5"

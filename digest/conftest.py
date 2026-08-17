@@ -114,10 +114,13 @@ def is_dedup_prompt(prompt: str) -> bool:
 def _blocks_under(prompt: str, heading: str) -> list[dict]:
     if heading not in prompt:
         return []
-    section = prompt.split(heading, 1)[1].split("###", 1)[0]
+    section = prompt.split(heading, 1)[1].split("###", 1)[0].strip()
+    if section.startswith("["):
+        parsed = json.loads(section)
+        return [item for item in parsed if isinstance(item, dict)]
     return [
         json.loads(line)
-        for line in section.strip().splitlines()
+        for line in section.splitlines()
         if line.startswith("{")
     ]
 
@@ -129,18 +132,21 @@ def stub_dedup_proposal(prompt: str) -> str:
     already in the file. Lets a test exercise proposer plumbing without
     depending on model judgement.
     """
-    existing_ids = {
-        str(block.get("id"))
-        for block in _blocks_under(prompt, "### Existing blocks already in the file")
-    }
+    existing_ids: set[str] = set()
+    for kind in ("events", "facts", "procedures", "decisions"):
+        existing_ids |= {
+            str(block.get("id"))
+            for block in _blocks_under(prompt, f"### Existing {kind}")
+        }
     operations = []
-    for block in _blocks_under(prompt, "### New blocks from this session"):
-        block_id = str(block.get("id"))
-        if block_id in existing_ids:
-            changes = {key: value for key, value in block.items() if key != "id"}
-            operations.append(
-                {"operation": "update", "id": block_id, "changes": changes}
-            )
+    for kind in ("events", "facts", "procedures", "decisions"):
+        for block in _blocks_under(prompt, f"### New {kind}"):
+            block_id = str(block.get("id"))
+            if block_id in existing_ids:
+                changes = {key: value for key, value in block.items() if key != "id"}
+                operations.append(
+                    {"operation": "update", "id": block_id, "changes": changes}
+                )
     return json.dumps(operations, ensure_ascii=False)
 
 

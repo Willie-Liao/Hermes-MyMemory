@@ -36,6 +36,43 @@ export const IMPORTANCE_MIN = 0;
 export const IMPORTANCE_MAX = 5;
 export const IMPORTANCE_DEFAULT: ImportanceLevel = 3;
 
+/** Matches digest ``DAY_WRAPUP_HEADING`` — catalog phrase after YAML fences. */
+export const DAY_WRAPUP_HEADING = '## Day wrap-up';
+const MAX_WRAPUP_CHARS = 120;
+
+export function splitDailyWrapup(content: string): { fences: string; phrase: string } {
+  const text = content || '';
+  const re = /^## Day wrap-up[ \t]*\n?/gm;
+  let last: RegExpExecArray | null = null;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(text)) !== null) {
+    last = match;
+  }
+  if (!last) {
+    return { fences: text, phrase: '' };
+  }
+  const before = text.slice(0, last.index).replace(/\s+$/, '');
+  const fences = before ? `${before}\n` : '';
+  const rest = text.slice(last.index + last[0].length).trim();
+  const phrase = rest.split('\n')[0]?.trim() ?? '';
+  return { fences, phrase };
+}
+
+export function joinDailyWrapup(fences: string, phrase: string): string {
+  const body = (fences || '').replace(/\s+$/, '');
+  const cleaned = String(phrase || '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .slice(0, MAX_WRAPUP_CHARS);
+  if (!cleaned) {
+    return body ? `${body}\n` : '';
+  }
+  if (body) {
+    return `${body}\n\n${DAY_WRAPUP_HEADING}\n${cleaned}\n`;
+  }
+  return `${DAY_WRAPUP_HEADING}\n${cleaned}\n`;
+}
+
 /** Clamp importance to 0–5; missing/invalid → IMPORTANCE_DEFAULT (3). */
 export function normalizeImportance(value: unknown): ImportanceLevel {
   if (value === undefined || value === null || value === '') {
@@ -65,8 +102,9 @@ export function ensureDirs() {
 
 // Simple frontmatter parser & stringifier
 export function parseMDBlock(fileContent: string, filePath: string): MemoryBlock[] {
+  const { fences } = splitDailyWrapup(fileContent);
   const blocks: MemoryBlock[] = [];
-  const rawParts = fileContent.split(/^---$/m);
+  const rawParts = fences.split(/^---$/m);
   
   // A file can have frontmatter blocks separated by ---
   // If the file starts with ---, rawParts[0] is empty, rawParts[1] has frontmatter, rawParts[2] has content or next block
@@ -439,7 +477,8 @@ export function writeMemoryBlock(block: MemoryBlock, oldId?: string) {
   
   // Read existing file and replace block
   const fileContent = fs.readFileSync(filePath, 'utf8');
-  const blocks = parseMDBlock(fileContent, filePath);
+  const { fences, phrase } = splitDailyWrapup(fileContent);
+  const blocks = parseMDBlock(fences, filePath);
   
   const searchId = oldId || block.id;
   const index = blocks.findIndex(b => b.id === searchId);
@@ -450,7 +489,10 @@ export function writeMemoryBlock(block: MemoryBlock, oldId?: string) {
     blocks.push(block);
   }
   
-  const updatedContent = blocks.map(b => stringifyMDBlock(b)).join('\n\n');
+  const updatedContent = joinDailyWrapup(
+    blocks.map(b => stringifyMDBlock(b)).join('\n\n'),
+    phrase,
+  );
   fs.writeFileSync(filePath, updatedContent);
 }
 
@@ -460,8 +502,9 @@ export function writeMemoryBlock(block: MemoryBlock, oldId?: string) {
  */
 export function listRawMDBlocks(fileContent: string): string[] {
   if (!fileContent.trim()) return [];
+  const { fences } = splitDailyWrapup(fileContent);
   const existing: string[] = [];
-  const rawParts = fileContent.split(/^---$/m);
+  const rawParts = fences.split(/^---$/m);
   let i = 0;
   while (i < rawParts.length) {
     const trimmed = rawParts[i].trim();
@@ -515,7 +558,8 @@ export function insertRawMDBlockAt(
   ensureDirs();
   const filePath = path.join(DAILY_DIR, dailyFile);
   const content = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '';
-  const existing = listRawMDBlocks(content);
+  const { fences, phrase } = splitDailyWrapup(content);
+  const existing = listRawMDBlocks(fences);
   const id = rawBlockId(rawBlock);
   const normalized = rawBlock.replace(/\s+$/, '') + '\n';
   let next = [...existing];
@@ -530,7 +574,7 @@ export function insertRawMDBlockAt(
   } else {
     next.push(normalized);
   }
-  fs.writeFileSync(filePath, joinRawMDBlocks(next));
+  fs.writeFileSync(filePath, joinDailyWrapup(joinRawMDBlocks(next), phrase));
 }
 
 // Delete Memory Block from file (raw splice — do not re-stringify siblings)
@@ -546,6 +590,7 @@ export function deleteMemoryBlock(id: string): boolean {
   }
   
   const fileContent = fs.readFileSync(filePath, 'utf8');
+  const { phrase } = splitDailyWrapup(fileContent);
   const rawBlocks = listRawMDBlocks(fileContent);
   const next = rawBlocks.filter((b) => rawBlockId(b) !== id);
   if (next.length === rawBlocks.length) {
@@ -554,7 +599,7 @@ export function deleteMemoryBlock(id: string): boolean {
   if (next.length === 0) {
     fs.unlinkSync(filePath);
   } else {
-    fs.writeFileSync(filePath, joinRawMDBlocks(next));
+    fs.writeFileSync(filePath, joinDailyWrapup(joinRawMDBlocks(next), phrase));
   }
   return true;
 }

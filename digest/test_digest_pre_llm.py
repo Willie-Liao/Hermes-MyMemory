@@ -546,3 +546,19 @@ def test_bootstrap_omits_span_ask_when_open_fact_exists(tmp_path, monkeypatch):
     assert "## Recall index" in result["context"]
     assert "## Span ask" not in result["context"]
     assert "## Span recall" not in result["context"]
+
+
+def test_recall_index_by_day_includes_wrapup_phrase(tmp_path, monkeypatch):
+    digest = _load_digest()
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    secret_body = "SECRET_BODY_MUST_NOT_APPEAR_IN_INDEX"
+    content = (
+        _block(block_id="mem-wrap", body=secret_body)
+        + "\n\n## Day wrap-up\nNotGPT blocked; Xiaohongshu HTML cards shipped.\n"
+    )
+    _write_daily(tmp_path, _today(), content)
+    ctx = digest.build_recall_injection_context(tier_max=1)
+    assert "### By day" in ctx
+    assert "NotGPT blocked; Xiaohongshu HTML cards shipped." in ctx
+    assert secret_body not in ctx
+    assert "SECRET_BODY" not in ctx

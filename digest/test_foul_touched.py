@@ -164,7 +164,7 @@ def test_attempt2_prompt_omits_unrelated_bodies():
     )
     assert "## Previous operations" in prompt
     assert '"survivor_id": "N1"' in prompt
-    assert "### Existing blocks" in prompt or "E1" in prompt
+    assert "### Existing events" in prompt or "### Existing facts" in prompt or "E1" in prompt
     assert "Factual: f1" in prompt  # F1 one-hop body
     assert "Beginning: e3" not in prompt
     assert "Factual: n3" not in prompt

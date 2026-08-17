@@ -42,6 +42,10 @@ consolidates.
 
 ## Resolution
 
+Cards are grouped into four JSON arrays (event, fact, procedure, decision).
+Compare **inside each array**. `related:` may cite ids in other arrays; that
+is coexistence, not a duplicate pair.
+
 1. Skip every pair whose `type` fields differ — emit nothing for that pair.
 2. Same type plus extension or restatement — emit `merge`. The survivor is the
    block with the higher `importance`. For merge, fill **exactly one** nested
@@ -168,11 +172,58 @@ def _render_block(block: Mapping[str, Any]) -> str:
     return json.dumps(dict(block), ensure_ascii=False, sort_keys=True, default=str)
 
 
+BLOCK_TYPE_ORDER = ("event", "fact", "procedure", "decision")
+
+
+def _group_blocks_by_type(
+    blocks: Iterable[Mapping[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Bucket cards so the proposer compares same-type neighbors, not a mixed list."""
+    grouped = {key: [] for key in BLOCK_TYPE_ORDER}
+    for block in blocks:
+        raw = dict(block)
+        kind = str(raw.get("type") or "").strip().lower()
+        if kind not in grouped:
+            continue
+        grouped[kind].append(raw)
+    return grouped
+
+
+def render_typed_board(prefix: str, blocks: Iterable[Mapping[str, Any]]) -> str:
+    """Dump one JSON array per type so mixed file order cannot hide same-type pairs.
+
+    Empty types are ``[]``. Each card is still one object (full fields, sort_keys).
+    """
+    grouped = _group_blocks_by_type(blocks)
+    parts: list[str] = []
+    for kind in BLOCK_TYPE_ORDER:
+        payload = [
+            json.loads(_render_block(card)) for card in grouped[kind]
+        ]
+        heading = f"### {prefix} {kind}s"
+        parts.append(heading + "\n" + json.dumps(payload, ensure_ascii=False, default=str))
+    return "\n\n".join(parts) + "\n"
+
+
+WRAPUP_RULES = """## Day wrap-up
+
+Write one English-dominant medium phrase that names today's thread across
+the typed arrays below. Not a paragraph. Not YAML. Not a list.
+
+Call submit_day_wrapup with { "phrase": "..." } only. Max 120 characters.
+One clause; do not add a second sentence.
+"""
+
+
+def build_wrapup_prompt(blocks: Iterable[Mapping[str, Any]]) -> str:
+    """Reuse typed JSON arrays so wrap-up sees the same board as Phase 2, not YAML."""
+    return WRAPUP_RULES + "\n" + render_typed_board("Today", blocks)
+
+
 def _render_blocks(label: str, blocks: Iterable[Mapping[str, Any]]) -> str:
-    rendered = [_render_block(block) for block in blocks]
-    if not rendered:
-        return f"### {label}\n\n(none)\n"
-    return f"### {label}\n\n" + "\n".join(rendered) + "\n"
+    """Compatibility alias — typed board headings replace the mixed list."""
+    prefix = "Existing" if "existing" in label.casefold() else "New"
+    return render_typed_board(prefix, blocks)
 
 
 _OP_INDEX_RE = re.compile(r"operation\[(\d+)\]")
@@ -321,8 +372,8 @@ def build_proposer_prompt(
     sections.extend(
         [
             "## Blocks in play",
-            _render_blocks("Existing blocks already in the file", existing_blocks),
-            _render_blocks("New blocks from this session", new_blocks),
+            render_typed_board("Existing", existing_blocks),
+            render_typed_board("New", new_blocks),
         ]
     )
     if previous_operations is not None and attempt >= 2:

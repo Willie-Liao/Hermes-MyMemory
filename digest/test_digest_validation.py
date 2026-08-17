@@ -947,6 +947,30 @@ def test_dedup_prompt_requires_submit_operations_tool_not_bare_json_array():
     assert "not in assistant text" in prompt.casefold() or "not in assistant text" in prompt
 
 
+def test_dedup_prompt_groups_mixed_cards_into_typed_json_arrays():
+    """One prompt, four type buckets — compare inside each array, one submit_operations."""
+    dedup = load_plugin_module("dedup_prompt.py", "memory_digest_dedup_typed_arrays")
+    fact = {"id": "mem-f", "type": "fact", "body": "Factual: x"}
+    event = {"id": "mem-e", "type": "event", "body": "Beginning: a"}
+    proc = {"id": "mem-p", "type": "procedure", "body": "Obstacle: o"}
+    prompt = dedup.build_proposer_prompt([fact, event, proc], [])
+    assert "### Existing events" in prompt
+    assert "### Existing facts" in prompt
+    assert "### Existing procedures" in prompt
+    assert "### Existing decisions" in prompt
+    assert "Existing blocks already in the file" not in prompt
+    assert "New blocks from this session" not in prompt
+    events = json.loads(prompt.split("### Existing events", 1)[1].split("###", 1)[0].strip())
+    assert events[0]["type"] == "event"
+    assert events[0]["id"] == "mem-e"
+    facts = json.loads(prompt.split("### Existing facts", 1)[1].split("###", 1)[0].strip())
+    assert facts[0]["id"] == "mem-f"
+    assert "You MUST call submit_operations" in prompt
+    assert "patch_operations" in prompt
+    folded = prompt.casefold()
+    assert "inside each array" in folded or "compare inside" in folded
+
+
 def test_normalize_defaults_missing_importance_to_3():
     digest = _load_digest()
     raw = _block()
