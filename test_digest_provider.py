@@ -1,0 +1,145 @@
+"""MyMemory provider discovery, prefetch compose, and lifecycle."""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+_HERE = Path(__file__).resolve().parent
+_PLUGINS = _HERE.parent
+_HERMES_HOME = _PLUGINS.parent
+_AGENT = _HERMES_HOME / "hermes-agent"
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+if str(_PLUGINS) not in sys.path:
+    sys.path.insert(0, str(_PLUGINS))
+if str(_AGENT) not in sys.path:
+    sys.path.insert(0, str(_AGENT))
+
+from MyMemory.provider import MyMemoryProvider, reset_bootstrap_for_tests
+from MyMemory.digest import digest
+
+
+def _block(*, block_id: str, body: str) -> str:
+    return "\n".join(
+        [
+            "---",
+            f"id: {block_id}",
+            "type: fact",
+            "entity: Gabby",
+            "confidence: high",
+            "status: candidate",
+            "sources: [session:s1]",
+            "---",
+            body,
+        ]
+    )
+
+
+def test_init_py_is_exclusive_register_only():
+    text = (_HERE / "__init__.py").read_text(encoding="utf-8")
+    assert "register_memory_provider" in text
+    assert "register_hook" not in text
+    assert "register_command" not in text
+
+
+def test_name_and_available():
+    p = MyMemoryProvider()
+    assert p.name == "MyMemory"
+    assert p.is_available() is True
+
+
+def test_system_prompt_block_stable_and_no_index():
+    p = MyMemoryProvider()
+    a = p.system_prompt_block()
+    b = p.system_prompt_block()
+    assert a == b
+    assert "Recall index" not in a
+    assert a.count("MEMORY.md") == 1
+    assert "already in the system prompt" in a
+
+
+def test_prefetch_compose_no_prewrap(tmp_path, monkeypatch):
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    daily = tmp_path / "memories" / "staging" / "daily"
+    daily.mkdir(parents=True)
+    from memory_staging import hermes_local_today_str
+
+    (daily / f"{hermes_local_today_str()}.md").write_text(
+        _block(block_id="mem-1", body="Gabby canteen open.") + "\n",
+        encoding="utf-8",
+    )
+    from MyMemory.weekly import weekly
+
+    monkeypatch.setattr(weekly, "on_pre_llm_call", lambda **_: None)
+    p = MyMemoryProvider()
+    first = p.prefetch("hello there", session_id="s-pre")
+    assert "## Recall index (unlocked window)" in first
+    assert "<memory-context>" not in first
+    assert "USER.md" not in first
+    second = p.prefetch("hello again", session_id="s-pre")
+    assert second == ""
+
+
+def test_prefetch_keeps_weekly_when_digest_empty(tmp_path, monkeypatch):
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    from MyMemory.weekly import weekly
+
+    monkeypatch.setattr(
+        weekly,
+        "on_pre_llm_call",
+        lambda **_: {"context": "## Weekly Brief\nhello"},
+    )
+    p = MyMemoryProvider()
+    p.prefetch("first", session_id="s-w")
+    text = p.prefetch("second", session_id="s-w")
+    assert "Weekly Brief" in text
+    assert "<memory-context>" not in text
+
+
+def test_sync_turn_calls_digest_extract(monkeypatch):
+    seen = []
+    monkeypatch.setattr(digest, "on_agent_end", lambda ctx: seen.append(ctx))
+    p = MyMemoryProvider()
+    p._agent_context = "primary"
+    p.sync_turn("hi", "ok", session_id="s-sync")
+    assert seen
+    assert seen[0]["session_id"] == "s-sync"
+
+
+def test_initialize_starts_clock_weekly_retention_once(monkeypatch):
+    reset_bootstrap_for_tests()
+    clock = []
+    weekly_reasons = []
+    ret_reasons = []
+    monkeypatch.setattr(digest, "start_digest_clock_thread", lambda: clock.append(1))
+    from MyMemory.weekly import weekly
+    from MyMemory.retention import retention
+
+    monkeypatch.setattr(weekly, "run_async", lambda reason: weekly_reasons.append(reason))
+    monkeypatch.setattr(retention, "run_async", lambda reason: ret_reasons.append(reason))
+    monkeypatch.setattr("MyMemory.provider.weekly_tools.ensure_weekly_tools_registered", lambda: None)
+    p = MyMemoryProvider()
+    p.initialize("s1", hermes_home=str(_HERMES_HOME), platform="cli")
+    p.initialize("s2", hermes_home=str(_HERMES_HOME), platform="cli")
+    assert clock == [1]
+    assert weekly_reasons == ["plugin_load"]
+    assert ret_reasons == ["plugin_load"]
+
+
+@pytest.mark.skipif(
+    not (_AGENT / "plugins" / "memory" / "__init__.py").exists(),
+    reason="hermes-agent not vendored",
+)
+def test_hermes_loader_discovers_mymemory(monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(_HERMES_HOME))
+    from plugins.memory import _is_memory_provider_dir, load_memory_provider
+
+    assert _is_memory_provider_dir(_HERE) is True
+    loaded = load_memory_provider("MyMemory")
+    assert loaded is not None
+    assert loaded.name == "MyMemory"
+    assert loaded.is_available() is True

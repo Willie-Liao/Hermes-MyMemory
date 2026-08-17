@@ -1,0 +1,4 @@
+name: MyMemory
+version: 1.0.0
+kind: exclusive
+description: "Digest, weekly, and retention as one Hermes memory provider. Last-3-days index and weekly Brief inject via prefetch."

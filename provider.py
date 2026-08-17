@@ -1,0 +1,264 @@
+"""Hermes memory provider that owns digest extract, weekly generate, and retention sweep.
+
+Without this wrap, PluginManager would load three sibling plugins and inject
+recall twice (pre_llm_call plus prefetch). Exclusive MyMemory is the only
+inject path Hermes wraps as ``<memory-context>``.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+_mymemory = Path(__file__).resolve().parent
+if str(_mymemory) not in sys.path:
+    sys.path.insert(0, str(_mymemory))
+_plugins_root = _mymemory.parent
+if str(_plugins_root) not in sys.path:
+    sys.path.insert(0, str(_plugins_root))
+_hermes_agent = _plugins_root.parent / "hermes-agent"
+if _hermes_agent.is_dir() and str(_hermes_agent) not in sys.path:
+    sys.path.insert(0, str(_hermes_agent))
+
+from agent.memory_provider import MemoryProvider
+
+from .digest import digest, slash as digest_slash
+from .retention import retention
+from .weekly import slash as weekly_slash
+from .weekly import weekly
+from .weekly import weekly_tools
+
+_SKIP_WRITE_CONTEXTS = frozenset({"cron", "subagent", "flush"})
+_BOOTSTRAPPED = False
+
+_SYSTEM_PROMPT_BLOCK = (
+    "The last-3-days digest recall index is injected on the user message when "
+    "due (once per session civil day). Fetch mem- ids from that index when you "
+    "need a card. MEMORY.md and USER.md are already in the system prompt — do "
+    "not expect those hot files in the recall index."
+)
+
+
+class MyMemoryProvider(MemoryProvider):
+    """Selectable ``memory.provider: MyMemory`` backend for this Hermes home."""
+
+    def __init__(self) -> None:
+        self._hermes_home = ""
+        self._session_id = ""
+        self._platform = ""
+        self._agent_context = "primary"
+        self._prefetch_seen: set[str] = set()
+
+    @property
+    def name(self) -> str:
+        return "MyMemory"
+
+    def is_available(self) -> bool:
+        """Always on — this pack is local files, not a remote memory API."""
+        return True
+
+    def get_config_schema(self) -> List[Dict[str, Any]]:
+        return []
+
+    def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
+        """No native config file — worker LLM lives under plugins.entries.MyMemory."""
+        return None
+
+    def initialize(self, session_id: str, **kwargs) -> None:
+        """Start digest clock plus weekly/retention catch-up once per process.
+
+        Exclusive plugins are not imported at PluginManager boot; the first
+        primary-agent initialize is what arms the civil clock.
+        """
+        self._session_id = str(session_id or "")
+        self._hermes_home = str(kwargs.get("hermes_home") or "")
+        self._platform = str(kwargs.get("platform") or "")
+        self._agent_context = str(kwargs.get("agent_context") or "primary")
+        if self._agent_context in _SKIP_WRITE_CONTEXTS:
+            return
+        _bootstrap_background()
+
+    def system_prompt_block(self) -> str:
+        """Cache-stable instructions only — daily file names would bust the prefix cache."""
+        return _SYSTEM_PROMPT_BLOCK
+
+    def prefetch(self, query: str, *, session_id: str = "") -> str:
+        """Compose digest last-3-days index plus weekly Brief when those hooks would inject.
+
+        Hermes wraps the return value; pre-wrapping ``<memory-context>`` would nest fences.
+        """
+        sid = str(session_id or self._session_id or "")
+        first = sid not in self._prefetch_seen
+        digest_hit = digest.on_pre_llm_call(
+            user_message=query,
+            is_first_turn=first,
+            session_id=sid,
+            platform=self._platform,
+        )
+        weekly_hit = weekly.on_pre_llm_call(
+            user_message=query,
+            is_first_turn=first,
+            session_id=sid,
+            platform=self._platform,
+        )
+        if sid:
+            self._prefetch_seen.add(sid)
+        parts: list[str] = []
+        for hit in (digest_hit, weekly_hit):
+            if isinstance(hit, dict):
+                text = str(hit.get("context") or "").strip()
+                if text:
+                    parts.append(text)
+        joined = "\n\n".join(parts)
+        if "<memory-context>" in joined:
+            joined = joined.replace("<memory-context>", "").replace("</memory-context>", "")
+        return joined.strip()
+
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Queue digest extract after a primary chat turn — must not block the API loop."""
+        del user_content, assistant_content, messages
+        if self._agent_context in _SKIP_WRITE_CONTEXTS:
+            return
+        sid = str(session_id or self._session_id or "")
+        digest.on_agent_end(
+            {
+                "session_id": sid,
+                "session_key": sid,
+                "platform": self._platform,
+            }
+        )
+
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        """Session boundary leftover extract plus weekly/retention sweeps."""
+        del messages
+        if self._agent_context in _SKIP_WRITE_CONTEXTS:
+            return
+        ctx = {
+            "session_id": self._session_id,
+            "session_key": self._session_id,
+            "platform": self._platform,
+        }
+        digest.on_session_boundary(ctx, reason="on_session_finalize")
+        weekly.run_async("on_session_finalize")
+        retention.run_async("on_session_finalize")
+
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs,
+    ) -> None:
+        """Keep provider session id in sync and re-arm weekly/retention like the old hooks."""
+        del parent_session_id, rewound, kwargs
+        self._session_id = str(new_session_id or "")
+        self._prefetch_seen.discard(self._session_id)
+        if self._agent_context in _SKIP_WRITE_CONTEXTS:
+            return
+        reason = "on_session_reset" if reset else "on_session_start"
+        weekly.run_async(reason)
+        retention.run_async(reason)
+
+    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        """Chat-facing digest/weekly actions that replaced in-chat slash commands."""
+        return [
+            {
+                "name": "mymemory_digest",
+                "description": (
+                    "Run a digest now or inspect bookmark/status. "
+                    "Pass the same tokens as the old /digest command (empty, status, bookmark …)."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "args": {
+                            "type": "string",
+                            "description": "Digest subcommand tokens, e.g. 'status' or 'bookmark show'.",
+                        }
+                    },
+                },
+            },
+            {
+                "name": "mymemory_weekly",
+                "description": (
+                    "Weekly memory: ui, update, close, reopen. "
+                    "Pass the same tokens as the old /weekly command."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "args": {
+                            "type": "string",
+                            "description": "Weekly subcommand tokens, e.g. 'ui' or 'update 2026-W33'.",
+                        }
+                    },
+                },
+            },
+        ]
+
+    def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        """Dispatch chat tools to the former slash handlers."""
+        del kwargs
+        raw = str((args or {}).get("args") or "")
+        if tool_name == "mymemory_digest":
+            return json.dumps(
+                {"ok": True, "text": digest_slash.handle_digest(raw)},
+                ensure_ascii=False,
+            )
+        if tool_name == "mymemory_weekly":
+            return json.dumps(
+                {"ok": True, "text": weekly_slash.handle_weekly(raw)},
+                ensure_ascii=False,
+            )
+        raise NotImplementedError(f"Provider {self.name} does not handle tool {tool_name}")
+
+    def shutdown(self) -> None:
+        """Stop the digest clock only under pytest so production daemons keep ticking."""
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            digest.stop_digest_clock_thread()
+
+
+def _bootstrap_background() -> None:
+    """Idempotent clock + weekly/retention plugin_load equivalent."""
+    global _BOOTSTRAPPED
+    if _BOOTSTRAPPED:
+        return
+    _BOOTSTRAPPED = True
+    try:
+        from memory_staging import migrate_all_weekly_files
+
+        home = digest.get_hermes_home()
+        migrate_all_weekly_files(home)
+    except Exception:
+        pass
+    digest.start_digest_clock_thread()
+    try:
+        weekly_tools.ensure_weekly_tools_registered()
+    except Exception:
+        pass
+    try:
+        from .digest import digest_tools
+
+        digest_tools.ensure_digest_tools_registered()
+    except Exception:
+        pass
+    weekly.run_async("plugin_load")
+    retention.run_async("plugin_load")
+
+
+def reset_bootstrap_for_tests() -> None:
+    """Let provider tests assert initialize starts clock/weekly/retention once."""
+    global _BOOTSTRAPPED
+    _BOOTSTRAPPED = False
