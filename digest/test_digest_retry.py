@@ -131,10 +131,10 @@ def test_normal_caller_routes_event_contract_and_retries_wrong_type(tmp_path, mo
         ),
         encoding="utf-8",
     )
-    # Ten user messages; assistant replies are included but not a floor.
+    # Twelve user messages; assistant replies are included but not a floor.
     messages = [
         item
-        for idx in range(1, 11)
+        for idx in range(1, 13)
         for item in (
             {"id": idx * 2 - 1, "role": "user", "content": f"user {idx}"},
             {"id": idx * 2, "role": "assistant", "content": f"assistant {idx}"},

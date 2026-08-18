@@ -2,8 +2,9 @@
 
 Plugin hooks (CLI + gateway):
   - on_session_end — after each completed agent turn, digest when the
-    undigested window past the session bookmark reaches ≥10 user messages
-    (assistant replies in that window are included; there is no assistant floor)
+    undigested window past the session bookmark reaches ≥12 user messages
+    (assistant replies between those 12 user turns are included; extra user
+    turns wait; there is no assistant floor)
   - on_session_finalize — digest session-boundary leftovers when the same
     user-count floor is met
   -     plugin clock — Phase 2 at 08:00/12:00/16:00/20:00/23:55 in config.yaml
@@ -92,7 +93,7 @@ def _hermes_home() -> Path:
     return get_hermes_home()
 
 
-BATCH_USER_MESSAGES = 10
+BATCH_USER_MESSAGES = 12
 # Trigger reason when the undigested window past the bookmark hits the batch floor.
 BOOKMARK_TRIGGER_REASON = "bookmark_ready"
 BATCH_TRIGGER_REASON = BOOKMARK_TRIGGER_REASON  # deprecated alias
@@ -4133,7 +4134,7 @@ def _run_digest_pipeline(
     """Phase-1 extract → persist daily → bookmark. Merge is a separate clock.
 
     Returns ``appended``, ``skip``, or ``failed``. Phase-2 no longer runs here
-    so a batch of ten user messages cannot spend a merge budget on every extract.
+    so a batch of twelve user messages cannot spend a merge budget on every extract.
     """
     try:
         phase1 = run_phase1_digest_blocks(
@@ -4259,10 +4260,12 @@ def _maybe_run_digest(
 ) -> dict[str, Any]:
     """Decide and launch a digest run for ``session_key``.
 
-    Returns an outcome dict. Hook callers ignore it; the slash path inspects it.
-    ``force`` skips the batch-size threshold (still requires undigested messages).
-    ``sync`` runs the worker inline and returns its terminal outcome
-    ('appended' / 'skip' / 'failed') instead of 'started'.
+    Auto runs wait for ``BATCH_USER_MESSAGES`` user turns, then take only
+    those turns plus assistant replies between them so leftover user 13+
+    cannot inflate one extract. ``force`` skips the floor and that clip
+    (still requires undigested messages). ``sync`` runs the worker inline
+    and returns its terminal outcome ('appended' / 'skip' / 'failed')
+    instead of 'started'. Hook callers ignore the outcome dict; slash inspects it.
     """
     with _digest_lock:
         state = _load_state()
@@ -4305,6 +4308,20 @@ def _maybe_run_digest(
                 "user": user_count,
                 "assistant": assistant_count,
             }
+
+        if not force:
+            sliced: list[dict[str, Any]] = []
+            users_kept = 0
+            for msg in messages:
+                if msg.get("role") == "user":
+                    if users_kept >= BATCH_USER_MESSAGES:
+                        break
+                    users_kept += 1
+                    sliced.append(msg)
+                    continue
+                sliced.append(msg)
+            messages = sliced
+            user_count, assistant_count = _role_counts(messages)
 
         platform = entry.get("platform", "")
         transcript = _format_transcript(messages)

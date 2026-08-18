@@ -39,11 +39,32 @@ def _block(*, block_id: str, body: str) -> str:
     )
 
 
-def test_init_py_is_exclusive_register_only():
+def test_init_py_registers_slash_without_hooks():
     text = (_HERE / "__init__.py").read_text(encoding="utf-8")
-    assert "register_memory_provider" in text
+    assert "register_command" in text
     assert "register_hook" not in text
-    assert "register_command" not in text
+    assert "hasattr" in text
+    assert "register_memory_provider" in text
+
+
+@pytest.mark.skipif(
+    not (_AGENT / "hermes_cli" / "plugins.py").exists(),
+    reason="hermes-agent not vendored",
+)
+def test_plugin_manager_discover_registers_digest_and_weekly_slash(monkeypatch):
+    """Gateway discover_plugins() must attach slash before any AIAgent initialize."""
+    from hermes_cli import plugins as plugins_mod
+
+    monkeypatch.setenv("HERMES_HOME", str(_HERMES_HOME))
+    mgr = plugins_mod.PluginManager()
+    monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+    monkeypatch.setattr(plugins_mod, "get_plugin_manager", lambda: mgr)
+    mgr.discover_and_load()
+    cmds = mgr._plugin_commands
+    assert cmds["digest"]["handler"].__name__ == "handle_digest"
+    assert cmds["weekly"]["handler"].__name__ == "handle_weekly"
+    assert "digest" in cmds
+    assert "weekly" in cmds
 
 
 def test_name_and_available():

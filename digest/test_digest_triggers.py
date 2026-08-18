@@ -114,9 +114,9 @@ def _configure_digest(digest, monkeypatch, home: Path, messages: list[dict]) -> 
     return calls
 
 
-def test_batch_trigger_skips_before_ten_user_messages(tmp_path, monkeypatch):
+def test_batch_trigger_skips_before_twelve_user_messages(tmp_path, monkeypatch):
     digest = _load_digest()
-    calls = _configure_digest(digest, monkeypatch, tmp_path, _messages(9))
+    calls = _configure_digest(digest, monkeypatch, tmp_path, _messages(11))
 
     digest.on_agent_end({"session_id": "s1", "platform": "wecom"})
 
@@ -125,22 +125,22 @@ def test_batch_trigger_skips_before_ten_user_messages(tmp_path, monkeypatch):
     assert "last_digest_message_id" not in state["sessions"]["s1"]
 
 
-def test_batch_trigger_ready_at_ten_user_without_assistant_floor(tmp_path, monkeypatch):
+def test_batch_trigger_ready_at_twelve_user_without_assistant_floor(tmp_path, monkeypatch):
     digest = _load_digest()
-    messages = _messages(10, assistant_count=0)
+    messages = _messages(12, assistant_count=0)
     calls = _configure_digest(digest, monkeypatch, tmp_path, messages)
 
     digest.on_agent_end({"session_id": "s1", "platform": "wecom"})
 
     assert len(calls) == 1
-    assert calls[0]["user_count"] == 10
+    assert calls[0]["user_count"] == 12
     assert calls[0]["assistant_count"] == 0
-    assert "[user] user 10" in calls[0]["prompt"]
+    assert "[user] user 12" in calls[0]["prompt"]
 
 
-def test_batch_trigger_ready_at_ten_user_messages(tmp_path, monkeypatch):
+def test_batch_trigger_ready_at_twelve_user_messages(tmp_path, monkeypatch):
     digest = _load_digest()
-    messages = _messages(10)
+    messages = _messages(13)
     calls = _configure_digest(digest, monkeypatch, tmp_path, messages)
 
     digest.on_agent_end({"session_id": "s1", "platform": "wecom"})
@@ -148,21 +148,24 @@ def test_batch_trigger_ready_at_ten_user_messages(tmp_path, monkeypatch):
     assert len(calls) == 1
     assert calls[0]["session_id"] == "s1"
     assert calls[0]["platform"] == "wecom"
-    assert calls[0]["batch_end_id"] == 20
+    assert calls[0]["user_count"] == 12
+    assert calls[0]["assistant_count"] == 12
+    assert calls[0]["batch_end_id"] == 24
     assert calls[0]["batch_start_id"] == 1
     # Production path passes raw transcript — not a nested mega-prompt.
-    assert "[user] user 10" in calls[0]["prompt"]
-    assert "[assistant] assistant 10" in calls[0]["prompt"]
+    assert "[user] user 12" in calls[0]["prompt"]
+    assert "[assistant] assistant 12" in calls[0]["prompt"]
+    assert "[user] user 13" not in calls[0]["prompt"]
     assert "You are the memory digest worker" not in calls[0]["prompt"]
     assert "OUTPUT CONTRACT" not in calls[0]["prompt"]
     state = _read_state(tmp_path)
-    assert state["sessions"]["s1"]["last_digest_message_id"] == 20
+    assert state["sessions"]["s1"]["last_digest_message_id"] == 24
     assert state["sessions"]["s1"]["digest_in_flight"] is False
 
 
 def test_normal_digest_caller_passes_raw_transcript(tmp_path, monkeypatch):
     digest = _load_digest()
-    calls = _configure_digest(digest, monkeypatch, tmp_path, _messages(10))
+    calls = _configure_digest(digest, monkeypatch, tmp_path, _messages(12))
 
     digest.on_agent_end({"session_id": "s1", "platform": "wecom"})
 
@@ -181,7 +184,7 @@ def test_in_flight_blocks_second_trigger(tmp_path, monkeypatch):
         digest,
         "_fetch_messages",
         lambda session_id, after_id=0: [
-            m for m in _messages(10) if m["id"] > after_id
+            m for m in _messages(12) if m["id"] > after_id
         ],
     )
 
@@ -231,16 +234,16 @@ def test_worker_active_guard_skips_on_agent_end(tmp_path, monkeypatch):
     assert not _state_path(tmp_path).exists()
 
 
-def test_session_boundary_runs_with_ten_user_messages(tmp_path, monkeypatch):
+def test_session_boundary_runs_with_twelve_user_messages(tmp_path, monkeypatch):
     digest = _load_digest()
     _write_state(tmp_path)
-    calls = _configure_digest(digest, monkeypatch, tmp_path, _messages(10))
+    calls = _configure_digest(digest, monkeypatch, tmp_path, _messages(12))
 
     digest.on_session_boundary({"session_id": "s1", "platform": "wecom"}, reason="session_expired")
 
     assert len(calls) == 1
     state = _read_state(tmp_path)
-    assert state["sessions"]["s1"]["last_digest_message_id"] == 20
+    assert state["sessions"]["s1"]["last_digest_message_id"] == 24
 
 
 def test_session_boundary_skips_short_batch(tmp_path, monkeypatch):
@@ -257,7 +260,7 @@ def test_session_boundary_skips_short_batch(tmp_path, monkeypatch):
 
 def test_bookmark_prevents_reprocessing_previous_batch(tmp_path, monkeypatch):
     digest = _load_digest()
-    messages = _messages(10)
+    messages = _messages(12)
     _write_state(tmp_path)
     calls = _configure_digest(digest, monkeypatch, tmp_path, messages)
 
@@ -265,7 +268,7 @@ def test_bookmark_prevents_reprocessing_previous_batch(tmp_path, monkeypatch):
 
     assert len(calls) == 1
     state = _read_state(tmp_path)
-    assert state["sessions"]["s1"]["last_digest_message_id"] == 20
+    assert state["sessions"]["s1"]["last_digest_message_id"] == 24
 
     messages.extend(
         [
@@ -284,12 +287,12 @@ def test_bookmark_prevents_reprocessing_previous_batch(tmp_path, monkeypatch):
 
     assert len(calls) == 1
     state = _read_state(tmp_path)
-    assert state["sessions"]["s1"]["last_digest_message_id"] == 20
+    assert state["sessions"]["s1"]["last_digest_message_id"] == 24
 
 
-def test_second_batch_runs_after_another_ten_user_messages(tmp_path, monkeypatch):
+def test_second_batch_runs_after_another_twelve_user_messages(tmp_path, monkeypatch):
     digest = _load_digest()
-    messages = _messages(10)
+    messages = _messages(12)
     _write_state(tmp_path)
     calls = _configure_digest(digest, monkeypatch, tmp_path, messages)
 
@@ -297,10 +300,10 @@ def test_second_batch_runs_after_another_ten_user_messages(tmp_path, monkeypatch
 
     assert len(calls) == 1
     state = _read_state(tmp_path)
-    assert state["sessions"]["s1"]["last_digest_message_id"] == 20
+    assert state["sessions"]["s1"]["last_digest_message_id"] == 24
 
-    next_id = 21
-    for user_index in range(11, 21):
+    next_id = 25
+    for user_index in range(13, 25):
         messages.append(
             {"id": next_id, "role": "user", "content": f"user {user_index}"}
         )
@@ -314,7 +317,7 @@ def test_second_batch_runs_after_another_ten_user_messages(tmp_path, monkeypatch
 
     assert len(calls) == 2
     state = _read_state(tmp_path)
-    assert state["sessions"]["s1"]["last_digest_message_id"] == 40
+    assert state["sessions"]["s1"]["last_digest_message_id"] == 48
 
 
 def test_prompt_constrains_status_values(tmp_path, monkeypatch):

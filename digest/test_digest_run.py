@@ -122,7 +122,7 @@ def test_request_digest_force_appends_below_threshold(tmp_path, monkeypatch):
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
     _write_state(tmp_path, session_id="s1")
 
-    msgs = _messages(2)  # well below the 10/10 batch floor
+    msgs = _messages(2)  # well below the 12-user batch floor
     monkeypatch.setattr(
         digest, "_fetch_messages", lambda sid, after_id=0: [m for m in msgs if m["id"] > after_id]
     )
