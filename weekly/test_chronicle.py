@@ -210,7 +210,7 @@ def test_chronicle_prefers_brief_section_skips_llm(tmp_path, monkeypatch):
     md = (
         "# Weekly distill 2026-W28\n\n"
         "## Distill\n\n"
-        "---\nid: evt-a\ntype: event\nsources: [session:s1]\n"
+        "---\nid: evt-a\ntype: event\nsources: [session s1]\n"
         'related:\n  - "[1] mem-2026-06-29-a"\n---\n'
         "Body [1].\n\n"
         "## Brief\n\n"

@@ -24,7 +24,7 @@ def _fact(block_id: str, *, body: str = "Project uses a single shared owner.", s
             "entity: Project",
             "confidence: high",
             f"status: {status}",
-            "sources: [session:s1]",
+            "sources: [session s1]",
             "---",
             body,
         ]
@@ -49,7 +49,7 @@ def _event(block_id: str, *, related: str = "", body: str = "User asked for a re
         "valid_to: 2026-08-02",
         "confidence: high",
         "status: candidate",
-        "sources: [session:s1]",
+        "sources: [session s1]",
         "---",
         body,
     ]
@@ -336,10 +336,10 @@ def test_supersede_overwrites_target_and_purges_helper(tmp_path, monkeypatch):
 def test_superseded_at_format_is_validated_only_when_present():
     digest = _digest("memory_digest_superseded_at_test")
     good = _fact("mem-2026-08-02-fact-A").replace(
-        "sources: [session:s1]", "superseded_at: 2026-08-02\nsources: [session:s1]"
+        "sources: [session s1]", "superseded_at: 2026-08-02\nsources: [session s1]"
     )
     bad = _fact("mem-2026-08-02-fact-A").replace(
-        "sources: [session:s1]", "superseded_at: soon\nsources: [session:s1]"
+        "sources: [session s1]", "superseded_at: soon\nsources: [session s1]"
     )
     assert digest._validate_digest_file(good + "\n") == []
     assert digest._validate_digest_file(_fact("mem-2026-08-02-fact-A") + "\n") == []

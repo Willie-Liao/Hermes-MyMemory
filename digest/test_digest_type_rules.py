@@ -19,7 +19,7 @@ def _block(block_id: str, block_type: str, *, importance: int = 3, **extra) -> d
         "type": block_type,
         "confidence": "high",
         "status": "candidate",
-        "sources": ["session:s1"],
+        "sources": ["session s1"],
         "importance": importance,
         "body": f"{block_type} body for {block_id}.",
         **extra,
@@ -477,7 +477,7 @@ def test_scrub_illegal_sources_strips_staging_keeps_real_file(tmp_path):
         "confidence: high\n"
         "importance: 3\n"
         "status: candidate\n"
-        "sources: [session:20260722_172657_c54f77a8, "
+        "sources: [session 20260722_172657_c54f77a8, "
         "file:/root/Me/Personal/notes/note.md, "
         "file:/root/.hermes/memories/staging/daily/2026-08-15.md, "
         "2026-08-15.md]\n"
@@ -485,7 +485,7 @@ def test_scrub_illegal_sources_strips_staging_keeps_real_file(tmp_path):
         "Factual: keep.\n"
     )
     out = digest._scrub_illegal_sources(content)
-    assert "session:20260722_172657_c54f77a8" in out
+    assert "session 20260722_172657_c54f77a8" in out
     assert "file:/root/Me/Personal/notes/note.md" in out
     assert "memories/staging" not in out
     assert "2026-08-15.md" not in out

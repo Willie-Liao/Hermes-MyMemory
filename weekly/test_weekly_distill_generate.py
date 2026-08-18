@@ -45,7 +45,7 @@ def _event_tool_args(
         "valid_to": day,
         "confidence": "high",
         "status": "candidate",
-        "sources": ["session:s1"],
+        "sources": ["session s1"],
         "related": [mem_id],
         "beginning": f"Fact recorded on {day}",
         "course": f"Fact recorded progress on {day}",
@@ -72,7 +72,7 @@ def _event_block(
         f"valid_to: {day}\n"
         "confidence: high\n"
         "status: candidate\n"
-        "sources: [session:s1]\n"
+        "sources: [session s1]\n"
         "related:\n"
         f"  - {mem_id}\n"
         "---\n"
@@ -87,7 +87,7 @@ def _hypothesis_tool_args(event_id: str = "evt-a") -> dict:
                 "id": "hyp-a",
                 "entity": "Example",
                 "valid_from": "2026-06-30",
-                "sources": ["session:s1"],
+                "sources": ["session s1"],
                 "related": [event_id],
                 "confidence": "medium",
                 "status": "candidate",
@@ -104,7 +104,7 @@ def _conflict_tool_args(event_id: str = "evt-a") -> dict:
                 "id": "cfl-a",
                 "confidence": "high",
                 "status": "candidate",
-                "sources": ["session:s1"],
+                "sources": ["session s1"],
                 "related": [event_id],
                 "tension": "Two readings disagree.",
             }
@@ -119,7 +119,7 @@ def _hypothesis_block(event_id: str = "evt-a") -> str:
         "type: hypothesis\n"
         "entity: Example\n"
         "valid_from: 2026-06-30\n"
-        "sources: [session:s1]\n"
+        "sources: [session s1]\n"
         f"related: [{event_id}]\n"
         "confidence: medium\n"
         "status: candidate\n"
@@ -135,7 +135,7 @@ def _conflict_block(event_id: str = "evt-a") -> str:
         "type: conflict\n"
         "confidence: high\n"
         "status: candidate\n"
-        "sources: [session:s1]\n"
+        "sources: [session s1]\n"
         f"related: [{event_id}]\n"
         "---\n"
         "Two readings disagree.\n"
@@ -178,7 +178,7 @@ def _write_daily(
     daily.parent.mkdir(parents=True, exist_ok=True)
     daily.write_text(
         f"---\nid: {mem_id}\ntype: {block_type}\nentity: X\nconfidence: high\n"
-        "status: candidate\nsources: [session:s1]\n---\n"
+        "status: candidate\nsources: [session s1]\n---\n"
         f"{block_type.capitalize()} recorded on {day}.\n",
         encoding="utf-8",
     )
@@ -589,7 +589,7 @@ def test_event_workers_never_emit_non_event_types(tmp_path, monkeypatch):
                             "valid_from": day,
                             "valid_to": day,
                             "confidence": "high",
-                            "sources": ["session:s1"],
+                            "sources": ["session s1"],
                             "related": [],
                             "beginning": "x",
                             "course": "y",

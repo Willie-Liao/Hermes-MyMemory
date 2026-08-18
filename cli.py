@@ -1,4 +1,4 @@
-"""CLI for ``hermes MyMemory digest|weekly`` — slash handlers without in-chat /digest /weekly."""
+"""CLI for ``hermes MyMemory digest|weekly`` — same handlers as in-chat /digest /weekly."""
 
 from __future__ import annotations
 

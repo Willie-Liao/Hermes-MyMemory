@@ -32,7 +32,7 @@ def _block(*, block_id: str, body: str) -> str:
             "entity: Gabby",
             "confidence: high",
             "status: candidate",
-            "sources: [session:s1]",
+            "sources: [session s1]",
             "---",
             body,
         ]
@@ -108,6 +108,72 @@ def test_sync_turn_calls_digest_extract(monkeypatch):
     p.sync_turn("hi", "ok", session_id="s-sync")
     assert seen
     assert seen[0]["session_id"] == "s-sync"
+
+
+def _stub_bootstrap(monkeypatch) -> None:
+    monkeypatch.setattr(digest, "start_digest_clock_thread", lambda: None)
+    from MyMemory.weekly import weekly
+    from MyMemory.retention import retention
+
+    monkeypatch.setattr(weekly, "run_async", lambda reason: None)
+    monkeypatch.setattr(retention, "run_async", lambda reason: None)
+    monkeypatch.setattr(
+        "MyMemory.provider.weekly_tools.ensure_weekly_tools_registered",
+        lambda: None,
+    )
+
+
+def _fresh_plugin_manager(monkeypatch):
+    """Skip PluginManager filesystem scan; keep an empty command table."""
+    from hermes_cli import plugins as plugins_mod
+
+    mgr = plugins_mod.PluginManager()
+    mgr._discovered = True
+    monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+    monkeypatch.setattr(plugins_mod, "get_plugin_manager", lambda: mgr)
+    return mgr
+
+
+@pytest.mark.skipif(
+    not (_AGENT / "hermes_cli" / "plugins.py").exists(),
+    reason="hermes-agent not vendored",
+)
+def test_initialize_registers_digest_and_weekly_slash(monkeypatch):
+    from hermes_cli.plugins import get_plugin_commands
+    from MyMemory.digest import slash as digest_slash
+    from MyMemory.weekly import slash as weekly_slash
+
+    _fresh_plugin_manager(monkeypatch)
+    reset_bootstrap_for_tests()
+    _stub_bootstrap(monkeypatch)
+    p = MyMemoryProvider()
+    p.initialize("s1", hermes_home=str(_HERMES_HOME), platform="cli")
+    cmds = get_plugin_commands()
+    assert cmds["digest"]["handler"] is digest_slash.handle_digest
+    assert cmds["weekly"]["handler"] is weekly_slash.handle_weekly
+
+
+@pytest.mark.skipif(
+    not (_AGENT / "hermes_cli" / "plugins.py").exists(),
+    reason="hermes-agent not vendored",
+)
+def test_initialize_registers_slash_in_skip_write_context(monkeypatch):
+    from hermes_cli.plugins import get_plugin_commands
+    from MyMemory.digest import slash as digest_slash
+    from MyMemory.weekly import slash as weekly_slash
+
+    _fresh_plugin_manager(monkeypatch)
+    reset_bootstrap_for_tests()
+    p = MyMemoryProvider()
+    p.initialize(
+        "s-cron",
+        hermes_home=str(_HERMES_HOME),
+        platform="cli",
+        agent_context="cron",
+    )
+    cmds = get_plugin_commands()
+    assert cmds["digest"]["handler"] is digest_slash.handle_digest
+    assert cmds["weekly"]["handler"] is weekly_slash.handle_weekly
 
 
 def test_initialize_starts_clock_weekly_retention_once(monkeypatch):

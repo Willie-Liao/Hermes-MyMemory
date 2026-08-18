@@ -63,7 +63,7 @@ _VALID_BLOCK = "\n".join(
         "entity: Gabby",
         "confidence: high",
         "status: candidate",
-        "sources: [session:s1]",
+        "sources: [session s1]",
         "---",
         "Gabby chose home-packed lunch.",
     ]
@@ -83,7 +83,7 @@ _VALID_EVENT = "\n".join(
         "valid_to: open",
         "confidence: explicit",
         "status: candidate",
-        "sources: [session:s1]",
+        "sources: [session s1]",
         "---",
         "Beginning: user requested review; Course: assistant reviewed sources; Outcome: draft delivered.",
     ]
@@ -96,7 +96,7 @@ _VALID_PROCEDURE = "\n".join(
         "type: procedure",
         "confidence: explicit",
         "status: candidate",
-        "sources: [session:s1]",
+        "sources: [session s1]",
         "---",
         "Obstacle: source notes were scattered; Solution: use an abstract source-triage checklist.",
     ]
@@ -109,7 +109,7 @@ _VALID_DECISION = "\n".join(
         "type: decision",
         "confidence: explicit",
         "status: candidate",
-        "sources: [session:s1]",
+        "sources: [session s1]",
         "---",
         "Decision: user prefers concise review summaries.",
     ]

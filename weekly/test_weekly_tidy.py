@@ -116,7 +116,7 @@ def test_parse_weekly_candidates_distill_yaml_hypothesis_procedure(tmp_path, mon
         "status: candidate\n"
         "related:\n"
         '  - "[1] mem-20260706-kickoff"\n'
-        "sources: [session:s1]\n"
+        "sources: [session s1]\n"
         "---\n"
         "Kickoff happened [1].\n\n"
         "---\n"
@@ -126,7 +126,7 @@ def test_parse_weekly_candidates_distill_yaml_hypothesis_procedure(tmp_path, mon
         "status: candidate\n"
         "related:\n"
         '  - "[1] mem-20260706-kickoff"\n'
-        "sources: [session:s1]\n"
+        "sources: [session s1]\n"
         "---\n"
         "Pilot scope still needs confirmation.\n\n"
         "---\n"
@@ -136,7 +136,7 @@ def test_parse_weekly_candidates_distill_yaml_hypothesis_procedure(tmp_path, mon
         "status: candidate\n"
         "related:\n"
         '  - "[2] mem-20260707-log-rule"\n'
-        "sources: [session:s2]\n"
+        "sources: [session s2]\n"
         "---\n"
         "Log every new file path when written.\n\n"
         "---\n"
@@ -146,7 +146,7 @@ def test_parse_weekly_candidates_distill_yaml_hypothesis_procedure(tmp_path, mon
         "status: candidate\n"
         "related:\n"
         '  - "[1] mem-20260706-kickoff"\n'
-        "sources: [session:s1]\n"
+        "sources: [session s1]\n"
         "---\n"
         "Capacity metric should not become a procedure.\n\n"
         "## Brief\n\n"

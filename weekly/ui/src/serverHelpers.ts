@@ -54,16 +54,29 @@ export function splitDailyWrapup(content: string): { fences: string; phrase: str
   const before = text.slice(0, last.index).replace(/\s+$/, '');
   const fences = before ? `${before}\n` : '';
   const rest = text.slice(last.index + last[0].length).trim();
-  const phrase = rest.split('\n')[0]?.trim() ?? '';
+  const phrase = rest
+    .split('\n')
+    .map((ln) => ln.trimEnd())
+    .filter((ln) => ln.trim())
+    .join('\n');
   return { fences, phrase };
+}
+
+function formatWrapupBody(phrase: string): string {
+  const items = String(phrase || '')
+    .split('\n')
+    .map((ln) => ln.replace(/^\s*-\s*/, '').trim())
+    .filter(Boolean);
+  const bullets = items.map((item) => {
+    const one = item.replace(/\s+/g, ' ').slice(0, MAX_WRAPUP_CHARS);
+    return `- ${one}`;
+  });
+  return bullets.join('\n');
 }
 
 export function joinDailyWrapup(fences: string, phrase: string): string {
   const body = (fences || '').replace(/\s+$/, '');
-  const cleaned = String(phrase || '')
-    .trim()
-    .replace(/\s+/g, ' ')
-    .slice(0, MAX_WRAPUP_CHARS);
+  const cleaned = formatWrapupBody(phrase);
   if (!cleaned) {
     return body ? `${body}\n` : '';
   }

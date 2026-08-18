@@ -67,7 +67,7 @@ def test_purge_orphan_single_dead_session(tmp_path, monkeypatch):
         "entity: X\n"
         "confidence: high\n"
         "status: candidate\n"
-        "sources: [session:dead-x]\n"
+        "sources: [session dead-x]\n"
         "---\n"
         "orphan body\n\n"
         "---\n"
@@ -76,7 +76,7 @@ def test_purge_orphan_single_dead_session(tmp_path, monkeypatch):
         "entity: Y\n"
         "confidence: high\n"
         "status: candidate\n"
-        "sources: [session:dead-x, zotero:ABC]\n"
+        "sources: [session dead-x, zotero:ABC]\n"
         "---\n"
         "multi source keep\n\n"
         "---\n"
@@ -85,7 +85,7 @@ def test_purge_orphan_single_dead_session(tmp_path, monkeypatch):
         "entity: Z\n"
         "confidence: high\n"
         "status: candidate\n"
-        "sources: [session:live-a]\n"
+        "sources: [session live-a]\n"
         "---\n"
         "live keep\n",
     )
@@ -120,7 +120,7 @@ def test_purge_orphan_fail_closed_no_db(tmp_path, monkeypatch):
         "entity: X\n"
         "confidence: high\n"
         "status: candidate\n"
-        "sources: [session:dead-x]\n"
+        "sources: [session dead-x]\n"
         "---\n"
         "orphan body\n",
     )

@@ -130,7 +130,7 @@ MAX_RETRY_ERROR_CHARS = 800
 # Clear a stuck in-flight flag if the worker never finished (e.g. gateway crash).
 IN_FLIGHT_STALE_SECONDS = 600
 
-# Civil-day catalog line after YAML fences — not a fifth memory type.
+# Civil-day event bullets after YAML fences — not a fifth memory type.
 DAY_WRAPUP_HEADING = "## Day wrap-up"
 MAX_WRAPUP_CHARS = 120
 _WRAPUP_HEADING_RE = re.compile(r"(?m)^## Day wrap-up[ \t]*\n?")
@@ -1532,10 +1532,10 @@ def _validate_related_target_types(
 
 
 def split_daily_wrapup(content: str) -> tuple[str, str]:
-    """Peel ``## Day wrap-up`` so fence parsers never treat the phrase as a body.
+    """Peel ``## Day wrap-up`` so fence parsers never treat bullets as a body.
 
-    Last heading wins. Phrase is the first non-empty line after it (medium
-    length, not a paragraph). Missing trailer → empty phrase.
+    Last heading wins. Trailer is every following non-empty line (one sentence
+    per event as ``- …``). Missing trailer → empty string.
     """
     text = content or ""
     matches = list(_WRAPUP_HEADING_RE.finditer(text))
@@ -1546,16 +1546,30 @@ def split_daily_wrapup(content: str) -> tuple[str, str]:
     if fences:
         fences += "\n"
     rest = text[mark.end() :].strip()
-    phrase = rest.splitlines()[0].strip() if rest else ""
-    return fences, phrase
+    lines = [ln.rstrip() for ln in rest.splitlines() if ln.strip()]
+    return fences, "\n".join(lines)
+
+
+def format_wrapup_body(raw: str | Iterable[Any]) -> str:
+    """Turn model output into markdown bullets so events stay independent sentences."""
+    if isinstance(raw, str):
+        items = [ln for ln in raw.splitlines() if ln.strip()]
+        if len(items) <= 1 and raw.strip() and "\n" not in raw:
+            items = [raw]
+    else:
+        items = list(raw)
+    bullets: list[str] = []
+    for item in items:
+        cleaned = clamp_wrapup_phrase(str(item or "").lstrip("-").strip())
+        if cleaned:
+            bullets.append(f"- {cleaned}")
+    return "\n".join(bullets)
 
 
 def join_daily_wrapup(fences: str, phrase: str) -> str:
-    """Re-attach a clamped wrap-up after fences so Phase-2 rewrite cannot drop it."""
+    """Re-attach event bullets after fences so Phase-2 rewrite cannot drop them."""
     body = (fences or "").rstrip()
-    cleaned = " ".join(str(phrase or "").split())
-    if len(cleaned) > MAX_WRAPUP_CHARS:
-        cleaned = cleaned[:MAX_WRAPUP_CHARS].rstrip()
+    cleaned = format_wrapup_body(phrase)
     if not cleaned:
         return body + ("\n" if body else "")
     if body:
@@ -1564,7 +1578,7 @@ def join_daily_wrapup(fences: str, phrase: str) -> str:
 
 
 def clamp_wrapup_phrase(raw: str) -> str:
-    """Keep a medium catalog line: blank and multi-sentence dumps must not land."""
+    """Keep one short catalog sentence: blank and extra sentences must not land."""
     cleaned = " ".join(str(raw or "").split())
     if not cleaned:
         return ""
@@ -1601,10 +1615,14 @@ def run_day_wrapup(daily_path: Path | str) -> dict[str, Any]:
             "error": str(capture.get("error") or capture.get("final_response") or ""),
         }
     _name, args = digest_tools.parse_tool_args_from_result(capture)
-    raw = ""
+    raw: str | list[Any] = ""
     if isinstance(args, Mapping):
-        raw = str(args.get("phrase") or "")
-    phrase = clamp_wrapup_phrase(raw)
+        listed = args.get("phrases")
+        if isinstance(listed, list) and listed:
+            raw = listed
+        else:
+            raw = str(args.get("phrase") or "")
+    phrase = format_wrapup_body(raw)
     if not phrase:
         return {"outcome": "failed", "error": "blank wrap-up phrase"}
     fences, _old = split_daily_wrapup(text)
@@ -1684,7 +1702,7 @@ def _staging_output_example() -> str:
         "confidence: high\n"
         f"importance: {IMPORTANCE_DEFAULT}\n"
         "status: candidate\n"
-        "sources: [session:example]\n"
+        "sources: [session example]\n"
         "---\n"
         "Gabby (student): parents chose home-packed lunch; school card is binary canteen vs gate-only.\n"
         "\n"
@@ -1703,7 +1721,7 @@ def _staging_output_example() -> str:
         "confidence: explicit\n"
         f"importance: {IMPORTANCE_DEFAULT}\n"
         "status: candidate\n"
-        "sources: [session:example, file:/tmp/章节稿.html]\n"
+        "sources: [session example, file:/tmp/章节稿.html]\n"
         "---\n"
         "Beginning: user requested the chapter; Course: assistant reviewed sources; Outcome: chapter pushed to WeChat.\n"
         "\n"
@@ -1714,7 +1732,7 @@ def _staging_output_example() -> str:
         "confidence: explicit\n"
         f"importance: {IMPORTANCE_DEFAULT}\n"
         "status: candidate\n"
-        "sources: [session:example, file:gateway/platforms/weixin.py]\n"
+        "sources: [session example, file:gateway/platforms/weixin.py]\n"
         "---\n"
         "Obstacle: the delivery path lacked a direct file flag; Solution: Assistant delivered the chapter file for this request using an abstract file-delivery procedure, with the tool recorded in sources.\n"
         "\n"
@@ -1727,7 +1745,7 @@ def _staging_output_example() -> str:
         f"importance: {IMPORTANCE_DEFAULT}\n"
         "status: candidate\n"
         "supersedes: [mem-20260725-user-deliverables]\n"
-        "sources: [session:example]\n"
+        "sources: [session example]\n"
         "---\n"
         "Decision: user corrected that 简历 was pushed separately on the evening of 7-25, not in the same batch as 技术成果证明.\n"
     )
@@ -4932,7 +4950,13 @@ def _collect_printed_ids_and_manifest(
         line = f"- {day_key} · {row['n']} blocks · {type_bits} · events={events}"
         wrap_phrase = str(wrap_by_day.get(day_key) or "").strip()
         if wrap_phrase:
-            line += f" · {wrap_phrase}"
+            index_bit = " · ".join(
+                ln.lstrip("- ").strip()
+                for ln in wrap_phrase.splitlines()
+                if ln.strip()
+            )
+            if index_bit:
+                line += f" · {index_bit}"
         lines.append(line)
         if row["standalone"]:
             shown = ", ".join(row["standalone"][:12])

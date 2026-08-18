@@ -31,7 +31,7 @@ def _block(
     lines += [
         "confidence: high",
         f"status: {status}",
-        "sources: [session:s1]",
+        "sources: [session s1]",
     ]
     if extra:
         lines.append(extra)
@@ -439,7 +439,7 @@ def test_event_with_file_sheet_sources():
             "predicate: signup_tally\n"
             "valid_from: 2026-06-25\n"
             "valid_to: open\n"
-            "sources: [session:s1, sheet:851003, file:/tmp/roster.xlsx]"
+            "sources: [session s1, sheet:851003, file:/tmp/roster.xlsx]"
         ),
     )
     assert digest._validate_digest_content(content) == []
@@ -1098,7 +1098,7 @@ def _event_block_for_related(
             "valid_to: 2026-07-26",
             "confidence: explicit",
             "status: candidate",
-            "sources: [session:s1]",
+            "sources: [session s1]",
             "---",
             "User asked for a resume revision; assistant pushed an update.",
         ]
@@ -1191,7 +1191,7 @@ def test_coordinator_rejects_mixed_session_artifacts_without_writing(tmp_path, m
         "entity": "Project",
         "confidence": "high",
         "status": "candidate",
-        "sources": ["session:s1"],
+        "sources": ["session s1"],
         "body": "A durable project fact.",
     }
     artifact = tmp_path / "memories" / "staging" / ".tmp_mem_files" / "s2" / "event-result.json"
@@ -1358,7 +1358,7 @@ def test_coordinator_applies_validated_operations_and_replaces_once(tmp_path, mo
         "entity": "Project",
         "confidence": "high",
         "status": "candidate",
-        "sources": ["session:s1"],
+        "sources": ["session s1"],
         "body": "A durable project fact.",
     }
     artifact = tmp_path / "memories" / "staging" / ".tmp_mem_files" / "s1" / "fact-result.json"
@@ -1539,7 +1539,7 @@ def test_append_rejects_event_related_to_existing_daily_event(tmp_path, monkeypa
             "valid_to: 2026-07-26",
             "confidence: explicit",
             "status: candidate",
-            "sources: [session:s1]",
+            "sources: [session s1]",
             "---",
             "User asked for resume v3; assistant pushed CocoIndex rewrite.",
         ]

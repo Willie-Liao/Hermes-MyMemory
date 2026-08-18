@@ -24,7 +24,7 @@ id: mem-only
 type: fact
 confidence: high
 status: candidate
-sources: ["session:test"]
+sources: ["session test"]
 ---
 only block
 `,

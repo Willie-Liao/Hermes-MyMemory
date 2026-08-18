@@ -45,7 +45,7 @@ def _block(
     lines += [
         "confidence: high",
         f"status: {status}",
-        "sources: [session:s1]",
+        "sources: [session s1]",
         "---",
         body,
     ]
@@ -69,7 +69,7 @@ _VALID_EVENT = "\n".join(
         "valid_to: open",
         "confidence: explicit",
         "status: candidate",
-        "sources: [session:s1]",
+        "sources: [session s1]",
         "---",
         "Beginning: user requested review; Course: assistant reviewed sources; Outcome: draft delivered.",
     ]
@@ -82,7 +82,7 @@ _VALID_DECISION = "\n".join(
         "type: decision",
         "confidence: explicit",
         "status: candidate",
-        "sources: [session:s1]",
+        "sources: [session s1]",
         "---",
         "Decision: user prefers concise review summaries.",
     ]

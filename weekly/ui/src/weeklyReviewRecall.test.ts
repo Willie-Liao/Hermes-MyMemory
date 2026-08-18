@@ -36,7 +36,7 @@ id: ${hypId}
 type: hypothesis
 confidence: medium
 status: candidate
-sources: [session:test]
+sources: [session test]
 related: [mem-2026-07-27-kickoff]
 ---
 ${hypBullet}
@@ -142,7 +142,7 @@ id: mem-keep
 type: fact
 confidence: high
 status: candidate
-sources: [session:test]
+sources: [session test]
 ---
 keep me
 `,
@@ -183,7 +183,7 @@ confidence: high
 status: candidate
 valid_from: 2026-07-01
 valid_to: open
-sources: [session:test]
+sources: [session test]
 ---
 span a
 `,
@@ -197,7 +197,7 @@ confidence: high
 status: candidate
 valid_from: 2026-07-01
 valid_to: 2026-08-01
-sources: [session:test]
+sources: [session test]
 ---
 span b
 `,
@@ -211,7 +211,7 @@ confidence: high
 status: candidate
 valid_from: 2026-07-01
 valid_to: 2026-08-10
-sources: [session:test]
+sources: [session test]
 ---
 span c
 `,
@@ -272,7 +272,7 @@ type: fact
 confidence: high
 status: candidate
 valid_to: 2026-08-01
-sources: [session:test]
+sources: [session test]
 ---
 prune
 `,

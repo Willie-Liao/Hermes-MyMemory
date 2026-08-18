@@ -942,17 +942,21 @@ def submit_day_wrapup_schema() -> dict[str, Any]:
     return _schema(
         "submit_day_wrapup",
         (
-            "Submit one English-dominant medium phrase that mentions every "
-            "event (2–4 word labels, commas or and). Not a paragraph. No YAML."
+            "Submit one independent short sentence per event (phrases[]). "
+            "Not one glued clause. Not a paragraph. No YAML."
         ),
         {
+            "phrases": {
+                "type": "array",
+                "description": "One short sentence per event, each ≤ 120 chars",
+                "items": {"type": "string", "maxLength": 120},
+            },
             "phrase": {
                 "type": "string",
-                "description": "One line, at most 120 characters",
-                "maxLength": 120,
-            }
+                "description": "Legacy single line; prefer phrases[]",
+            },
         },
-        ["phrase"],
+        ["phrases"],
     )
 
 

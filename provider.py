@@ -71,12 +71,15 @@ class MyMemoryProvider(MemoryProvider):
         """Start digest clock plus weekly/retention catch-up once per process.
 
         Exclusive plugins are not imported at PluginManager boot; the first
-        primary-agent initialize is what arms the civil clock.
+        primary-agent initialize is what arms the civil clock. Slash commands
+        still register here for cron/subagent/flush so chat handlers exist
+        even when those contexts skip the clock.
         """
         self._session_id = str(session_id or "")
         self._hermes_home = str(kwargs.get("hermes_home") or "")
         self._platform = str(kwargs.get("platform") or "")
         self._agent_context = str(kwargs.get("agent_context") or "primary")
+        _register_slash_commands()
         if self._agent_context in _SKIP_WRITE_CONTEXTS:
             return
         _bootstrap_background()
@@ -172,7 +175,7 @@ class MyMemoryProvider(MemoryProvider):
         retention.run_async(reason)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        """Chat-facing digest/weekly actions that replaced in-chat slash commands."""
+        """LLM tools for digest/weekly; in-chat /digest and /weekly stay on PluginManager."""
         return [
             {
                 "name": "mymemory_digest",
@@ -228,6 +231,48 @@ class MyMemoryProvider(MemoryProvider):
         """Stop the digest clock only under pytest so production daemons keep ticking."""
         if os.environ.get("PYTEST_CURRENT_TEST"):
             digest.stop_digest_clock_thread()
+
+
+def _register_slash_commands() -> None:
+    """Put /digest and /weekly on PluginManager; exclusive load never calls register_command.
+
+    The memory loader's fake context has no register_command. Without this,
+    those names never enter _plugin_commands and chat treats them as unknown.
+    Fail-open so a missing hermes_cli cannot block provider init. Never
+    rediscover with force=True (that wipes the command table).
+    """
+    try:
+        from hermes_cli.plugins import (
+            PluginContext,
+            PluginManifest,
+            get_plugin_manager,
+        )
+    except Exception:
+        return
+    try:
+        mgr = get_plugin_manager()
+        mgr.discover_and_load()
+        loaded = mgr._plugins.get("MyMemory")
+        manifest = (
+            loaded.manifest if loaded is not None else PluginManifest(name="MyMemory")
+        )
+        ctx = PluginContext(manifest, mgr)
+        ctx.register_command(
+            "digest",
+            digest_slash.handle_digest,
+            description=(
+                "Force a digest run or manage bookmark / resummarise / recall / show"
+            ),
+            args_hint="[status|bookmark|help]",
+        )
+        ctx.register_command(
+            "weekly",
+            weekly_slash.handle_weekly,
+            description="Weekly memory: ui / update / close / reopen",
+            args_hint="[ui|update [week]|close [week]|reopen [week]|help]",
+        )
+    except Exception:
+        return
 
 
 def _bootstrap_background() -> None:

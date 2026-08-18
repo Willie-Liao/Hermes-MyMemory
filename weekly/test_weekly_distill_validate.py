@@ -32,7 +32,7 @@ valid_from: 2026-06-25
 valid_to: 2026-06-26
 confidence: high
 status: candidate
-sources: [session:x]
+sources: [session x]
 related:
   - "[1] mem-2026-06-29-a"
   - "[2] mem-2026-06-29-b"
@@ -44,7 +44,7 @@ id: hyp-a
 type: hypothesis
 entity: Example
 valid_from: 2026-06-25
-sources: [session:x]
+sources: [session x]
 related: [evt-a]
 confidence: medium
 status: candidate
@@ -89,7 +89,7 @@ def test_bad_type():
 ---
 id: x
 type: fact
-sources: [session:x]
+sources: [session x]
 related: ["[1] mem-2026-06-29-a"]
 ---
 Body [1].
@@ -136,7 +136,7 @@ valid_from: 2026-06-25
 valid_to: 2026-06-26
 confidence: high
 status: candidate
-sources: [session:x]
+sources: [session x]
 related:
   - "[1] mem-2026-06-29-a"
   - "[3] mem-2026-06-29-b"
@@ -163,7 +163,7 @@ valid_from: 2026-06-25
 valid_to: 2026-06-26
 confidence: high
 status: candidate
-sources: [session:x]
+sources: [session x]
 related:
   - "[1] mem-2026-06-29-a"
   - "[2] mem-2026-06-29-b"
@@ -188,7 +188,7 @@ valid_from: 2026-06-25
 valid_to: 2026-06-26
 confidence: high
 status: candidate
-sources: [session:x]
+sources: [session x]
 related:
   - "[1] mem-2026-06-29-a"
 ---
@@ -199,7 +199,7 @@ id: hyp-a
 type: hypothesis
 entity: Example
 valid_from: 2026-06-25
-sources: [session:x]
+sources: [session x]
 related:
   - "[1] mem-2026-06-29-a"
 confidence: medium
@@ -227,7 +227,7 @@ valid_from: 2026-06-25
 valid_to: 2026-06-26
 confidence: high
 status: candidate
-sources: [session:x]
+sources: [session x]
 related:
   - "[1] mem-2026-06-29-a"
 ---
@@ -236,7 +236,7 @@ Body [1].
 ---
 id: cfl-a
 type: conflict
-sources: [session:x]
+sources: [session x]
 related: [evt-a]
 confidence: medium
 ---
@@ -259,7 +259,7 @@ valid_from: 2026-06-25
 valid_to: 2026-06-26
 confidence: high
 status: candidate
-sources: [session:x]
+sources: [session x]
 related:
   - "[1] mem-2026-06-29-a"
 ---
@@ -282,7 +282,7 @@ valid_from: 2026-06-25
 valid_to: 2026-06-26
 confidence: high
 status: candidate
-sources: [session:x]
+sources: [session x]
 related:
   - "[1] mem-2026-06-29-a"
 ---
@@ -305,7 +305,7 @@ valid_from: 2026-06-25
 valid_to: 2026-06-26
 confidence: high
 status: candidate
-sources: [session:x]
+sources: [session x]
 related:
   - "[1] mem-2026-06-29-a"
 ---
@@ -329,7 +329,7 @@ valid_from: 2026-06-25
 valid_to: 2026-06-26
 confidence: medium
 status: candidate
-sources: [session:x]
+sources: [session x]
 related:
   - "[1] mem-2026-06-29-a"
 ---
@@ -353,7 +353,7 @@ valid_from: 2026-06-25
 valid_to: 2026-06-26
 confidence: high
 status: candidate
-sources: [session:x]
+sources: [session x]
 related:
   - "[1] mem-2026-06-29-a"
 ---
@@ -363,7 +363,7 @@ Body [1].
 id: hyp-a
 type: hypothesis
 valid_from: 2026-06-25
-sources: [session:x]
+sources: [session x]
 related: [evt-a]
 confidence: medium
 status: candidate
@@ -381,7 +381,7 @@ def test_bare_mem_related_without_cite_prefix_ok():
 ---
 id: evt-a
 type: event
-sources: [session:x]
+sources: [session x]
 related:
   - mem-2026-06-29-a
 ---

@@ -43,7 +43,7 @@ def _block(block_id: str, *, entity: str, valid_to: str, body: str = "note") -> 
             f"valid_to: {valid_to}",
             "confidence: high",
             "status: candidate",
-            "sources: [session:s1]",
+            "sources: [session s1]",
             "---",
             body,
         ]

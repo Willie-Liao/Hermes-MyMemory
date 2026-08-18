@@ -20,7 +20,7 @@ def _fence(block_id: str = "mem-a", body: str = "Factual: keep.") -> str:
     return (
         f"---\nid: {block_id}\ntype: fact\nentity: Gabby\n"
         "confidence: high\nimportance: 3\nstatus: candidate\n"
-        "sources: [session:s1]\n---\n"
+        "sources: [session s1]\n---\n"
         f"{body}\n"
     )
 
@@ -31,7 +31,7 @@ def test_split_join_roundtrip_and_daily_blocks_ignore_trailer():
     joined = digest.join_daily_wrapup(fences, "Xiaohongshu infographic as HTML cards")
     assert digest.DAY_WRAPUP_HEADING in joined
     body, phrase = digest.split_daily_wrapup(joined)
-    assert phrase == "Xiaohongshu infographic as HTML cards"
+    assert phrase == "- Xiaohongshu infographic as HTML cards"
     assert digest.DAY_WRAPUP_HEADING not in body
     blocks = digest._daily_blocks(joined)
     assert len(blocks) == 1
@@ -97,7 +97,12 @@ def test_run_day_wrapup_writes_clamped_phrase(tmp_path, monkeypatch):
         assert "### Today events" in prompt or "### Today facts" in prompt
         return {
             "tool_name": "submit_day_wrapup",
-            "tool_args": {"phrase": "NotGPT blocked; Xiaohongshu HTML cards shipped."},
+            "tool_args": {
+                "phrases": [
+                    "The user discussed an infographic about the memory plugin.",
+                    "The user asked for dialects listed in a table.",
+                ]
+            },
             "failed": False,
         }
 
@@ -105,8 +110,9 @@ def test_run_day_wrapup_writes_clamped_phrase(tmp_path, monkeypatch):
     digest.run_day_wrapup(daily)
     text = daily.read_text(encoding="utf-8")
     assert digest.DAY_WRAPUP_HEADING in text
-    assert "Xiaohongshu HTML cards" in text
-    assert text.rstrip().endswith("NotGPT blocked; Xiaohongshu HTML cards shipped.")
+    assert "- The user discussed an infographic about the memory plugin." in text
+    assert "- The user asked for dialects listed in a table." in text
+    assert text.rstrip().endswith("- The user asked for dialects listed in a table.")
 
 
 def test_clamp_wrapup_phrase_keeps_first_sentence():
@@ -114,6 +120,19 @@ def test_clamp_wrapup_phrase_keeps_first_sentence():
     assert digest.clamp_wrapup_phrase("") == ""
     long_two = "First thread closed. Second sentence should drop."
     assert digest.clamp_wrapup_phrase(long_two) == "First thread closed."
+
+
+def test_join_preserves_independent_event_bullets():
+    digest = _digest()
+    body = (
+        "- The user discussed an infographic about the memory plugin.\n"
+        "- The user asked for dialects listed in a table."
+    )
+    joined = digest.join_daily_wrapup(_fence("mem-a"), body)
+    _fences, phrase = digest.split_daily_wrapup(joined)
+    assert "- The user discussed an infographic about the memory plugin." in phrase
+    assert "- The user asked for dialects listed in a table." in phrase
+    assert phrase.count("\n") == 1
 
 
 def test_build_wrapup_prompt_lists_every_event_predicate():
@@ -133,9 +152,9 @@ def test_build_wrapup_prompt_lists_every_event_predicate():
             {"id": "mem-f1", "type": "fact", "entity": "Gabby"},
         ]
     )
-    assert "Events that must appear" in prompt
+    assert "Events — one independent sentence each" in prompt
     assert "user_requested_recipe_ingredients" in prompt
     assert "user_requested_progressive_recall_procedure" in prompt
-    assert "2–4 word" in prompt or "2-4 word" in prompt
+    assert "phrases" in prompt
     assert "### Today events" in prompt
     assert "submit_day_wrapup" in prompt

@@ -49,7 +49,7 @@ def _block(*, block_id: str, body: str, valid_to: str | None = None, entity: str
     lines = ["---", f"id: {block_id}", "type: fact", f"entity: {entity}"]
     if valid_to is not None:
         lines += ["valid_from: 2026-06-14", f"valid_to: {valid_to}"]
-    lines += ["confidence: high", "status: candidate", "sources: [session:s1]", "---", body]
+    lines += ["confidence: high", "status: candidate", "sources: [session s1]", "---", body]
     return "\n".join(lines)
 
 
@@ -268,7 +268,7 @@ def test_involves_indexed_in_recent_context(tmp_path, monkeypatch):
             "involves: [Gary, George-mom]",
             "confidence: high",
             "status: candidate",
-            "sources: [session:20260623_161751_3d4ad0]",
+            "sources: [session 20260623_161751_3d4ad0]",
             "---",
             "Narration: Agent drafted parent WeChat reply re grade dispute.",
         ]
@@ -302,7 +302,7 @@ def test_participants_not_indexed_on_manifest_entity_axis(tmp_path, monkeypatch)
             "valid_to: open",
             "confidence: high",
             "status: candidate",
-            "sources: [session:20260623_161751_3d4ad0]",
+            "sources: [session 20260623_161751_3d4ad0]",
             "---",
             "Agent drafted parent WeChat reply re grade dispute.",
         ]
@@ -335,7 +335,7 @@ def test_session_hint_in_recent_context(tmp_path, monkeypatch):
             "valid_to: open",
             "confidence: high",
             "status: candidate",
-            "sources: [session:20260623_161751_3d4ad0]",
+            "sources: [session 20260623_161751_3d4ad0]",
             "---",
             "Agent drafted parent reply.",
         ]
@@ -431,7 +431,7 @@ def _event_block(*, block_id: str, body: str, entity: str = "George", predicate:
             "valid_to: open",
             "confidence: high",
             "status: candidate",
-            "sources: [session:s1]",
+            "sources: [session s1]",
             "---",
             body,
         ]
@@ -474,7 +474,7 @@ def test_event_in_recent_context(tmp_path, monkeypatch):
                 f"valid_to: {future}",
                 "confidence: high",
                 "status: candidate",
-                "sources: [session:s1]",
+                "sources: [session s1]",
                 "---",
                 "Delivered meal-card xlsx.",
             ]
@@ -501,7 +501,7 @@ def test_existing_hypothesis_is_excluded_from_recent_context(tmp_path, monkeypat
             "entity: Project",
             "confidence: medium",
             "status: candidate",
-            "sources: [session:s1]",
+            "sources: [session s1]",
             "---",
             "The project may change direction.",
         ]
@@ -554,7 +554,7 @@ def test_recall_index_by_day_includes_wrapup_phrase(tmp_path, monkeypatch):
     secret_body = "SECRET_BODY_MUST_NOT_APPEAR_IN_INDEX"
     content = (
         _block(block_id="mem-wrap", body=secret_body)
-        + "\n\n## Day wrap-up\nNotGPT blocked; Xiaohongshu HTML cards shipped.\n"
+        + "\n\n## Day wrap-up\n- NotGPT blocked; Xiaohongshu HTML cards shipped.\n"
     )
     _write_daily(tmp_path, _today(), content)
     ctx = digest.build_recall_injection_context(tier_max=1)

@@ -112,7 +112,7 @@ def _write_daily_block(hermes_home: Path, *, day: str, mem_id: str, body: str, s
     path = daily / f"{day}.md"
     path.write_text(
         f"---\nid: {mem_id}\ntype: fact\nconfidence: high\nstatus: {status}\n"
-        f"sources: [session:s1]\n---\n{body}\n",
+        f"sources: [session s1]\n---\n{body}\n",
         encoding="utf-8",
     )
     return path
@@ -170,8 +170,8 @@ def test_patch_daily_block_status_with_body_leaves_other_blocks(tmp_path):
     daily.mkdir(parents=True)
     path = daily / "2026-06-16.md"
     path.write_text(
-        "---\nid: mem-keep\ntype: fact\nstatus: candidate\nsources: [session:s1]\n---\nkeep me\n\n"
-        "---\nid: mem-edit\ntype: fact\nstatus: candidate\nsources: [session:s1]\n---\nreplace me\n",
+        "---\nid: mem-keep\ntype: fact\nstatus: candidate\nsources: [session s1]\n---\nkeep me\n\n"
+        "---\nid: mem-edit\ntype: fact\nstatus: candidate\nsources: [session s1]\n---\nreplace me\n",
         encoding="utf-8",
     )
 
@@ -198,7 +198,7 @@ def test_patch_daily_block_status_preserves_day_wrapup(tmp_path):
     path = daily / "2026-08-15.md"
     path.write_text(
         "---\nid: mem-a\ntype: fact\nconfidence: high\nstatus: candidate\n"
-        "sources: [session:s1]\n---\nkeep body\n\n"
+        "sources: [session s1]\n---\nkeep body\n\n"
         "## Day wrap-up\nXiaohongshu infographic as HTML cards\n",
         encoding="utf-8",
     )
@@ -231,7 +231,7 @@ def _write_daily_block_with_valid_to(
     path = daily / f"{day}.md"
     path.write_text(
         f"---\nid: {mem_id}\ntype: fact\nconfidence: high\nstatus: {status}\n"
-        f"valid_to: {valid_to}\nsources: [session:s1]\n---\n{body}\n",
+        f"valid_to: {valid_to}\nsources: [session s1]\n---\n{body}\n",
         encoding="utf-8",
     )
     return path
@@ -280,9 +280,9 @@ def test_patch_daily_block_valid_to_leaves_other_blocks(tmp_path):
     path = daily / "2026-06-16.md"
     path.write_text(
         "---\nid: mem-keep\ntype: fact\nstatus: candidate\nvalid_to: open\n"
-        "sources: [session:s1]\n---\nkeep me\n\n"
+        "sources: [session s1]\n---\nkeep me\n\n"
         "---\nid: mem-edit\ntype: fact\nstatus: candidate\nvalid_to: open\n"
-        "sources: [session:s1]\n---\nedit me\n",
+        "sources: [session s1]\n---\nedit me\n",
         encoding="utf-8",
     )
 
@@ -348,9 +348,9 @@ def _write_two_blocks(tmp_path: Path, day: str = "2026-06-16") -> Path:
     path = daily / f"{day}.md"
     path.write_text(
         "---\nid: mem-keep\ntype: fact\nstatus: candidate\n"
-        "sources: [session:s1]\n---\nkeep me\n\n"
+        "sources: [session s1]\n---\nkeep me\n\n"
         "---\nid: mem-drop\ntype: fact\nstatus: candidate\n"
-        "sources: [session:s1]\n---\ndrop me\n",
+        "sources: [session s1]\n---\ndrop me\n",
         encoding="utf-8",
     )
     return path

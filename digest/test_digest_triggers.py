@@ -532,7 +532,7 @@ def test_prompt_includes_existing_block_ids(tmp_path, monkeypatch):
                 "entity: Elsa",
                 "confidence: high",
                 "status: candidate",
-                "sources: [session:s1]",
+                "sources: [session s1]",
                 "---",
                 "Prior staged fact about Elsa grade.",
             ]
@@ -573,7 +573,7 @@ def _write_daily_block(
                 f"entity: {entity}",
                 "confidence: high",
                 "status: candidate",
-                "sources: [session:s1]",
+                "sources: [session s1]",
                 "---",
                 body,
             ]

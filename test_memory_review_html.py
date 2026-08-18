@@ -87,7 +87,7 @@ def test_confirm_payload_roundtrip_and_apply_weekly(tmp_path, monkeypatch):
     daily_file = daily / "2026-06-16.md"
     daily_file.write_text(
         "---\nid: mem-20260616-b\ntype: fact\nconfidence: high\nstatus: candidate\n"
-        "sources: [session:s1]\n---\nbody b\n",
+        "sources: [session s1]\n---\nbody b\n",
         encoding="utf-8",
     )
     _write_reviewed(
@@ -142,9 +142,9 @@ def test_daily_approve_reject_apply(tmp_path, monkeypatch):
     daily_file = daily / "2026-07-10.md"
     daily_file.write_text(
         "---\nid: mem-20260710-a\ntype: fact\nconfidence: high\nstatus: candidate\n"
-        "sources: [session:s1]\n---\nkeep me\n\n"
+        "sources: [session s1]\n---\nkeep me\n\n"
         "---\nid: mem-20260710-b\ntype: fact\nconfidence: medium\nstatus: candidate\n"
-        "sources: [session:s1]\n---\ndrop me\n",
+        "sources: [session s1]\n---\ndrop me\n",
         encoding="utf-8",
     )
     path = review.write_daily_html("2026-07-10")

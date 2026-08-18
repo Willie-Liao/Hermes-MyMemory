@@ -113,8 +113,8 @@ def test_live_typed_phase2_and_wrapup_on_full_2026_08_15(tmp_path, monkeypatch):
     assert wrap.get("outcome") == "written"
     phrase = str(wrap.get("phrase") or "")
     assert phrase
-    assert len(phrase) <= digest.MAX_WRAPUP_CHARS
-    assert "\n" not in phrase
+    for line in phrase.splitlines():
+        assert len(line.lstrip("- ").strip()) <= digest.MAX_WRAPUP_CHARS
     wcap = next(c for c in captures if c.get("force_tool_name") == "submit_day_wrapup")
     assert wcap.get("failed") is False
 

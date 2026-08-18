@@ -629,7 +629,7 @@ def _event_tool_args(
         "valid_to": day,
         "confidence": "high",
         "status": "candidate",
-        "sources": ["session:s1"],
+        "sources": ["session s1"],
         "related": [mem_id],
         "beginning": f"Fact recorded on {day}",
         "course": f"Fact recorded progress on {day}",
@@ -648,7 +648,7 @@ def _incomplete_event_tool_args(day: str = "2026-06-30") -> dict:
                 "valid_from": day,
                 "valid_to": day,
                 "confidence": "high",
-                "sources": ["session:s1"],
+                "sources": ["session s1"],
                 "related": [],
                 "beginning": "x",
                 "course": "y",
@@ -665,7 +665,7 @@ def _hypothesis_tool_args(event_id: str = "evt-a") -> dict:
                 "id": "hyp-a",
                 "entity": "Example",
                 "valid_from": "2026-06-30",
-                "sources": ["session:s1"],
+                "sources": ["session s1"],
                 "related": [event_id],
                 "confidence": "medium",
                 "status": "candidate",
@@ -770,7 +770,7 @@ def test_generate_weekly_content_bounded_fallback_on_llm_error(
     daily.parent.mkdir(parents=True, exist_ok=True)
     daily.write_text(
         "---\nid: mem-1\ntype: fact\nentity: X\nconfidence: high\n"
-        "status: candidate\nsources: [session:s1]\n---\nFact.\n",
+        "status: candidate\nsources: [session s1]\n---\nFact.\n",
         encoding="utf-8",
     )
 
@@ -834,7 +834,7 @@ def test_generate_weekly_content_retries_then_succeeds(tmp_path, monkeypatch):
     daily.parent.mkdir(parents=True, exist_ok=True)
     daily.write_text(
         "---\nid: mem-2026-06-30-a\ntype: fact\nentity: X\nconfidence: high\n"
-        "status: candidate\nsources: [session:s1]\n---\n"
+        "status: candidate\nsources: [session s1]\n---\n"
         "Fact recorded on 2026-06-30.\n",
         encoding="utf-8",
     )
@@ -900,7 +900,7 @@ def test_generate_weekly_content_retries_shape_errors(tmp_path, monkeypatch):
     daily.parent.mkdir(parents=True, exist_ok=True)
     daily.write_text(
         "---\nid: mem-2026-06-30-a\ntype: fact\nentity: X\nconfidence: high\n"
-        "status: candidate\nsources: [session:s1]\n---\n"
+        "status: candidate\nsources: [session s1]\n---\n"
         "Fact recorded on 2026-06-30.\n",
         encoding="utf-8",
     )
@@ -929,7 +929,7 @@ def test_weeks_needing_report_never_requeues_reviewed(
     weekly = _load_weekly_module(tmp_path, monkeypatch)
     daily = tmp_path / "memories" / "staging" / "daily" / "2026-06-30.md"
     daily.parent.mkdir(parents=True, exist_ok=True)
-    daily.write_text("---\nid: mem-1\ntype: fact\nentity: X\nconfidence: high\nstatus: candidate\nsources: [session:s1]\n---\nFact.\n", encoding="utf-8")
+    daily.write_text("---\nid: mem-1\ntype: fact\nentity: X\nconfidence: high\nstatus: candidate\nsources: [session s1]\n---\nFact.\n", encoding="utf-8")
     reviewed = tmp_path / "memories" / "staging" / "weekly" / "2026-W27 reviewed.md"
     reviewed.parent.mkdir(parents=True, exist_ok=True)
     reviewed.write_text("API call failed after 3 retries: Connection error.\n", encoding="utf-8")
@@ -944,7 +944,7 @@ def test_weeks_needing_report_skips_when_draft_beside_reviewed(tmp_path, monkeyp
     daily.parent.mkdir(parents=True, exist_ok=True)
     daily.write_text(
         "---\nid: mem-1\ntype: fact\nentity: X\nconfidence: high\nstatus: candidate\n"
-        "sources: [session:s1]\n---\nFact.\n",
+        "sources: [session s1]\n---\nFact.\n",
         encoding="utf-8",
     )
     weekly_dir = tmp_path / "memories" / "staging" / "weekly"

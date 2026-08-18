@@ -207,7 +207,7 @@ def test_extra_file_sources_strips_memory_staging_paths():
             "2026-08-15.md",
             "file:2026-08-15.md",
             "sheet:851003",
-            "session:20260722_172657_c54f77a8",
+            "session 20260722_172657_c54f77a8",
         ]
     )
     assert kept == [
@@ -225,7 +225,7 @@ def test_dry_run_flags_related_to_retiring():
             "confidence": "high",
             "status": "candidate",
             "importance": 3,
-            "sources": ["session:s"],
+            "sources": ["session s"],
         },
         {
             "id": "mem-2026-08-11-fact-b",
@@ -234,7 +234,7 @@ def test_dry_run_flags_related_to_retiring():
             "confidence": "high",
             "status": "candidate",
             "importance": 3,
-            "sources": ["session:s"],
+            "sources": ["session s"],
             "related": ["mem-2026-08-11-fact-a"],
         },
     ]
@@ -253,7 +253,7 @@ def test_standalone_decay_only_eligible_existing():
             "confidence": "high",
             "status": "candidate",
             "importance": 3,
-            "sources": ["session:s"],
+            "sources": ["session s"],
         },
         {
             "id": "mem-2026-08-11-event-1",
@@ -262,7 +262,7 @@ def test_standalone_decay_only_eligible_existing():
             "confidence": "high",
             "status": "candidate",
             "importance": 3,
-            "sources": ["session:s"],
+            "sources": ["session s"],
             "related": ["mem-2026-08-11-fact-linked"],
         },
         {
@@ -272,7 +272,7 @@ def test_standalone_decay_only_eligible_existing():
             "confidence": "high",
             "status": "candidate",
             "importance": 3,
-            "sources": ["session:s"],
+            "sources": ["session s"],
         },
     ]
     ops = composition.append_standalone_decay_ops(
@@ -298,7 +298,7 @@ def test_create_importance_one_orphan_decrements_to_zero():
         "confidence": "high",
         "status": "candidate",
         "importance": 1,
-        "sources": ["session:s"],
+        "sources": ["session s"],
     }
     ops = composition.append_standalone_decay_ops([], [orphan])
     assert ops == [
@@ -319,7 +319,7 @@ def test_importance_zero_orphan_drops_on_decay():
         "confidence": "high",
         "status": "candidate",
         "importance": 0,
-        "sources": ["session:s"],
+        "sources": ["session s"],
     }
     ops = composition.append_standalone_decay_ops([], [orphan])
     assert ops == [{"operation": "drop", "id": "mem-2026-08-11-fact-floor"}]
@@ -334,7 +334,7 @@ def test_create_importance_two_orphan_decrements_then_survives_one_cycle():
         "confidence": "high",
         "status": "candidate",
         "importance": digest_tools.IMPORTANCE_DIRTY,
-        "sources": ["session:s"],
+        "sources": ["session s"],
     }
     ops = composition.append_standalone_decay_ops([], [orphan])
     assert ops == [
@@ -360,7 +360,7 @@ def test_validate_digest_file_accepts_thirty_one_blocks(monkeypatch):
                 "confidence: high\n"
                 "importance: 3\n"
                 "status: candidate\n"
-                "sources: [session:s]\n"
+                "sources: [session s]\n"
                 "---\n"
                 f"Fact number {i}.\n"
             )
@@ -398,7 +398,7 @@ def test_store_validated_worker_is_blocks_primary(tmp_path, monkeypatch):
         "entity": "Topic",
         "confidence": "high",
         "status": "candidate",
-        "sources": ["session:s1"],
+        "sources": ["session s1"],
         "body": "A fact.",
     }
     result = digest.ValidatedWorkerResult(
@@ -430,7 +430,7 @@ def test_commit_uses_in_memory_ops_without_worker_tmp(tmp_path, monkeypatch):
         "confidence": "high",
         "importance": 3,
         "status": "candidate",
-        "sources": ["session:s1"],
+        "sources": ["session s1"],
         "body": "Committed from memory.",
     }
     worker = digest.ValidatedWorkerResult(
@@ -475,7 +475,7 @@ def test_commit_truncates_overlength_body_before_write(tmp_path, monkeypatch):
         "confidence": "high",
         "importance": 3,
         "status": "candidate",
-        "sources": ["session:s1"],
+        "sources": ["session s1"],
         "valid_from": "2026-08-11",
         "valid_to": "open",
         "body": long_body,
@@ -563,7 +563,7 @@ def test_proposer_tool_loop_submit_then_patch(tmp_path, monkeypatch):
             "confidence": "high",
             "importance": 3,
             "status": "candidate",
-            "sources": ["session:s1"],
+            "sources": ["session s1"],
             "body": "Fixed.",
         }
     ]
@@ -616,7 +616,7 @@ def test_oneshot_attempt2_uses_teach_and_foul_touched_patch(monkeypatch, tmp_pat
         "confidence": "high",
         "importance": 3,
         "status": "candidate",
-        "sources": ["session:s1"],
+        "sources": ["session s1"],
         "body": "Keep this.",
     }
     other = {
@@ -626,7 +626,7 @@ def test_oneshot_attempt2_uses_teach_and_foul_touched_patch(monkeypatch, tmp_pat
         "confidence": "high",
         "importance": 3,
         "status": "candidate",
-        "sources": ["session:s1"],
+        "sources": ["session s1"],
         "body": "Unrelated.",
     }
     proposer([keep, other], [], errors=(), attempt=1)

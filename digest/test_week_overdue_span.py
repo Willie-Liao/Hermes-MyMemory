@@ -45,7 +45,7 @@ def _write_daily(home: Path, date_str: str, body: str = "day note") -> None:
                 "entity: Day",
                 "confidence: high",
                 "status: candidate",
-                "sources: [session:s1]",
+                "sources: [session s1]",
                 "---",
                 body,
                 "",

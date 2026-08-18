@@ -539,7 +539,7 @@ def test_weeks_needing_report_respects_reviewed_only(tmp_path, monkeypatch):
         "---\n"
         "id: evt-a\n"
         "type: event\n"
-        "sources: [session:s1]\n"
+        "sources: [session s1]\n"
         "related:\n"
         '  - "[1] mem-2026-06-09-a"\n'
         "---\n"
@@ -554,9 +554,9 @@ def test_exclude_resolved_blocks_skips_rejected(tmp_path, monkeypatch):
     weekly = _load_weekly(tmp_path, monkeypatch)
     content = (
         "---\nid: mem-20260616-a\ntype: fact\nconfidence: high\nstatus: rejected\n"
-        "sources: [session:s1]\n---\nrejected body\n\n"
+        "sources: [session s1]\n---\nrejected body\n\n"
         "---\nid: mem-20260616-b\ntype: fact\nconfidence: high\nstatus: candidate\n"
-        "sources: [session:s1]\n---\ncandidate body\n"
+        "sources: [session s1]\n---\ncandidate body\n"
     )
     filtered = weekly._exclude_resolved_blocks(content)
     assert "rejected body" not in filtered
@@ -604,7 +604,7 @@ entity: Andrae
 related:
   - "[1] mem-2026-06-29-andrae-feedback-summary"
 sources:
-  - session:sess-a
+  - session sess-a
 confidence: high
 status: candidate
 valid_from: 2026-06-29

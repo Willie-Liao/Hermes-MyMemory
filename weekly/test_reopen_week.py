@@ -30,7 +30,7 @@ def _write_daily_block(tmp_path: Path, day: str, block_id: str, status: str) -> 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         f"---\nid: {block_id}\ntype: fact\nconfidence: high\nstatus: {status}\n"
-        f"sources: [session:s1]\n---\nbody {block_id}\n",
+        f"sources: [session s1]\n---\nbody {block_id}\n",
         encoding="utf-8",
     )
     return path

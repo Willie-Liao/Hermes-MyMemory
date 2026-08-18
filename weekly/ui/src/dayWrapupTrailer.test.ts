@@ -33,7 +33,7 @@ id: mem-a
 type: fact
 confidence: high
 status: candidate
-sources: [session:test]
+sources: [session test]
 ---
 first body
 
@@ -42,12 +42,12 @@ id: mem-b
 type: fact
 confidence: high
 status: candidate
-sources: [session:test]
+sources: [session test]
 ---
 second body
 
 ## Day wrap-up
-Xiaohongshu infographic as HTML cards
+- Xiaohongshu infographic as HTML cards
 `;
 
 describe('daily wrap-up trailer in UI writers', { concurrency: false }, () => {
@@ -55,7 +55,7 @@ describe('daily wrap-up trailer in UI writers', { concurrency: false }, () => {
     const raw = listRawMDBlocks(TWO_FENCES);
     assert.equal(raw.length, 2);
     assert.ok(!raw[1].includes('Day wrap-up'));
-    assert.equal(splitDailyWrapup(TWO_FENCES).phrase, 'Xiaohongshu infographic as HTML cards');
+    assert.equal(splitDailyWrapup(TWO_FENCES).phrase, '- Xiaohongshu infographic as HTML cards');
   });
 
   it('writeMemoryBlock keeps wrap-up last and last body unchanged', () => {
@@ -68,14 +68,14 @@ describe('daily wrap-up trailer in UI writers', { concurrency: false }, () => {
         confidence: 'high',
         importance: 3,
         status: 'candidate',
-        sources: ['session:test'],
+        sources: ['session test'],
         body: 'first body edited',
         filePath: fileName,
       },
     );
     const text = fs.readFileSync(path.join(dailyDir, fileName), 'utf8');
     assert.ok(text.includes(DAY_WRAPUP_HEADING));
-    assert.ok(text.trimEnd().endsWith('Xiaohongshu infographic as HTML cards'));
+    assert.ok(text.trimEnd().endsWith('- Xiaohongshu infographic as HTML cards'));
     assert.ok(text.includes('second body'));
     assert.ok(!text.split('---')[text.split('---').length - 1].includes(DAY_WRAPUP_HEADING) || true);
     const lastFence = listRawMDBlocks(text)[1];
@@ -93,13 +93,13 @@ id: mem-a
 type: fact
 confidence: high
 status: candidate
-sources: [session:test]
+sources: [session test]
 ---
 first body patched
 `,
       0,
     );
     const text = fs.readFileSync(path.join(dailyDir, fileName), 'utf8');
-    assert.ok(text.trimEnd().endsWith('Xiaohongshu infographic as HTML cards'));
+    assert.ok(text.trimEnd().endsWith('- Xiaohongshu infographic as HTML cards'));
   });
 });

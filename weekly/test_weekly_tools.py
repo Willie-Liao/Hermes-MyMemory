@@ -43,7 +43,7 @@ def test_render_events_beginning_course_outcome():
                 "valid_from": "2026-07-28",
                 "valid_to": "2026-07-28",
                 "confidence": "explicit",
-                "sources": ["session:s1"],
+                "sources": ["session s1"],
                 "related": ["mem-2026-07-28-ilink-file-push"],
                 "beginning": "asked",
                 "course": "delivered",

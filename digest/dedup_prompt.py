@@ -207,21 +207,25 @@ def render_typed_board(prefix: str, blocks: Iterable[Mapping[str, Any]]) -> str:
 
 WRAPUP_RULES = """## Day wrap-up
 
-Write one English-dominant medium phrase (not a paragraph, not YAML, not a
-bullet list). Call submit_day_wrapup with { "phrase": "..." } only.
+Call submit_day_wrapup with { "phrases": ["...", "..."] }.
 
-Every event on the board must be mentioned — a 2–4 word label each, joined
-with commas or "and". Same-thread events can share a short cluster, but none
-may be omitted. Other types (fact/procedure/decision) may color the clause
-only after every event is named.
+Each event gets its own independent short sentence (one line). Do not glue
+events into one clause with commas. Not a paragraph. Not YAML.
 
-Max 120 characters. One clause: at most one period, at the end. No second
-sentence (code keeps only the first).
+Shape:
+- "The user discussed the design of an infographic about the memory plugin."
+- "The user asked for commonly spoken dialects listed in a table."
+
+One sentence per event on the checklist. Start with "The user …" when it is
+the user's action. At most 120 characters per sentence. No second sentence
+inside a bullet (code keeps only the first).
+
+If there are no events, one short bullet for the day's remaining cards.
 """
 
 
 def _wrapup_event_checklist(blocks: Iterable[Mapping[str, Any]]) -> str:
-    """Force every event predicate into the prompt so the phrase cannot drop a thread."""
+    """Force every event predicate into the prompt so no event shares a glued clause."""
     lines: list[str] = []
     for block in blocks:
         if str(block.get("type") or "").strip().lower() != "event":
@@ -236,8 +240,7 @@ def _wrapup_event_checklist(blocks: Iterable[Mapping[str, Any]]) -> str:
     if not lines:
         return ""
     return (
-        "## Events that must appear\n"
-        "Each bullet needs a 2–4 word mention in the one phrase.\n\n"
+        "## Events — one independent sentence each\n\n"
         + "\n".join(lines)
         + "\n"
     )

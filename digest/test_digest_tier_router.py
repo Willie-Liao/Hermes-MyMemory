@@ -49,7 +49,7 @@ def _block(
     entity: str = "Gabby",
     involves: list[str] | None = None,
     related: list[str] | None = None,
-    sources: str = "session:abc-123",
+    sources: str = "session abc-123",
     item_type: str = "fact",
 ) -> str:
     lines = ["---", f"id: {block_id}", f"type: {item_type}", f"entity: {entity}"]
@@ -93,7 +93,7 @@ def test_recall_inject_line_includes_event_related_ids(tmp_path, monkeypatch):
         entity="论文文献综述",
         item_type="event",
         related=["mem-2026-07-25-ilink", "mem-2026-07-25-boyle"],
-        sources="session:evt-1",
+        sources="session evt-1",
     )
     _write_daily(tmp_path, _today(), fact + "\n\n" + event)
     text = digest.build_recall_injection_context(tier_max=1, session_id="s-rel")

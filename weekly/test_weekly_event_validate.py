@@ -25,7 +25,7 @@ def test_pass_when_mem_ids_resolve_and_overlap(tmp_path: Path):
         "entity: X\n"
         "confidence: high\n"
         "status: candidate\n"
-        "sources: [session:s1]\n"
+        "sources: [session s1]\n"
         "---\n"
         "Project kickoff moved to the event-first digest flow.\n",
     )

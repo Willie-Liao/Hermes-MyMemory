@@ -28,7 +28,7 @@ function block(partial: Partial<MemoryBlock> & Pick<MemoryBlock, 'id' | 'body' |
     confidence: 'high',
     importance: 3,
     status: 'candidate',
-    sources: ['session:test'],
+    sources: ['session test'],
     ...partial,
   };
 }
@@ -52,7 +52,7 @@ id: b1
 type: fact
 confidence: high
 status: candidate
-sources: [session:test]
+sources: [session test]
 ---
 hello
 `,
@@ -88,7 +88,7 @@ id: b2
 type: fact
 confidence: high
 status: candidate
-sources: [session:test]
+sources: [session test]
 ---
 keep me
 `,

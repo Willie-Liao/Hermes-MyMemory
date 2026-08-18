@@ -68,7 +68,7 @@ def _write_usable_daily(tmp_path: Path, date_str: str, body: str = "day note") -
                 "entity: Day",
                 "confidence: high",
                 "status: candidate",
-                "sources: [session:s1]",
+                "sources: [session s1]",
                 "---",
                 body,
                 "",

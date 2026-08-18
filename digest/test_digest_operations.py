@@ -16,7 +16,7 @@ def _block(block_id: str, body: str = "A durable note.") -> dict:
         "entity": "Project",
         "confidence": "high",
         "status": "candidate",
-        "sources": ["session:s1"],
+        "sources": ["session s1"],
         "body": body,
     }
 
@@ -700,7 +700,7 @@ def test_candidate_validated_interruption_fails_and_cleans_after_terminal_state(
         "entity: Project\n"
         "confidence: high\n"
         "status: candidate\n"
-        "sources: [session:s1]\n"
+        "sources: [session s1]\n"
         "---\n"
         "Old note.\n"
     )
@@ -822,7 +822,7 @@ def test_successful_candidate_reaches_committed_after_replacement(tmp_path, monk
         "entity: Project\n"
         "confidence: high\n"
         "status: candidate\n"
-        "sources: [session:s1]\n"
+        "sources: [session s1]\n"
         "---\n"
         "Old note.\n"
     )
@@ -876,7 +876,7 @@ def test_replacement_success_with_commit_log_failure_is_uncertain(tmp_path, monk
         "entity: Project\n"
         "confidence: high\n"
         "status: candidate\n"
-        "sources: [session:s1]\n"
+        "sources: [session s1]\n"
         "---\n"
         "Old note.\n"
     )
@@ -940,7 +940,7 @@ def test_write_failure_after_replacement_is_recovered_as_uncertain(tmp_path, mon
         "entity: Project\n"
         "confidence: high\n"
         "status: candidate\n"
-        "sources: [session:s1]\n"
+        "sources: [session s1]\n"
         "---\n"
         "Old note.\n"
     )

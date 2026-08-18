@@ -10,7 +10,7 @@ related:
   - "[1] mem-2026-06-29-andrae-feedback-summary"
   - "[2] mem-2026-06-29-parent-grading-package-delivered"
 sources:
-  - session:sess-a
+  - session sess-a
 confidence: high
 status: candidate
 valid_from: 2026-06-29

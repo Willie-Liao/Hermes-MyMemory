@@ -37,7 +37,7 @@ related:
   - "[1] mem-2026-06-29-andrae-feedback-summary"
   - "[2] mem-2026-06-29-parent-grading-package-delivered"
 sources:
-  - session:sess-a
+  - session sess-a
 confidence: high
 status: candidate
 valid_from: 2026-06-29
@@ -52,7 +52,7 @@ entity: Willie
 related:
   - "[3] mem-2026-06-30-career-pivot-note"
 sources:
-  - session:sess-b
+  - session sess-b
 confidence: medium
 status: candidate
 valid_from: 2026-06-30
@@ -146,7 +146,7 @@ def test_find_staging_block_returns_body_and_sources(tmp_path, monkeypatch):
         "entity: Andrae\n"
         "confidence: high\n"
         "status: candidate\n"
-        "sources: [session:sess-a, file:notes.md]\n"
+        "sources: [session sess-a, file:notes.md]\n"
         "---\n"
         "Andrae gave concrete feedback on the draft.\n"
     )
@@ -156,7 +156,7 @@ def test_find_staging_block_returns_body_and_sources(tmp_path, monkeypatch):
 
     assert found is not None
     assert "Andrae gave concrete feedback" in found["body"]
-    assert "session:sess-a" in found["sources"] or "session:sess-a" in str(found["sources"])
+    assert "session sess-a" in found["sources"] or "session sess-a" in str(found["sources"])
 
 
 def test_find_staging_block_missing_returns_none(tmp_path, monkeypatch):

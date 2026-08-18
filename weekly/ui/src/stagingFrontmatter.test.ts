@@ -27,7 +27,7 @@ describe('staging frontmatter display', () => {
       importance: 4,
       status: 'candidate',
       sources: [
-        'session:20260722_172657_c54f77a8',
+        'session 20260722_172657_c54f77a8',
         'file:Grading/assistant/cocoindex_codebase.py',
       ],
       body: 'User asked to revise project.',
@@ -43,7 +43,7 @@ describe('staging frontmatter display', () => {
     assert.match(yaml, /supersedes: \[mem-old\]/);
     assert.match(
       yaml,
-      /sources: \[session:20260722_172657_c54f77a8, file:Grading\/assistant\/cocoindex_codebase\.py\]/,
+      /sources: \[session 20260722_172657_c54f77a8, file:Grading\/assistant\/cocoindex_codebase\.py\]/,
     );
 
     // Digest order: related before valid_from; sources last.
@@ -65,7 +65,7 @@ importance: 1
 status: rejected
 discarded_at: 2026-07-26
 supersedes: [mem-target]
-sources: [session:s1]
+sources: [session s1]
 ---
 Spent helper.
 `;

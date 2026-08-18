@@ -34,7 +34,7 @@ id: mem-2026-07-11-short
 type: fact
 confidence: high
 status: candidate
-sources: ["session:test"]
+sources: ["session test"]
 valid_from: 2026-07-11
 valid_to: open
 ---
@@ -45,7 +45,7 @@ id: mem-2026-07-11-delete-me
 type: fact
 confidence: medium
 status: candidate
-sources: ["session:test2"]
+sources: ["session test2"]
 ---
 Temporary fact to delete.
 
@@ -54,7 +54,7 @@ id: mem-2026-07-11-keep-tail
 type: fact
 confidence: high
 status: candidate
-sources: ["session:test3"]
+sources: ["session test3"]
 ---
 Tail block stays last.
 `,
