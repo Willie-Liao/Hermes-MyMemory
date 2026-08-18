@@ -75,7 +75,8 @@ except ImportError:  # pragma: no cover - direct pytest collection path
 
 _DEFAULT_UI_URL = "http://127.0.0.1:3000"
 _UI_PROBE_TIMEOUT = 1.0
-_UI_START_WAIT_SECONDS = 15.0
+_UI_START_WAIT_SECONDS = 60.0
+_UI_INSTALL_WAIT_SECONDS = 180.0
 _UI_POLL_INTERVAL = 0.5
 # Always health-check loopback so public share URLs (NAT / phone) do not break start detection.
 _LOCAL_UI_URL = "http://127.0.0.1:3000"
@@ -439,10 +440,10 @@ def _format_ui_ready(share_url: str, *, note: str | None = None) -> str:
 
 
 def _ensure_ui_server() -> tuple[str, str | None]:
-    """Ensure the weekly UI is up.
+    """Bring loopback :3000 up before Cloudflare, or /weekly ui never starts trycloudflare.
 
-    Returns ``(fallback_share_url, error)`` — ``error`` is None on success.
-    Health checks always hit loopback; chat prefers a live tunnel URL when available.
+    Cloud copies of this plugin omit gitignored ``node_modules``, so ``tsx`` is missing and
+    ``npm run dev`` dies immediately. Tunnel start is gated on this probe succeeding.
     """
     share_url = _ui_share_url()
     probe_url = _ui_probe_url()
@@ -460,17 +461,58 @@ def _ensure_ui_server() -> tuple[str, str | None]:
         if (candidate / "memories").exists() or (candidate / "config.yaml").exists():
             env["HERMES_HOME"] = str(candidate)
 
+    log_path = _tunnel_log_path().with_name("weekly-ui-dev.log")
+    if not (ui_dir / "node_modules").is_dir():
+        try:
+            install = subprocess.run(
+                ["npm", "install"],
+                cwd=str(ui_dir),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=_UI_INSTALL_WAIT_SECONDS,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return share_url, f"npm install failed in {ui_dir}: {exc}"
+        try:
+            log_path.write_text(
+                (install.stdout or "") + (install.stderr or ""),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        if install.returncode != 0:
+            tail = ((install.stderr or install.stdout or "")[-800:]).strip()
+            return share_url, (
+                f"npm install failed in {ui_dir} (exit {install.returncode})"
+                + (f": {tail}" if tail else "")
+            )
+
+    try:
+        log_fh = log_path.open("a", encoding="utf-8")
+    except OSError:
+        log_fh = subprocess.DEVNULL
     try:
         subprocess.Popen(
             ["npm", "run", "dev"],
             cwd=str(ui_dir),
             env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
             start_new_session=True,
         )
     except OSError as exc:
+        if log_fh is not subprocess.DEVNULL:
+            try:
+                log_fh.close()
+            except OSError:
+                pass
         return share_url, f"failed to spawn `npm run dev` in {ui_dir}: {exc}"
+    if log_fh is not subprocess.DEVNULL:
+        try:
+            log_fh.close()
+        except OSError:
+            pass
 
     deadline = time.monotonic() + _UI_START_WAIT_SECONDS
     while time.monotonic() < deadline:
@@ -478,10 +520,16 @@ def _ensure_ui_server() -> tuple[str, str | None]:
             return share_url, None
         time.sleep(_UI_POLL_INTERVAL)
 
+    tail = ""
+    try:
+        tail = log_path.read_text(encoding="utf-8", errors="replace")[-800:].strip()
+    except OSError:
+        pass
+    detail = f" (log: {log_path}" + (f"; {tail}" if tail else "") + ")"
     return (
         share_url,
         f"UI did not become ready at {probe_url} within {_UI_START_WAIT_SECONDS:.0f}s "
-        f"(started `npm run dev` under {ui_dir})",
+        f"(started `npm run dev` under {ui_dir}){detail}",
     )
 
 

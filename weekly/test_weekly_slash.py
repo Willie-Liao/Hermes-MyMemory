@@ -470,6 +470,55 @@ def test_ui_starts_dev_server_when_down(monkeypatch):
     assert "failed" not in out.lower()
 
 
+def test_ui_npm_install_when_node_modules_missing(tmp_path, monkeypatch):
+    s = _load_slash()
+    ui = tmp_path / "ui"
+    ui.mkdir()
+    cmds = []
+
+    def fake_run(cmd, **kwargs):
+        cmds.append(("run", list(cmd)))
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    def fake_popen(cmd, **kwargs):
+        cmds.append(("popen", list(cmd)))
+        return object()
+
+    monkeypatch.delenv("WEEKLY_UI_URL", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(s, "_ui_dir", lambda: ui)
+    monkeypatch.setattr(s, "_ui_probe", lambda url: False)
+    monkeypatch.setattr(s.subprocess, "run", fake_run)
+    monkeypatch.setattr(s.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(s.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(s, "_UI_START_WAIT_SECONDS", 0.01)
+    out = s.handle_weekly("ui")
+    assert ("run", ["npm", "install"]) in cmds
+    assert ("popen", ["npm", "run", "dev"]) in cmds
+    assert "fail" in out.lower()
+
+
+def test_ui_skips_dev_when_npm_install_fails(tmp_path, monkeypatch):
+    s = _load_slash()
+    ui = tmp_path / "ui"
+    ui.mkdir()
+    popen = []
+
+    def fake_run(cmd, **kwargs):
+        return type("R", (), {"returncode": 1, "stdout": "", "stderr": "no tsx"})()
+
+    monkeypatch.delenv("WEEKLY_UI_URL", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(s, "_ui_dir", lambda: ui)
+    monkeypatch.setattr(s, "_ui_probe", lambda url: False)
+    monkeypatch.setattr(s.subprocess, "run", fake_run)
+    monkeypatch.setattr(s.subprocess, "Popen", lambda *a, **k: popen.append(a) or object())
+    out = s.handle_weekly("ui")
+    assert popen == []
+    assert "npm install failed" in out
+    assert "no tsx" in out
+
+
 def test_ui_fails_clearly_when_start_does_not_come_up(monkeypatch):
     s = _load_slash()
     monkeypatch.delenv("WEEKLY_UI_URL", raising=False)
