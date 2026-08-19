@@ -205,6 +205,35 @@ def test_bridge_dispatches_digest_staleness(monkeypatch, capsys):
     assert captured == {"week_key": "2026-W28"}
 
 
+def test_bridge_dispatches_weekly_json(monkeypatch, capsys):
+    bridge = _load_bridge_module()
+    captured = {}
+
+    class FakeActions:
+        @staticmethod
+        def load_weekly_json(week_key=None):
+            captured["week_key"] = week_key
+            return {
+                "outcome": "ok",
+                "week": week_key or "2026-W33",
+                "payload": {"week_key": week_key, "legend": {}},
+            }
+
+    monkeypatch.setattr(bridge, "_load_weekly_actions", lambda: FakeActions)
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        StringIO(json.dumps({"op": "weekly_json", "args": {"week_key": "2026-W33"}})),
+    )
+
+    assert bridge.main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["result"]["outcome"] == "ok"
+    assert captured == {"week_key": "2026-W33"}
+    assert "md" not in str(payload["result"]).casefold()
+
+
 def test_bridge_dispatches_generate_week_with_update_reason(monkeypatch, capsys):
     bridge = _load_bridge_module()
     captured = {}

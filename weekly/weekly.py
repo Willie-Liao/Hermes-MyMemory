@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import threading
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -80,6 +81,7 @@ try:
         validate_weekly_review_payload,
     )
     from .weekly_event_workers import run_parallel_worker1
+    from . import weekly_json
 except ImportError:
     from weekly_brief_validate import format_brief_for_chat  # type: ignore[no-redef]
     from weekly_citations import normalize_event_citations  # type: ignore[no-redef]
@@ -105,6 +107,7 @@ except ImportError:
         validate_weekly_review_payload,
     )
     from weekly_event_workers import run_parallel_worker1  # type: ignore[no-redef]
+    import weekly_json  # type: ignore[no-redef]
 
 logger = logging.getLogger("plugins.memory-weekly")
 
@@ -1063,6 +1066,24 @@ def _weekly_path(year: int, week: int) -> Path:
     return _staging_weekly() / f"{_week_key(year, week)}.md"
 
 
+def _commit_weekly_outputs(
+    target: Path, content: str, payload: WeeklyReviewPayload, week_key: str
+) -> None:
+    """Serialize JSON before replacing the weekly md so a dumps crash cannot clobber last week's file."""
+    json_text = weekly_json.dumps(payload)
+    yaml_text = weekly_json.dump_yaml(payload)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    write_week_status(
+        target,
+        WEEK_STATUS_PENDING,
+        week_key_str=week_key,
+        content=content.rstrip() + "\n",
+    )
+    weekly_json.write_sidecars(
+        target, payload, json_text=json_text, yaml_text=yaml_text
+    )
+
+
 def _build_prompt(
     week_key: str,
     daily_bundle: str,
@@ -1244,6 +1265,8 @@ def _strip_code_fence(content: str) -> str:
 
 # Set by `_generate_weekly_content` when four-part Brief assembly fails; cleared each generate.
 _last_brief_error: str | None = None
+# Last payload that produced Distill+Brief, so the writer can dump JSON/YAML without a second LLM.
+_last_weekly_payload: WeeklyReviewPayload | None = None
 
 
 def _is_weekly_worker_turn(user_message: Any) -> bool:
@@ -1319,16 +1342,14 @@ def _prepare_distill_content(
 def _generate_weekly_content(
     week_key: str, files: list[Path], *, reason: str = ""
 ) -> str | None:
-    """Worker 1 parallel coordinator → Distill MD → four-part Brief.
+    """Worker 1 → JSON sidecar projection as YAML. No weekly Distill document.
 
-    Worker 1 runs one ``worker1_event`` LLM over all active days, merges Mon–Sun
-    (event cites only; no F/P/D attach), then runs Conflict / Hypothesis /
-    Span analysts. Step 3 renders the four-part presentation deterministically
-    from ``WeeklyReviewPayload`` (no Worker 2 LLM rewrite of facts). Distill
-    YAML remains for legacy cite-map / internal compatibility.
+    Distill event fences stay on daily files; duplicating them here would make
+    Chronicle parse a second copy.
     """
-    global _last_brief_error
+    global _last_brief_error, _last_weekly_payload
     _last_brief_error = None
+    _last_weekly_payload = None
     reason_bit = f" reason={reason}" if reason else ""
     try:
         daily_bundle = _read_daily_bundle(files)
@@ -1357,90 +1378,34 @@ def _generate_weekly_content(
         _log(f"weekly worker1 parallel failed {week_key}: {exc}{reason_bit}")
         return None
 
-    blocks = list(w1.blocks)
-    legend = dict(w1.legend)
     payload = w1.payload
-    if not blocks:
+    legend = dict(w1.legend) or dict(payload.legend)
+    if not legend and not payload.intra_day_thread and not payload.cross_day_thread:
         _log(
-            f"weekly worker1 produced no blocks {week_key} "
+            f"weekly worker1 produced no payload {week_key} "
             f"errors={w1.errors[:5]}{reason_bit}"
         )
         return None
 
-    prepared = _render_weekly_distill_document(week_key, blocks)
-    errors = validate_weekly_distill(prepared)
-    if errors:
-        # Soft salvage: keep event blocks only (analyst extras may be incomplete).
-        event_only = [
-            b
-            for b in blocks
-            if str((b.get("frontmatter") or {}).get("type") or "").strip().casefold()
-            == "event"
-        ]
-        if event_only:
-            prepared = _render_weekly_distill_document(week_key, event_only)
-            event_errors = validate_weekly_distill(prepared)
-            if not event_errors:
-                _log(
-                    f"weekly worker1 distill salvage to events-only {week_key}: "
-                    f"{'; '.join(errors[:3])}{reason_bit}"
-                )
-                blocks = event_only
-                _, legend = normalize_event_citations(blocks)
-                payload = WeeklyReviewPayload(
-                    days=payload.days,
-                    conflicts=(),
-                    hypotheses=(),
-                    span_candidates=(),
-                    legend=dict(legend),
-                    week_key=week_key,
-                )
-                errors = []
-            else:
-                errors = event_errors
-        if errors:
-            _log(
-                f"weekly worker1 distill validation failed {week_key}: "
-                f"{'; '.join(errors[:5])}{reason_bit}"
-            )
-            return None
-
-    if not payload.week_key:
-        payload = WeeklyReviewPayload(
-            days=payload.days,
-            conflicts=payload.conflicts,
-            hypotheses=payload.hypotheses,
-            span_candidates=payload.span_candidates,
-            legend=dict(legend) if legend else dict(payload.legend),
-            typed_legend=dict(payload.typed_legend),
-            week_key=week_key,
-        )
-    elif legend and legend != payload.legend:
-        payload = WeeklyReviewPayload(
-            days=payload.days,
-            conflicts=payload.conflicts,
-            hypotheses=payload.hypotheses,
-            span_candidates=payload.span_candidates,
-            legend=dict(legend),
-            typed_legend=dict(payload.typed_legend),
-            week_key=payload.week_key or week_key,
-        )
-
+    payload = replace(
+        payload,
+        legend=legend,
+        week_key=week_key,
+        cross_day_thread=w1.cross_day_thread or payload.cross_day_thread,
+        entities=w1.entities or payload.entities,
+        conflicts=(),
+        hypotheses=(),
+    )
     assigned = assign_typed_citations(payload)
-    shape_errs = validate_weekly_review_payload(assigned)
-    if shape_errs:
-        _log(
-            f"weekly four-part payload warnings {week_key}: "
-            f"{'; '.join(shape_errs[:5])}{reason_bit}"
-        )
-    brief = render_weekly_review_brief(week_key, assigned)
-    if not brief.strip():
-        _last_brief_error = "empty four-part brief"
-        _log(
-            f"weekly four-part brief_error {week_key}: "
-            f"{_last_brief_error}{reason_bit}"
-        )
-    return _render_weekly_distill_document(week_key, blocks, brief=brief)
+    assigned = replace(
+        assigned,
+        cross_day_thread=payload.cross_day_thread,
+        intra_day_thread=payload.intra_day_thread,
+        entities=payload.entities,
+        week_key=week_key,
+    )
+    _last_weekly_payload = assigned
+    return weekly_json.dump_yaml(assigned)
 
 
 def _run_weekly(reason: str) -> None:
@@ -1512,12 +1477,10 @@ def _run_weekly(reason: str) -> None:
                     _log(f"weekly skip write {key} generation failed ({reason})")
                     continue
                 target.parent.mkdir(parents=True, exist_ok=True)
-                write_week_status(
-                    target,
-                    WEEK_STATUS_PENDING,
-                    week_key_str=key,
-                    content=content.rstrip() + "\n",
-                )
+                payload = _last_weekly_payload
+                if payload is None:
+                    payload = WeeklyReviewPayload(days=(), week_key=key)
+                _commit_weekly_outputs(target, content, payload, key)
 
                 state["last_generated_week"] = key
                 state["last_generated_at"] = datetime.now(timezone.utc).isoformat()

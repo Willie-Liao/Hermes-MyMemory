@@ -49,6 +49,7 @@ import {
   type WeekViewMode,
 } from '../chronicleFold';
 import { isFourPartBrief } from '../fourPartBrief';
+import type { WeeklyJsonPayload } from '../weeklyJson';
 import type { WeeklySpanBridgeRow } from '../overdueActions';
 import FourPartWeeklyCard from './FourPartWeeklyCard';
 import MemoryApprovalActionQueue from './MemoryApprovalActionQueue';
@@ -184,6 +185,7 @@ export default function WeekReview({
   const [reorganizeLoading, setReorganizeLoading] = useState(false);
 
   const [chronicleSummary, setChronicleSummary] = useState('');
+  const [weeklyJson, setWeeklyJson] = useState<WeeklyJsonPayload | null>(null);
   const [chronicleLoading, setChronicleLoading] = useState(false);
   const [spanBridgeRows, setSpanBridgeRows] = useState<WeeklySpanBridgeRow[]>([]);
   const [spansLoading, setSpansLoading] = useState(false);
@@ -903,8 +905,31 @@ export default function WeekReview({
     }
   };
 
+  const fetchWeeklyJson = async (weekKey: string) => {
+    try {
+      const res = await fetch(`/api/weekly/weeks/${weekKey}/json`);
+      if (res.status === 404) {
+        setWeeklyJson(null);
+        return;
+      }
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setWeeklyJson(null);
+        return;
+      }
+      const payload = data.payload && typeof data.payload === 'object' ? data.payload : data;
+      setWeeklyJson(payload as WeeklyJsonPayload);
+    } catch {
+      setWeeklyJson(null);
+    }
+  };
+
   const refreshFourPartSurfaces = async (weekKey: string) => {
-    await Promise.all([fetchChronicle(weekKey), fetchWeeklySpans(weekKey)]);
+    await Promise.all([
+      fetchChronicle(weekKey),
+      fetchWeeklySpans(weekKey),
+      fetchWeeklyJson(weekKey),
+    ]);
   };
 
   const checkStaleness = async (weekKey: string) => {
@@ -2123,10 +2148,12 @@ export default function WeekReview({
                     <Sparkles className="w-4.5 h-4.5 text-indigo-400 group-hover:text-indigo-300 transition-colors" />
                     <div>
                       <h3 className="text-xs font-mono font-bold text-slate-200 group-hover:text-slate-100 transition-colors uppercase tracking-wider">
-                        {isFourPartBrief(chronicleSummary) ? 'Weekly Review' : 'Weekly Chronicle'}
+                        {weeklyJson || isFourPartBrief(chronicleSummary) ? 'Weekly Review' : 'Weekly Chronicle'}
                       </h3>
                       <p className="text-[10px] text-slate-500 font-mono mt-0.5">
-                        {isFourPartBrief(chronicleSummary)
+                        {weeklyJson
+                          ? `cross-day-thread · wrap-up · overdue · ${selectedWeek.week}`
+                          : isFourPartBrief(chronicleSummary)
                           ? `Brief · Conflict · ${selectedWeek.week}`
                           : `What you did · ${selectedWeek.week}`}
                       </p>
@@ -2155,9 +2182,29 @@ export default function WeekReview({
                         ? 'Loading weekly review…'
                         : 'Loading chronicle…'}
                     </p>
+                  ) : weeklyJson ? (
+                    <FourPartWeeklyCard
+                      payload={weeklyJson}
+                      allBlocks={allBlocks}
+                      onJumpApprovalCite={jumpToApprovalCite}
+                      onJumpDailyBlock={jumpToDailyBlock}
+                    >
+                    <MemoryApprovalActionQueue
+                      weekKey={selectedWeek.week}
+                      bridgeSpans={spanBridgeRows}
+                      allBlocks={allBlocks}
+                      pendingOps={reviewPendingOps}
+                      savedReviewOps={savedReviewOps}
+                      onPendOp={handleReviewPendOp}
+                      onClearPendingOp={handleClearReviewPendingOp}
+                      onRecallSavedReview={() => void handleRecallSavedReview()}
+                      onJumpApprovalCite={jumpToApprovalCite}
+                      onJumpDailyBlock={jumpToDailyBlock}
+                    />
+                    </FourPartWeeklyCard>
                   ) : chronicleSummary.trim() && isFourPartBrief(chronicleSummary) ? (
                     <FourPartWeeklyCard
-                      summary={chronicleSummary}
+                      payload={{ legend: {}, 'cross-day-thread': [], 'intra-day-thread': [] }}
                       allBlocks={allBlocks}
                       onJumpApprovalCite={jumpToApprovalCite}
                       onJumpDailyBlock={jumpToDailyBlock}
@@ -2780,7 +2827,7 @@ export default function WeekReview({
                   {/* Candidate list queue */}
                   {weeklyProposals.length === 0 ? (
                     <div className="bg-slate-950/40 border border-slate-850 rounded-2xl p-8 text-center text-xs text-slate-500 font-mono">
-                      No event candidates for this week. Fact / procedure / decision stay off Approval Hub unless quoted as Events in the Brief Cite map — hypotheses use the review actions below.
+                      No event candidates for this week. Fact / procedure / decision stay off Approval Hub unless quoted as Events in legend. Overdue actions live in Chronicle.
                     </div>
                   ) : (
                     <div
@@ -3145,24 +3192,6 @@ export default function WeekReview({
                       })}
                     </div>
                   )}
-
-                  {selectedWeek
-                    && chronicleSummary.trim()
-                    && isFourPartBrief(chronicleSummary) ? (
-                    <MemoryApprovalActionQueue
-                      weekKey={selectedWeek.week}
-                      summary={chronicleSummary}
-                      bridgeSpans={spanBridgeRows}
-                      allBlocks={allBlocks}
-                      pendingOps={reviewPendingOps}
-                      savedReviewOps={savedReviewOps}
-                      onPendOp={handleReviewPendOp}
-                      onClearPendingOp={handleClearReviewPendingOp}
-                      onRecallSavedReview={() => void handleRecallSavedReview()}
-                      onJumpApprovalCite={jumpToApprovalCite}
-                      onJumpDailyBlock={jumpToDailyBlock}
-                    />
-                  ) : null}
 
                   {/* Fast-Track container — always show Save/Recall (events-only hub may be empty). */}
                   <div className="bg-gradient-to-r from-[#111625] to-slate-900 border border-indigo-500/20 p-5 rounded-2xl shadow-xl">

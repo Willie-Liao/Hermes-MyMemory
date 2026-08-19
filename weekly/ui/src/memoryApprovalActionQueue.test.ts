@@ -147,7 +147,7 @@ describe('memoryApprovalActionQueue helpers', () => {
 });
 
 describe('Memory Approval action queue placement (source fixture)', () => {
-  it('renders queue inside Memory Approval and not in Chronicle card', () => {
+  it('renders overdue queue inside Chronicle, not Memory Approval', () => {
     const weekReview = fs.readFileSync(
       path.join(root, 'components/WeekReview.tsx'),
       'utf8',
@@ -161,29 +161,26 @@ describe('Memory Approval action queue placement (source fixture)', () => {
       'utf8',
     );
 
-    expect(queue).toContain('Hypothesis');
+    expect(queue).not.toContain('Hypothesis');
     expect(queue).toContain('Possible overdue report');
-    expect(queue).toContain('id="memory-approval-action-queue"');
+    expect(queue).toContain('id="chronicle-overdue-queue"');
 
-    expect(chronicle).not.toContain('Hypothesis');
-    expect(chronicle).not.toContain('Possible overdue report');
-    expect(chronicle).toContain('Weekly Brief');
-    expect(chronicle).toContain('Conflict');
+    expect(chronicle).toContain('cross-day-thread');
+    expect(chronicle).toContain('intra-day-thread');
+    expect(chronicle).not.toContain('Weekly Brief');
+    expect(chronicle).not.toContain('Conflict');
 
-    // Chronicle call site no longer receives review pending props.
     const chronicleCall = weekReview.match(
-      /<FourPartWeeklyCard[\s\S]*?\/>/,
+      /<FourPartWeeklyCard[\s\S]*?<\/FourPartWeeklyCard>/,
     )?.[0] ?? '';
-    expect(chronicleCall).toContain('summary={chronicleSummary}');
-    expect(chronicleCall).not.toContain('pendingOps');
-    expect(chronicleCall).not.toContain('onPendOp');
+    expect(chronicleCall).toContain('payload={weeklyJson}');
+    expect(chronicleCall).toContain('<MemoryApprovalActionQueue');
 
-    // Action queue sits under Memory Approval, above the shared Save footer.
     const approvalIdx = weekReview.indexOf('id="memory-approval-section"');
     const queueIdx = weekReview.indexOf('<MemoryApprovalActionQueue');
     const saveIdx = weekReview.indexOf('<span>Memory Approval Save / Recall</span>');
-    expect(approvalIdx).toBeGreaterThan(-1);
-    expect(queueIdx).toBeGreaterThan(approvalIdx);
-    expect(saveIdx).toBeGreaterThan(queueIdx);
+    expect(queueIdx).toBeGreaterThan(-1);
+    expect(queueIdx).toBeLessThan(approvalIdx);
+    expect(saveIdx).toBeGreaterThan(approvalIdx);
   });
 });

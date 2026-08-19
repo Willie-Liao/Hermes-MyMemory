@@ -275,14 +275,9 @@ def _ok_event_tools(days, *, force_tool_name: str = "") -> dict:
 
 
 def _empty_analyst(purpose: str, force_tool_name: str = "") -> dict:
-    if purpose == "worker1_conflict":
-        return {
-            "tool_name": force_tool_name or "submit_weekly_conflict",
-            "tool_args": {"conflicts": []},
-        }
     return {
-        "tool_name": force_tool_name or "submit_weekly_hypothesis",
-        "tool_args": {"hypotheses": []},
+        "tool_name": force_tool_name or "submit_weekly_thread",
+        "tool_args": {"cross-day-thread": []},
     }
 
 def test_call_weekly_llm_delegates_to_run_worker_llm(tmp_path, monkeypatch):
@@ -359,16 +354,8 @@ def test_single_event_worker_purpose_called(tmp_path, monkeypatch):
                 "tool_name": force_tool_name or "submit_weekly_event",
                 "tool_args": {"events": events},
             }
-        if purpose == "worker1_conflict":
-            return {
-                "tool_name": force_tool_name or "submit_weekly_conflict",
-                "tool_args": _conflict_tool_args("evt-2026-06-29"),
-            }
-        if purpose == "worker1_hypothesis":
-            return {
-                "tool_name": force_tool_name or "submit_weekly_hypothesis",
-                "tool_args": _hypothesis_tool_args("evt-2026-06-29"),
-            }
+        if purpose == "worker1_thread":
+            return _empty_analyst(purpose, force_tool_name)
         if purpose == "worker2_brief":
             return _brief_ok()
         return ""
@@ -385,8 +372,7 @@ def test_single_event_worker_purpose_called(tmp_path, monkeypatch):
     # Analysts still run after the single event worker.
     assert {c["purpose"] for c in calls} >= {
         "worker1_event",
-        "worker1_conflict",
-        "worker1_hypothesis",
+        "worker1_thread",
     }
     assert not any(c["purpose"] == "worker1_span" for c in calls)
 
@@ -420,15 +406,10 @@ def test_all_active_dates_represented_mon_sun_order(tmp_path, monkeypatch):
                 "tool_name": force_tool_name or "submit_weekly_event",
                 "tool_args": {"events": events},
             }
-        if purpose == "worker1_conflict":
+        if purpose == "worker1_thread":
             return {
-                "tool_name": force_tool_name or "submit_weekly_conflict",
-                "tool_args": {"conflicts": []},
-            }
-        if purpose == "worker1_hypothesis":
-            return {
-                "tool_name": force_tool_name or "submit_weekly_hypothesis",
-                "tool_args": {"hypotheses": []},
+                "tool_name": force_tool_name or "submit_weekly_thread",
+                "tool_args": {"cross-day-thread": []},
             }
         if purpose == "worker2_brief":
             return _brief_ok()
@@ -474,7 +455,8 @@ def test_all_active_dates_represented_mon_sun_order(tmp_path, monkeypatch):
     ]
     result = weekly._generate_weekly_content("2026-W27", files, reason="test")
     assert result is not None
-    assert "## Distill" in result
+    assert "cross-day-thread" in result
+    assert "intra-day-thread" in result
     for day in days:
         assert day in result
 
@@ -509,16 +491,11 @@ def test_analysts_receive_merged_event_context(tmp_path, monkeypatch):
                 "tool_name": force_tool_name or "submit_weekly_event",
                 "tool_args": {"events": events},
             }
-        if purpose in {"worker1_conflict", "worker1_hypothesis"}:
+        if purpose == "worker1_thread":
             analyst_prompts[purpose] = prompt
-            if purpose == "worker1_conflict":
-                return {
-                    "tool_name": force_tool_name or "submit_weekly_conflict",
-                    "tool_args": _conflict_tool_args("evt-mon"),
-                }
             return {
-                "tool_name": force_tool_name or "submit_weekly_hypothesis",
-                "tool_args": _hypothesis_tool_args("evt-mon"),
+                "tool_name": force_tool_name or "submit_weekly_thread",
+                "tool_args": {"cross-day-thread": []},
             }
         if purpose == "worker2_brief":
             return _brief_ok()
@@ -527,10 +504,7 @@ def test_analysts_receive_merged_event_context(tmp_path, monkeypatch):
     _purpose_keyed_llm(weekly, monkeypatch, handler)
     result = weekly._generate_weekly_content("2026-W27", files, reason="test")
     assert result is not None
-    assert set(analyst_prompts) == {
-        "worker1_conflict",
-        "worker1_hypothesis",
-    }
+    assert set(analyst_prompts) == {"worker1_thread"}
     for purpose, prompt in analyst_prompts.items():
         assert "MERGED EVENTS" in prompt, purpose
         assert "CITATION LEGEND" in prompt, purpose
@@ -551,7 +525,7 @@ def test_event_worker_failure_bounded_fallback_keeps_day(tmp_path, monkeypatch):
     def handler(prompt: str, purpose: str, force_tool_name: str = "") -> object:
         if purpose == "worker1_event":
             raise RuntimeError("simulated event worker failure")
-        if purpose in {"worker1_conflict", "worker1_hypothesis"}:
+        if purpose == "worker1_thread":
             return _empty_analyst(purpose, force_tool_name)
         if purpose == "worker2_brief":
             return _brief_ok()
@@ -598,7 +572,7 @@ def test_event_workers_never_emit_non_event_types(tmp_path, monkeypatch):
                     ]
                 },
             }
-        if purpose in {"worker1_conflict", "worker1_hypothesis"}:
+        if purpose == "worker1_thread":
             return _empty_analyst(purpose, force_tool_name)
         if purpose == "worker2_brief":
             return _brief_ok()
@@ -635,28 +609,21 @@ def test_generate_weekly_content_fills_brief_after_w1(tmp_path, monkeypatch):
                     ]
                 },
             }
-        if purpose == "worker1_hypothesis":
+        if purpose == "worker1_thread":
             return {
-                "tool_name": force_tool_name or "submit_weekly_hypothesis",
-                "tool_args": _hypothesis_tool_args("evt-a"),
-            }
-        if purpose == "worker1_conflict":
-            return {
-                "tool_name": force_tool_name or "submit_weekly_conflict",
-                "tool_args": _conflict_tool_args("evt-a"),
+                "tool_name": force_tool_name or "submit_weekly_thread",
+                "tool_args": {"cross-day-thread": []},
             }
         return ""
 
     calls = _purpose_keyed_llm(weekly, monkeypatch, handler)
     result = weekly._generate_weekly_content("2026-W27", files, reason="test")
     assert result is not None
-    assert "## Distill" in result
-    assert "## Brief" in result
-    assert "Weekly Brief — 2026-W27" in result
-    assert " · Events" in result
-    assert "Conflict" in result
-    assert "Hypothesis" in result
-    assert "Possible overdue report\n- None." in result
+    assert "cross-day-thread" in result
+    assert "intra-day-thread" in result
+    assert "legend:" in result
+    assert "Conflict" not in result
+    assert "Hypothesis" not in result
     assert not any(c["purpose"] == "worker2_brief" for c in calls)
     assert not any(c["purpose"] == "worker1_span" for c in calls)
     assert any(
@@ -665,7 +632,7 @@ def test_generate_weekly_content_fills_brief_after_w1(tmp_path, monkeypatch):
 
 
 def test_generate_weekly_content_soft_fails_brief_keeps_distill(tmp_path, monkeypatch):
-    """Analyst soft-empty still yields Distill + deterministic four-part Brief."""
+    """Analyst soft-empty still yields YAML of JSON (no Distill fences)."""
     weekly = _load_weekly(tmp_path, monkeypatch)
     files = [_write_daily(tmp_path, "2026-06-30")]
     logs: list[str] = []
@@ -685,27 +652,22 @@ def test_generate_weekly_content_soft_fails_brief_keeps_distill(tmp_path, monkey
                     ]
                 },
             }
-        if purpose in {"worker1_conflict", "worker1_hypothesis"}:
+        if purpose == "worker1_thread":
             return _empty_analyst(purpose, force_tool_name)
         return ""
 
     _purpose_keyed_llm(weekly, monkeypatch, handler)
     result = weekly._generate_weekly_content("2026-W27", files, reason="test")
     assert result is not None
-    assert "## Distill" in result
-    assert "evt-a" in result or "2026-06-30" in result
-    assert "## Brief" in result
-    brief_section = result.split("## Brief", 1)[1]
-    assert "Weekly Brief — 2026-W27" in brief_section
-    assert "No record for this day." in brief_section
-    assert "Conflict" in brief_section
-    assert "Hypothesis" in brief_section
+    assert "cross-day-thread" in result
+    assert "## Distill" not in result
+    assert "## Brief" not in result
 
 
 def test_generate_weekly_content_renders_four_part_without_worker2_llm(
     tmp_path, monkeypatch
 ):
-    """Step 3: deterministic four-part Brief; Worker 2 LLM is not consulted."""
+    """YAML dump of JSON; Worker 2 LLM is not consulted."""
     weekly = _load_weekly(tmp_path, monkeypatch)
     files = [_write_daily(tmp_path, "2026-06-30")]
     logs: list[str] = []
@@ -725,7 +687,7 @@ def test_generate_weekly_content_renders_four_part_without_worker2_llm(
                     ]
                 },
             }
-        if purpose in {"worker1_conflict", "worker1_hypothesis"}:
+        if purpose == "worker1_thread":
             return _empty_analyst(purpose, force_tool_name)
         if purpose == "worker2_brief":
             raise AssertionError("Worker 2 LLM must not run for four-part brief")
@@ -734,10 +696,9 @@ def test_generate_weekly_content_renders_four_part_without_worker2_llm(
     calls = _purpose_keyed_llm(weekly, monkeypatch, handler)
     result = weekly._generate_weekly_content("2026-W27", files, reason="test")
     assert result is not None
-    assert "## Distill" in result
-    brief_section = result.split("## Brief", 1)[1]
-    assert "Weekly Brief — 2026-W27" in brief_section
-    assert "Tuesday — 2026-06-30 · Events" in brief_section
-    assert "Possible overdue report\n- None." in brief_section
+    assert "cross-day-thread" in result
+    assert "intra-day-thread" in result
+    assert "## Distill" not in result
     assert not any(c["purpose"] == "worker2_brief" for c in calls)
     assert not any(c["purpose"] == "worker1_span" for c in calls)
+

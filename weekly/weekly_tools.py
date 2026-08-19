@@ -94,39 +94,6 @@ def _event_item_props() -> dict[str, Any]:
     }
 
 
-def _conflict_item_props() -> dict[str, Any]:
-    return {
-        "id": {"type": "string"},
-        "confidence": _confidence_prop(),
-        "status": _status_prop(),
-        "sources": {"type": "array", "items": {"type": "string"}},
-        "related": {
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": 1,
-            "description": "Must include ≥1 week event id",
-        },
-        "tension": {"type": "string"},
-    }
-
-
-def _hypothesis_item_props() -> dict[str, Any]:
-    return {
-        "id": {"type": "string"},
-        "entity": {"type": "string"},
-        "valid_from": {"type": "string", "format": "date"},
-        "confidence": _confidence_prop(),
-        "status": _status_prop(),
-        "sources": {"type": "array", "items": {"type": "string"}},
-        "related": {
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": 1,
-        },
-        "statement": {"type": "string"},
-    }
-
-
 def _schema(
     name: str, description: str, props: dict[str, Any], required: list[str]
 ) -> dict[str, Any]:
@@ -199,76 +166,68 @@ def skip_weekly_event_schema() -> dict[str, Any]:
     )
 
 
-def submit_weekly_conflict_schema() -> dict[str, Any]:
+def _thread_step_props() -> dict[str, Any]:
+    return {
+        "seq": {"type": "integer"},
+        "date": {"type": "string"},
+        "event_id": {"type": "string"},
+        "text": {"type": "string"},
+        "via": {"type": "string", "enum": ["evolves", "invalidates"]},
+        "to_seq": {"type": "integer"},
+    }
+
+
+def _thread_item_props() -> dict[str, Any]:
+    return {
+        "id": {"type": "string"},
+        "label": {"type": "string"},
+        "entity_keys": {"type": "array", "items": {"type": "string"}},
+        "steps": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": _thread_step_props(),
+                "required": ["seq", "date", "event_id", "text"],
+            },
+        },
+        "outcome": {
+            "type": "object",
+            "properties": {
+                "state": {"type": "string"},
+                "text": {"type": "string"},
+            },
+        },
+    }
+
+
+def submit_weekly_thread_schema() -> dict[str, Any]:
     return _schema(
-        "submit_weekly_conflict",
-        "Submit conflict analyst results for the week.",
+        "submit_weekly_thread",
+        "Submit cross-day-thread chains. Use existing daily event ids. Do not invent wrap-ups, entities, or legend.",
         {
-            "conflicts": {
+            "cross-day-thread": {
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "properties": _conflict_item_props(),
-                    "required": ["confidence", "related", "tension", "sources"],
+                    "properties": _thread_item_props(),
+                    "required": ["id", "label", "steps"],
                 },
             }
         },
-        ["conflicts"],
+        ["cross-day-thread"],
     )
 
 
-def patch_weekly_conflict_schema() -> dict[str, Any]:
+def patch_weekly_thread_schema() -> dict[str, Any]:
     return _schema(
-        "patch_weekly_conflict",
-        "Patch ONLY changed fields on previous submit_weekly_conflict args.",
+        "patch_weekly_thread",
+        "Patch ONLY changed fields on previous submit_weekly_thread args.",
         {
-            "conflicts": {
+            "cross-day-thread": {
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "properties": _conflict_item_props(),
-                },
-            }
-        },
-        [],
-    )
-
-
-def submit_weekly_hypothesis_schema() -> dict[str, Any]:
-    return _schema(
-        "submit_weekly_hypothesis",
-        "Submit hypothesis analyst results for the week.",
-        {
-            "hypotheses": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": _hypothesis_item_props(),
-                    "required": [
-                        "entity",
-                        "valid_from",
-                        "confidence",
-                        "related",
-                        "statement",
-                        "sources",
-                    ],
-                },
-            }
-        },
-        ["hypotheses"],
-    )
-
-
-def patch_weekly_hypothesis_schema() -> dict[str, Any]:
-    return _schema(
-        "patch_weekly_hypothesis",
-        "Patch ONLY changed fields on previous submit_weekly_hypothesis args.",
-        {
-            "hypotheses": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": _hypothesis_item_props(),
+                    "properties": _thread_item_props(),
                 },
             }
         },
@@ -286,10 +245,8 @@ def all_tool_schemas() -> list[dict[str, Any]]:
         submit_weekly_event_schema(),
         patch_weekly_event_schema(),
         skip_weekly_event_schema(),
-        submit_weekly_conflict_schema(),
-        patch_weekly_conflict_schema(),
-        submit_weekly_hypothesis_schema(),
-        patch_weekly_hypothesis_schema(),
+        submit_weekly_thread_schema(),
+        patch_weekly_thread_schema(),
         *tighten_tools.all_tighten_tool_schemas(),
     ]
 
@@ -344,6 +301,7 @@ def validate_closed_choice_args(args: Mapping[str, Any], *, role: str) -> list[s
         "event": "events",
         "conflict": "conflicts",
         "hypothesis": "hypotheses",
+        "thread": "cross-day-thread",
     }.get(role, "")
     items = args.get(items_key) if items_key else None
     if not isinstance(items, list):
@@ -362,6 +320,15 @@ def validate_closed_choice_args(args: Mapping[str, Any], *, role: str) -> list[s
             errors.append(
                 f"{role}[{i}] status must be candidate (or omit)"
             )
+        if role == "thread":
+            for step in item.get("steps") or []:
+                if not isinstance(step, Mapping):
+                    continue
+                via = step.get("via")
+                if via is not None and str(via).strip() not in {"evolves", "invalidates"}:
+                    errors.append(
+                        f"{role}[{i}] step via must be evolves|invalidates"
+                    )
         if role == "event":
             parts = item.get("participants")
             if isinstance(parts, list):
@@ -462,72 +429,6 @@ def render_events_from_tool_args(args: Mapping[str, Any]) -> list[dict[str, Any]
     ]
 
 
-def render_conflict_block_from_args(
-    args: Mapping[str, Any], *, index: int = 0
-) -> dict[str, Any]:
-    bag = dict(args)
-    status = str(bag.get("status") or "candidate").strip() or "candidate"
-    if status not in WORKER_STATUS_ENUM:
-        status = "candidate"
-    fm = {
-        "id": str(bag.get("id") or "").strip() or f"w-cfl-{index + 1}",
-        "type": "conflict",
-        "confidence": str(bag.get("confidence") or "").strip(),
-        "status": status,
-        "sources": bag.get("sources") if isinstance(bag.get("sources"), list) else [],
-        "related": bag.get("related") if isinstance(bag.get("related"), list) else [],
-    }
-    return {
-        "frontmatter": fm,
-        "body": str(bag.get("tension") or "").strip() or "Conflict.",
-    }
-
-
-def render_conflicts_from_tool_args(args: Mapping[str, Any]) -> list[dict[str, Any]]:
-    items = args.get("conflicts")
-    if not isinstance(items, list):
-        return []
-    return [
-        render_conflict_block_from_args(it, index=i)
-        for i, it in enumerate(items)
-        if isinstance(it, Mapping)
-    ]
-
-
-def render_hypothesis_block_from_args(
-    args: Mapping[str, Any], *, index: int = 0
-) -> dict[str, Any]:
-    bag = dict(args)
-    status = str(bag.get("status") or "candidate").strip() or "candidate"
-    if status not in WORKER_STATUS_ENUM:
-        status = "candidate"
-    fm = {
-        "id": str(bag.get("id") or "").strip() or f"w-hyp-{index + 1}",
-        "type": "hypothesis",
-        "entity": str(bag.get("entity") or "").strip(),
-        "valid_from": str(bag.get("valid_from") or "").strip(),
-        "confidence": str(bag.get("confidence") or "").strip(),
-        "status": status,
-        "sources": bag.get("sources") if isinstance(bag.get("sources"), list) else [],
-        "related": bag.get("related") if isinstance(bag.get("related"), list) else [],
-    }
-    return {
-        "frontmatter": fm,
-        "body": str(bag.get("statement") or "").strip() or "Hypothesis.",
-    }
-
-
-def render_hypotheses_from_tool_args(args: Mapping[str, Any]) -> list[dict[str, Any]]:
-    items = args.get("hypotheses")
-    if not isinstance(items, list):
-        return []
-    return [
-        render_hypothesis_block_from_args(it, index=i)
-        for i, it in enumerate(items)
-        if isinstance(it, Mapping)
-    ]
-
-
 def failed_fields_teach(
     errors: Sequence[str],
     previous: Mapping[str, Any],
@@ -582,15 +483,10 @@ __all__ = [
     "forced_tool_choice",
     "is_skip_event",
     "merge_field_patch",
-    "patch_weekly_conflict_schema",
     "patch_weekly_event_schema",
-    "patch_weekly_hypothesis_schema",
-    "related_has_mem_id",
-    "render_conflicts_from_tool_args",
+    "patch_weekly_thread_schema",
+    "submit_weekly_thread_schema",
     "render_events_from_tool_args",
-    "render_hypotheses_from_tool_args",
-    "submit_weekly_conflict_schema",
     "submit_weekly_event_schema",
-    "submit_weekly_hypothesis_schema",
     "validate_closed_choice_args",
 ]

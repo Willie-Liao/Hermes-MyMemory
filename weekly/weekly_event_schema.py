@@ -169,6 +169,65 @@ class HypothesisItem:
 
 
 @dataclass(frozen=True)
+class ThreadStep:
+    """Keep preference-change on the later step so weekly JSON does not mint Conflict fences.
+
+    Seq 1 has no ``via``. Later ``via`` is evolves (continue) or invalidates (close an earlier seq).
+    """
+
+    seq: int
+    date: date
+    event_id: str
+    text: str
+    cite_n: int | None = None
+    via: str | None = None
+    to_seq: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.seq < 1:
+            raise ValueError(f"ThreadStep.seq must be >= 1, got {self.seq}")
+        if not str(self.event_id).strip():
+            raise ValueError("ThreadStep.event_id must be non-empty")
+        if self.cite_n is not None and self.cite_n < 1:
+            raise ValueError(f"ThreadStep.cite_n must be >= 1, got {self.cite_n}")
+        if self.via is not None and self.via not in {"evolves", "invalidates"}:
+            raise ValueError(
+                f"ThreadStep.via {self.via!r} not in {{'evolves', 'invalidates'}}"
+            )
+        if self.to_seq is not None and self.to_seq >= self.seq:
+            raise ValueError(
+                f"ThreadStep.to_seq {self.to_seq} must be < seq {self.seq}"
+            )
+
+
+@dataclass(frozen=True)
+class IntraDayThread:
+    """Hold the day's wrap-up verbatim so Chronicle cannot substitute leftover Outcomes."""
+
+    date: date
+    weekday: str
+    source_field: str
+    text: str
+    empty: bool = False
+
+
+@dataclass(frozen=True)
+class WeeklyEntity:
+    """Collapse alias surfaces onto one key so weekly JSON and recall share a roster.
+
+    A second normalizer would split Memory Digest / MemoryDigest into two nodes.
+    """
+
+    key: str
+    canonical: str
+    aliases: tuple[str, ...] = ()
+    first_seen: date | None = None
+    last_seen: date | None = None
+    week_blocks: tuple[str, ...] = ()
+    embedding: None = None
+
+
+@dataclass(frozen=True)
 class SpanCandidate:
     """A candidate multi-day span (e.g. an initiative) linking several events."""
 
@@ -179,6 +238,9 @@ class SpanCandidate:
     confidence: str
     related_event_ids: tuple[str, ...] = ()
     cite: int | None = None
+    steps: tuple[ThreadStep, ...] = ()
+    outcome: dict | None = None
+    entity_keys: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not str(self.id).strip():
@@ -234,7 +296,7 @@ class DayBrief:
 
 @dataclass(frozen=True)
 class WeeklyReviewPayload:
-    """Full intermediate payload for one week's Event-First review."""
+    """Carry cross-day-thread, wrap-ups, and entities beside the four-part brief so JSON can dump without Distill."""
 
     days: tuple[DayBrief, ...]
     conflicts: tuple[ConflictItem, ...] = ()
@@ -243,6 +305,9 @@ class WeeklyReviewPayload:
     legend: dict[int, str] = field(default_factory=dict)
     typed_legend: dict[int, TypedCite] = field(default_factory=dict)
     week_key: str = ""
+    cross_day_thread: tuple[SpanCandidate, ...] = ()
+    intra_day_thread: tuple["IntraDayThread", ...] = ()
+    entities: tuple["WeeklyEntity", ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +543,9 @@ def assign_typed_citations(payload: WeeklyReviewPayload) -> WeeklyReviewPayload:
         legend=dict(payload.legend),
         typed_legend=typed,
         week_key=payload.week_key,
+        cross_day_thread=payload.cross_day_thread,
+        intra_day_thread=payload.intra_day_thread,
+        entities=payload.entities,
     )
 
 
@@ -899,6 +967,9 @@ def parse_four_part_brief(text: str) -> WeeklyReviewPayload:
         legend=legend,
         typed_legend=typed_legend,
         week_key=week_key,
+        cross_day_thread=(),
+        intra_day_thread=(),
+        entities=(),
     )
 
 

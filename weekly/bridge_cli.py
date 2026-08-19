@@ -134,6 +134,9 @@ def main() -> int:
                 "chronicle": lambda **a: weekly_actions.get_or_refresh_chronicle(
                     a.get("week_key"), force=bool(a.get("force"))
                 ),
+                "weekly_json": lambda **a: weekly_actions.load_weekly_json(
+                    a.get("week_key")
+                ),
                 "tighten_hot_entry": lambda **a: weekly_actions.tighten_hot_entry(
                     mode=a.get("mode") or "tighten",
                     text=a.get("text") or "",

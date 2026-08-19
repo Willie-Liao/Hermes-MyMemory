@@ -18,7 +18,7 @@ import re
 import sys
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Callable
@@ -39,7 +39,10 @@ try:
         DayBrief,
         EventCite,
         HypothesisItem,
+        IntraDayThread,
         SpanCandidate,
+        ThreadStep,
+        WeeklyEntity,
         WeeklyReviewPayload,
         weekday_label,
     )
@@ -55,7 +58,10 @@ except ImportError:  # pragma: no cover - flat pytest load
         DayBrief,
         EventCite,
         HypothesisItem,
+        IntraDayThread,
         SpanCandidate,
+        ThreadStep,
+        WeeklyEntity,
         WeeklyReviewPayload,
         weekday_label,
     )
@@ -74,8 +80,7 @@ MAX_DAY_FILE_CHARS = 8000
 
 EVENT_WORKER_PURPOSES: tuple[str, ...] = ("worker1_event",)
 ANALYST_PURPOSES: tuple[str, ...] = (
-    "worker1_conflict",
-    "worker1_hypothesis",
+    "worker1_thread",
 )
 
 _EVENT_ONLY_FORBIDDEN: frozenset[str] = frozenset(
@@ -106,7 +111,7 @@ __all__ = [
 
 @dataclass
 class Worker1Result:
-    """Outcome of the parallel Worker 1 coordinator."""
+    """Carry thread and entity extras beside Distill blocks so generate can dump JSON without a second LLM pass."""
 
     blocks: list[dict[str, Any]]
     legend: dict[int, str]
@@ -114,6 +119,8 @@ class Worker1Result:
     errors: list[str] = field(default_factory=list)
     fallback_days: tuple[date, ...] = ()
     purposes_called: tuple[str, ...] = ()
+    cross_day_thread: tuple[SpanCandidate, ...] = ()
+    entities: tuple[WeeklyEntity, ...] = ()
 
 
 def iso_week_dates(week_key: str) -> list[date]:
@@ -282,45 +289,27 @@ def _build_analyst_prompt(
     errors: Sequence[str] = (),
     previous_args: Mapping[str, Any] | None = None,
 ) -> str:
+    """Thread-only analyst prompt; conflict/hypothesis Distill fences would hide via: invalidates."""
+    _ = role
     legend_lines = "\n".join(
         f"[{n}] {mem}" for n, mem in sorted(legend.items())
     ) or "(empty legend)"
-    if role == "conflict":
-        submit = "submit_weekly_conflict"
-        patch = "patch_weekly_conflict"
-        rules = (
-            f"Call {submit} with a conflicts array. Each item needs "
-            "confidence, status (candidate or omit), sources, related "
-            "(≥1 week event id from MERGED EVENTS), tension. "
-            "Do not emit events/facts/procedures/decisions/hypotheses."
-        )
-    elif role == "hypothesis":
-        submit = "submit_weekly_hypothesis"
-        patch = "patch_weekly_hypothesis"
-        rules = (
-            f"Call {submit} with a hypotheses array. Each item needs "
-            "entity, valid_from, confidence, status (candidate or omit), "
-            "sources, related (≥1 week event id), statement. "
-            "Do not emit events/facts/procedures/decisions/conflicts."
-        )
-    else:
-        # span analyst kept for tests; still free-form (out of Worker1 tool family)
-        submit = ""
-        patch = ""
-        rules = (
-            "Emit ONLY YAML frontmatter blocks with type: span_candidate "
-            "(weekly analysis only — not Distill). Keys: id, label, "
-            "start_date, end_date, confidence "
-            "(explicit|high|medium|low), related_event_ids (list of event ids). "
-            "CRITICAL: id MUST be copied exactly from ALLOWED DAILY BLOCK IDS "
-            "(real mem-* staging ids). Never invent span-* narrative ids."
-        )
+    submit = "submit_weekly_thread"
+    patch = "patch_weekly_thread"
+    rules = (
+        f"Call {submit} with cross-day-thread. Each chain needs ≥2 "
+        "distinct step dates, existing event_id values from MERGED EVENTS "
+        "(mem-…-event-… ids), label, and step text. Seq 1 has no via. "
+        "Later steps via evolves or invalidates (optional to_seq). "
+        "Drop one-day chains. Do not emit wrap-ups, entities, legend, "
+        "conflicts, or hypotheses."
+    )
     base = (
-        f"You are weekly Worker 1 {role} analyst ({purpose}).\n\n"
+        f"You are weekly Worker 1 thread analyst ({purpose}).\n\n"
         f"Week: {week_key}\n\n"
         f"{rules}\n"
         "Do NOT write hot memory. Do NOT invent events.\n"
-        "Do NOT emit free-form Distill YAML for conflict/hypothesis — use the tool.\n\n"
+        "Do NOT emit Distill YAML — use the tool.\n\n"
         f"CITATION LEGEND:\n{legend_lines}\n"
     )
     if attempt <= 1:
@@ -328,22 +317,13 @@ def _build_analyst_prompt(
         if extra_context.strip():
             base += f"\n\nADDITIONAL CONTEXT:\n{extra_context}\n"
         return base
-    if role in {"conflict", "hypothesis"}:
-        return base + "\n" + weekly_tools.failed_fields_teach(
-            errors,
-            previous_args or {},
-            role=role,
-            patch_tool=patch,
-            attempt=attempt,
-            max_attempts=MAX_WORKER_ATTEMPTS,
-        )
-    error_lines = "\n".join(f"- {e}" for e in errors[:8])
-    return (
-        base
-        + f"\nMERGED EVENTS:\n{merged_events_md}\n"
-        + f"\n\nVALIDATION FAILED (attempt {attempt} of {MAX_WORKER_ATTEMPTS}).\n"
-        f"Fix ONLY the listed issues. Re-emit {role} blocks only.\n\n"
-        f"Validator errors:\n{error_lines}\n"
+    return base + "\n" + weekly_tools.failed_fields_teach(
+        errors,
+        previous_args or {},
+        role="thread",
+        patch_tool=patch,
+        attempt=attempt,
+        max_attempts=MAX_WORKER_ATTEMPTS,
     )
 
 
@@ -829,6 +809,11 @@ def _humanize_predicate(predicate: str) -> str:
 
 
 def _compress_phrase(text: str, *, max_words: int = 10) -> str:
+    """Cut on a clause boundary so a 10-word headline cannot land mid-clause.
+
+    Blind word slices produced titles like 'Kimi quota exhaustion diagnosed provider'
+    when the source continued after a semicolon.
+    """
     cleaned = re.sub(r"\s+", " ", (text or "").strip())
     cleaned = cleaned.strip(" .;:")
     if not cleaned:
@@ -837,7 +822,16 @@ def _compress_phrase(text: str, *, max_words: int = 10) -> str:
     if len(words) <= max_words:
         phrase = " ".join(words)
     else:
-        phrase = " ".join(words[:max_words]).rstrip(",;")
+        window = words[:max_words]
+        cut = None
+        for i, word in enumerate(window):
+            if re.search(r"[.;:]$", word):
+                cut = i + 1
+        if cut is None:
+            for i, word in enumerate(window):
+                if word.endswith(","):
+                    cut = i + 1
+        phrase = " ".join(window[:cut] if cut else window).rstrip(",;")
     if phrase and phrase[0].islower():
         phrase = phrase[0].upper() + phrase[1:]
     return phrase
@@ -966,59 +960,6 @@ def _procedure_blocks_from_claims(
     return blocks
 
 
-def _parse_span_candidates(
-    content: str,
-    *,
-    allowed_ids: set[str] | None = None,
-) -> tuple[list[SpanCandidate], list[str]]:
-    blocks = _parse_blocks(content)
-    errors: list[str] = []
-    out: list[SpanCandidate] = []
-    for block in blocks:
-        fm = block.get("frontmatter") or {}
-        block_type = str(fm.get("type") or "").strip().casefold()
-        if block_type in _EVENT_ONLY_FORBIDDEN or block_type == "event":
-            errors.append(f"span analyst must not emit type: {block_type}")
-            continue
-        if block_type not in {"span_candidate", "span"}:
-            errors.append(f"span analyst unexpected type: {block_type or '(missing)'}")
-            continue
-        try:
-            start = date.fromisoformat(str(fm.get("start_date") or "").strip())
-            end = date.fromisoformat(str(fm.get("end_date") or "").strip())
-        except ValueError:
-            errors.append("span_candidate missing/invalid start_date/end_date")
-            continue
-        related = fm.get("related_event_ids") or fm.get("related") or ()
-        if isinstance(related, str):
-            related_ids = (related,)
-        elif isinstance(related, list):
-            related_ids = tuple(str(x).strip() for x in related if str(x).strip())
-        else:
-            related_ids = ()
-        span_id = str(fm.get("id") or "").strip() or f"span-{len(out)+1}"
-        if allowed_ids is not None and span_id not in allowed_ids:
-            errors.append(
-                f"span_candidate id {span_id!r} must be an existing daily staging "
-                f"block id for this week (got invented/unknown id)"
-            )
-            continue
-        try:
-            out.append(
-                SpanCandidate(
-                    id=span_id,
-                    label=str(fm.get("label") or block.get("body") or "Span").strip(),
-                    start_date=start,
-                    end_date=end,
-                    confidence=str(fm.get("confidence") or "medium").strip().casefold(),
-                    related_event_ids=related_ids,
-                )
-            )
-        except ValueError as exc:
-            errors.append(str(exc))
-    return out, errors
-
-
 def _daily_block_ids_for_days(
     by_day: dict[date, Path],
     days: Sequence[date],
@@ -1055,62 +996,19 @@ def _run_analyst(
     extra_context: str = "",
     allowed_span_ids: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[SpanCandidate]]:
+    """Force submit then patch so a second submit cannot wipe a half-valid thread."""
+    _ = call_llm, allowed_span_ids, role
     last_errors: list[str] = []
     previous_args: dict[str, Any] = {}
-    last_content = ""
-
-    submit_name = {
-        "conflict": "submit_weekly_conflict",
-        "hypothesis": "submit_weekly_hypothesis",
-    }.get(role)
-    patch_name = {
-        "conflict": "patch_weekly_conflict",
-        "hypothesis": "patch_weekly_hypothesis",
-    }.get(role)
+    submit_name = "submit_weekly_thread"
+    patch_name = "patch_weekly_thread"
 
     for attempt in range(1, MAX_WORKER_ATTEMPTS + 1):
-        # Span analyst (tests/legacy): keep free-form path.
-        if role == "span" or submit_name is None:
-            prompt = _build_analyst_prompt(
-                purpose=purpose,
-                week_key=week_key,
-                role=role,
-                merged_events_md=merged_events_md,
-                legend=legend,
-                extra_context=extra_context,
-                attempt=attempt,
-                errors=last_errors,
-                previous_args=None,
-            )
-            try:
-                if call_llm is None:
-                    raise RuntimeError("call_llm required for span analyst")
-                raw = call_llm(prompt, purpose=purpose)
-            except Exception as exc:  # noqa: BLE001
-                last_errors = [f"agent error: {exc}"]
-                last_content = ""
-                log(f"weekly {purpose} agent failed {week_key}: {exc}")
-                continue
-            spans, errors = _parse_span_candidates(
-                raw,
-                allowed_ids=allowed_span_ids,
-            )
-            if not errors:
-                log(f"weekly {purpose} ok {week_key} spans={len(spans)}")
-                return [], spans
-            last_errors = errors
-            last_content = raw or ""
-            log(
-                f"weekly {purpose} validation failed {week_key} "
-                f"attempt={attempt}: {'; '.join(last_errors[:3])}"
-            )
-            continue
-
-        force_name = submit_name if attempt == 1 else patch_name or submit_name
+        force_name = submit_name if attempt == 1 else patch_name
         prompt = _build_analyst_prompt(
             purpose=purpose,
             week_key=week_key,
-            role=role,
+            role="thread",
             merged_events_md=merged_events_md if attempt == 1 else "",
             legend=legend,
             extra_context=extra_context if attempt == 1 else "",
@@ -1162,23 +1060,18 @@ def _run_analyst(
             previous_args = weekly_tools.merge_field_patch(previous_args, tool_args)
 
         enum_errors = weekly_tools.validate_closed_choice_args(
-            previous_args, role=role
+            previous_args, role="thread"
         )
         if enum_errors:
             last_errors = enum_errors
             continue
 
-        if role == "conflict":
-            blocks = weekly_tools.render_conflicts_from_tool_args(previous_args)
-        else:
-            blocks = weekly_tools.render_hypotheses_from_tool_args(previous_args)
-
-        errors = _validate_analyst_blocks(
-            blocks, expected_type=role, event_ids=event_ids
+        spans, errors = threads_from_tool_args(
+            previous_args, event_ids=event_ids, legend=legend
         )
         if not errors:
-            log(f"weekly {purpose} ok {week_key} blocks={len(blocks)}")
-            return blocks, []
+            log(f"weekly {purpose} ok {week_key} threads={len(spans)}")
+            return [], spans
         last_errors = errors
         log(
             f"weekly {purpose} validation failed {week_key} "
@@ -1186,8 +1079,281 @@ def _run_analyst(
         )
 
     log(f"weekly {purpose} soft-empty after failures {week_key}: {last_errors[:3]}")
-    _ = last_content
     return [], []
+
+
+def threads_from_tool_args(
+    args: Mapping[str, Any],
+    *,
+    event_ids: set[str],
+    legend: dict[int, str],
+) -> tuple[list[SpanCandidate], list[str]]:
+    """Keep only multi-day chains whose event_ids exist this week, so one-day LLM noise cannot become Chronicle rows."""
+    items = args.get("cross-day-thread")
+    if not isinstance(items, list):
+        return [], []
+    cite_by_id = {mem: n for n, mem in legend.items()}
+    allowed = set(event_ids) | set(legend.values())
+    threads: list[SpanCandidate] = []
+    errors: list[str] = []
+    for i, item in enumerate(items):
+        if not isinstance(item, Mapping):
+            errors.append(f"cross-day-thread[{i}] must be an object")
+            continue
+        raw_steps = item.get("steps")
+        if not isinstance(raw_steps, list) or not raw_steps:
+            errors.append(f"cross-day-thread[{i}] needs steps")
+            continue
+        steps: list[ThreadStep] = []
+        dates: set[date] = set()
+        skip = False
+        for raw in raw_steps:
+            if not isinstance(raw, Mapping):
+                skip = True
+                break
+            event_id = str(raw.get("event_id") or "").strip()
+            if event_id not in allowed:
+                errors.append(
+                    f"cross-day-thread[{i}] unknown event_id {event_id}"
+                )
+                skip = True
+                break
+            try:
+                step_day = date.fromisoformat(str(raw.get("date") or "")[:10])
+            except ValueError:
+                errors.append(f"cross-day-thread[{i}] bad step date")
+                skip = True
+                break
+            seq = int(raw.get("seq") or len(steps) + 1)
+            via = str(raw.get("via") or "").strip() or None
+            if seq == 1:
+                via = None
+            elif via not in {"evolves", "invalidates"}:
+                via = "evolves"
+            to_seq = raw.get("to_seq")
+            cite_n = cite_by_id.get(event_id)
+            try:
+                steps.append(
+                    ThreadStep(
+                        seq=seq,
+                        date=step_day,
+                        event_id=event_id,
+                        text=str(raw.get("text") or "").strip(),
+                        cite_n=cite_n,
+                        via=via,
+                        to_seq=int(to_seq) if to_seq is not None else None,
+                    )
+                )
+            except ValueError as exc:
+                errors.append(str(exc))
+                skip = True
+                break
+            dates.add(step_day)
+        if skip:
+            continue
+        if len(dates) < 2:
+            continue
+        ordered = sorted(steps, key=lambda s: s.seq)
+        outcome = item.get("outcome")
+        try:
+            threads.append(
+                SpanCandidate(
+                    id=str(item.get("id") or f"w-t{i+1}"),
+                    label=str(item.get("label") or "thread"),
+                    start_date=min(dates),
+                    end_date=max(dates),
+                    confidence="high",
+                    related_event_ids=tuple(s.event_id for s in ordered),
+                    steps=tuple(ordered),
+                    outcome=dict(outcome) if isinstance(outcome, dict) else None,
+                    entity_keys=tuple(
+                        str(k) for k in item.get("entity_keys") or () if str(k).strip()
+                    ),
+                )
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
+    return threads, errors
+
+
+def _daily_supersedes_map(by_day: Mapping[date, Path]) -> dict[str, list[str]]:
+    """Read daily supersedes so disk, not the model, closes a prior step."""
+    out: dict[str, list[str]] = {}
+    for path in by_day.values():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for block in _parse_blocks(text):
+            fm = block.get("frontmatter") or {}
+            bid = str(fm.get("id") or "").strip()
+            sup = fm.get("supersedes")
+            if not bid or not isinstance(sup, list):
+                continue
+            out[bid] = [str(x).strip() for x in sup if str(x).strip()]
+    return out
+
+
+def _stamp_invalidates_from_supersedes(
+    threads: Sequence[SpanCandidate],
+    by_day: Mapping[date, Path],
+) -> list[SpanCandidate]:
+    """Force via=invalidates when a later step's daily card supersedes an earlier step."""
+    mapping = _daily_supersedes_map(by_day)
+    stamped: list[SpanCandidate] = []
+    for thread in threads:
+        id_to_seq = {step.event_id: step.seq for step in thread.steps}
+        new_steps: list[ThreadStep] = []
+        for step in thread.steps:
+            targets = mapping.get(step.event_id) or []
+            hit = next((tid for tid in targets if tid in id_to_seq and id_to_seq[tid] < step.seq), None)
+            if hit is None:
+                new_steps.append(step)
+                continue
+            new_steps.append(
+                replace(step, via="invalidates", to_seq=id_to_seq[hit])
+            )
+        stamped.append(replace(thread, steps=tuple(new_steps)))
+    return stamped
+
+
+def _fill_thread_entity_keys(
+    threads: Sequence[SpanCandidate],
+    entities: Sequence[WeeklyEntity],
+) -> list[SpanCandidate]:
+    """Join thread steps to roster keys so the LLM cannot invent a second entity spelling."""
+    key_by_block: dict[str, str] = {}
+    for entity in entities:
+        for bid in entity.week_blocks:
+            key_by_block[bid] = entity.key
+    filled: list[SpanCandidate] = []
+    for thread in threads:
+        keys = tuple(
+            dict.fromkeys(
+                key_by_block[step.event_id]
+                for step in thread.steps
+                if step.event_id in key_by_block
+            )
+        )
+        filled.append(replace(thread, entity_keys=keys or thread.entity_keys))
+    return filled
+
+
+_WRAPUP_HEADING_RE = re.compile(r"(?m)^## Day wrap-up[ \t]*\n?")
+
+
+def _copy_daily_wrapup_trailer(content: str) -> str:
+    """Copy digest.split_daily_wrapup without importing digest.py, which path-shadows as a non-package module in weekly tests."""
+    text = content or ""
+    matches = list(_WRAPUP_HEADING_RE.finditer(text))
+    if not matches:
+        return ""
+    rest = text[matches[-1].end() :].strip()
+    return "\n".join(ln.rstrip() for ln in rest.splitlines() if ln.strip())
+
+
+def _intra_day_from_dailies(
+    week_dates: Sequence[date], by_day: Mapping[date, Path]
+) -> tuple[IntraDayThread, ...]:
+    """Copy each day's wrap-up trailer so Chronicle does not invent leftover Outcomes."""
+    rows: list[IntraDayThread] = []
+    for day in week_dates:
+        path = by_day.get(day)
+        text = ""
+        if path is not None and path.is_file():
+            text = _copy_daily_wrapup_trailer(path.read_text(encoding="utf-8"))
+        rows.append(
+            IntraDayThread(
+                date=day,
+                weekday=weekday_label(day),
+                source_field="day_wrapup",
+                text=text,
+                empty=not bool(text.strip()),
+            )
+        )
+    return tuple(rows)
+
+
+def _entities_from_event_blocks(
+    blocks: Sequence[dict[str, Any]],
+) -> tuple[WeeklyEntity, ...]:
+    """Collapse entity: surfaces onto one key so weekly JSON matches the recall roster."""
+    try:
+        from .weekly_json import normalize_entity_key
+    except ImportError:  # pragma: no cover
+        from weekly_json import normalize_entity_key  # type: ignore
+
+    buckets: dict[str, dict[str, Any]] = {}
+    for block in blocks:
+        fm = block.get("frontmatter") or {}
+        surface = str(fm.get("entity") or "").strip()
+        if not surface:
+            continue
+        key = normalize_entity_key(surface)
+        if not key:
+            continue
+        vf = str(fm.get("valid_from") or "").strip()[:10]
+        bid = str(fm.get("id") or "").strip()
+        related = fm.get("related") or []
+        mems = []
+        if bid.startswith("mem-"):
+            mems.append(bid)
+        mems.extend(
+            str(r).strip()
+            for r in related
+            if isinstance(related, list) and str(r).strip().startswith("mem-")
+        )
+        bucket = buckets.setdefault(
+            key,
+            {
+                "canonical": surface,
+                "aliases": {surface},
+                "dates": [],
+                "blocks": [],
+            },
+        )
+        bucket["aliases"].add(surface)
+        if vf:
+            bucket["dates"].append(vf)
+        bucket["blocks"].extend(mems)
+        if surface.casefold() == bucket["canonical"].casefold() and "-" in surface:
+            bucket["canonical"] = surface
+    entities: list[WeeklyEntity] = []
+    for key, bag in buckets.items():
+        dates = sorted(bag["dates"])
+        aliases = tuple(
+            sorted(a for a in bag["aliases"] if a != bag["canonical"])
+        )
+        first = date.fromisoformat(dates[0]) if dates else None
+        last = date.fromisoformat(dates[-1]) if dates else None
+        entities.append(
+            WeeklyEntity(
+                key=key,
+                canonical=str(bag["canonical"]),
+                aliases=aliases,
+                first_seen=first,
+                last_seen=last,
+                week_blocks=tuple(dict.fromkeys(bag["blocks"])),
+                embedding=None,
+            )
+        )
+    return tuple(entities)
+
+
+def _entities_from_dailies(
+    week_dates: Sequence[date], by_day: Mapping[date, Path]
+) -> tuple[WeeklyEntity, ...]:
+    """Roster from daily entity: fields so weekly JSON does not depend on Distill fences."""
+    blocks: list[dict[str, Any]] = []
+    for day in week_dates:
+        path = by_day.get(day)
+        if path is None or not path.is_file():
+            continue
+        try:
+            blocks.extend(_parse_blocks(path.read_text(encoding="utf-8")))
+        except OSError:
+            continue
+    return _entities_from_event_blocks(blocks)
 
 
 def _blocks_to_conflict_items(
@@ -1352,64 +1518,48 @@ def run_parallel_worker1(
 
     # Possible overdue UI comes from memory-digest validate_weekly_spans only.
     # Do not invent Worker 1 span candidates into the Brief.
-    conflict_blocks: list[dict[str, Any]] = []
-    hypothesis_blocks: list[dict[str, Any]] = []
     span_candidates: list[SpanCandidate] = []
+    cross_day: list[SpanCandidate] = []
 
     with ThreadPoolExecutor(
-        max_workers=2, thread_name_prefix="memory-weekly-analyst"
+        max_workers=1, thread_name_prefix="memory-weekly-analyst"
     ) as pool:
-        fut_conflict = pool.submit(
+        fut_thread = pool.submit(
             _run_analyst,
-            role="conflict",
-            purpose="worker1_conflict",
+            role="thread",
+            purpose="worker1_thread",
             week_key=week_key,
             merged_events_md=merged_events_md,
             legend=legend,
-            event_ids=event_id_set,
+            event_ids=event_id_set | set(legend.values()),
             call_llm=call_llm,
             call_llm_tools=call_llm_tools,
             log=_log,
         )
-        fut_hyp = pool.submit(
-            _run_analyst,
-            role="hypothesis",
-            purpose="worker1_hypothesis",
-            week_key=week_key,
-            merged_events_md=merged_events_md,
-            legend=legend,
-            event_ids=event_id_set,
-            call_llm=call_llm,
-            call_llm_tools=call_llm_tools,
-            log=_log,
-        )
-        for fut, label in (
-            (fut_conflict, "conflict"),
-            (fut_hyp, "hypothesis"),
-        ):
-            purpose = (
-                "worker1_conflict" if label == "conflict" else "worker1_hypothesis"
-            )
-            purposes_called.append(purpose)
-            try:
-                blocks, _spans = fut.result()
-            except Exception as exc:  # noqa: BLE001
-                _log(f"weekly {purpose} future error {week_key}: {exc}")
-                blocks = []
-            if label == "conflict":
-                conflict_blocks = blocks
-            else:
-                hypothesis_blocks = blocks
+        purposes_called.append("worker1_thread")
+        try:
+            _blocks, cross_day = fut_thread.result()
+        except Exception as exc:  # noqa: BLE001
+            _log(f"weekly worker1_thread future error {week_key}: {exc}")
+            cross_day = []
 
     procedure_blocks = _procedure_blocks_from_claims(day_briefs, event_ids)
-    distill_blocks = list(event_blocks) + procedure_blocks + hypothesis_blocks + conflict_blocks
+    distill_blocks = list(event_blocks) + procedure_blocks
+    intra = _intra_day_from_dailies(week_dates, by_day)
+    entities = _entities_from_dailies(week_dates, by_day)
+    cross_day = _stamp_invalidates_from_supersedes(cross_day, by_day)
+    cross_day = _fill_thread_entity_keys(cross_day, entities)
 
     payload = WeeklyReviewPayload(
         days=tuple(day_briefs),
-        conflicts=_blocks_to_conflict_items(conflict_blocks),
-        hypotheses=_blocks_to_hypothesis_items(hypothesis_blocks),
+        conflicts=(),
+        hypotheses=(),
         span_candidates=tuple(span_candidates),
         legend=dict(legend),
+        week_key=week_key,
+        cross_day_thread=tuple(cross_day),
+        intra_day_thread=intra,
+        entities=entities,
     )
 
     errors: list[str] = []
@@ -1428,4 +1578,6 @@ def run_parallel_worker1(
         errors=errors,
         fallback_days=tuple(sorted(set(fallback_days))),
         purposes_called=tuple(purposes_called),
+        cross_day_thread=tuple(cross_day),
+        entities=entities,
     )

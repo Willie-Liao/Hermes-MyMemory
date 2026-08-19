@@ -12,7 +12,7 @@ from typing import Any
 
 import yaml
 
-_ALLOWED_TYPES = frozenset({"event", "hypothesis", "procedure", "conflict"})
+_ALLOWED_TYPES = frozenset({"event", "procedure"})
 _DISTILL_HEADER_RE = re.compile(r"^##\s+Distill\s*$", re.IGNORECASE | re.MULTILINE)
 _LEVEL_TWO_HEADER_RE = re.compile(r"^##(?!#)\s+", re.MULTILINE)
 _RELATED_PREFIX_RE = re.compile(

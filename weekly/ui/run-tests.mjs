@@ -18,6 +18,7 @@ const VITEST_FILES = new Set([
   'viewScroll.test.ts',
   'weeklyReorganise.test.ts',
   'weeklyReviewRecall.test.ts',
+  'weeklyJson.test.ts',
 ]);
 
 const args = process.argv.slice(2);

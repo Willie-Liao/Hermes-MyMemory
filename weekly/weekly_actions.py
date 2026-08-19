@@ -343,6 +343,34 @@ def get_or_refresh_chronicle(
     return chronicle.get_or_refresh_chronicle(week_key, force=force)
 
 
+def load_weekly_json(week_key: str | None = None) -> dict[str, Any]:
+    """Return the JSON sidecar only; 404-equivalent missing so UI never parses weekly markdown."""
+    try:
+        from . import weekly_json
+    except ImportError:
+        from weekly_json import load_sidecar  # type: ignore
+
+        class _W:
+            load_sidecar = load_sidecar
+
+        weekly_json = _W()  # type: ignore
+    parsed = weekly._parse_week_key(str(week_key or ""))
+    if parsed is None:
+        return {"outcome": "bad_week", "week": week_key or ""}
+    target = weekly._weekly_path(*parsed).with_suffix(".json")
+    try:
+        payload = weekly_json.load_sidecar(target)
+    except FileNotFoundError:
+        return {"outcome": "missing", "week": weekly._week_key(*parsed)}
+    if not isinstance(payload, dict):
+        return {"outcome": "missing", "week": weekly._week_key(*parsed)}
+    return {
+        "outcome": "ok",
+        "week": weekly._week_key(*parsed),
+        "payload": payload,
+    }
+
+
 def _refresh_hot_health_after_generate(reason: str) -> None:
     """No-op: hot health is scheduled only from UI rescan/auto-rescan, not generate."""
     return
@@ -491,12 +519,10 @@ def generate_week(week_key: str | None = None, *, reason: str = "slash") -> dict
             return {"outcome": "failed", "week": week_key}
 
         target.parent.mkdir(parents=True, exist_ok=True)
-        write_week_status(
-            target,
-            WEEK_STATUS_PENDING,
-            week_key_str=week_key,
-            content=content.rstrip() + "\n",
-        )
+        payload = weekly._last_weekly_payload
+        if payload is None:
+            payload = weekly.WeeklyReviewPayload(days=(), week_key=week_key)
+        weekly._commit_weekly_outputs(target, content, payload, week_key)
 
         fingerprint = weekly._digest_fingerprint_for_files(files)
         state = weekly._load_state()

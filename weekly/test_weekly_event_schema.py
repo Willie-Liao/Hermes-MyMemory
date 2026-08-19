@@ -253,3 +253,72 @@ def test_claim_sentence_accepts_fact_procedure_decision():
     for kind in ("fact", "procedure", "decision"):
         sentence = schema.ClaimSentence("Some text.", kind=kind)
         assert sentence.kind == kind
+
+
+def test_payload_defaults_omit_cross_day_thread():
+    schema = _load()
+    days = tuple(_week(schema, with_events=False))
+    payload = schema.WeeklyReviewPayload(days=days, week_key="2026-W31")
+    assert payload.cross_day_thread == ()
+    assert payload.intra_day_thread == ()
+    assert payload.entities == ()
+
+
+def test_span_candidate_defaults_omit_steps_outcome_entity_keys():
+    schema = _load()
+    span = schema.SpanCandidate(
+        id="span-project-deadline",
+        label="Project deadline",
+        start_date=date(2026, 7, 27),
+        end_date=date(2026, 8, 2),
+        confidence="explicit",
+    )
+    assert span.steps == ()
+    assert span.outcome is None
+    assert span.entity_keys == ()
+
+
+def test_thread_step_via_and_entity_record_shape():
+    schema = _load()
+    step = schema.ThreadStep(
+        seq=2,
+        date=date(2026, 8, 13),
+        event_id="mem-2026-08-13-event-48AB7607830B",
+        text="provider swap",
+        cite_n=3,
+        via="evolves",
+    )
+    span = schema.SpanCandidate(
+        id="w33-t1",
+        label="memory-digest validation",
+        start_date=date(2026, 8, 12),
+        end_date=date(2026, 8, 14),
+        confidence="high",
+        steps=(step,),
+        outcome={"state": "open", "text": "still stuck"},
+        entity_keys=("memorydigest",),
+    )
+    entity = schema.WeeklyEntity(
+        key="memorydigest",
+        canonical="memory-digest",
+        aliases=("MemoryDigest",),
+        first_seen=date(2026, 8, 12),
+        last_seen=date(2026, 8, 14),
+        week_blocks=("mem-2026-08-12-event-9625547B667B",),
+        embedding=None,
+    )
+    wrap = schema.IntraDayThread(
+        date=date(2026, 8, 15),
+        weekday="Saturday",
+        source_field="day_wrapup",
+        text="- wrap",
+        empty=False,
+    )
+    payload = schema.WeeklyReviewPayload(
+        days=tuple(_week(schema, with_events=False)),
+        cross_day_thread=(span,),
+        intra_day_thread=(wrap,),
+        entities=(entity,),
+    )
+    assert payload.cross_day_thread[0].steps[0].via == "evolves"
+    assert payload.entities[0].key == "memorydigest"

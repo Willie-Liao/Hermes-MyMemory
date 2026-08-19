@@ -1,13 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { briefCiteAnchorId } from '../briefCiteNav';
 import {
-  paragraphSegments,
-  parseFourPartBrief,
-  citeTargetId,
-  type FourPartBrief,
-  type FourPartBullet,
-} from '../fourPartBrief';
-import {
   PUT_OFF_OPTIONS,
   buildSpanConfirmPending,
   buildSpanPutOffPending,
@@ -20,9 +13,6 @@ import {
 } from '../overdueActions';
 import {
   findReviewMark,
-  hypMarkedIn,
-  hypothesisIdFor,
-  resolveReviewCiteJump,
   spanMarkedIn,
 } from '../memoryApprovalActionQueue';
 import {
@@ -34,13 +24,11 @@ import type { MemoryBlock } from '../types';
 
 export type MemoryApprovalActionQueueProps = {
   weekKey: string;
-  summary: string;
   bridgeSpans?: WeeklySpanBridgeRow[];
   allBlocks: MemoryBlock[];
   pendingOps?: WeeklyReviewPendingOp[];
   savedReviewOps?: WeeklyReviewPendingOp[];
   onPendOp: (op: WeeklyReviewPendingOp) => void;
-  /** Second click on a pending badge — clear local pending, restore action buttons. */
   onClearPendingOp: (op: WeeklyReviewPendingOp) => void;
   onRecallSavedReview: () => void;
   onJumpApprovalCite: (n: number) => void;
@@ -50,49 +38,11 @@ export type MemoryApprovalActionQueueProps = {
   ) => void;
 };
 
-function CiteButtons({
-  text,
-  citeMap,
-  onCite,
-}: {
-  text: string;
-  citeMap: FourPartBrief['citeMap'];
-  onCite: (n: number) => void;
-}) {
-  return (
-    <>
-      {paragraphSegments(text).map((seg, i) =>
-        seg.kind === 'text' ? (
-          <span key={i}>{seg.value}</span>
-        ) : (
-          <button
-            key={i}
-            type="button"
-            id={briefCiteAnchorId(seg.n)}
-            onClick={() => onCite(seg.n)}
-            className="text-indigo-400 hover:text-indigo-300 font-mono text-[11px] px-0.5 rounded"
-            title={
-              citeTargetId(citeMap, seg.n)
-                ? `Open [${seg.n}] ${citeTargetId(citeMap, seg.n)!.kind}`
-                : `Open cite [${seg.n}]`
-            }
-          >
-            {seg.value}
-          </button>
-        ),
-      )}
-    </>
-  );
-}
-
 /**
- * Weekly Review action queue: Hypothesis + Possible overdue.
- * Renders inside Memory Approval (not Chronicle). Actions pend locally;
- * Memory Approval Save / Recall finalizes the batch.
+ * Overdue-only queue for Chronicle: hypothesis Confirm/Delete would hide preference-change on thread via.
  */
 export default function MemoryApprovalActionQueue({
   weekKey,
-  summary,
   bridgeSpans = [],
   allBlocks,
   pendingOps = [],
@@ -100,10 +50,9 @@ export default function MemoryApprovalActionQueue({
   onPendOp,
   onClearPendingOp,
   onRecallSavedReview,
-  onJumpApprovalCite,
   onJumpDailyBlock,
+  onJumpApprovalCite,
 }: MemoryApprovalActionQueueProps) {
-  const parsed = useMemo(() => parseFourPartBrief(summary), [summary]);
   const rows = useMemo(
     () =>
       mergeActionableOverdueRows({
@@ -117,19 +66,6 @@ export default function MemoryApprovalActionQueue({
   const [dueDraft, setDueDraft] = useState<Record<string, string>>({});
   const [duePickerOpen, setDuePickerOpen] = useState<Record<string, boolean>>({});
   const [actionError, setActionError] = useState<Record<string, string>>({});
-
-  if (!parsed.isFourPart) {
-    return null;
-  }
-
-  const handleCite = (n: number) => {
-    const jump = resolveReviewCiteJump(n, parsed.citeMap, allBlocks);
-    if (jump.kind === 'daily') {
-      onJumpDailyBlock(jump.block, { mode: 'brief', n });
-      return;
-    }
-    onJumpApprovalCite(jump.n);
-  };
 
   const rowHasAnyMark = (blockId: string) =>
     spanMarkedIn(pendingOps, blockId) || spanMarkedIn(savedReviewOps, blockId);
@@ -178,119 +114,16 @@ export default function MemoryApprovalActionQueue({
     }
   };
 
-  const onHypConfirm = (item: FourPartBullet) => {
-    const hypId = hypothesisIdFor(item, parsed.citeMap);
-    if (hypMarkedIn(pendingOps, hypId) || hypMarkedIn(savedReviewOps, hypId)) return;
-    onPendOp({
-      kind: 'hyp_confirm',
-      weekKey,
-      hypothesisId: hypId,
-      text: item.text,
-      cite: item.cite,
-    });
-  };
-
-  const onHypDelete = (item: FourPartBullet) => {
-    const hypId = hypothesisIdFor(item, parsed.citeMap);
-    if (hypMarkedIn(pendingOps, hypId) || hypMarkedIn(savedReviewOps, hypId)) return;
-    onPendOp({
-      kind: 'hyp_delete',
-      weekKey,
-      hypothesisId: hypId,
-      text: item.text,
-      cite: item.cite,
-    });
-  };
-
   const pendingCount = pendingOps.length;
   const savedCount = savedReviewOps.length;
 
   return (
     <div
-      id="memory-approval-action-queue"
+      id="chronicle-overdue-queue"
       className="space-y-5 border-t border-slate-850 pt-4"
-      data-testid="memory-approval-action-queue"
+      data-testid="chronicle-overdue-queue"
     >
-      <div className="space-y-2">
-        <h4 className="text-[11px] font-mono font-bold text-slate-200 uppercase tracking-wider">
-          Hypothesis
-        </h4>
-        {parsed.hypotheses.length === 0 ? (
-          <p className="text-xs text-slate-500 font-mono">- None.</p>
-        ) : (
-          <ul className="space-y-2">
-            {parsed.hypotheses.map((item, idx) => {
-              const hypId = hypothesisIdFor(item, parsed.citeMap);
-              const pending = findReviewMark(
-                pendingOps,
-                (op) =>
-                  (op.kind === 'hyp_confirm' || op.kind === 'hyp_delete')
-                  && op.hypothesisId === hypId,
-              );
-              const saved = findReviewMark(
-                savedReviewOps,
-                (op) =>
-                  (op.kind === 'hyp_confirm' || op.kind === 'hyp_delete')
-                  && op.hypothesisId === hypId,
-              );
-              return (
-                <li key={idx} className="space-y-1.5">
-                  <div className="text-xs md:text-sm text-slate-300 leading-relaxed">
-                    <span className="text-slate-500 font-mono mr-1">-</span>
-                    <CiteButtons
-                      text={item.cite != null ? `${item.text} [${item.cite}]` : item.text}
-                      citeMap={parsed.citeMap}
-                      onCite={handleCite}
-                    />
-                  </div>
-                  <div className="flex flex-wrap items-center gap-2 pl-3">
-                    {saved ? (
-                      <button
-                        type="button"
-                        onClick={() => onRecallSavedReview()}
-                        className="px-2.5 py-1.5 rounded-lg text-[11px] font-mono font-bold bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/30 cursor-pointer"
-                        title="Undo last weekly review Save batch (Memory Approval Recall)"
-                      >
-                        {reviewRecallButtonLabel(saved)}
-                      </button>
-                    ) : pending ? (
-                      <button
-                        type="button"
-                        onClick={() => onClearPendingOp(pending)}
-                        className="px-2.5 py-1.5 rounded-lg text-[11px] font-mono font-bold bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/25 cursor-pointer"
-                        title="Clear pending — restore Confirm / Delete"
-                      >
-                        {reviewPendingButtonLabel(pending)}
-                      </button>
-                    ) : (
-                      <>
-                        <button
-                          type="button"
-                          onClick={() => onHypConfirm(item)}
-                          className="px-2.5 py-1.5 rounded-lg text-[11px] font-mono font-bold bg-emerald-600/80 hover:bg-emerald-500 text-slate-100 cursor-pointer"
-                          title="Pend Confirm — Save in Memory Approval"
-                        >
-                          Confirm
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => onHypDelete(item)}
-                          className="px-2.5 py-1.5 rounded-lg text-[11px] font-mono font-bold bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-700 cursor-pointer"
-                          title="Pend Delete — Save in Memory Approval"
-                        >
-                          Delete
-                        </button>
-                      </>
-                    )}
-                  </div>
-                </li>
-              );
-            })}
-          </ul>
-        )}
-      </div>
-
-      <div className="space-y-3 pt-2 border-t border-slate-850">
+      <div className="space-y-3">
         <h4 className="text-[11px] font-mono font-bold text-slate-200 uppercase tracking-wider">
           Possible overdue report
         </h4>
@@ -325,7 +158,7 @@ export default function MemoryApprovalActionQueue({
                 onJumpDailyBlock(block, { mode: 'brief', n: row.cite });
                 return;
               }
-              handleCite(row.cite);
+              onJumpApprovalCite(row.cite);
             };
             return (
               <div
@@ -430,11 +263,6 @@ export default function MemoryApprovalActionQueue({
                       disabled={actionsLocked}
                       onClick={() => onPutOff(row)}
                       className="px-2.5 py-1.5 rounded-lg text-[11px] font-mono font-bold bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-100 border border-slate-700 cursor-pointer"
-                      title={
-                        row.stagingMissing
-                          ? row.confirmDisabledReason
-                          : 'Pend Put off — Save in Memory Approval'
-                      }
                     >
                       Put off
                     </button>
@@ -469,7 +297,6 @@ export default function MemoryApprovalActionQueue({
                       type="button"
                       onClick={() => onSetDueDate(row)}
                       className="px-2.5 py-1.5 rounded-lg text-[11px] font-mono font-bold bg-indigo-600 hover:bg-indigo-500 text-slate-100 cursor-pointer"
-                      title="Pend Set due date — Save in Memory Approval"
                     >
                       Pend date
                     </button>

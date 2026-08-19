@@ -941,6 +941,31 @@ async function startServer() {
     }
   });
 
+  // JSON sidecar for Chronicle (never the weekly .md)
+  app.get('/api/weekly/weeks/:week/json', async (req, res) => {
+    try {
+      const { week } = req.params;
+      if (!isValidWeekKey(week)) {
+        return res.status(400).json({ error: 'A valid week code (YYYY-Www) is required.' });
+      }
+      const bridged = await callWeeklyBridge('weekly_json', { week_key: week });
+      if (!bridged.ok) {
+        return res.status(502).json({ error: bridged.error });
+      }
+      const result = bridged.result && typeof bridged.result === 'object' ? bridged.result : {};
+      if (result.outcome === 'missing' || result.outcome === 'bad_week') {
+        return res.status(404).json({ error: 'weekly json not found', week });
+      }
+      const outcomeError = pluginOutcomeError(bridged.result, ['ok']);
+      if (outcomeError) {
+        return res.status(outcomeError.status).json(outcomeError);
+      }
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // 9g. Weekly span candidates (digest bridge — explicit/high after validate)
   app.get('/api/weekly/weeks/:week/spans', async (req, res) => {
     try {

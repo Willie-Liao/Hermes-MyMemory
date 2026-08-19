@@ -74,6 +74,16 @@ def test_validate_rejects_bad_confidence():
     assert any("confidence" in e for e in errs)
 
 
+def test_thread_tools_are_registered_conflict_hypothesis_are_not():
+    names = {s["name"] for s in weekly_tools.all_tool_schemas()}
+    assert "submit_weekly_thread" in names
+    assert "patch_weekly_thread" in names
+    assert "submit_weekly_conflict" not in names
+    assert "submit_weekly_hypothesis" not in names
+    submit = weekly_tools.submit_weekly_thread_schema()
+    assert "cross-day-thread" in submit["parameters"]["properties"]
+
+
 def test_failed_fields_teach_names_patch_tool():
     teach = weekly_tools.failed_fields_teach(
         ["event missing related"],

@@ -825,7 +825,8 @@ def test_generate_weekly_content_bounded_fallback_on_llm_error(
 
     result = weekly._generate_weekly_content("2026-W27", [daily], reason="test")
     assert result is not None
-    assert "## Distill" in result
+    assert "cross-day-thread" in result
+    assert "## Distill" not in result
     assert "2026-06-30" in result
     assert any("fallback" in line.casefold() for line in logs)
 
@@ -863,18 +864,10 @@ def test_generate_weekly_content_retries_then_succeeds(tmp_path, monkeypatch):
                     ]
                 },
             }
-        if purpose in {"worker1_conflict", "worker1_hypothesis"}:
-            empty_key = (
-                "conflicts" if purpose == "worker1_conflict" else "hypotheses"
-            )
+        if purpose == "worker1_thread":
             return {
-                "tool_name": force_tool_name
-                or (
-                    "submit_weekly_conflict"
-                    if purpose == "worker1_conflict"
-                    else "submit_weekly_hypothesis"
-                ),
-                "tool_args": {empty_key: []},
+                "tool_name": force_tool_name or "submit_weekly_thread",
+                "tool_args": {"cross-day-thread": []},
             }
         return ""
 
@@ -890,9 +883,9 @@ def test_generate_weekly_content_retries_then_succeeds(tmp_path, monkeypatch):
 
     result = weekly._generate_weekly_content("2026-W27", [daily], reason="test")
     assert result is not None
-    assert "## Distill" in result
-    assert "evt-a" in result
-    assert "## Brief" in result
+    assert "cross-day-thread" in result
+    assert "## Distill" not in result
+    assert "2026-06-30" in result
     active = [
         c
         for c in calls
@@ -932,15 +925,10 @@ def test_generate_weekly_content_retries_shape_errors(tmp_path, monkeypatch):
                     ]
                 },
             }
-        if purpose == "worker1_hypothesis":
+        if purpose == "worker1_thread":
             return {
-                "tool_name": force_tool_name or "submit_weekly_hypothesis",
-                "tool_args": _hypothesis_tool_args("evt-a"),
-            }
-        if purpose == "worker1_conflict":
-            return {
-                "tool_name": force_tool_name or "submit_weekly_conflict",
-                "tool_args": {"conflicts": []},
+                "tool_name": force_tool_name or "submit_weekly_thread",
+                "tool_args": {"cross-day-thread": []},
             }
         return ""
 
@@ -957,9 +945,10 @@ def test_generate_weekly_content_retries_shape_errors(tmp_path, monkeypatch):
     result = weekly._generate_weekly_content("2026-W27", [daily], reason="test")
 
     assert result is not None
-    assert "## Distill" in result
-    assert "evt-a" in result
-    assert "hyp-a" in result
+    assert "cross-day-thread" in result
+    assert "## Distill" not in result
+    assert "type: hypothesis" not in result
+    assert any(c["purpose"] == "worker1_thread" for c in calls)
     active = [
         c
         for c in calls

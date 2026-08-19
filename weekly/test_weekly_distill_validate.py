@@ -39,18 +39,6 @@ related:
 ---
 First [1]. Second [2].
 
----
-id: hyp-a
-type: hypothesis
-entity: Example
-valid_from: 2026-06-25
-sources: [session x]
-related: [evt-a]
-confidence: medium
-status: candidate
----
-Still open.
-
 ## Brief
 
 What happened [1].
@@ -60,20 +48,6 @@ What happened [1].
 def test_happy_path_ok():
     v = _load()
     assert v.validate_weekly_distill(_HAPPY) == []
-
-
-def test_w26_file_still_validates():
-    v = _load()
-    path = (
-        Path(__file__).resolve().parents[3]
-        / "memories"
-        / "staging"
-        / "weekly"
-        / "2026-W26.md"
-    )
-    if not path.is_file():
-        return
-    assert v.validate_weekly_distill(path.read_text(encoding="utf-8")) == []
 
 
 def test_missing_distill_section():
@@ -208,7 +182,7 @@ status: candidate
 Orphan hypothesis.
 """
     errs = v.validate_weekly_distill(md)
-    assert any("event id" in e for e in errs)
+    assert any("hypothesis" in e.casefold() or "type" in e.casefold() for e in errs)
 
 
 def test_conflict_missing_status_no_longer_fail_closed():
@@ -242,7 +216,8 @@ confidence: medium
 ---
 Tension without status.
 """
-    assert v.validate_weekly_distill(md) == []
+    errs = v.validate_weekly_distill(md)
+    assert any("conflict" in e for e in errs)
 
 
 def test_event_missing_entity_no_longer_fail_closed():
@@ -370,7 +345,8 @@ status: candidate
 ---
 Missing entity.
 """
-    assert v.validate_weekly_distill(md) == []
+    errs = v.validate_weekly_distill(md)
+    assert any("hypothesis" in e for e in errs)
 
 
 def test_bare_mem_related_without_cite_prefix_ok():

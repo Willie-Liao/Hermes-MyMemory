@@ -10,6 +10,7 @@ export default defineConfig({
       'src/viewScroll.test.ts',
       'src/weeklyReorganise.test.ts',
       'src/weeklyReviewRecall.test.ts',
+      'src/weeklyJson.test.ts',
     ],
   },
 });

@@ -30,7 +30,7 @@ import {
 const originalHermesHome = process.env.HERMES_HOME;
 const originalCwd = process.cwd();
 const managerRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const expectedHermesHome = path.resolve(managerRoot, '..', '..', '..');
+const expectedHermesHome = path.resolve(managerRoot, '..', '..', '..', '..');
 try {
   delete process.env.HERMES_HOME;
   process.chdir(managerRoot);
