@@ -1,10 +1,12 @@
-"""Live mimo-v2.5 eval: submit_weekly_thread over real 2026-W33 daily events."""
+"""Live mimo-v2.5 eval: submit_weekly_thread or full weekly generate on 2026-W33."""
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
+import tempfile
 import time
 from datetime import date, timedelta
 from pathlib import Path
@@ -65,7 +67,97 @@ def _event_cards() -> tuple[str, set[str]]:
     return "\n\n---\n\n".join(chunks), allowed
 
 
-def main() -> int:
+def _daily_files_w33() -> list[Path]:
+    """Only days that exist so generate does not fail on a missing Sunday file."""
+    return [
+        DAILY / f"{day.isoformat()}.md"
+        for day in _w33_days()
+        if (DAILY / f"{day.isoformat()}.md").is_file()
+    ]
+
+
+def run_full_generate() -> int:
+    """Call _generate_weekly_content without committing live staging.
+
+    Distill-freeze pytest cannot prove Worker 1 still returns dump_yaml.
+    """
+    import weekly as weekly_mod
+    import weekly_json
+
+    live = HERMES_HOME / "memories" / "staging" / "weekly" / "2026-W33.md"
+    mtime_before = live.stat().st_mtime_ns if live.is_file() else None
+    files = _daily_files_w33()
+    yaml_text = None
+    elapsed_ms = 0
+    last_error = ""
+    for _attempt in range(3):
+        t0 = time.perf_counter()
+        try:
+            yaml_text = weekly_mod._generate_weekly_content(
+                "2026-W33", files, reason="eval_full_generate"
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+            yaml_text = None
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        if yaml_text:
+            break
+    mtime_after = live.stat().st_mtime_ns if live.is_file() else None
+    missing: list[str] = []
+    has_cross = False
+    json_gone = False
+    yaml_gone = False
+    distill = False
+    if not yaml_text:
+        missing.append("yaml_text")
+        if last_error:
+            missing.append(last_error[:200])
+    else:
+        distill = "## Distill" in yaml_text
+        if distill:
+            missing.append("distill_heading")
+        payload = weekly_json.loads(yaml_text)
+        has_cross = bool(payload.cross_day_thread)
+        if not has_cross:
+            missing.append("cross-day-thread")
+        with tempfile.TemporaryDirectory() as tmp:
+            md = Path(tmp) / "2026-W33.md"
+            md.write_text(yaml_text, encoding="utf-8")
+            json_path = Path(tmp) / "2026-W33.json"
+            yaml_path = Path(tmp) / "2026-W33.yaml"
+            json_path.write_text("{}\n", encoding="utf-8")
+            yaml_path.write_text("stale: 1\n", encoding="utf-8")
+            weekly_json.write_sidecars(md, payload)
+            json_gone = not json_path.exists()
+            yaml_gone = not yaml_path.exists()
+            if not json_gone:
+                missing.append("json_sidecar")
+            if not yaml_gone:
+                missing.append("yaml_sidecar")
+    staging_ok = mtime_before == mtime_after
+    if not staging_ok:
+        missing.append("staging_mtime")
+    ok = not missing
+    report = {
+        "ok": ok,
+        "mode": "full_generate",
+        "latency_ms": elapsed_ms,
+        "has_cross_day_thread": has_cross,
+        "distill_heading": distill,
+        "json_sidecar_deleted": json_gone,
+        "yaml_sidecar_deleted": yaml_gone,
+        "staging_mtime_unchanged": staging_ok,
+        "daily_files": len(files),
+        "missing": missing,
+        "input_tokens": None,
+        "output_tokens": None,
+        "total_tokens": None,
+    }
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    return 0 if ok else 1
+
+
+def run_thread_eval() -> int:
     bundle, allowed = _event_cards()
     prompt = (
         "Call submit_weekly_thread with cross-day-thread over these daily events.\n"
@@ -133,6 +225,19 @@ def main() -> int:
     }
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report["ok"] else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--full-generate",
+        action="store_true",
+        help="Live _generate_weekly_content on W33 dailies (no staging commit)",
+    )
+    args = parser.parse_args(argv)
+    if args.full_generate:
+        return run_full_generate()
+    return run_thread_eval()
 
 
 if __name__ == "__main__":

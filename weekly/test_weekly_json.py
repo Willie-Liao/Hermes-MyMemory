@@ -1,4 +1,4 @@
-"""Serializer tests for weekly JSON/YAML sidecar (no Distill blocks)."""
+"""Serializer tests for weekly MD YAML schema (no Distill blocks, no sidecars)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ import sys
 from datetime import date
 from pathlib import Path
 
-import pytest
 import yaml
 
 from test_weekly_event_schema import _load, _week
@@ -102,7 +101,7 @@ def test_entity_key_collapses_digest_aliases():
     assert keys == {"memorydigest"}
 
 
-def test_write_sidecars_skips_files_when_dumps_raises(tmp_path, monkeypatch):
+def test_write_sidecars_deletes_json_and_yaml_leaves_md(tmp_path):
     schema = _load()
     wj = _load_weekly_json()
     payload = schema.WeeklyReviewPayload(
@@ -111,13 +110,9 @@ def test_write_sidecars_skips_files_when_dumps_raises(tmp_path, monkeypatch):
     )
     md = tmp_path / "2026-W31.md"
     md.write_text("keep\n", encoding="utf-8")
-
-    def boom(*_a, **_k):
-        raise RuntimeError("serializer failed")
-
-    monkeypatch.setattr(wj, "dumps", boom)
-    with pytest.raises(RuntimeError, match="serializer failed"):
-        wj.write_sidecars(md, payload)
+    (tmp_path / "2026-W31.json").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "2026-W31.yaml").write_text("week_key: stale\n", encoding="utf-8")
+    wj.write_sidecars(md, payload)
     assert not (tmp_path / "2026-W31.json").exists()
     assert not (tmp_path / "2026-W31.yaml").exists()
     assert md.read_text(encoding="utf-8") == "keep\n"
@@ -189,15 +184,20 @@ def test_threads_from_tool_args_drops_one_day_and_stamps_cite():
     assert threads[0].steps[1].cite_n == 2
 
 
-def test_load_sidecar_reads_json_not_md(tmp_path):
+def test_load_sidecar_reads_md_yaml_not_json_sidecar(tmp_path):
     wj = _load_weekly_json()
     json_path = tmp_path / "2026-W33.json"
     md_path = tmp_path / "2026-W33.md"
-    json_path.write_text('{"week_key": "2026-W33", "legend": {"1": "mem-a"}}\n', encoding="utf-8")
-    md_path.write_text("## Distill\nsecret\n", encoding="utf-8")
+    json_path.write_text('{"week_key": "stale-json"}\n', encoding="utf-8")
+    md_path.write_text(
+        "---\nweek: 2026-W33\nweek_status: pending\n---\n"
+        "week_key: 2026-W33\nlegend:\n  1: mem-a\n",
+        encoding="utf-8",
+    )
     obj = wj.load_sidecar(json_path)
     assert obj["week_key"] == "2026-W33"
-    assert "Distill" not in json.dumps(obj)
+    assert obj["legend"][1] == "mem-a" or obj["legend"]["1"] == "mem-a"
+    assert "stale-json" not in json.dumps(obj)
 
 
 def test_compress_phrase_stops_at_semicolon():

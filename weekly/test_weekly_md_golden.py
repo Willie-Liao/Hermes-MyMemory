@@ -1,6 +1,6 @@
-"""Freeze weekly markdown bytes so later JSON/YAML work cannot silently rewrite Distill+Brief.
+"""Pin dump_yaml key order so generate cannot drift from dumps without a failing fixture.
 
-Without this snapshot, Step 3 could claim losslessness while the renderer drifted.
+Distill byte freezes of staging/weekly/*.md are retired: live weeks are YAML of JSON.
 """
 
 from __future__ import annotations
@@ -12,40 +12,9 @@ from pathlib import Path
 
 import yaml
 
-from test_weekly_four_part import _golden_payload, _load_schema
+from test_weekly_four_part import _load_schema
 
 FIXTURES = Path(__file__).with_name("fixtures")
-STAGING_W33 = (
-    Path(__file__).resolve().parents[3]
-    / "memories"
-    / "staging"
-    / "weekly"
-    / "2026-W33.md"
-)
-GOLDEN_W33 = FIXTURES / "golden_2026-W33.md"
-
-
-def test_w33_staging_matches_frozen_snapshot_bytes():
-    assert GOLDEN_W33.is_file(), "copy 2026-W33.md into fixtures/golden_2026-W33.md first"
-    assert STAGING_W33.is_file()
-    assert GOLDEN_W33.read_bytes() == STAGING_W33.read_bytes()
-
-
-def test_fixed_payload_brief_matches_golden_bytes():
-    schema = _load_schema()
-    payload = schema.assign_typed_citations(_golden_payload(schema))
-    rendered = schema.render_weekly_review_brief("2026-W31", payload)
-    golden = (FIXTURES / "weekly_four_part_w31.md").read_text(encoding="utf-8")
-    assert rendered == golden
-
-
-def test_golden_fails_if_brief_renderer_output_changes():
-    schema = _load_schema()
-    payload = schema.assign_typed_citations(_golden_payload(schema))
-    rendered = schema.render_weekly_review_brief("2026-W31", payload)
-    golden = (FIXTURES / "weekly_four_part_w31.md").read_text(encoding="utf-8")
-    mutated = rendered.replace("Weekly Brief — 2026-W31", "Weekly Brief — DRIFT", 1)
-    assert mutated != golden
 
 
 def test_fixed_payload_yaml_matches_json_keys():
@@ -78,6 +47,7 @@ def test_fixed_payload_yaml_matches_json_keys():
 
 
 def test_yaml_golden_fails_if_serializer_drifts():
+    """Catch silent dump_yaml edits that would still pass key-equality."""
     schema = _load_schema()
     wj = _load_weekly_json()
     payload = schema.WeeklyReviewPayload(
@@ -99,6 +69,7 @@ def test_yaml_golden_fails_if_serializer_drifts():
 
 
 def _load_weekly_json():
+    """Load weekly_json by path so golden tests do not depend on package install."""
     path = Path(__file__).with_name("weekly_json.py")
     spec = importlib.util.spec_from_file_location("memory_weekly_json_golden", path)
     assert spec is not None and spec.loader is not None

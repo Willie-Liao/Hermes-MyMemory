@@ -1069,19 +1069,17 @@ def _weekly_path(year: int, week: int) -> Path:
 def _commit_weekly_outputs(
     target: Path, content: str, payload: WeeklyReviewPayload, week_key: str
 ) -> None:
-    """Serialize JSON before replacing the weekly md so a dumps crash cannot clobber last week's file."""
-    json_text = weekly_json.dumps(payload)
+    """Dump YAML before replacing the md so a serializer crash cannot clobber last week's file."""
     yaml_text = weekly_json.dump_yaml(payload)
+    del content
     target.parent.mkdir(parents=True, exist_ok=True)
     write_week_status(
         target,
         WEEK_STATUS_PENDING,
         week_key_str=week_key,
-        content=content.rstrip() + "\n",
+        content=yaml_text.rstrip() + "\n",
     )
-    weekly_json.write_sidecars(
-        target, payload, json_text=json_text, yaml_text=yaml_text
-    )
+    weekly_json.write_sidecars(target, payload)
 
 
 def _build_prompt(

@@ -1,16 +1,26 @@
-"""Persist weekly JSON/YAML without Distill blocks so Chronicle can load one schema.
+"""Persist the weekly schema as YAML inside YYYY-Www.md so Chronicle has one file.
 
-Weekly Distill fences stay on daily files; duplicating them here would make the UI parse a second copy.
+A JSON or YAML sidecar would become a second source of truth next to week_status.
 """
 
 from __future__ import annotations
 
 import json
+import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+_mymemory = Path(__file__).resolve().parent.parent
+if str(_mymemory) not in sys.path:
+    sys.path.insert(0, str(_mymemory))
+
+try:
+    from memory_staging import _split_week_doc_frontmatter
+except ImportError:  # pragma: no cover - packaged import
+    from ..memory_staging import _split_week_doc_frontmatter
 
 try:
     from .weekly_event_schema import (
@@ -56,15 +66,15 @@ def normalize_entity_key(surface: str) -> str:
 
 
 def dumps(payload: WeeklyReviewPayload, *, generated_at: str | None = None) -> str:
-    """Persist entities/cross-day-thread/intra-day-thread/legend so YAML and UI can load without Distill.
+    """Keep an in-memory JSON twin of the MD schema for tests and the HTTP bridge.
 
-    Weekly Distill fences are daily-only; duplicating them here would make Chronicle parse a second copy.
+    This string is not written next to YYYY-Www.md; a sidecar would race week_status.
     """
     return json.dumps(_to_dict(payload, generated_at=generated_at), ensure_ascii=False, indent=2) + "\n"
 
 
 def dump_yaml(payload: WeeklyReviewPayload, *, generated_at: str | None = None) -> str:
-    """Same object as dumps, yaml.safe_dump, so the weekly file cannot drift from JSON."""
+    """YAML body of YYYY-Www.md so recall can parse threads without a second file."""
     return yaml.safe_dump(
         _to_dict(payload, generated_at=generated_at),
         sort_keys=False,
@@ -73,40 +83,46 @@ def dump_yaml(payload: WeeklyReviewPayload, *, generated_at: str | None = None) 
 
 
 def loads(raw: str) -> WeeklyReviewPayload:
-    """Re-coerce ISO date strings so callers get dataclasses, not leftover JSON primitives."""
-    obj = json.loads(raw)
+    """Re-coerce ISO date strings so callers get dataclasses, not leftover JSON/YAML primitives."""
+    text = raw or ""
+    stripped = text.lstrip()
+    if stripped.startswith("---"):
+        _fm, rest = _split_week_doc_frontmatter(text)
+        text = rest if _fm is not None else text
+        stripped = text.lstrip()
+    if stripped.startswith("{"):
+        obj = json.loads(text)
+    else:
+        obj = yaml.safe_load(text)
     if not isinstance(obj, dict):
-        raise ValueError("weekly json root must be an object")
+        raise ValueError("weekly schema root must be an object")
     return _from_dict(obj)
 
 
 def write_sidecars(
     weekly_md_path: Path,
-    payload: WeeklyReviewPayload,
-    *,
-    json_text: str | None = None,
-    yaml_text: str | None = None,
+    payload: WeeklyReviewPayload | None = None,
+    **_: Any,
 ) -> None:
-    """Write JSON then YAML next to the weekly md only after dumps succeeds, so a serializer crash leaves neither file."""
-    json_body = dumps(payload) if json_text is None else json_text
-    yaml_body = dump_yaml(payload) if yaml_text is None else yaml_text
-    json_path = weekly_md_path.with_suffix(".json")
-    yaml_path = weekly_md_path.with_suffix(".yaml")
-    tmp_json = json_path.with_suffix(".json.tmp")
-    tmp_yaml = yaml_path.with_suffix(".yaml.tmp")
-    tmp_json.write_text(json_body, encoding="utf-8")
-    tmp_yaml.write_text(yaml_body, encoding="utf-8")
-    tmp_json.replace(json_path)
-    tmp_yaml.replace(yaml_path)
+    """Delete leftover .json/.yaml so Chronicle cannot load a second copy of the week."""
+    del payload
+    for suffix in (".json", ".yaml"):
+        extra = weekly_md_path.with_suffix(suffix)
+        extra.unlink(missing_ok=True)
 
 
-def load_sidecar(json_path: Path) -> dict[str, Any]:
-    """Read the JSON sidecar only — never the weekly .md — so Distill cannot masquerade as schema."""
-    if json_path.suffix != ".json":
-        json_path = json_path.with_suffix(".json")
-    if not json_path.is_file():
-        raise FileNotFoundError(str(json_path))
-    return json.loads(json_path.read_text(encoding="utf-8"))
+def load_sidecar(weekly_path: Path) -> dict[str, Any]:
+    """Read week_status-stripped YAML from YYYY-Www.md so UI and recall share one file."""
+    path = weekly_path if weekly_path.suffix == ".md" else weekly_path.with_suffix(".md")
+    if not path.is_file():
+        raise FileNotFoundError(str(path))
+    text = path.read_text(encoding="utf-8")
+    fm, rest = _split_week_doc_frontmatter(text)
+    body = rest if fm is not None else text
+    obj = yaml.safe_load(body)
+    if not isinstance(obj, dict):
+        raise ValueError("weekly md body must be a YAML object")
+    return obj
 
 
 def _week_bounds(week_key: str) -> tuple[date, date]:

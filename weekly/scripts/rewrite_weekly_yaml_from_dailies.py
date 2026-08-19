@@ -1,12 +1,10 @@
-"""Replace weekly Distill+Brief .md with YAML of mechanical JSON (no LLM).
+"""Replace weekly Distill+Brief .md with schema YAML (no LLM, no sidecars).
 
-Step 11: UI and the weekly file share one schema. Threads stay empty unless JSON
-already has cross-day-thread from a prior generate/eval.
+Threads stay empty unless the existing MD already has cross-day-thread.
 """
 
 from __future__ import annotations
 
-import json
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -22,7 +20,7 @@ from weekly_event_workers import (  # noqa: E402
     _intra_day_from_dailies,
     _parse_blocks,
 )
-from weekly_json import dump_yaml, dumps, load_sidecar, loads, write_sidecars  # noqa: E402
+from weekly_json import dump_yaml, load_sidecar, loads, write_sidecars  # noqa: E402
 
 HERMES_HOME = Path(__file__).resolve().parents[4]
 WEEKLY_DIR = HERMES_HOME / "memories" / "staging" / "weekly"
@@ -61,10 +59,9 @@ def rewrite_week(week_key: str) -> Path:
         if (DAILY_DIR / f"{day.isoformat()}.md").is_file()
     }
     md_path = WEEKLY_DIR / f"{week_key}.md"
-    json_path = md_path.with_suffix(".json")
     existing_threads = ()
-    if json_path.is_file():
-        prior = loads(json_path.read_text(encoding="utf-8"))
+    if md_path.is_file():
+        prior = loads(md_path.read_text(encoding="utf-8"))
         existing_threads = prior.cross_day_thread
     payload = WeeklyReviewPayload(
         days=(),
@@ -77,7 +74,6 @@ def rewrite_week(week_key: str) -> Path:
         hypotheses=(),
     )
     yaml_text = dump_yaml(payload)
-    json_text = dumps(payload)
     status = read_week_status(md_path) if md_path.is_file() else None
     write_week_status(
         md_path,
@@ -85,7 +81,7 @@ def rewrite_week(week_key: str) -> Path:
         week_key_str=week_key,
         content=yaml_text,
     )
-    write_sidecars(md_path, payload, json_text=json_text, yaml_text=yaml_text)
+    write_sidecars(md_path, payload)
     return md_path
 
 
@@ -93,7 +89,7 @@ def main() -> int:
     weeks = [f"2026-W{n:02d}" for n in range(25, 34)]
     for week in weeks:
         path = rewrite_week(week)
-        obj = load_sidecar(path.with_suffix(".json"))
+        obj = load_sidecar(path)
         assert set(obj) >= {
             "entities",
             "legend",

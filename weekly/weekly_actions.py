@@ -344,7 +344,7 @@ def get_or_refresh_chronicle(
 
 
 def load_weekly_json(week_key: str | None = None) -> dict[str, Any]:
-    """Return the JSON sidecar only; 404-equivalent missing so UI never parses weekly markdown."""
+    """Return the schema parsed from YYYY-Www.md; missing file stays 404-equivalent."""
     try:
         from . import weekly_json
     except ImportError:
@@ -357,7 +357,7 @@ def load_weekly_json(week_key: str | None = None) -> dict[str, Any]:
     parsed = weekly._parse_week_key(str(week_key or ""))
     if parsed is None:
         return {"outcome": "bad_week", "week": week_key or ""}
-    target = weekly._weekly_path(*parsed).with_suffix(".json")
+    target = weekly._weekly_path(*parsed)
     try:
         payload = weekly_json.load_sidecar(target)
     except FileNotFoundError:
