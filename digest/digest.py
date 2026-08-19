@@ -135,7 +135,7 @@ IN_FLIGHT_STALE_SECONDS = 600
 
 # Civil-day event bullets after YAML fences — not a fifth memory type.
 DAY_WRAPUP_HEADING = "## Day wrap-up"
-MAX_WRAPUP_CHARS = 120
+MAX_WRAPUP_CHARS = 200
 _WRAPUP_HEADING_RE = re.compile(r"(?m)^## Day wrap-up[ \t]*\n?")
 
 # Cap on blocks in a committed daily staging file.
@@ -1600,8 +1600,8 @@ def _validate_related_target_types(
 def split_daily_wrapup(content: str) -> tuple[str, str]:
     """Peel ``## Day wrap-up`` so fence parsers never treat bullets as a body.
 
-    Last heading wins. Trailer is every following non-empty line (one sentence
-    per event as ``- …``). Missing trailer → empty string.
+    Last heading wins. Trailer is every following non-empty line (catalog
+    bullets as ``- …``). Missing trailer → empty string.
     """
     text = content or ""
     matches = list(_WRAPUP_HEADING_RE.finditer(text))
@@ -1644,7 +1644,11 @@ def join_daily_wrapup(fences: str, phrase: str) -> str:
 
 
 def clamp_wrapup_phrase(raw: str) -> str:
-    """Keep one short catalog sentence: blank and extra sentences must not land."""
+    """Keep one catalog sentence so a second clause cannot land as a paragraph.
+
+    Length follows MAX_WRAPUP_CHARS so a same-day connected sitting can fit
+    one bullet without inventing a second sentence.
+    """
     cleaned = " ".join(str(raw or "").split())
     if not cleaned:
         return ""

@@ -120,6 +120,10 @@ def test_clamp_wrapup_phrase_keeps_first_sentence():
     assert digest.clamp_wrapup_phrase("") == ""
     long_two = "First thread closed. Second sentence should drop."
     assert digest.clamp_wrapup_phrase(long_two) == "First thread closed."
+    assert digest.MAX_WRAPUP_CHARS == 200
+    kept = "x" * 200
+    assert digest.clamp_wrapup_phrase(kept) == kept
+    assert digest.clamp_wrapup_phrase("y" * 201) == "y" * 200
 
 
 def test_join_preserves_independent_event_bullets():
@@ -152,9 +156,26 @@ def test_build_wrapup_prompt_lists_every_event_predicate():
             {"id": "mem-f1", "type": "fact", "entity": "Gabby"},
         ]
     )
-    assert "Events — one independent sentence each" in prompt
+    assert "Events — cover each; related same-day events may share one bullet" in prompt
     assert "user_requested_recipe_ingredients" in prompt
     assert "user_requested_progressive_recall_procedure" in prompt
+    assert "same sitting" in prompt
+    assert "one markdown bullet" in prompt
+    assert "Do not glue" not in prompt
+    assert "one independent sentence each" not in prompt
+    assert "One sentence per event on the checklist" not in prompt
     assert "phrases" in prompt
     assert "### Today events" in prompt
     assert "submit_day_wrapup" in prompt
+    assert "200" in prompt
+
+
+def test_submit_day_wrapup_schema_allows_grouped_bullets():
+    tools = load_plugin_module("digest_tools.py", "memory_digest_wrapup_schema_test")
+    schema = tools.submit_day_wrapup_schema()
+    blob = str(schema)
+    assert "share one bullet" in blob.casefold() or "same-day" in blob.casefold()
+    assert "Not one glued clause" not in blob
+    assert "one independent short sentence per event" not in blob
+    items = schema["parameters"]["properties"]["phrases"]["items"]
+    assert items["maxLength"] == 200

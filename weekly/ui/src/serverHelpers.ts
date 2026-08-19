@@ -38,7 +38,7 @@ export const IMPORTANCE_DEFAULT: ImportanceLevel = 3;
 
 /** Matches digest ``DAY_WRAPUP_HEADING`` — catalog phrase after YAML fences. */
 export const DAY_WRAPUP_HEADING = '## Day wrap-up';
-const MAX_WRAPUP_CHARS = 120;
+const MAX_WRAPUP_CHARS = 200;
 
 export function splitDailyWrapup(content: string): { fences: string; phrase: string } {
   const text = content || '';

@@ -938,18 +938,26 @@ def submit_operations_schema() -> dict[str, Any]:
 
 
 def submit_day_wrapup_schema() -> dict[str, Any]:
-    """Force one medium phrase so 23:55 wrap-up cannot dump a paragraph or YAML."""
+    """Force catalog bullets so 23:55 wrap-up cannot dump a paragraph or YAML.
+
+    Related same-day events may share one phrase; unrelated events stay
+    separate. Length matches digest.MAX_WRAPUP_CHARS (200).
+    """
     return _schema(
         "submit_day_wrapup",
         (
-            "Submit one independent short sentence per event (phrases[]). "
-            "Not one glued clause. Not a paragraph. No YAML."
+            "Submit phrases[]: one short sentence per bullet. Related "
+            "same-day events may share one bullet. Unrelated events stay "
+            "separate. Not a paragraph. No YAML. Each phrase ≤ 200 chars."
         ),
         {
             "phrases": {
                 "type": "array",
-                "description": "One short sentence per event, each ≤ 120 chars",
-                "items": {"type": "string", "maxLength": 120},
+                "description": (
+                    "Catalog bullets: related same-day events may share one "
+                    "bullet; unrelated stay separate; each ≤ 200 chars"
+                ),
+                "items": {"type": "string", "maxLength": 200},
             },
             "phrase": {
                 "type": "string",

@@ -209,23 +209,39 @@ WRAPUP_RULES = """## Day wrap-up
 
 Call submit_day_wrapup with { "phrases": ["...", "..."] }.
 
-Each event gets its own independent short sentence (one line). Do not glue
-events into one clause with commas. Not a paragraph. Not YAML.
+This trailer is a same-day catalog, not a rewrite of the YAML cards.
+Events stay separate on disk so detail is not lost. The wrap-up may
+connect them.
 
-Shape:
-- "The user discussed the design of an infographic about the memory plugin."
+Cover every event on the checklist. If two or more events are clearly
+the same sitting — same task, same artifact, later turns only refine
+it — write them as one markdown bullet that names the through-line.
+Unrelated events stay one bullet each. Do not invent a connection.
+Do not drop an unrelated event because another cluster was large.
+
+Not a paragraph. Not YAML. Not a comma-spliced list of every turn.
+
+Shape (connected same-day sitting — preferred when true):
+- "The user spent the day iterating a Xiaohongshu infographic for the memory plugin, from layout through final page delivery."
+
+Shape (unrelated events — keep separate):
 - "The user asked for commonly spoken dialects listed in a table."
+- "The user requested a WeChat reminder draft to 张主任."
 
-One sentence per event on the checklist. Start with "The user …" when it is
-the user's action. At most 120 characters per sentence. No second sentence
-inside a bullet (code keeps only the first).
+Start with "The user …" when it is the user's action. One sentence per
+bullet. At most 200 characters. No second sentence inside a bullet
+(code keeps only the first).
 
 If there are no events, one short bullet for the day's remaining cards.
 """
 
 
 def _wrapup_event_checklist(blocks: Iterable[Mapping[str, Any]]) -> str:
-    """Force every event predicate into the prompt so no event shares a glued clause."""
+    """List every event predicate so wrap-up cannot silently drop a sitting.
+
+    Related same-day events may still share one bullet in phrases[]; the
+    checklist is coverage, not a one-phrase-per-line quota.
+    """
     lines: list[str] = []
     for block in blocks:
         if str(block.get("type") or "").strip().lower() != "event":
@@ -240,7 +256,7 @@ def _wrapup_event_checklist(blocks: Iterable[Mapping[str, Any]]) -> str:
     if not lines:
         return ""
     return (
-        "## Events — one independent sentence each\n\n"
+        "## Events — cover each; related same-day events may share one bullet\n\n"
         + "\n".join(lines)
         + "\n"
     )
