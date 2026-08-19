@@ -74,6 +74,8 @@ def test_phase2_tick_requires_more_than_twenty_five_cards():
     now = datetime(2026, 8, 16, 12, 0, tzinfo=SHANGHAI)
     assert should_run_phase2_tick(25, None, now) is False
     assert should_run_phase2_tick(26, None, now) is True
+    assert should_run_phase2_tick(1, None, now, ignore_block_gate=True) is True
+    assert should_run_phase2_tick(0, None, now, ignore_block_gate=True) is False
 
 
 def test_phase2_tick_cooldown_skips_recent_merge():
@@ -84,16 +86,15 @@ def test_phase2_tick_cooldown_skips_recent_merge():
     assert should_run_phase2_tick(26, last, now) is True
 
 
-def test_nightly_leftover_only_after_2355_once_per_date():
-    before = datetime(2026, 8, 16, 23, 54, tzinfo=SHANGHAI)
-    assert should_run_nightly_leftover(None, before, SHANGHAI) is False
-    at = datetime(2026, 8, 16, 23, 55, tzinfo=SHANGHAI)
-    assert should_run_nightly_leftover(None, at, SHANGHAI) is True
-    assert should_run_nightly_leftover("2026-08-16", at, SHANGHAI) is False
-    catch = datetime(2026, 8, 16, 23, 56, tzinfo=SHANGHAI)
-    assert should_run_nightly_leftover("2026-08-15", catch, SHANGHAI) is True
+def test_nightly_leftover_when_last_nightly_behind():
+    """Catch up leftover whenever last_nightly is missing or before local today."""
     morning = datetime(2026, 8, 17, 8, 0, tzinfo=SHANGHAI)
-    assert should_run_nightly_leftover("2026-08-16", morning, SHANGHAI) is False
+    assert should_run_nightly_leftover("2026-08-16", morning, SHANGHAI) is True
+    noon = datetime(2026, 8, 16, 12, 0, tzinfo=SHANGHAI)
+    assert should_run_nightly_leftover(None, noon, SHANGHAI) is True
+    at = datetime(2026, 8, 16, 23, 55, tzinfo=SHANGHAI)
+    assert should_run_nightly_leftover("2026-08-16", at, SHANGHAI) is False
+    assert should_run_nightly_leftover("2026-08-15", at, SHANGHAI) is True
 
 
 def test_clock_phase2_grid_hours_over_gate(tmp_path, monkeypatch):
@@ -120,6 +121,7 @@ def test_clock_phase2_grid_hours_over_gate(tmp_path, monkeypatch):
             state.pop("last_phase2_at", None)
             state.pop("next_clock_at", None)
             state["phase2_in_flight"] = False
+            state["last_nightly_date"] = "2026-08-16"
             digest._save_state(state)
         now = datetime(2026, 8, 16, hour, minute, tzinfo=SHANGHAI)
         digest.maybe_run_digest_clock(now=now, sync=True)
@@ -153,6 +155,11 @@ def test_clock_phase2_at_noon_only_over_gate(tmp_path, monkeypatch):
     monkeypatch.setattr(
         digest.digest_clock, "digest_clock_tz", lambda **_k: SHANGHAI
     )
+    state_path = tmp_path / "memories" / "staging" / ".digest-state.json"
+    state_path.write_text(
+        json.dumps({"last_nightly_date": "2026-08-16", "sessions": {}}),
+        encoding="utf-8",
+    )
     phase2: list[str] = []
     monkeypatch.setattr(
         digest,
@@ -176,6 +183,11 @@ def test_clock_phase2_at_noon_runs_over_gate(tmp_path, monkeypatch):
     monkeypatch.setattr(
         digest.digest_clock, "digest_clock_tz", lambda **_k: SHANGHAI
     )
+    state_path = tmp_path / "memories" / "staging" / ".digest-state.json"
+    state_path.write_text(
+        json.dumps({"last_nightly_date": "2026-08-16", "sessions": {}}),
+        encoding="utf-8",
+    )
     phase2: list[str] = []
     monkeypatch.setattr(
         digest,
@@ -188,7 +200,7 @@ def test_clock_phase2_at_noon_runs_over_gate(tmp_path, monkeypatch):
     assert phase2 == [str(path)]
 
 
-def test_clock_leftover_without_phase2_when_under_gate(tmp_path, monkeypatch):
+def test_clock_leftover_with_phase2_when_under_gate(tmp_path, monkeypatch):
     digest = _load_digest()
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
     daily_dir = tmp_path / "memories" / "staging" / "daily"
@@ -228,7 +240,7 @@ def test_clock_leftover_without_phase2_when_under_gate(tmp_path, monkeypatch):
     now = datetime(2026, 8, 16, 23, 55, tzinfo=SHANGHAI)
     digest.maybe_run_digest_clock(now=now, sync=True)
     assert leftover == ["s1", "s2"]
-    assert phase2 == []
+    assert phase2 == ["p2"]
     saved = json.loads(state_path.read_text(encoding="utf-8"))
     assert saved["last_nightly_date"] == "2026-08-16"
     assert saved["sessions"]["s1"]["last_digest_message_id"] == 9
@@ -245,6 +257,11 @@ def test_clock_noon_phase2_does_not_call_wrapup(tmp_path, monkeypatch):
     monkeypatch.setattr(digest, "hermes_local_today_str", lambda: "2026-08-16")
     monkeypatch.setattr(
         digest.digest_clock, "digest_clock_tz", lambda **_k: SHANGHAI
+    )
+    state_path = tmp_path / "memories" / "staging" / ".digest-state.json"
+    state_path.write_text(
+        json.dumps({"last_nightly_date": "2026-08-16", "sessions": {}}),
+        encoding="utf-8",
     )
     wrap: list[str] = []
     monkeypatch.setattr(
@@ -275,6 +292,11 @@ def test_clock_2355_calls_wrapup_even_under_gate(tmp_path, monkeypatch):
     )
     wrap: list[str] = []
     monkeypatch.setattr(digest, "_maybe_run_digest", lambda *a, **k: None)
+    monkeypatch.setattr(
+        digest,
+        "run_manual_phase2",
+        lambda *a, **k: {"outcome": "rewritten"},
+    )
     monkeypatch.setattr(
         digest,
         "run_day_wrapup",
@@ -342,6 +364,11 @@ def test_clock_weekly_hook_after_leftover(tmp_path, monkeypatch):
     monkeypatch.setattr(digest, "run_day_wrapup", lambda *_a, **_k: None)
     monkeypatch.setattr(
         digest,
+        "run_manual_phase2",
+        lambda *a, **k: {"outcome": "rewritten"},
+    )
+    monkeypatch.setattr(
+        digest,
         "_maybe_run_weekly_clock",
         lambda local, leftover_ran=False: order.append(("weekly", leftover_ran))
         or {"outcome": "ok"},
@@ -356,3 +383,162 @@ def test_clock_weekly_hook_after_leftover(tmp_path, monkeypatch):
     assert order[0] == "leftover"
     assert ("weekly", True) in order
     assert order.index("leftover") < order.index(("weekly", True))
+
+
+def test_clock_morning_catchup_leftover_if_last_nightly_yesterday(tmp_path, monkeypatch):
+    digest = _load_digest()
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    daily_dir = tmp_path / "memories" / "staging" / "daily"
+    daily_dir.mkdir(parents=True)
+    (daily_dir / "2026-08-17.md").write_text(_card_yaml(3), encoding="utf-8")
+    monkeypatch.setattr(digest, "hermes_local_today_str", lambda: "2026-08-17")
+    monkeypatch.setattr(
+        digest.digest_clock, "digest_clock_tz", lambda **_k: SHANGHAI
+    )
+    leftover: list[str] = []
+    monkeypatch.setattr(
+        digest,
+        "_maybe_run_digest",
+        lambda session_key, reason, force=False, sync=False: leftover.append(
+            (session_key, force, reason)
+        ),
+    )
+    monkeypatch.setattr(digest, "run_manual_phase2", lambda *a, **k: {"outcome": "rewritten"})
+    monkeypatch.setattr(digest, "run_day_wrapup", lambda *_a, **_k: None)
+    state_path = tmp_path / "memories" / "staging" / ".digest-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "last_nightly_date": "2026-08-16",
+                "sessions": {"s1": {"session_id": "s1"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    now = datetime(2026, 8, 17, 8, 0, tzinfo=SHANGHAI)
+    digest.maybe_run_digest_clock(now=now, sync=True)
+    assert leftover == [("s1", True, "nightly_leftover")]
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    assert saved["last_nightly_date"] == "2026-08-17"
+
+
+def test_clock_morning_wrapup_yesterday_if_no_trailer(tmp_path, monkeypatch):
+    digest = _load_digest()
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    daily_dir = tmp_path / "memories" / "staging" / "daily"
+    daily_dir.mkdir(parents=True)
+    yesterday = daily_dir / "2026-08-16.md"
+    yesterday.write_text(_card_yaml(4), encoding="utf-8")
+    (daily_dir / "2026-08-17.md").write_text(_card_yaml(2), encoding="utf-8")
+    monkeypatch.setattr(digest, "hermes_local_today_str", lambda: "2026-08-17")
+    monkeypatch.setattr(
+        digest.digest_clock, "digest_clock_tz", lambda **_k: SHANGHAI
+    )
+    wrap: list[str] = []
+    monkeypatch.setattr(digest, "_maybe_run_digest", lambda *a, **k: None)
+    monkeypatch.setattr(digest, "run_manual_phase2", lambda *a, **k: {"outcome": "rewritten"})
+    monkeypatch.setattr(
+        digest,
+        "run_day_wrapup",
+        lambda daily_path: wrap.append(Path(daily_path).name),
+    )
+    state_path = tmp_path / "memories" / "staging" / ".digest-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "last_nightly_date": "2026-08-16",
+                "sessions": {"s1": {"session_id": "s1"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    now = datetime(2026, 8, 17, 8, 0, tzinfo=SHANGHAI)
+    digest.maybe_run_digest_clock(now=now, sync=True)
+    assert "2026-08-16.md" in wrap
+    assert "2026-08-17.md" in wrap
+
+
+def test_clock_loop_sleeps_until_deadline_not_sixty(tmp_path, monkeypatch):
+    digest = _load_digest()
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    (tmp_path / "memories" / "staging").mkdir(parents=True)
+    waits: list[float] = []
+
+    def fake_wait(timeout=None):
+        waits.append(float(timeout))
+        return True
+
+    monkeypatch.setattr(digest._clock_stop, "wait", fake_wait)
+    monkeypatch.setattr(
+        digest.digest_clock, "digest_clock_tz", lambda **_k: SHANGHAI
+    )
+    future = datetime(2026, 8, 16, 23, 55, tzinfo=SHANGHAI)
+    state_path = tmp_path / "memories" / "staging" / ".digest-state.json"
+    state_path.write_text(
+        json.dumps({"next_clock_at": future.isoformat(), "sessions": {}}),
+        encoding="utf-8",
+    )
+    frozen = datetime(2026, 8, 16, 12, 0, tzinfo=SHANGHAI)
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen if tz is None else frozen.astimezone(tz)
+
+    monkeypatch.setattr(digest, "datetime", FrozenDateTime)
+    digest._digest_clock_loop()
+    assert waits, "clock loop must wait once"
+    assert waits[0] >= 3600, waits
+    assert waits[0] <= 12 * 3600 + 1, waits
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    assert saved.get("clock_heartbeat_at")
+    assert saved["clock_alive"] is False
+    assert saved.get("clock_stopped_at")
+
+
+def test_clock_loop_death_writes_error(tmp_path, monkeypatch):
+    digest = _load_digest()
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    (tmp_path / "memories" / "staging").mkdir(parents=True)
+    monkeypatch.setattr(digest._clock_stop, "wait", lambda timeout=None: False)
+    monkeypatch.setattr(
+        digest,
+        "maybe_run_digest_clock",
+        lambda **k: (_ for _ in ()).throw(RuntimeError("clock boom")),
+    )
+    monkeypatch.setattr(digest, "start_digest_clock_thread", lambda: None)
+    monkeypatch.setattr(
+        digest.digest_clock, "digest_clock_tz", lambda **_k: SHANGHAI
+    )
+    state_path = tmp_path / "memories" / "staging" / ".digest-state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "next_clock_at": datetime(2026, 8, 16, 8, 0, tzinfo=SHANGHAI).isoformat(),
+                "sessions": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    digest._digest_clock_loop()
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    assert saved["clock_alive"] is False
+    assert "clock boom" in str(saved.get("clock_error"))
+    assert saved.get("clock_stopped_at")
+
+
+def test_on_agent_end_records_observed_dead_clock(tmp_path, monkeypatch):
+    digest = _load_digest()
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    (tmp_path / "memories" / "staging").mkdir(parents=True)
+    digest._clock_thread = None
+    monkeypatch.setattr(digest, "_fetch_messages", lambda *a, **k: [])
+    monkeypatch.setattr(digest, "maybe_run_digest_clock", lambda **k: {"outcome": "idle"})
+    logs: list[str] = []
+    monkeypatch.setattr(digest, "_log", logs.append)
+    digest.on_agent_end({"session_id": "s1", "platform": "wecom"})
+    saved = json.loads(
+        (tmp_path / "memories" / "staging" / ".digest-state.json").read_text(encoding="utf-8")
+    )
+    assert saved["clock_alive"] is False
+    assert any("observed dead" in line for line in logs)

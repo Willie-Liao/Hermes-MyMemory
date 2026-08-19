@@ -77,9 +77,17 @@ def should_run_phase2_tick(
     now: datetime,
     *,
     cooldown: timedelta = PHASE2_COOLDOWN,
+    ignore_block_gate: bool = False,
 ) -> bool:
-    """Merge only when the daily file is crowded and the last merge cooled down."""
-    if block_count <= PHASE2_BLOCK_GATE:
+    """Merge only when the daily file is crowded and the last merge cooled down.
+
+    Nightly leftover/catch-up passes ``ignore_block_gate`` so a quiet day still
+    consolidates; 08/12/16/20 keep the 25-card floor so noon does not pay for
+    a sparse file.
+    """
+    if block_count <= 0:
+        return False
+    if not ignore_block_gate and block_count <= PHASE2_BLOCK_GATE:
         return False
     if last_phase2_at is None:
         return True
@@ -95,10 +103,12 @@ def should_run_nightly_leftover(
     now: datetime,
     tz: ZoneInfo,
 ) -> bool:
-    """Same-calendar-date leftover extract after local 23:55, once per date."""
+    """Run leftover extract when last_nightly is missing or before local today.
+
+    A missed 23:55 must still extract at 08:00; gating on civil 23:55 today
+    dropped 08-18 leftover after midnight.
+    """
     local = _as_local(now, tz)
-    if (local.hour, local.minute, local.second) < (23, 55, 0):
-        return False
     today = local.date().isoformat()
     return str(last_nightly_date or "") != today
 

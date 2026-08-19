@@ -7,10 +7,12 @@ Plugin hooks (CLI + gateway):
     turns wait; there is no assistant floor)
   - on_session_finalize — digest session-boundary leftovers when the same
     user-count floor is met
-  -     plugin clock — Phase 2 at 08:00/12:00/16:00/20:00/23:55 in config.yaml
-    ``timezone:`` (same IANA chain as Hermes cron) only if today's daily
-    file has more than 25 cards; 23:55 also force-extracts leftover chat
-    then refreshes the ``## Day wrap-up`` trailer (day ticks only re-attach it)
+  -     plugin clock — sleep until next_clock_at (08:00/12:00/16:00/20:00/23:55
+    in config.yaml ``timezone:``). Day ticks Phase-2 only if today's file has
+    more than 25 cards. Leftover force-extract runs when last_nightly is
+    behind (including morning catch-up); that path also Phase-2's any card
+    count ≥ 1 then refreshes ``## Day wrap-up`` (and yesterday if it has
+    cards and no trailer). Day ticks only re-attach the trailer.
 
 Progress is one cursor: the session bookmark (``last_digest_message_id``).
 Never calls the memory tool — write_file/patch to staging only.
@@ -33,7 +35,7 @@ import uuid
 import copy
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Literal, Mapping, Sequence
 
@@ -458,7 +460,11 @@ def _run_digest_clock_once(
     now: datetime | None = None,
     tz: Any = None,
 ) -> dict[str, Any]:
-    """Fire leftover extract and/or gated merge, then the Sunday weekly clock."""
+    """Fire leftover extract and/or gated merge, then the Sunday weekly clock.
+
+    Leftover follows last_nightly, not civil 23:55, so a missed night still
+    extracts at 08:00. Nightly/catch-up Phase 2 ignores the 25-card noon gate.
+    """
     zone = tz or digest_clock.digest_clock_tz()
     local = digest_clock._as_local(now or datetime.now(zone), zone)
     today = local.date().isoformat()
@@ -512,7 +518,12 @@ def _run_digest_clock_once(
 
     daily_path, block_count = _today_block_count(today)
     want_phase2 = (past_tick or first_boot_on_grid or need_leftover) and (
-        digest_clock.should_run_phase2_tick(block_count, last_p2, local)
+        digest_clock.should_run_phase2_tick(
+            block_count,
+            last_p2,
+            local,
+            ignore_block_gate=need_leftover,
+        )
     )
     if want_phase2 and in_flight:
         want_phase2 = False
@@ -542,6 +553,23 @@ def _run_digest_clock_once(
             payload["wrapup"] = True
         except Exception as exc:
             _log(f"digest clock wrapup failed: {exc}")
+        yesterday = (local.date() - timedelta(days=1)).isoformat()
+        ypath = daily_staging_path(_hermes_home(), yesterday)
+        if ypath.exists():
+            try:
+                ytext = ypath.read_text(encoding="utf-8")
+            except OSError:
+                ytext = ""
+            if (
+                ytext
+                and DAY_WRAPUP_HEADING not in ytext
+                and _daily_blocks(ytext)
+            ):
+                try:
+                    run_day_wrapup(ypath)
+                    payload["wrapup_yesterday"] = True
+                except Exception as exc:
+                    _log(f"digest clock wrapup yesterday failed: {exc}")
 
     with _digest_lock:
         state = _load_state()
@@ -557,7 +585,11 @@ def _run_digest_clock_once(
 
 
 def start_digest_clock_thread() -> None:
-    """Daemon loop so 08/12/16/20/23:55 fire without a chat turn."""
+    """Arm the civil clock and record clock_alive so a dead worker is visible.
+
+    Exclusive plugins skip manager boot; the first primary initialize is what
+    starts this thread. State stamps exist because idle sleeps write no digest log.
+    """
     global _clock_thread
     if _clock_thread is not None and _clock_thread.is_alive():
         return
@@ -568,6 +600,14 @@ def start_digest_clock_thread() -> None:
         daemon=True,
     )
     _clock_thread.start()
+    with _digest_lock:
+        state = _load_state()
+        state["clock_alive"] = True
+        state["clock_started_at"] = datetime.now(timezone.utc).isoformat()
+        state["clock_error"] = ""
+        state["clock_stopped_at"] = ""
+        _save_state(state)
+    _log("digest clock started")
 
 
 def stop_digest_clock_thread() -> None:
@@ -576,23 +616,48 @@ def stop_digest_clock_thread() -> None:
 
 
 def _digest_clock_loop() -> None:
+    """Sleep until next_clock_at; a 60s poll hid a sleeping thread from state."""
+    global _clock_thread
     while not _clock_stop.is_set():
-        zone = digest_clock.digest_clock_tz()
-        local = datetime.now(zone)
-        with _digest_lock:
-            stored = digest_clock.parse_aware(
-                _load_state().get("next_clock_at"), zone
-            )
-        if stored is None:
-            _kind, stored = digest_clock.next_deadline(local, zone)
+        try:
+            zone = digest_clock.digest_clock_tz()
+            local = datetime.now(zone)
+            with _digest_lock:
+                stored = digest_clock.parse_aware(
+                    _load_state().get("next_clock_at"), zone
+                )
+            if stored is None:
+                _kind, stored = digest_clock.next_deadline(local, zone)
+                with _digest_lock:
+                    state = _load_state()
+                    state["next_clock_at"] = stored.isoformat()
+                    _save_state(state)
+            delay = max(0.0, (stored - local).total_seconds())
             with _digest_lock:
                 state = _load_state()
-                state["next_clock_at"] = stored.isoformat()
+                state["clock_alive"] = True
+                state["clock_heartbeat_at"] = datetime.now(timezone.utc).isoformat()
                 _save_state(state)
-        delay = max(1.0, min(60.0, (stored - local).total_seconds()))
-        if _clock_stop.wait(delay):
-            break
-        maybe_run_digest_clock(sync=True)
+            _log(f"digest clock waiting until {stored.isoformat()}")
+            if _clock_stop.wait(delay):
+                with _digest_lock:
+                    state = _load_state()
+                    state["clock_alive"] = False
+                    state["clock_stopped_at"] = datetime.now(timezone.utc).isoformat()
+                    _save_state(state)
+                break
+            maybe_run_digest_clock(sync=True)
+        except Exception as exc:
+            _log(f"digest clock died: {exc}")
+            with _digest_lock:
+                state = _load_state()
+                state["clock_alive"] = False
+                state["clock_error"] = str(exc)
+                state["clock_stopped_at"] = datetime.now(timezone.utc).isoformat()
+                _save_state(state)
+            _clock_thread = None
+            start_digest_clock_thread()
+            return
 
 
 def _session_key(context: dict) -> str:
@@ -4391,8 +4456,22 @@ def _maybe_run_digest(
 
 
 def on_agent_end(context: dict) -> None:
+    """Bookmark-ready extract after a turn; also stamp a dead civil clock.
+
+    Chat is the only observer if the daemon died without an except handler
+    writing clock_alive; leftover still runs via maybe_run_digest_clock.
+    """
     if getattr(_digest_worker_active, "active", False):
         return
+
+    if _clock_thread is None or not _clock_thread.is_alive():
+        with _digest_lock:
+            state = _load_state()
+            was_alive = state.get("clock_alive")
+            state["clock_alive"] = False
+            _save_state(state)
+        if was_alive is not False:
+            _log("digest clock observed dead")
 
     session_key = _session_key(context)
     session_id = context.get("session_id")
