@@ -9,6 +9,7 @@ import {
   callWeeklyBridge,
   emptyWeekSoftLoadPayload,
   isEmptyDigestGenerateOutcome,
+  isValidMonthKey,
   isValidWeekKey,
   mapListWeeks,
   pluginOutcomeError,
@@ -152,6 +153,9 @@ assert.equal(isValidWeekKey('2026-W00'), false);
 assert.equal(isValidWeekKey('2026-W99'), false);
 assert.equal(isValidWeekKey('../2026-W26'), false);
 assert.equal(isValidWeekKey('2026-W6'), false);
+assert.equal(isValidMonthKey('2026-08'), true);
+assert.equal(isValidMonthKey('2026-13'), false);
+assert.equal(isValidMonthKey('2026-W33'), false);
 
 assert.equal(pluginOutcomeError({ outcome: 'generated' }, ['generated']), undefined);
 assert.deepEqual(pluginOutcomeError({ outcome: 'bad_week' }, ['generated']), {

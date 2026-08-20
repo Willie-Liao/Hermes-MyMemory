@@ -104,6 +104,7 @@ __all__ = [
     "attach_claim_sentences",
     "iso_week_dates",
     "merge_event_blocks",
+    "parse_blocks",
     "partition_days",
     "run_parallel_worker1",
 ]
@@ -162,7 +163,8 @@ def _files_by_day(files: Sequence[Path]) -> dict[date, Path]:
     return by_day
 
 
-def _parse_blocks(content: str) -> list[dict[str, Any]]:
+def parse_blocks(content: str) -> list[dict[str, Any]]:
+    """Share the weekly Distill splitter so monthly cannot invent a second YAML block parser."""
     text = (content or "").strip()
     if text.startswith("```"):
         lines = text.splitlines()
@@ -182,6 +184,9 @@ def _parse_blocks(content: str) -> list[dict[str, Any]]:
             continue
         blocks.append({"frontmatter": fm, "body": body})
     return blocks
+
+
+_parse_blocks = parse_blocks
 
 
 def _render_block(block: dict[str, Any]) -> str:

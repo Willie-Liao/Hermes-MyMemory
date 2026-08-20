@@ -172,8 +172,8 @@ def _split_week_doc_frontmatter(text: str) -> tuple[dict[str, Any] | None, str]:
         return None, text or ""
     if not isinstance(data, dict):
         return None, text or ""
-    # Document FM uses week_status; Distill blocks use per-block status.
-    if "week_status" in data or "week" in data:
+    # Document FM uses week_status or month_status; Distill blocks use per-block status.
+    if "week_status" in data or "week" in data or "month_status" in data or "month" in data:
         return dict(data), rest
     return None, text or ""
 
@@ -193,36 +193,38 @@ def read_week_status(path: Path) -> str | None:
     return None
 
 
-def write_week_status(
+def write_cycle_status(
     path: Path,
     status: str,
     *,
-    week_key_str: str = "",
+    key_str: str = "",
     content: str | None = None,
+    cycle: str = "week",
 ) -> str:
-    """Write/replace document-level week_status; return full file text written."""
+    """Write week_status or month_status through one helper so the two envelopes cannot drift."""
     status_n = status.strip().casefold()
     if status_n not in WEEK_STATUS_ENUM:
-        raise ValueError(f"invalid week_status: {status!r}")
+        raise ValueError(f"invalid {cycle}_status: {status!r}")
     if content is None:
         try:
             content = path.read_text(encoding="utf-8")
         except OSError:
             content = ""
     _fm, rest = _split_week_doc_frontmatter(content)
-    key = week_key_str.strip()
-    if not key and _fm and _fm.get("week"):
-        key = str(_fm.get("week")).strip()
+    id_key = "month" if cycle == "month" else "week"
+    status_key = "month_status" if cycle == "month" else "week_status"
+    key = key_str.strip()
+    if not key and _fm and _fm.get(id_key):
+        key = str(_fm.get(id_key)).strip()
     if not key:
         key = path.stem
     header = (
         "---\n"
-        f"week: {key}\n"
-        f"week_status: {status_n}\n"
+        f"{id_key}: {key}\n"
+        f"{status_key}: {status_n}\n"
         "---\n"
     )
     body = rest.lstrip("\n") if rest else (content or "")
-    # If original had no doc FM, body is full content.
     if _fm is None:
         body = content or ""
     text = header + (body if body.startswith("#") or body.startswith("---") else body)
@@ -231,6 +233,23 @@ def write_week_status(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     return text
+
+
+def write_week_status(
+    path: Path,
+    status: str,
+    *,
+    week_key_str: str = "",
+    content: str | None = None,
+) -> str:
+    """Write/replace document-level week_status; return full file text written."""
+    return write_cycle_status(
+        path,
+        status,
+        key_str=week_key_str,
+        content=content,
+        cycle="week",
+    )
 
 
 def resolve_weekly_path(hermes_home: Path, week_key_str: str) -> Path | None:

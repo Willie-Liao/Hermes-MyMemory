@@ -68,6 +68,7 @@ interface PluginWeeksResult {
 }
 
 const WEEK_KEY_RE = /^\d{4}-W(?:0[1-9]|[1-4]\d|5[0-3])$/;
+const MONTH_KEY_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
 
 function looksLikeHermesHome(dir: string): boolean {
   return (
@@ -117,6 +118,10 @@ export function isValidWeekKey(value: unknown): value is string {
   return typeof value === 'string' && WEEK_KEY_RE.test(value);
 }
 
+export function isValidMonthKey(value: unknown): value is string {
+  return typeof value === 'string' && MONTH_KEY_RE.test(value);
+}
+
 function mapWeekStatus(status: string): WeekOverview['status'] {
   return normalizeWeekStatus(status);
 }
@@ -149,6 +154,7 @@ export function pluginOutcomeError(
 
   const statuses: Record<string, number> = {
     bad_week: 400,
+    bad_month: 400,
     no_draft: 400,
     empty_digests: 400,
     no_daily: 400, // generate empty-digest (no dailies)

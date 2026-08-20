@@ -103,6 +103,8 @@ def _worker_llm_lane(plugin: str, purpose: str) -> str | None:
         return None
     if plug == "memory-weekly":
         return "weekly"
+    if plug == "memory-monthly":
+        return "monthly"
     return None
 
 
@@ -134,6 +136,7 @@ def _plugin_worker_runtime(plugin: str, purpose: str = "") -> dict[str, str]:
             "memory-digest": "digest",
             "memory-weekly": "weekly",
             "memory-retention": "retention",
+            "memory-monthly": "monthly",
         }.get(name)
         my_memory = table.get("MyMemory")
         if nested_key and isinstance(my_memory, dict):

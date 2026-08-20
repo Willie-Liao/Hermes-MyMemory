@@ -442,6 +442,20 @@ def _weekly_clock_leftover_flag(local: datetime, need_leftover: bool) -> bool:
     return bool(need_leftover) or sunday_close
 
 
+def _maybe_run_monthly_clock(local: datetime) -> dict[str, Any]:
+    """Month rollover after weekly so a weekly exception cannot skip L4 generation."""
+    try:
+        monthly_dir = _mymemory / "monthly"
+        if str(monthly_dir) not in sys.path:
+            sys.path.insert(0, str(monthly_dir))
+        import monthly_clock as _monthly_clock
+
+        return _monthly_clock.maybe_run(local)
+    except Exception as exc:
+        _log(f"monthly clock failed: {exc}")
+        return {"outcome": "error", "error": str(exc)}
+
+
 def _maybe_run_weekly_clock(local: datetime, leftover_ran: bool = False) -> dict[str, Any]:
     """Sunday generate/close after leftover so stale cron next_run cannot empty-close Monday."""
     try:
@@ -498,6 +512,7 @@ def _run_digest_clock_once(
         payload["weekly"] = _maybe_run_weekly_clock(
             local, leftover_ran=_weekly_clock_leftover_flag(local, need_leftover)
         )
+        payload["monthly"] = _maybe_run_monthly_clock(local)
         return payload
 
     leftover_n = 0
@@ -581,6 +596,7 @@ def _run_digest_clock_once(
     payload["weekly"] = _maybe_run_weekly_clock(
         local, leftover_ran=_weekly_clock_leftover_flag(local, need_leftover)
     )
+    payload["monthly"] = _maybe_run_monthly_clock(local)
     return payload
 
 
@@ -5090,6 +5106,17 @@ def build_recall_injection_context(
         hot_text=_hot_memory_text(),
         heading="## Recall index (unlocked window)",
     )
+    try:
+        monthly_dir = _mymemory / "monthly"
+        if str(monthly_dir) not in sys.path:
+            sys.path.insert(0, str(monthly_dir))
+        from monthly_actions import month_band
+
+        band = month_band()
+    except Exception:
+        band = ""
+    if band:
+        return (manifest + "\n\n" + band) if manifest else band
     return manifest or ""
 
 

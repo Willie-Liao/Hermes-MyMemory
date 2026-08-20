@@ -33,6 +33,7 @@ import {
   callWeeklyBridge,
   emptyWeekSoftLoadPayload,
   isEmptyDigestGenerateOutcome,
+  isValidMonthKey,
   isValidWeekKey,
   mapListWeeks,
   parseWeekStatusFromContent,
@@ -955,6 +956,30 @@ async function startServer() {
       const result = bridged.result && typeof bridged.result === 'object' ? bridged.result : {};
       if (result.outcome === 'missing' || result.outcome === 'bad_week') {
         return res.status(404).json({ error: 'weekly json not found', week });
+      }
+      const outcomeError = pluginOutcomeError(bridged.result, ['ok']);
+      if (outcomeError) {
+        return res.status(outcomeError.status).json(outcomeError);
+      }
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.get('/api/monthly/months/:month/json', async (req, res) => {
+    try {
+      const { month } = req.params;
+      if (!isValidMonthKey(month)) {
+        return res.status(400).json({ error: 'A valid month code (YYYY-MM) is required.' });
+      }
+      const bridged = await callWeeklyBridge('monthly_json', { month_key: month });
+      if (!bridged.ok) {
+        return res.status(502).json({ error: bridged.error });
+      }
+      const result = bridged.result && typeof bridged.result === 'object' ? bridged.result : {};
+      if (result.outcome === 'missing' || result.outcome === 'bad_month') {
+        return res.status(404).json({ error: 'monthly json not found', month });
       }
       const outcomeError = pluginOutcomeError(bridged.result, ['ok']);
       if (outcomeError) {

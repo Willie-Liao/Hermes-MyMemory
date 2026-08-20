@@ -66,6 +66,17 @@ def _load_weekly_actions() -> Any:
         return weekly_actions
 
 
+def _load_monthly_actions() -> Any:
+    """Load sibling MyMemory monthly pack without making weekly import monthly at module load."""
+    path = _mymemory / "monthly" / "monthly_actions.py"
+    spec = importlib.util.spec_from_file_location("memory_monthly_actions_bridge", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"could not load monthly_actions from {path}")
+    monthly_actions = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(monthly_actions)
+    return monthly_actions
+
+
 def _load_retention() -> Any:
     """Load sibling MyMemory retention pack."""
     path = _mymemory / "retention" / "retention.py"
@@ -151,6 +162,12 @@ def main() -> int:
                     actions=a.get("actions") if isinstance(a.get("actions"), list) else None,
                     source_ref=a.get("source_ref") or "",
                     peer_ref=a.get("peer_ref") or "",
+                ),
+                "monthly_json": lambda **a: _load_monthly_actions().load_monthly_yaml(
+                    a.get("month_key")
+                ),
+                "generate_month": lambda **a: _load_monthly_actions().generate_month(
+                    a.get("month_key"), reason=a.get("reason") or "bridge"
                 ),
             }
             fn = dispatch.get(op)
