@@ -274,6 +274,10 @@ _FRONTMATTER_KEY_ORDER = (
     "discarded_at",
     "superseded_at",
     "sources",
+    "strength",
+    "recall_n",
+    "last_recall_at",
+    "first_seen",
 )
 
 
@@ -1415,24 +1419,23 @@ def _validate_worker_output(
 
 
 def _week_alive_block_ids() -> set[str]:
-    """Mem-ids from tier-1 + tier-2 daily staging (week-alive related window)."""
+    """Mem-ids from the last seven daily staging files (related window)."""
     alive: set[str] = set()
-    for tier in (1, 2):
-        for path in _daily_files_for_tier(tier):
+    for path in _daily_files_for_tier():
+        try:
+            text_d = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for _line_no, raw_frontmatter, _body in _frontmatter_blocks(text_d):
             try:
-                text_d = path.read_text(encoding="utf-8")
-            except OSError:
+                parsed = yaml.safe_load(raw_frontmatter)
+            except yaml.YAMLError:
                 continue
-            for _line_no, raw_frontmatter, _body in _frontmatter_blocks(text_d):
-                try:
-                    parsed = yaml.safe_load(raw_frontmatter)
-                except yaml.YAMLError:
-                    continue
-                if not isinstance(parsed, dict):
-                    continue
-                block_id = str(parsed.get("id", "")).strip()
-                if block_id:
-                    alive.add(block_id)
+            if not isinstance(parsed, dict):
+                continue
+            block_id = str(parsed.get("id", "")).strip()
+            if block_id:
+                alive.add(block_id)
     return alive
 
 
@@ -1660,17 +1663,13 @@ def join_daily_wrapup(fences: str, phrase: str) -> str:
 
 
 def clamp_wrapup_phrase(raw: str) -> str:
-    """Keep one catalog sentence so a second clause cannot land as a paragraph.
+    """Keep one catalog bullet without splitting on '.' so mimo-v2.5 stays intact.
 
-    Length follows MAX_WRAPUP_CHARS so a same-day connected sitting can fit
-    one bullet without inventing a second sentence.
+    Period-splitting cut worker_llm.py and model names; length is per bullet.
     """
     cleaned = " ".join(str(raw or "").split())
     if not cleaned:
         return ""
-    ends = list(_WRAPUP_SENTENCE_END.finditer(cleaned))
-    if len(ends) > 1:
-        cleaned = cleaned[: ends[0].end()].strip()
     if len(cleaned) > MAX_WRAPUP_CHARS:
         cleaned = cleaned[:MAX_WRAPUP_CHARS].rstrip()
     return cleaned
@@ -2092,7 +2091,7 @@ def _build_existing_ids_section() -> str:
     """List recent staging mem-ids for supersedes:/related: (tier-1 window)."""
     id_lines: list[str] = []
     seen_ids: set[str] = set()
-    for path in _daily_files_for_tier(1):
+    for path in _recent_daily_files(RECALL_DAYS):
         try:
             existing_text = path.read_text(encoding="utf-8")
         except OSError:
@@ -4539,23 +4538,18 @@ class StagingEntry:
     path: Path
 
 
-def _daily_files_for_tier(tier: int) -> list[Path]:
-    today = hermes_local_today()
+def _recent_daily_files(n: int) -> list[Path]:
+    """Newest n daily files so prompt id lists and week-alive can disagree on width."""
     all_files = iter_daily_staging_files(_staging_daily())
-    if tier == 1:
-        return all_files[-RECALL_DAYS:] if RECALL_DAYS > 0 else all_files
-    if tier == 2:
-        out: list[Path] = []
-        for path in all_files:
-            try:
-                file_date = date.fromisoformat(path.stem)
-            except ValueError:
-                continue
-            age_days = (today - file_date).days
-            if RECALL_EXTENDED_DAY_START <= age_days <= RECALL_EXTENDED_DAY_END:
-                out.append(path)
-        return out
-    return []
+    if n <= 0:
+        return all_files
+    return all_files[-n:] if len(all_files) > n else all_files
+
+
+def _daily_files_for_tier(tier: int = 1) -> list[Path]:
+    """Last seven daily files. The two-tier split is retired; ``tier`` is ignored."""
+    del tier
+    return _recent_daily_files(7)
 
 
 def _file_date_for_path(path: Path, tier: int) -> date | None:
@@ -4662,7 +4656,10 @@ _PATH_SHAPED_ANCHOR_RE = re.compile(
 
 
 def _normalize_anchor_key(name: str) -> str:
-    return re.sub(r"[\s_\-]+", "", name.casefold())
+    """Same join key as Channel 2 so the prefetch index cannot fork aliases."""
+    from recall.normalize import entity_key
+
+    return entity_key(name)
 
 
 def _index_anchor_set(parsed: dict[str, Any]) -> set[str]:
@@ -5092,32 +5089,15 @@ def _build_recall_manifest_section(
 
 
 def build_recall_injection_context(
-    tier_max: int = 1,
     **_: Any,
 ) -> str:
-    """Inject an index of the newest RECALL_DAYS daily staging files."""
-    del tier_max
-    files = _daily_files_for_tier(1)
-    if not files:
-        return ""
-    entries = _collect_staging_entries(files, 1)
-    manifest, _printed = _build_recall_manifest_section(
-        entries,
-        hot_text=_hot_memory_text(),
-        heading="## Recall index (unlocked window)",
-    )
-    try:
-        monthly_dir = _mymemory / "monthly"
-        if str(monthly_dir) not in sys.path:
-            sys.path.insert(0, str(monthly_dir))
-        from monthly_actions import month_band
+    """Inject Bands A–C (7-day wrap-ups, entity index, week ladder); Band D is empty."""
+    from recall.tools import render_bands
 
-        band = month_band()
-    except Exception:
-        band = ""
-    if band:
-        return (manifest + "\n\n" + band) if manifest else band
-    return manifest or ""
+    staging = _hermes_home() / "memories" / "staging"
+    return render_bands(
+        staging, today=hermes_local_today(), hot_text=_hot_memory_text()
+    )
 
 
 def on_pre_llm_call(
@@ -5151,7 +5131,7 @@ def on_pre_llm_call(
         _mark_bootstrap(session_id)
     _log(
         f"recall injected session={session_id or '-'} decision={decision} "
-        "window=last-3-days"
+        "window=bands-a-c"
     )
     return {"context": text}
 

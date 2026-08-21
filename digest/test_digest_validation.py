@@ -610,7 +610,7 @@ def test_rejected_excluded_from_recent_context(tmp_path, monkeypatch):
         ),
         encoding="utf-8",
     )
-    text = digest.build_recall_injection_context(tier_max=1, session_id="s-rej")
+    text = digest.build_recall_injection_context(session_id="s-rej")
     assert "mem-rejected" not in text
     assert "rejected fact" not in text
 

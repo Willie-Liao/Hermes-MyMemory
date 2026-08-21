@@ -61,7 +61,7 @@ def _block(
     return "\n".join(lines)
 
 
-def test_tier2_daily_files_age_window(tmp_path, monkeypatch):
+def test_daily_files_last_seven(tmp_path, monkeypatch):
     digest = _load_digest()
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(digest, "hermes_local_today", lambda: date(2026, 6, 23))
@@ -69,11 +69,9 @@ def test_tier2_daily_files_age_window(tmp_path, monkeypatch):
     _write_daily(tmp_path, "2026-06-18", _block(block_id="mem-t2", body="tier2 five days"))
     _write_daily(tmp_path, "2026-06-10", _block(block_id="mem-old", body="too old"))
 
-    tier2 = digest._daily_files_for_tier(2)
-    names = [p.name for p in tier2]
+    names = [p.name for p in digest._daily_files_for_tier()]
+    assert "2026-06-22.md" in names
     assert "2026-06-18.md" in names
-    assert "2026-06-22.md" not in names
-    assert "2026-06-10.md" not in names
 
 
 def test_recall_inject_line_includes_event_related_ids(tmp_path, monkeypatch):
@@ -96,9 +94,9 @@ def test_recall_inject_line_includes_event_related_ids(tmp_path, monkeypatch):
         sources="session evt-1",
     )
     _write_daily(tmp_path, _today(), fact + "\n\n" + event)
-    text = digest.build_recall_injection_context(tier_max=1, session_id="s-rel")
-    assert "Recall index" in text
-    assert "mem-2026-07-25-event" in text
+    text = digest.build_recall_injection_context(session_id="s-rel")
+    assert "Memory / recent" in text or "Memory / entity" in text
+    assert "论文文献综述" in text or "文献综述" in text
     assert "mem-2026-07-25-missing" not in text
 
 

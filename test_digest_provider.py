@@ -78,7 +78,7 @@ def test_system_prompt_block_stable_and_no_index():
     a = p.system_prompt_block()
     b = p.system_prompt_block()
     assert a == b
-    assert "Recall index" not in a
+    assert "Memory / recent days" not in a
     assert a.count("MEMORY.md") == 1
     assert "already in the system prompt" in a
 
@@ -98,7 +98,7 @@ def test_prefetch_compose_no_prewrap(tmp_path, monkeypatch):
     monkeypatch.setattr(weekly, "on_pre_llm_call", lambda **_: None)
     p = MyMemoryProvider()
     first = p.prefetch("hello there", session_id="s-pre")
-    assert "## Recall index (unlocked window)" in first
+    assert "Memory / recent days" in first or "Memory / entity index" in first
     assert "<memory-context>" not in first
     assert "USER.md" not in first
     second = p.prefetch("hello again", session_id="s-pre")

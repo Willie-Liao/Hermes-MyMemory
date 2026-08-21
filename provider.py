@@ -35,10 +35,10 @@ _SKIP_WRITE_CONTEXTS = frozenset({"cron", "subagent", "flush"})
 _BOOTSTRAPPED = False
 
 _SYSTEM_PROMPT_BLOCK = (
-    "The last-3-days digest recall index is injected on the user message when "
-    "due (once per session civil day). Fetch mem- ids from that index when you "
-    "need a card. MEMORY.md and USER.md are already in the system prompt — do "
-    "not expect those hot files in the recall index."
+    "Digest recall bands (recent wrap-ups, entity index, week ladder) inject "
+    "once per civil day. Fetch mem- ids from that index with recall_memory / "
+    "expand_memory; read daily YAML for bodies. MEMORY.md and USER.md are "
+    "already in the system prompt — do not expect those hot files in the bands."
 )
 
 
@@ -89,7 +89,7 @@ class MyMemoryProvider(MemoryProvider):
         return _SYSTEM_PROMPT_BLOCK
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Compose digest last-3-days index plus weekly Brief when those hooks would inject.
+        """Compose Bands A–C plus weekly inject when those hooks would fire.
 
         Hermes wraps the return value; pre-wrapping ``<memory-context>`` would nest fences.
         """
@@ -175,7 +175,9 @@ class MyMemoryProvider(MemoryProvider):
         retention.run_async(reason)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        """LLM tools for digest/weekly; in-chat /digest and /weekly stay on PluginManager."""
+        """LLM tools for digest/weekly plus recall_memory / expand_memory."""
+        from recall.tools import TOOL_SCHEMAS
+
         return [
             {
                 "name": "mymemory_digest",
@@ -209,11 +211,16 @@ class MyMemoryProvider(MemoryProvider):
                     },
                 },
             },
+            *TOOL_SCHEMAS,
         ]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
-        """Dispatch chat tools to the former slash handlers."""
+        """Dispatch chat tools to slash handlers or the recall ladder."""
         del kwargs
+        if tool_name in {"recall_memory", "expand_memory"}:
+            from recall.tools import handle_tool
+
+            return handle_tool(tool_name, args)
         raw = str((args or {}).get("args") or "")
         if tool_name == "mymemory_digest":
             return json.dumps(

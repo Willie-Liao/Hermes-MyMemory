@@ -115,11 +115,13 @@ def test_run_day_wrapup_writes_clamped_phrase(tmp_path, monkeypatch):
     assert text.rstrip().endswith("- The user asked for dialects listed in a table.")
 
 
-def test_clamp_wrapup_phrase_keeps_first_sentence():
+def test_clamp_wrapup_phrase_keeps_identifiers():
     digest = _digest()
     assert digest.clamp_wrapup_phrase("") == ""
-    long_two = "First thread closed. Second sentence should drop."
-    assert digest.clamp_wrapup_phrase(long_two) == "First thread closed."
+    intact = "switched to mimo-v2.5 then patched worker_llm.py."
+    assert digest.clamp_wrapup_phrase(intact) == intact
+    assert "mimo-v2.5" in digest.clamp_wrapup_phrase(intact)
+    assert "worker_llm.py" in digest.clamp_wrapup_phrase(intact)
     assert digest.MAX_WRAPUP_CHARS == 200
     kept = "x" * 200
     assert digest.clamp_wrapup_phrase(kept) == kept

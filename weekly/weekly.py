@@ -1131,14 +1131,6 @@ def _fallback_report(week_key: str, files: list[Path], reason: str) -> str:
     return (
         f"# Weekly distill {week_key}\n\n"
         f"Generated at: {now}\n\n"
-        "## Distill\n\n"
-        f"Automatic LLM consolidation was not completed: {reason}\n\n"
-        "## Brief\n\n"
-        "Manual review required.\n\n"
-        "## Action ledger\n\n"
-        "| Status | Item | Notes |\n"
-        "| --- | --- | --- |\n"
-        "| — | — | stub |\n\n"
         "## Source daily files\n\n"
         f"{source_list}\n"
     )

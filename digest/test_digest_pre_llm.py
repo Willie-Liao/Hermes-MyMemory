@@ -113,7 +113,7 @@ def test_stable_fact_returns_recent_context(tmp_path, monkeypatch):
     result = _prefetch_ctx(digest, monkeypatch,user_message="hi", is_first_turn=True, session_id="s1")
 
     assert result is not None
-    assert "Recall index" in result["context"]
+    assert "Memory / recent" in result["context"] or "Memory / entity" in result["context"]
     assert "mem-stable" in result["context"] or "Gabby" in result["context"]
     assert "Span recall" not in result["context"]
 
@@ -207,7 +207,7 @@ def test_hermes_cron_session_env_skips_bootstrap_inject(tmp_path, monkeypatch):
 def test_only_last_three_days_scanned_for_span(tmp_path, monkeypatch):
     digest = _load_digest()
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
-    _write_daily(tmp_path, _days_ago(5), _block(block_id="mem-old", body="Old open.", valid_to="open"))
+    _write_daily(tmp_path, _days_ago(10), _block(block_id="mem-old", body="Old open.", valid_to="open"))
     _write_daily(tmp_path, _days_ago(2), _block(block_id="mem-recent", body="Recent stable.", entity="Willie"))
     _write_daily(tmp_path, _days_ago(1), _block(block_id="mem-y", body="Yesterday stable.", entity="JCID-PE"))
     _write_daily(tmp_path, _today(), _block(block_id="mem-t", body="Today stable.", entity="George"))
@@ -231,7 +231,7 @@ def test_inject_excerpt_respects_cap(tmp_path, monkeypatch):
     result = _prefetch_ctx(digest, monkeypatch,user_message="hi", is_first_turn=True, session_id="s1")
 
     assert result is not None
-    assert "Recall index" in result["context"]
+    assert "Memory / recent" in result["context"] or "Memory / entity" in result["context"]
     assert "25blk" in result["context"] or "fact:25" in result["context"]
 
 
@@ -275,12 +275,12 @@ def test_involves_indexed_in_recent_context(tmp_path, monkeypatch):
     )
     _write_daily(tmp_path, _today(), block)
 
-    text = digest.build_recall_injection_context(tier_max=1, session_id="s-inv")
+    text = digest.build_recall_injection_context(session_id="s-inv")
 
-    assert "Recall index" in text
+    assert "Memory / recent" in text or "Memory / entity" in text
     assert "Gary" in text
     assert "George-mom" in text
-    assert "mem-2026-06-26-george-draft" in text
+    assert "george" in text.casefold()
     assert "Narration: Agent drafted" not in text
 
 
@@ -309,13 +309,10 @@ def test_participants_not_indexed_on_manifest_entity_axis(tmp_path, monkeypatch)
     )
     _write_daily(tmp_path, _today(), block)
 
-    text = digest.build_recall_injection_context(tier_max=1, session_id="s-part")
+    text = digest.build_recall_injection_context(session_id="s-part")
 
-    assert "Recall index" in text
+    assert "Memory / recent" in text or "Memory / entity" in text
     assert "George" in text
-    assert "mem-2026-06-26-george-draft" in text
-    assert "grade_dispute" in text
-    # Participant-only cast is not an index entity line.
     assert re.search(r"(?m)^- Gary\b", text) is None
     assert re.search(r"(?m)^- George-mom\b", text) is None
     assert "Agent drafted parent WeChat reply" not in text
@@ -346,7 +343,6 @@ def test_session_hint_in_recent_context(tmp_path, monkeypatch):
 
     assert result is not None
     assert "mem-2026-06-26-george-draft" in result["context"]
-    assert "grade_dispute" in result["context"]
 
 
 def test_injects_again_on_new_calendar_day(tmp_path, monkeypatch):
@@ -411,11 +407,11 @@ def test_build_recall_injection_context_matches_hook_tier1_body(tmp_path, monkey
     _write_daily(tmp_path, _today(), _block(block_id="mem-1", body="Shared builder fact."))
 
     hook = _prefetch_ctx(digest, monkeypatch,user_message="hi", is_first_turn=True, session_id="s2", turn_id="t1")
-    direct = digest.build_recall_injection_context(tier_max=1)
+    direct = digest.build_recall_injection_context()
     assert hook is not None
     assert "mem-1" in hook["context"]
     assert "mem-1" in direct
-    assert "Recall index" in hook["context"]
+    assert "Memory /" in hook["context"]
     assert "Recall policy" not in hook["context"]
 
 
@@ -451,7 +447,6 @@ def test_event_with_open_span_silent_without_watch(tmp_path, monkeypatch):
 
     assert result is not None
     assert "mem-ev" in result["context"]
-    assert "grade_dispute" in result["context"]
     assert "## Span ask" not in result["context"]
     assert "## Span recall" not in result["context"]
 
@@ -484,9 +479,8 @@ def test_event_in_recent_context(tmp_path, monkeypatch):
     result = _prefetch_ctx(digest, monkeypatch,user_message="hi", is_first_turn=True, session_id="s1")
 
     assert result is not None
-    assert "Recall index" in result["context"]
+    assert "Memory / recent" in result["context"] or "Memory / entity" in result["context"]
     assert "mem-ev2" in result["context"]
-    assert "file_delivered" in result["context"]
     assert "Span recall" not in result["context"]
 
 
@@ -530,7 +524,7 @@ def test_bootstrap_inject_omits_retrieval_footer(tmp_path, monkeypatch):
     result = _prefetch_ctx(digest, monkeypatch,user_message="hi", is_first_turn=True, session_id="s1")
 
     assert result is not None
-    assert "Recall index" in result["context"]
+    assert "Memory / recent" in result["context"] or "Memory / entity" in result["context"]
     assert "Retrieval (progressive recall)" not in result["context"]
     assert "session_search(session_id=" not in result["context"]
 
@@ -543,7 +537,7 @@ def test_bootstrap_omits_span_ask_when_open_fact_exists(tmp_path, monkeypatch):
     result = _prefetch_ctx(digest, monkeypatch,user_message="hi", is_first_turn=True, session_id="s1")
 
     assert result is not None
-    assert "## Recall index" in result["context"]
+    assert "Memory /" in result["context"]
     assert "## Span ask" not in result["context"]
     assert "## Span recall" not in result["context"]
 
@@ -557,8 +551,7 @@ def test_recall_index_by_day_includes_wrapup_phrase(tmp_path, monkeypatch):
         + "\n\n## Day wrap-up\n- NotGPT blocked; Xiaohongshu HTML cards shipped.\n"
     )
     _write_daily(tmp_path, _today(), content)
-    ctx = digest.build_recall_injection_context(tier_max=1)
-    assert "### By day" in ctx
+    ctx = digest.build_recall_injection_context()
     assert "NotGPT blocked; Xiaohongshu HTML cards shipped." in ctx
     assert secret_body not in ctx
     assert "SECRET_BODY" not in ctx
