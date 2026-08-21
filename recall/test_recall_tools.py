@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from recall.tools import expand_memory, recall_memory
+from recall.tools import expand_memory, handle_tool, recall_memory
 
 SEED = "mem-2026-08-12-event-9625547B667B"
 HOP1 = "mem-2026-08-09-procedure-C1DD5CAA2A26"
@@ -49,3 +49,57 @@ def test_expand_ppr_order_and_depth_clamp(staging):
     assert pos1 != -1 and pos2 != -1
     if pos_o != -1:
         assert min(pos1, pos2) < pos_o
+
+
+def test_handle_tool_recall_then_expand(staging):
+    text = handle_tool(
+        "recall_memory",
+        {"query": "semicolon digest bug"},
+        staging=staging,
+    )
+    assert "channel=" in text
+    assert SEED in text
+    assert HOP1 in text and HOP2 in text
+    assert "depth=2" in text
+    ladder_only = recall_memory("semicolon digest bug", staging=staging)
+    assert "depth=2" not in ladder_only
+
+
+def test_handle_tool_expand_rewrites_to_recall_first(staging):
+    text = handle_tool(
+        "expand_memory",
+        {"id_or_key": SEED, "depth": 0},
+        staging=staging,
+    )
+    assert SEED in text
+    assert HOP1 in text and HOP2 in text
+    assert "depth=2" in text
+
+
+def test_handle_tool_ghost_skips_expand(staging):
+    text = handle_tool(
+        "recall_memory",
+        {"query": "mem-2099-01-01-event-DEADBEEFDEAD"},
+        staging=staging,
+    )
+    assert "channel=miss" in text or "miss" in text
+    assert "depth=2" not in text
+
+
+def test_handle_tool_entity_query_expands_listed_seeds(staging):
+    text = handle_tool(
+        "recall_memory",
+        {"query": "what did we do about memory digest?"},
+        staging=staging,
+    )
+    assert SEED in text
+    assert HOP1 in text and HOP2 in text
+
+
+def test_handle_tool_mixed_cjk_english(staging):
+    text = handle_tool(
+        "recall_memory",
+        {"query": "张主任相关的记忆有哪些？ also memory digest"},
+        staging=staging,
+    )
+    assert "mem-20260729-zhang-zhurui-wechat-softening-rule" in text

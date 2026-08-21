@@ -408,8 +408,9 @@ TOOL_SCHEMAS = [
     {
         "name": "recall_memory",
         "description": (
-            "Find memory cards by id, normalized entity, or lexical match. "
-            "Returns ids and one-liners; read the daily YAML for bodies."
+            "Find memory cards by id, entity, or lexical match. The host always "
+            "runs expand_memory on the first seed id after recall (depth 2). "
+            "Do not call search_memory."
         ),
         "parameters": {
             "type": "object",
@@ -423,8 +424,8 @@ TOOL_SCHEMAS = [
     {
         "name": "expand_memory",
         "description": (
-            "Walk related/cite/overlap edges up to depth 2 and rank with "
-            "Personalized PageRank. Structure only, no narrative."
+            "Neighborhood walk. Chat/eval must not use this as the first step: "
+            "the host rewrites a lone call into recall_memory then expand."
         ),
         "parameters": {
             "type": "object",
@@ -439,14 +440,98 @@ TOOL_SCHEMAS = [
 ]
 
 
-def handle_tool(name: str, args: Mapping[str, Any] | None) -> str:
+def _first_seed_id(recall_text: str) -> str | None:
+    """Skip expand on a miss so ghost ids do not PPR an empty graph."""
+    if "channel=miss" in (recall_text or ""):
+        return None
+    found = _MEM_ID_RE.findall(recall_text or "")
+    return found[0] if found else None
+
+
+def _script_queries(query: str) -> list[str]:
+    """Split a mixed CJK+English turn so one FTS string cannot bury the other entity."""
+    q = str(query or "").strip()
+    if not q:
+        return []
+    out = [q]
+    cjk = "".join(
+        ch if ("\u4e00" <= ch <= "\u9fff" or ch.isspace() or ch in "？?，,。、") else " "
+        for ch in q
+    )
+    lat = "".join(ch if ch.isascii() else " " for ch in q)
+    for part in (re.sub(r"\s+", " ", cjk).strip(), re.sub(r"\s+", " ", lat).strip()):
+        if part and part not in out and len(part) >= 2:
+            out.append(part)
+    return out
+
+
+def _ordered_ids(text: str) -> list[str]:
+    seen: set[str] = set()
+    ids: list[str] = []
+    for mid in _MEM_ID_RE.findall(text or ""):
+        if mid in seen:
+            continue
+        seen.add(mid)
+        ids.append(mid)
+    return ids
+
+
+def _recall_then_expand(
+    query: str,
+    *,
+    k: int = 8,
+    staging: Path | None = None,
+    min_weight: float = 0.5,
+) -> str:
+    """Recall first, then expand listed seeds so hops do not depend on rank-1 or a second LLM tool.
+
+    Entity channel pins the newest member first (June plugin), so expanding only that seed
+    misses the August semicolon hops still listed further down.
+    """
+    chunks = []
+    for q in _script_queries(query):
+        chunks.append(recall_memory(q, k=k, staging=staging))
+    found = "\n\n".join(chunks)
+    q0 = str(query or "").strip()
+    asked = _MEM_ID_RE.findall(q0)
+    # Explicit id that did not resolve (ghost): keep the dump, do not PPR unrelated FTS hits.
+    if asked and q0 == asked[0] and "channel=id" not in found:
+        return found
+    if all("channel=miss" in c for c in chunks):
+        return found
+    ids = _ordered_ids(found)
+    if not ids:
+        return found
+    walked = []
+    for seed in ids[:8]:
+        blob = expand_memory(seed, depth=MAX_DEPTH, min_weight=min_weight, staging=staging)
+        if "  miss" in blob.split("\n", 1)[0]:
+            continue
+        walked.append(blob)
+    if not walked:
+        return found
+    return found.rstrip() + "\n\n" + "\n\n".join(walked)
+
+
+def handle_tool(
+    name: str,
+    args: Mapping[str, Any] | None = None,
+    *,
+    staging: Path | None = None,
+) -> str:
+    """Chat/eval door: expand_memory is never the first step.
+
+    A lone expand_memory call is rewritten to recall(id_or_key) then expand so
+    the model cannot PPR-walk before a find.
+    """
     args = args or {}
     if name == "recall_memory":
-        return recall_memory(str(args.get("query") or ""), k=int(args.get("k") or 8))
-    if name == "expand_memory":
-        return expand_memory(
-            str(args.get("id_or_key") or args.get("id") or ""),
-            depth=int(args.get("depth") or 2),
-            min_weight=float(args.get("min_weight") or 0.5),
+        return _recall_then_expand(
+            str(args.get("query") or ""),
+            k=int(args.get("k") or 8),
+            staging=staging,
         )
+    if name == "expand_memory":
+        q = str(args.get("id_or_key") or args.get("id") or args.get("query") or "")
+        return _recall_then_expand(q, staging=staging)
     raise NotImplementedError(name)
