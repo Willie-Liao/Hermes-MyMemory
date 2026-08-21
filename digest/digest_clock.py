@@ -102,15 +102,25 @@ def should_run_nightly_leftover(
     last_nightly_date: str | None,
     now: datetime,
     tz: ZoneInfo,
-) -> bool:
-    """Run leftover extract when last_nightly is missing or before local today.
+) -> str | None:
+    """Return the daily file date to flush, or None.
 
-    A missed 23:55 must still extract at 08:00; gating on civil 23:55 today
-    dropped 08-18 leftover after midnight.
+    23:55 writes today when that night is unstamped. 08:00 writes yesterday
+    only if yesterday's 23:55 never stamped — so morning cannot consume
+    tonight's leftover slot or land cards on the new civil day.
     """
     local = _as_local(now, tz)
-    today = local.date().isoformat()
-    return str(last_nightly_date or "") != today
+    today = local.date()
+    today_s = today.isoformat()
+    yesterday_s = (today - timedelta(days=1)).isoformat()
+    stamp = str(last_nightly_date or "")
+    if (local.hour, local.minute) >= NIGHTLY_TICK:
+        return None if stamp == today_s else today_s
+    if local.hour == 8:
+        if stamp in (yesterday_s, today_s):
+            return None
+        return yesterday_s
+    return None
 
 
 def parse_aware(value: Any, tz: ZoneInfo) -> datetime | None:

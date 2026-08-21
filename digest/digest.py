@@ -480,8 +480,9 @@ def _run_digest_clock_once(
 ) -> dict[str, Any]:
     """Fire leftover extract and/or gated merge, then the Sunday weekly clock.
 
-    Leftover follows last_nightly, not civil 23:55, so a missed night still
-    extracts at 08:00. Nightly/catch-up Phase 2 ignores the 25-card noon gate.
+    23:55 leftover writes today's file; 08:00 catch-up writes yesterday only
+    when that night never stamped, so morning cannot spend tonight's slot.
+    Nightly/catch-up Phase 2 ignores the 25-card noon gate.
     """
     zone = tz or digest_clock.digest_clock_tz()
     local = digest_clock._as_local(now or datetime.now(zone), zone)
@@ -514,34 +515,37 @@ def _run_digest_clock_once(
             state["next_clock_at"] = upcoming.isoformat()
             _save_state(state)
         payload["weekly"] = _maybe_run_weekly_clock(
-            local, leftover_ran=_weekly_clock_leftover_flag(local, need_leftover)
+            local, leftover_ran=_weekly_clock_leftover_flag(local, bool(need_leftover))
         )
         payload["monthly"] = _maybe_run_monthly_clock(local)
         return payload
 
     leftover_n = 0
     payload["wrapup"] = False
-    if need_leftover:
+    leftover_date = str(need_leftover) if need_leftover else None
+    if leftover_date:
         for session_key in session_keys:
             _maybe_run_digest(
                 session_key,
                 reason="nightly_leftover",
                 force=True,
                 sync=True,
+                date_str=leftover_date,
             )
             leftover_n += 1
         with _digest_lock:
             state = _load_state()
-            state["last_nightly_date"] = today
+            state["last_nightly_date"] = leftover_date
             _save_state(state)
 
-    daily_path, block_count = _today_block_count(today)
-    want_phase2 = (past_tick or first_boot_on_grid or need_leftover) and (
+    board_date = leftover_date or today
+    daily_path, block_count = _today_block_count(board_date)
+    want_phase2 = (past_tick or first_boot_on_grid or bool(leftover_date)) and (
         digest_clock.should_run_phase2_tick(
             block_count,
             last_p2,
             local,
-            ignore_block_gate=need_leftover,
+            ignore_block_gate=bool(leftover_date),
         )
     )
     if want_phase2 and in_flight:
@@ -552,7 +556,7 @@ def _run_digest_clock_once(
             state["phase2_in_flight"] = True
             _save_state(state)
         try:
-            run_manual_phase2(daily_path, date_str=today)
+            run_manual_phase2(daily_path, date_str=board_date)
             payload["phase2"] = True
             with _digest_lock:
                 state = _load_state()
@@ -598,7 +602,7 @@ def _run_digest_clock_once(
     payload["outcome"] = "ran"
     payload["block_count"] = block_count
     payload["weekly"] = _maybe_run_weekly_clock(
-        local, leftover_ran=_weekly_clock_leftover_flag(local, need_leftover)
+        local, leftover_ran=_weekly_clock_leftover_flag(local, bool(need_leftover))
     )
     payload["monthly"] = _maybe_run_monthly_clock(local)
     return payload
@@ -4341,6 +4345,7 @@ def _maybe_run_digest(
     *,
     force: bool = False,
     sync: bool = False,
+    date_str: str | None = None,
 ) -> dict[str, Any]:
     """Decide and launch a digest run for ``session_key``.
 
@@ -4350,6 +4355,8 @@ def _maybe_run_digest(
     (still requires undigested messages). ``sync`` runs the worker inline
     and returns its terminal outcome ('appended' / 'skip' / 'failed')
     instead of 'started'. Hook callers ignore the outcome dict; slash inspects it.
+    Nightly leftover passes ``date_str`` so a missed 23:55 still writes
+    yesterday's file instead of the morning's civil date.
     """
     with _digest_lock:
         state = _load_state()
@@ -4411,7 +4418,7 @@ def _maybe_run_digest(
         transcript = _format_transcript(messages)
         daily_dir = _staging_daily()
         migrate_legacy_daily_yaml(daily_dir)
-        today = hermes_local_today_str()
+        today = date_str or hermes_local_today_str()
         daily_path = daily_staging_path(_hermes_home(), today)
         batch_start_id = messages[0]["id"] if messages else None
         batch_end_id = messages[-1]["id"] if messages else None
