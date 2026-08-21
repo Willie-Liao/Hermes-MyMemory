@@ -243,11 +243,12 @@ class MonthlyState:
 
 @dataclass(frozen=True)
 class MonthlyEntity:
-    """Roster only the keys that span months; per-block id lists are weekly's 83% tax."""
+    """Roster keys that span months or two-plus ISO weeks here; per-block id lists are weekly's 83% tax."""
 
     key: str
     canonical: str
     months: tuple[str, ...] = ()
+    weeks: tuple[str, ...] = ()
     month_count: int = 0
     first_seen: str | None = None
     last_seen: str | None = None
@@ -488,6 +489,7 @@ def payload_to_dict(payload: MonthlyPayload) -> dict[str, Any]:
                 "key": row.key,
                 "canonical": row.canonical,
                 "months": list(row.months),
+                "weeks": list(row.weeks),
                 "month_count": row.month_count,
                 "first_seen": row.first_seen,
                 "last_seen": row.last_seen,

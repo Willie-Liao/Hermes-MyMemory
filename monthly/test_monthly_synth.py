@@ -72,6 +72,8 @@ def test_reduce_drops_invented_ids_and_keeps_verbatim():
     elif clause.startswith("Preference:"):
         clause = clause[len("Preference:") :].strip()
     assert kept.text == clause
+    gitnexus = next(row for row in payload.entities if row.key == "gitnexus")
+    assert gitnexus.weeks == ("2026-W32", "2026-W33")
 
 
 def test_cognition_change_requires_supersedes_pair():

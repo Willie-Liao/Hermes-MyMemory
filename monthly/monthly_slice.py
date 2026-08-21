@@ -173,6 +173,7 @@ class MechanicalFacts:
             f"open_decisions: {list(self.open_decision_ids)}",
             f"supersedes_pairs: {list(self.supersedes_pairs)}",
             f"cross_month_entities: {[row['key'] for row in self.cross_month_entities]}",
+            f"entity_weeks: { {row['key']: list(row.get('weeks') or ()) for row in self.cross_month_entities} }",
             f"decision_kind_counts: {self.decision_kind_counts}",
             f"behavior: {self.behavior}",
         ]
@@ -211,6 +212,9 @@ def inbound_degree(rows: Iterable[tuple[date, dict[str, Any], str]]) -> Counter[
 
 
 def render_clause_line(block: SliceBlock) -> str:
+    """Keep the canonical key on every map line so batches can name the same node."""
+    if block.entity_key:
+        return f"{block.entity_key} | {block.id} | {block.clause}"
     return f"{block.id} | {block.clause}"
 
 
@@ -442,6 +446,7 @@ def mechanical_facts(month_key: str) -> MechanicalFacts:
             )
 
     entity_months: dict[str, set[str]] = defaultdict(set)
+    entity_weeks: dict[str, set[str]] = defaultdict(set)
     entity_meta: dict[str, dict[str, Any]] = {}
     for day, fm, body in all_rows:
         entity = str(fm.get("entity") or "").strip()
@@ -451,6 +456,8 @@ def mechanical_facts(month_key: str) -> MechanicalFacts:
         if not key:
             continue
         entity_months[key].add(day.strftime("%Y-%m"))
+        if day.strftime("%Y-%m") == month_key:
+            entity_weeks[key].add(week_key_for(day))
         meta = entity_meta.setdefault(
             key, {"canonical": entity, "first": day.isoformat(), "last": day.isoformat(), "count": 0}
         )
@@ -462,7 +469,8 @@ def mechanical_facts(month_key: str) -> MechanicalFacts:
 
     cross = []
     for key, months in sorted(entity_months.items()):
-        if len(months) < 2:
+        weeks_this_month = tuple(sorted(entity_weeks.get(key, ())))
+        if len(months) < 2 and len(weeks_this_month) < 2:
             continue
         meta = entity_meta[key]
         cross.append(
@@ -470,6 +478,7 @@ def mechanical_facts(month_key: str) -> MechanicalFacts:
                 "key": key,
                 "canonical": meta["canonical"],
                 "months": tuple(sorted(months)),
+                "weeks": weeks_this_month,
                 "month_count": int(meta["count"]),
                 "first_seen": meta["first"],
                 "last_seen": meta["last"],

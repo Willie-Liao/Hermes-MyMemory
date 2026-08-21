@@ -383,6 +383,7 @@ def payload_from_synthesis(
             key=str(row["key"]),
             canonical=str(row["canonical"]),
             months=tuple(row["months"]),
+            weeks=tuple(row.get("weeks") or ()),
             month_count=int(row["month_count"]),
             first_seen=row.get("first_seen"),
             last_seen=row.get("last_seen"),

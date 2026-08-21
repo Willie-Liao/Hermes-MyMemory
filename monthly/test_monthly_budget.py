@@ -95,3 +95,27 @@ def test_month_band_and_expand(tmp_path, monkeypatch):
     walked = expand_from_block("mem-2026-08-12-event-9625547B667B")
     assert walked["ok"] is True
     assert "mem-2026-08-09-procedure-C1DD5CAA2A26" in walked["sibling_ids"]
+
+
+def test_lookup_by_entity_returns_weeks(tmp_path, monkeypatch):
+    from monthly_schema import MonthlyEntity
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    payload = MonthlyPayload(
+        key="2026-08",
+        summary="entity weeks",
+        entities=(
+            MonthlyEntity(
+                key="gitnexus",
+                canonical="GitNexus",
+                months=("2026-08",),
+                weeks=("2026-W32", "2026-W33"),
+                month_count=2,
+            ),
+        ),
+    )
+    write_month(payload)
+    hits = lookup_by_entity("gitnexus")
+    assert len(hits) == 1
+    assert hits[0]["month"] == "2026-08"
+    assert hits[0]["entity"].weeks == ("2026-W32", "2026-W33")

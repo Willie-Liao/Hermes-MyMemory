@@ -100,6 +100,18 @@ def test_corpus_baseline():
     assert max(entity_share) >= 0.80 or sum(entity_share) / len(entity_share) >= 0.70
 
 
+def test_august_entity_week_spans():
+    from monthly_slice import mechanical_facts
+
+    facts = mechanical_facts("2026-08")
+    by_key = {row["key"]: row for row in facts.cross_month_entities}
+    assert len(by_key) < 41
+    assert len(by_key) <= 20
+    assert by_key["gitnexus"]["weeks"] == ("2026-W32", "2026-W33")
+    assert by_key["memorydigest"]["weeks"] == ("2026-W31", "2026-W32", "2026-W33")
+    assert "entity_weeks:" in facts.rendered()
+
+
 def test_parse_blocks_alias_matches_weekly():
     sample = next(iter(iter_daily_files())).read_text(encoding="utf-8")
     assert parse_blocks is weekly_parse_blocks or parse_blocks(sample) == weekly_parse_blocks(sample)

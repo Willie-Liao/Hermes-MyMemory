@@ -268,6 +268,7 @@ def payload_from_dict(obj: dict[str, Any]) -> MonthlyPayload:
                 key=str(row.get("key") or ""),
                 canonical=str(row.get("canonical") or ""),
                 months=_tuple(row.get("months")),
+                weeks=_tuple(row.get("weeks")),
                 month_count=int(row.get("month_count") or 0),
                 first_seen=row.get("first_seen"),
                 last_seen=row.get("last_seen"),
