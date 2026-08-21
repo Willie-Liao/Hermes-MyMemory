@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from recall.tools import expand_memory, handle_tool, recall_memory
 
 SEED = "mem-2026-08-12-event-9625547B667B"
@@ -103,3 +105,23 @@ def test_handle_tool_mixed_cjk_english(staging):
         staging=staging,
     )
     assert "mem-20260729-zhang-zhurui-wechat-softening-rule" in text
+
+
+def test_handle_tool_writes_strength_fields(tmp_path, monkeypatch):
+    monkeypatch.setenv("RECALL_PERSIST_IN_TEST", "1")
+    daily = tmp_path / "daily"
+    daily.mkdir()
+    src = (
+        Path(__file__).resolve().parents[3]
+        / "memories"
+        / "staging"
+        / "daily"
+        / "2026-08-12.md"
+    )
+    (daily / "2026-08-12.md").write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    handle_tool("recall_memory", {"query": SEED}, staging=tmp_path)
+    text = (daily / "2026-08-12.md").read_text(encoding="utf-8")
+    assert "recall_n:" in text
+    assert "strength:" in text
+    assert "last_recall_at:" in text
+    assert "first_seen:" in text

@@ -86,15 +86,21 @@ def test_phase2_tick_cooldown_skips_recent_merge():
     assert should_run_phase2_tick(26, last, now) is True
 
 
-def test_nightly_leftover_when_last_nightly_behind():
-    """Catch up leftover whenever last_nightly is missing or before local today."""
+def test_nightly_leftover_2355_today_and_morning_writes_yesterday():
+    """23:55 flushes today; 08:00 catch-up is only if yesterday's 23:55 never stamped."""
     morning = datetime(2026, 8, 17, 8, 0, tzinfo=SHANGHAI)
-    assert should_run_nightly_leftover("2026-08-16", morning, SHANGHAI) is True
     noon = datetime(2026, 8, 16, 12, 0, tzinfo=SHANGHAI)
-    assert should_run_nightly_leftover(None, noon, SHANGHAI) is True
     at = datetime(2026, 8, 16, 23, 55, tzinfo=SHANGHAI)
-    assert should_run_nightly_leftover("2026-08-16", at, SHANGHAI) is False
-    assert should_run_nightly_leftover("2026-08-15", at, SHANGHAI) is True
+    # Yesterday already flushed → morning must wait for tonight 23:55.
+    assert should_run_nightly_leftover("2026-08-16", morning, SHANGHAI) is None
+    assert should_run_nightly_leftover("2026-08-16", noon, SHANGHAI) is None
+    # Missed 16th 23:55 (stamp still 15th) → 08:00 on 17th writes the 16th file.
+    assert should_run_nightly_leftover("2026-08-15", morning, SHANGHAI) == "2026-08-16"
+    assert should_run_nightly_leftover(None, morning, SHANGHAI) == "2026-08-16"
+    # 23:55 same day.
+    assert should_run_nightly_leftover("2026-08-16", at, SHANGHAI) is None
+    assert should_run_nightly_leftover("2026-08-15", at, SHANGHAI) == "2026-08-16"
+    assert should_run_nightly_leftover(None, at, SHANGHAI) == "2026-08-16"
 
 
 def test_clock_phase2_grid_hours_over_gate(tmp_path, monkeypatch):

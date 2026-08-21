@@ -8,8 +8,12 @@ so one hot entity cannot inflate a 40-member clique.
 from __future__ import annotations
 
 import math
+import os
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any, Iterable, Mapping
+
+import yaml
 
 D = 0.5
 W0 = 1.0
@@ -100,6 +104,78 @@ def apply_recall(
     imp = int(parsed.get("importance") or 3)
     parsed["strength"] = round(strength_value(recall_n=n, first_seen=first, importance=imp, now=today), 4)
     return neighbor_credits(neighbor_weights or {})
+
+
+def _fmt_field(value: Any) -> Any:
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
+def _upsert_optional_frontmatter(fm: str, parsed: Mapping[str, Any]) -> str:
+    """Keep the existing card body and fence; only add or replace ACT-R keys."""
+    keep = []
+    skip = {f"{k}:" for k in OPTIONAL_FIELDS}
+    for line in fm.splitlines():
+        if any(line.startswith(prefix) for prefix in skip):
+            continue
+        keep.append(line)
+    for key in OPTIONAL_FIELDS:
+        if key not in parsed:
+            continue
+        keep.append(f"{key}: {_fmt_field(parsed[key])}")
+    return "\n".join(keep)
+
+
+def stamp_recall_on_card(
+    block_id: str,
+    *,
+    staging: Path | None = None,
+    now: date | None = None,
+) -> dict[str, Any] | None:
+    """Persist apply_recall onto the daily YAML card so L1/L2 have fields to read.
+
+    Chat recall used to leave staging unchanged; pytest-only apply_recall never
+    flushed. Fail-open: missing card or IO error returns None and does not raise.
+    """
+    from .ids import BlockIndex, _FRONTMATTER_RE
+
+    if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("RECALL_PERSIST_IN_TEST"):
+        return None
+
+    rec = BlockIndex(staging).get(str(block_id or "").strip())
+    if rec is None or not rec.path.is_file():
+        return None
+    parsed = dict(rec.parsed)
+    apply_recall(parsed, now=now)
+    try:
+        text = rec.path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    parts: list[str] = []
+    last = 0
+    wrote = False
+    for match in _FRONTMATTER_RE.finditer(text):
+        parts.append(text[last : match.start()])
+        try:
+            fm_obj = yaml.safe_load(match.group(1))
+        except yaml.YAMLError:
+            fm_obj = None
+        if isinstance(fm_obj, dict) and str(fm_obj.get("id") or "").strip() == rec.block_id:
+            new_fm = _upsert_optional_frontmatter(match.group(1), parsed)
+            parts.append(f"---\n{new_fm}\n---\n{match.group(2)}")
+            wrote = True
+        else:
+            parts.append(match.group(0))
+        last = match.end()
+    parts.append(text[last:])
+    if not wrote:
+        return None
+    try:
+        rec.path.write_text("".join(parts), encoding="utf-8")
+    except OSError:
+        return None
+    return {key: parsed.get(key) for key in OPTIONAL_FIELDS}
 
 
 def should_drop_from_prefetch(parsed: Mapping[str, Any]) -> bool:

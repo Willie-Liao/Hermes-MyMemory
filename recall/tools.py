@@ -28,7 +28,7 @@ from .l1 import search_l1
 from .lexical import search_lexical
 from .normalize import entity_key, load_entity_index, lookup_key
 from .policy import DEFAULT_SCOPE, SCOPE_BUDGETS
-from .strength import apply_recall, should_drop_from_prefetch
+from .strength import apply_recall, should_drop_from_prefetch, stamp_recall_on_card
 
 _MEM_ID_RE = re.compile(r"\b(mem-[A-Za-z0-9\-]+|w-evt-\d{4}-\d{2}-\d{2}-\d+|w\d{1,2}-e\d+-[A-Za-z0-9\-]+)\b")
 PPR_ALPHA = 0.5
@@ -510,6 +510,7 @@ def _recall_then_expand(
         walked.append(blob)
     if not walked:
         return found
+    stamp_recall_on_card(ids[0], staging=staging)
     return found.rstrip() + "\n\n" + "\n\n".join(walked)
 
 
