@@ -98,6 +98,26 @@ hermes MyMemory digest history 7d --yes    # confirmed CLI run (synchronous)
 
 Estimate-only forms never write staging or start workers. Confirmed runs skip messages already past each session bookmark, write cards to the message's civil-day file, then consolidate that day once. Back up `memories/staging/` first: Phase-2 may rewrite affected daily files.
 
+## Same-day supersede vs past-day contradiction
+
+**Current (unchanged) same-day supersede.** On today's daily file, Phase-1 persist then `supersede` overwrites the target body, stamps `superseded_at`, and purges the helper. Clock/UI leftover Phase-2 still applies same-file supersedes the same way. Do not use this path to rewrite history.
+
+**After this change: retrieval-grounded past-day update.** When `recall_memory` / `expand_memory` returns cards, MyMemory stores at most **8 ordered mem-ids** on that session's `.digest-state.json` entry for **30 minutes**. After the chat turn, a background Phase-2 check (non-blocking) may patch an **older past-day** card without changing its body or id:
+
+```yaml
+valid_to: YYYY-MM-DD
+status: rejected
+rejected_reason: rejected by <later-mem-id>   # automatic, later card's date
+# or
+rejected_reason: rejected by user's correction  # explicit user wording
+```
+
+Automatic rejection requires same type, same entity, an older target, a later card, and both ids in that fresh retrieval set. A vague “that memory is dated/wrong” updates only when **exactly one** eligible older target exists; several older hits are a no-op. Cross-day merge/drop/supersede and body/source/id edits stay invalid.
+
+Default FTS/entity/embed recall and monthly synthesis **omit** `status: rejected`. Exact mem-id recall still shows `status`, `valid_to`, and `rejected_reason` for audit. There is **no history backfill** — only cards that appear in a fresh recall set (or an explicit user correction of that set) can be closed. A failed patch leaves the old card unchanged and keeps the retrieval set for retry.
+
+## Troubleshooting
+
 ## Generated paths (runtime, not shipped)
 
 - `memories/staging/.digest-state.json`

@@ -972,6 +972,16 @@ def test_dedup_prompt_groups_mixed_cards_into_typed_json_arrays():
     assert "inside each array" in folded or "compare inside" in folded
 
 
+def test_dedup_prompt_teaches_retrieval_rejection_reasons():
+    dedup = load_plugin_module("dedup_prompt.py", "memory_digest_dedup_reject_reason")
+    prompt = dedup.build_proposer_prompt([], [])
+    folded = prompt.casefold()
+    assert "rejected by" in folded
+    assert "user's correction" in folded
+    assert "contradiction" in folded
+    assert "complementary" in folded or "historical evolution" in folded
+
+
 def test_normalize_defaults_missing_importance_to_3():
     digest = _load_digest()
     raw = _block()

@@ -31,3 +31,24 @@ def test_sentence_query_ors_to_semicolon_seed(staging, tmp_path):
     assert hits, hits
     ids = [h["id"] for h in hits]
     assert SEED in ids
+
+
+def test_rebuild_lexical_skips_rejected_status(staging, tmp_path):
+    daily = staging / "daily"
+    rejected_id = "mem-2026-08-21-fact-dddddddddddd"
+    daily.joinpath("2026-08-21.md").write_text(
+        "---\n"
+        f"id: {rejected_id}\n"
+        "type: fact\n"
+        "entity: Canteen\n"
+        "confidence: high\n"
+        "status: rejected\n"
+        "sources: [session s-fake]\n"
+        "---\n"
+        "Canteen zxqvrejectedcanteen is open.\n",
+        encoding="utf-8",
+    )
+    db = tmp_path / "rejected.db"
+    rebuild_lexical(staging, db_path=db)
+    hits = search_lexical("zxqvrejectedcanteen", staging=staging, db_path=db)
+    assert rejected_id not in [h["id"] for h in hits]

@@ -1335,3 +1335,96 @@ def test_merge_into_nest_slots_parses_decision_predicate():
     assert slots.get("subject") == "user"
     assert slots.get("ruling") == "wants tea"
     assert "Decision:" not in slots.get("ruling", "")
+
+
+def test_external_update_must_be_metadata_only():
+    operations = _operations()
+    old = {
+        **_block("mem-2026-08-01-fact-aaaaaaaaaaaa"),
+        "entity": "Canteen",
+        "valid_from": "2026-08-01",
+        "valid_to": "open",
+    }
+    new = {
+        **_block("mem-2026-08-20-fact-bbbbbbbbbbbb"),
+        "entity": "Canteen",
+        "valid_from": "2026-08-20",
+        "valid_to": "open",
+    }
+    allowed = operations.check_type_rules(
+        [old, new],
+        [
+            {
+                "operation": "update",
+                "id": old["id"],
+                "changes": {
+                    "valid_to": "2026-08-20",
+                    "status": "rejected",
+                    "rejected_reason": "rejected by mem-2026-08-20-fact-bbbbbbbbbbbb",
+                },
+            }
+        ],
+        current_day="2026-08-20",
+        retrieval_ids=[old["id"], new["id"]],
+    )
+    assert allowed == []
+
+    body_change = operations.check_type_rules(
+        [old, new],
+        [{"operation": "update", "id": old["id"], "changes": {"body": "rewritten"}}],
+        current_day="2026-08-20",
+        retrieval_ids=[old["id"], new["id"]],
+    )
+    assert body_change
+
+    merge = operations.check_type_rules(
+        [old, new],
+        [
+            {
+                "operation": "merge",
+                "survivor_id": new["id"],
+                "absorbed_ids": [old["id"]],
+                "reason": "same canteen",
+                "fact": {"kind": "Factual", "content": "x"},
+            }
+        ],
+        current_day="2026-08-20",
+        retrieval_ids=[old["id"], new["id"]],
+    )
+    assert merge
+
+    bad_reason = operations.check_type_rules(
+        [old, new],
+        [
+            {
+                "operation": "update",
+                "id": old["id"],
+                "changes": {
+                    "valid_to": "2026-08-20",
+                    "status": "rejected",
+                    "rejected_reason": "nope",
+                },
+            }
+        ],
+        current_day="2026-08-20",
+        retrieval_ids=[old["id"], new["id"]],
+    )
+    assert bad_reason
+
+    too_early = operations.check_type_rules(
+        [old, new],
+        [
+            {
+                "operation": "update",
+                "id": old["id"],
+                "changes": {
+                    "valid_to": "2026-07-01",
+                    "status": "rejected",
+                    "rejected_reason": "rejected by user's correction",
+                },
+            }
+        ],
+        current_day="2026-08-20",
+        retrieval_ids=[old["id"], new["id"]],
+    )
+    assert too_early

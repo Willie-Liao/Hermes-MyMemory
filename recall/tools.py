@@ -43,7 +43,11 @@ def _week(rec: BlockRecord) -> str:
 
 
 def format_id_block(rec: BlockRecord) -> str:
-    """Paged-in daily YAML — Channel 1 returns the card, not a summary."""
+    """Paged-in daily YAML — Channel 1 returns the card, not a summary.
+
+    Exact-id lookup is the audit door: include status/valid_to/rejected_reason
+    so a rejected card remains inspectable after default recall hides it.
+    """
     rel = rec.parsed.get("related")
     lines = [
         f"## Memory / block  channel=id  file=daily/{rec.path.name}",
@@ -52,10 +56,14 @@ def format_id_block(rec: BlockRecord) -> str:
         f"entity: {rec.entity}",
         f"related: {rel}",
         f"valid_from: {rec.parsed.get('valid_from') or rec.day}",
+        f"valid_to: {rec.parsed.get('valid_to') or ''}",
+        f"status: {rec.parsed.get('status') or ''}",
         f"importance: {rec.parsed.get('importance', '')}",
-        "---",
-        rec.body.strip(),
     ]
+    reason = str(rec.parsed.get("rejected_reason") or "").strip()
+    if reason:
+        lines.append(f"rejected_reason: {reason}")
+    lines.extend(["---", rec.body.strip()])
     return "\n".join(lines)
 
 
@@ -68,7 +76,11 @@ def recall_memory(
     valid_from: str | None = None,
     index: BlockIndex | None = None,
 ) -> str:
-    """Channel ladder: id → entity_key → fts5 → (gated embed) → l1 last resort."""
+    """Channel ladder: id → entity_key → fts5 → (gated embed) → l1 last resort.
+
+    Default channels omit ``status: rejected`` so an outdated contradiction
+    cannot answer a normal lookup; exact mem-id still pages the card in.
+    """
     q = str(query or "").strip()
     root = staging_root(staging)
     store = index or BlockIndex(root)
@@ -104,13 +116,20 @@ def recall_memory(
         rec = store.get(str(row["id"]))
         if rec is None or rec.block_id in seen:
             continue
+        if str(rec.parsed.get("status") or "").strip() == "rejected":
+            continue
         if member_ids and rec.block_id in member_ids:
             continue
         fts_only.append(rec)
         seen.add(rec.block_id)
     if node and member_ids:
         recs = [store.get(mid) for mid in node["mem_ids"]]
-        recs = [r for r in recs if r is not None]
+        recs = [
+            r
+            for r in recs
+            if r is not None
+            and str(r.parsed.get("status") or "").strip() != "rejected"
+        ]
         recs.sort(key=lambda r: r.day or "", reverse=True)
         pinned = fts_only + recs
         lines = [f"## Memory / recall  channel=entity_key  key={key}"]
@@ -123,6 +142,8 @@ def recall_memory(
         lines = [f"## Memory / recall  channel=fts5  q={q}"]
         for row in fts:
             rec = store.get(str(row["id"]))
+            if rec is not None and str(rec.parsed.get("status") or "").strip() == "rejected":
+                continue
             snippet = one_line(rec.body, 100) if rec else ""
             lines.append(
                 f"- rank={row['rank']}  bm25={row['bm25']:.2f}  {row['id']}  {row['day']} {iso_week(str(row['day']))}"
@@ -133,7 +154,12 @@ def recall_memory(
         return "\n".join(lines)
 
     if embed_enabled(root):
-        reranked = rerank_embed(q, store.records, k=cap)
+        live = [
+            rec
+            for rec in store.records
+            if str(rec.parsed.get("status") or "").strip() != "rejected"
+        ]
+        reranked = rerank_embed(q, live, k=cap)
         if reranked:
             return str(reranked)
 
@@ -260,6 +286,12 @@ def expand_memory(
     ]
     for item in ranked[:EXPAND_K]:
         hit = store.get(item)
+        if (
+            hit is not None
+            and str(hit.parsed.get("status") or "").strip() == "rejected"
+            and item != seed_id
+        ):
+            continue
         rel = (adj.get(seed_id) or {}).get(item) or (adj.get(item) or {}).get(seed_id)
         why = "seed" if item == seed_id else ""
         if rel and not why:

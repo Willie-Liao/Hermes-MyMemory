@@ -128,8 +128,12 @@ class MyMemoryProvider(MemoryProvider):
         session_id: str = "",
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
-        """Queue digest extract after a primary chat turn — must not block the API loop."""
-        del user_content, assistant_content, messages
+        """Queue digest extract after a primary chat turn — must not block the API loop.
+
+        Passes the user text so a just-recalled dated card can be rejected after
+        the turn without waiting for the 12-message Phase-1 batch.
+        """
+        del assistant_content, messages
         if self._agent_context in _SKIP_WRITE_CONTEXTS:
             return
         sid = str(session_id or self._session_id or "")
@@ -138,6 +142,7 @@ class MyMemoryProvider(MemoryProvider):
                 "session_id": sid,
                 "session_key": sid,
                 "platform": self._platform,
+                "user_content": user_content,
             }
         )
 
@@ -215,12 +220,48 @@ class MyMemoryProvider(MemoryProvider):
         ]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
-        """Dispatch chat tools to slash handlers or the recall ladder."""
-        del kwargs
-        if tool_name in {"recall_memory", "expand_memory"}:
-            from recall.tools import handle_tool
+        """Dispatch chat tools to slash handlers or the recall ladder.
 
-            return handle_tool(tool_name, args)
+        After recall, persist at most 8 ordered mem-ids on digest state so a
+        later user correction can bind to the co-retrieved set without mutating
+        card bodies in the recall path.
+        """
+        if tool_name in {"recall_memory", "expand_memory"}:
+            from recall.tools import handle_tool, _MEM_ID_RE
+
+            text = handle_tool(tool_name, args)
+            sid = str(kwargs.get("session_id") or self._session_id or "")
+            ordered: list[str] = []
+            for match in _MEM_ID_RE.findall(text or ""):
+                mem_id = match if isinstance(match, str) else match[0]
+                if not str(mem_id).startswith("mem-"):
+                    continue
+                if mem_id in ordered:
+                    continue
+                ordered.append(mem_id)
+                if len(ordered) >= digest.RETRIEVAL_ID_CAP:
+                    break
+            if sid and ordered:
+                import time as time_mod
+
+                with digest._digest_lock:
+                    state = digest._load_state()
+                    sessions = state.setdefault("sessions", {})
+                    entry = dict(sessions.get(sid) or {})
+                    entry["session_id"] = sid
+                    entry["retrieval"] = {
+                        "ids": ordered,
+                        "query": str(
+                            (args or {}).get("query")
+                            or (args or {}).get("id_or_key")
+                            or ""
+                        ),
+                        "recorded_at": time_mod.time(),
+                        "consumed": False,
+                    }
+                    sessions[sid] = entry
+                    digest._save_state(state)
+            return text
         raw = str((args or {}).get("args") or "")
         if tool_name == "mymemory_digest":
             return json.dumps(

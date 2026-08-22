@@ -818,3 +818,79 @@ def test_exhausted_detail_aborts_transaction_without_daily_write(tmp_path, monke
     assert result == "failed"
     assert daily.read_text(encoding="utf-8") == "existing daily content\n"
     assert _read_entry(tmp_path)["digest_in_flight"] is False
+
+
+def test_retrieval_patch_failure_does_not_mark_phase2_success(tmp_path, monkeypatch):
+    digest = _load_digest()
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    daily = tmp_path / "memories" / "staging" / "daily"
+    daily.mkdir(parents=True)
+    old_id = "mem-2026-08-01-fact-aaaaaaaaaaaa"
+    new_id = "mem-2026-08-20-fact-bbbbbbbbbbbb"
+    (daily / "2026-08-01.md").write_text(
+        f"---\nid: {old_id}\ntype: fact\nentity: Canteen\nconfidence: high\n"
+        f"status: candidate\nvalid_from: 2026-08-01\nvalid_to: open\n"
+        f"sources: [session s1]\n---\nCanteen is open.\n",
+        encoding="utf-8",
+    )
+    (daily / "2026-08-20.md").write_text(
+        f"---\nid: {new_id}\ntype: fact\nentity: Canteen\nconfidence: high\n"
+        f"status: candidate\nvalid_from: 2026-08-20\nvalid_to: open\n"
+        f"sources: [session s1]\n---\nCanteen is closed.\n",
+        encoding="utf-8",
+    )
+    state_path = _state_path(tmp_path)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    import time as time_mod
+
+    state_path.write_text(
+        json.dumps(
+            {
+                "sessions": {
+                    "s-retry": {
+                        "session_id": "s-retry",
+                        "retrieval": {
+                            "ids": [old_id, new_id],
+                            "query": "Canteen",
+                            "recorded_at": time_mod.time(),
+                            "consumed": False,
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def boom(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("memory_staging.patch_daily_block_status", boom)
+    monkeypatch.setattr(digest, "_fetch_messages", lambda *a, **k: [])
+    monkeypatch.setattr(digest, "maybe_run_digest_clock", lambda **k: {"outcome": "idle"})
+
+    class ImmediateThread:
+        def __init__(self, target=None, args=(), kwargs=None, name=None, daemon=None):
+            self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
+
+        def start(self):
+            if self._target is not None:
+                self._target(*self._args, **self._kwargs)
+
+    monkeypatch.setattr(digest.threading, "Thread", ImmediateThread)
+    digest.on_agent_end(
+        {
+            "session_id": "s-retry",
+            "session_key": "s-retry",
+            "platform": "cli",
+            "user_content": "that memory is dated",
+        }
+    )
+    old = (daily / "2026-08-01.md").read_text(encoding="utf-8")
+    assert "status: candidate" in old
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    retrieval = payload["sessions"]["s-retry"]["retrieval"]
+    assert retrieval.get("consumed") is not True
+    assert retrieval.get("ids") == [old_id, new_id]

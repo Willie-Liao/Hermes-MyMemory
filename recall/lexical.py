@@ -36,10 +36,21 @@ def rebuild_lexical(
     records: list[BlockRecord] | None = None,
     db_path: Path | None = None,
 ) -> float:
-    """Rebuild the FTS5 table; returns wall-ms so the <100ms bound stays testable."""
+    """Rebuild the FTS5 table; returns wall-ms so the <100ms bound stays testable.
+
+    Skip ``status: rejected`` cards unless the caller passed an explicit record
+    list, so a closed contradiction cannot win BM25 after a daily-file patch.
+    """
     root = staging_root(staging)
     path = db_path or lexical_db_path(root)
-    rows = records if records is not None else BlockIndex(root).records
+    if records is None:
+        rows = [
+            rec
+            for rec in BlockIndex(root).records
+            if str(rec.parsed.get("status") or "").strip() != "rejected"
+        ]
+    else:
+        rows = records
     t0 = time.perf_counter()
     con = sqlite3.connect(str(path))
     try:

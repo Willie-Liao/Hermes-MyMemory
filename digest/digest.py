@@ -97,6 +97,13 @@ def _hermes_home() -> Path:
 
 
 BATCH_USER_MESSAGES = 12
+RETRIEVAL_ID_CAP = 8
+RETRIEVAL_TTL_SECONDS = 30 * 60
+USER_CORRECTION_REASON = "rejected by user's correction"
+_USER_DATED_RE = re.compile(
+    r"\b(dated|outdated|wrong|incorrect|not true)\b",
+    re.I,
+)
 # Trigger reason when the undigested window past the bookmark hits the batch floor.
 BOOKMARK_TRIGGER_REASON = "bookmark_ready"
 BATCH_TRIGGER_REASON = BOOKMARK_TRIGGER_REASON  # deprecated alias
@@ -276,6 +283,7 @@ _FRONTMATTER_KEY_ORDER = (
     "confidence",
     "importance",
     "status",
+    "rejected_reason",
     "promoted_at",
     "discarded_at",
     "superseded_at",
@@ -4304,11 +4312,21 @@ def _run_phase2_consolidate(
         return False, [f"organizer error: {exc}"]
 
 
-def run_manual_phase2(daily_path: Path, *, date_str: str) -> dict[str, Any]:
+def run_manual_phase2(
+    daily_path: Path,
+    *,
+    date_str: str,
+    retrieval_only: bool = False,
+    session_key: str = "",
+    user_content: str = "",
+) -> dict[str, Any]:
     """Clock/UI Phase-2: leftover same-file overwrite first, then LLM merge.
 
     Extract already applied most supersedes; this prepend catches pointers that
     landed without an extract-time commit. Tick gates stay in the clock caller.
+    Retrieval-grounded past-day rejection runs first so a co-retrieved
+    contradiction cannot wait on the merge tick; ``retrieval_only`` skips the
+    LLM so chat turns stay non-blocking.
     """
     payload: dict[str, Any] = {
         "outcome": "rewritten",
@@ -4316,6 +4334,170 @@ def run_manual_phase2(daily_path: Path, *, date_str: str) -> dict[str, Any]:
         "date": date_str,
         "operations": 0,
     }
+
+    def apply_retrieval_grounded_updates() -> None:
+        """Close dated past cards from this session's fresh recall set only."""
+        import memory_staging as staging_mod
+        from recall.ids import BlockIndex
+        from recall.lexical import rebuild_lexical
+        from recall.normalize import entity_key, write_entity_index
+
+        key = str(session_key or "").strip()
+        if not key:
+            return
+        with _digest_lock:
+            state = _load_state()
+            entry = (state.get("sessions") or {}).get(key) or {}
+            retrieval = dict(entry.get("retrieval") or {})
+        ids = [str(item) for item in retrieval.get("ids") or [] if str(item).strip()]
+        if not ids or retrieval.get("consumed"):
+            return
+        recorded_at = float(retrieval.get("recorded_at") or 0)
+        if recorded_at <= 0 or (time.time() - recorded_at) > RETRIEVAL_TTL_SECONDS:
+            return
+        root = _hermes_home() / "memories" / "staging"
+        store = BlockIndex(root)
+        resolved = []
+        for mem_id in ids:
+            rec = store.get(mem_id)
+            if rec is not None:
+                resolved.append(rec)
+        if not resolved:
+            return
+        max_day = max(str(rec.day or "") for rec in resolved)
+        today = date_str or hermes_local_today_str()
+        user_text = str(user_content or "")
+        user_correction = bool(_USER_DATED_RE.search(user_text))
+        patches: list[tuple[str, str, str]] = []
+        if user_correction:
+            older = [
+                rec
+                for rec in resolved
+                if str(rec.parsed.get("status") or "").strip() != "rejected"
+                and str(rec.day or "") < max_day
+            ]
+            if len(older) != 1:
+                with _digest_lock:
+                    state = _load_state()
+                    sessions = state.setdefault("sessions", {})
+                    held = dict(sessions.get(key) or {})
+                    retrieval = dict(held.get("retrieval") or {})
+                    retrieval["consumed"] = True
+                    held["retrieval"] = retrieval
+                    sessions[key] = held
+                    _save_state(state)
+                return
+            target = older[0]
+            valid_from = str(target.parsed.get("valid_from") or target.day or "")[:10]
+            valid_to = today if today >= valid_from else valid_from
+            patches.append((target.block_id, valid_to, USER_CORRECTION_REASON))
+        else:
+            groups: dict[tuple[str, str], list] = {}
+            for rec in resolved:
+                if str(rec.parsed.get("status") or "").strip() == "rejected":
+                    continue
+                group_key = (
+                    str(rec.item_type or "").strip(),
+                    entity_key(rec.entity) or str(rec.entity or "").strip().casefold(),
+                )
+                groups.setdefault(group_key, []).append(rec)
+            for _group, recs in groups.items():
+                recs = sorted(recs, key=lambda item: str(item.day or ""))
+                if len(recs) < 2:
+                    continue
+                latest = recs[-1]
+                for older_rec in recs[:-1]:
+                    if str(older_rec.day or "") >= str(latest.day or ""):
+                        continue
+                    valid_from = str(
+                        older_rec.parsed.get("valid_from") or older_rec.day or ""
+                    )[:10]
+                    valid_to = str(latest.day or today)
+                    if valid_from and valid_to < valid_from:
+                        continue
+                    patches.append(
+                        (
+                            older_rec.block_id,
+                            valid_to,
+                            f"rejected by {latest.block_id}",
+                        )
+                    )
+        if not patches:
+            with _digest_lock:
+                state = _load_state()
+                sessions = state.setdefault("sessions", {})
+                held = dict(sessions.get(key) or {})
+                retrieval = dict(held.get("retrieval") or {})
+                retrieval["consumed"] = True
+                held["retrieval"] = retrieval
+                sessions[key] = held
+                _save_state(state)
+            return
+        wrote = False
+        for block_id, valid_to, reason in patches:
+            changes = {
+                "valid_to": valid_to,
+                "status": "rejected",
+                "rejected_reason": reason,
+            }
+            target_rec = store.get(block_id)
+            existing_block = (
+                {
+                    "id": block_id,
+                    "valid_from": str(
+                        (target_rec.parsed.get("valid_from") if target_rec else "")
+                        or (target_rec.day if target_rec else "")
+                    )[:10],
+                }
+                if target_rec is not None
+                else {"id": block_id, "valid_from": "1970-01-01"}
+            )
+            errors = digest_operations.check_type_rules(
+                [existing_block],
+                [{"operation": "update", "id": block_id, "changes": changes}],
+                current_day=today,
+                retrieval_ids=ids,
+            )
+            if errors:
+                continue
+            ok = staging_mod.patch_daily_block_status(
+                _hermes_home(),
+                block_id,
+                status="rejected",
+                timestamp_field="superseded_at",
+                timestamp_value=valid_to,
+                extra_fields={
+                    "valid_to": valid_to,
+                    "rejected_reason": reason,
+                },
+            )
+            if not ok:
+                raise OSError(f"failed to patch {block_id}")
+            wrote = True
+        if wrote:
+            try:
+                rebuild_lexical(root)
+                write_entity_index(root)
+            except Exception:
+                pass
+        with _digest_lock:
+            state = _load_state()
+            sessions = state.setdefault("sessions", {})
+            held = dict(sessions.get(key) or {})
+            retrieval = dict(held.get("retrieval") or {})
+            retrieval["consumed"] = True
+            held["retrieval"] = retrieval
+            sessions[key] = held
+            _save_state(state)
+
+    try:
+        apply_retrieval_grounded_updates()
+    except Exception as exc:
+        _log(f"retrieval-grounded update fail-open: {exc}")
+        if retrieval_only:
+            return {**payload, "outcome": "failed", "errors": [str(exc)]}
+    if retrieval_only:
+        return payload
     content = daily_path.read_text(encoding="utf-8") if daily_path.exists() else ""
     existing = list(_daily_blocks(content))
     if not existing:
@@ -4690,6 +4872,8 @@ def on_agent_end(context: dict) -> None:
 
     Chat is the only observer if the daemon died without an except handler
     writing clock_alive; leftover still runs via maybe_run_digest_clock.
+    Schedules retrieval-grounded Phase-2 on a daemon thread so dated
+    co-retrieved cards can close without blocking the chat turn.
     """
     if getattr(_digest_worker_active, "active", False):
         return
@@ -4727,6 +4911,21 @@ def on_agent_end(context: dict) -> None:
     if _batch_ready(messages):
         _maybe_run_digest(session_key, reason=BOOKMARK_TRIGGER_REASON)
     maybe_run_digest_clock(sync=False)
+    user_content = str(context.get("user_content") or "")
+    today = hermes_local_today_str()
+    threading.Thread(
+        target=run_manual_phase2,
+        args=(),
+        kwargs={
+            "daily_path": daily_staging_path(_hermes_home(), today),
+            "date_str": today,
+            "retrieval_only": True,
+            "session_key": session_key,
+            "user_content": user_content,
+        },
+        name="memory-retrieval-phase2",
+        daemon=True,
+    ).start()
 
 
 def on_session_boundary(context: dict, reason: str) -> None:

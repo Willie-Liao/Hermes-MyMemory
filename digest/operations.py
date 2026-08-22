@@ -1042,14 +1042,25 @@ def _outranks(winner: Mapping[str, Any], loser: Mapping[str, Any]) -> bool:
     return str(winner.get("valid_from", "")) < str(loser.get("valid_from", ""))
 
 
+_EXTERNAL_UPDATE_KEYS = frozenset({"valid_to", "status", "rejected_reason"})
+_REJECTED_REASON_RE = re.compile(
+    r"^rejected by (mem-[A-Za-z0-9\-]+|user's correction)$"
+)
+
+
 def check_type_rules(
     existing_blocks: Iterable[Mapping[str, Any]],
     proposed: Iterable[Operation | Mapping[str, Any]],
+    *,
+    current_day: str | None = None,
+    retrieval_ids: Iterable[str] | None = None,
 ) -> list[str]:
     """Enforce the type-priority rules on proposed operations.
 
     ``build_update_operations`` enforced same-type merge inline, but a proposer
     replaces it entirely, so the rule has to live somewhere that still runs.
+    Optional ``current_day`` / ``retrieval_ids`` reject cross-day body rewrites
+    so a past contradiction can only close metadata, never merge or overwrite.
     """
     operations = []
     for raw in proposed:
@@ -1121,6 +1132,68 @@ def check_type_rules(
                 )
             if not (op.reason or "").strip():
                 errors.append(f"{label}: drop requires a non-empty reason")
+        if current_day:
+            retrieved = (
+                {str(item) for item in retrieval_ids}
+                if retrieval_ids is not None
+                else None
+            )
+            if op.operation == "update":
+                target = snapshot.get(str(op.id))
+                target_day = ""
+                if target is not None:
+                    target_day = str(target.get("valid_from") or "")[:10]
+                if target_day and target_day < current_day:
+                    changes = op.changes if isinstance(op.changes, dict) else {}
+                    extra = set(changes) - _EXTERNAL_UPDATE_KEYS
+                    if extra:
+                        errors.append(
+                            f"{label}: past-day update may only set "
+                            f"valid_to/status/rejected_reason; got {sorted(extra)}"
+                        )
+                    if str(changes.get("status") or "").strip() != "rejected":
+                        errors.append(
+                            f"{label}: past-day update must set status: rejected"
+                        )
+                    reason = str(changes.get("rejected_reason") or "").strip()
+                    if not _REJECTED_REASON_RE.fullmatch(reason):
+                        errors.append(
+                            f"{label}: rejected_reason must be "
+                            "'rejected by <mem-id>' or \"rejected by user's correction\""
+                        )
+                    valid_to = str(changes.get("valid_to") or "").strip()
+                    if valid_to and valid_to != "open" and valid_to < target_day:
+                        errors.append(
+                            f"{label}: valid_to must not precede valid_from"
+                        )
+                    if retrieved is not None and str(op.id) not in retrieved:
+                        errors.append(
+                            f"{label}: past-day update target was not in the "
+                            "fresh retrieval set"
+                        )
+            elif op.operation == "merge":
+                days = []
+                for mem_id in [op.survivor_id, *list(op.absorbed_ids or [])]:
+                    block = snapshot.get(str(mem_id))
+                    if block is not None:
+                        days.append(str(block.get("valid_from") or "")[:10])
+                if any(day and day < current_day for day in days):
+                    errors.append(
+                        f"{label}: merge must not span past-day cards"
+                    )
+            elif op.operation in {"drop", "supersede"}:
+                ids = (
+                    [op.id]
+                    if op.operation == "drop"
+                    else [op.helper_id, op.target_id]
+                )
+                for mem_id in ids:
+                    block = snapshot.get(str(mem_id))
+                    day = str((block or {}).get("valid_from") or "")[:10]
+                    if day and day < current_day:
+                        errors.append(
+                            f"{label}: {op.operation} must not target past-day cards"
+                        )
     return errors
 
 

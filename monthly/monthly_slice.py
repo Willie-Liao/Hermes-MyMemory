@@ -184,7 +184,11 @@ class MechanicalFacts:
 
 
 def load_all_blocks() -> list[tuple[date, dict[str, Any], str]]:
-    """Parse every nonempty daily file through weekly's splitter so id shapes stay identical."""
+    """Parse every nonempty daily file through weekly's splitter so id shapes stay identical.
+
+    Rejected cards are closed contradictions; leaving them in would let monthly
+    synthesis resurrect a fact Phase 2 already marked dated.
+    """
     rows: list[tuple[date, dict[str, Any], str]] = []
     for path in iter_daily_files():
         try:
@@ -198,6 +202,8 @@ def load_all_blocks() -> list[tuple[date, dict[str, Any], str]]:
         for block in parse_blocks(text):
             fm = block.get("frontmatter")
             if not isinstance(fm, dict):
+                continue
+            if str(fm.get("status") or "").strip() == "rejected":
                 continue
             rows.append((day, fm, str(block.get("body") or "")))
     return rows

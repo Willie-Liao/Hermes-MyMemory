@@ -445,12 +445,16 @@ def patch_daily_block_status(
     timestamp_field: str,
     timestamp_value: str | None = None,
     body: str | None = None,
+    extra_fields: dict[str, Any] | None = None,
 ) -> bool:
     """Patch one staging block's status across daily files. Returns True if found.
 
     When ``body`` is set, replace that block's body in the same file walk.
     When omitted (None), existing body is preserved — tidy/gate/reopen callers
-    keep identical behavior.
+    keep identical behavior. Optional ``extra_fields`` merge into frontmatter in
+    the same rewrite so contradiction metadata cannot desync from status.
+    A sibling tempfile plus ``os.replace`` keeps a failed write from truncating
+    the live daily file.
     """
     block_id = block_id.strip()
     if not block_id:
@@ -483,18 +487,28 @@ def patch_daily_block_status(
                 continue
             block_parsed["status"] = status
             block_parsed[timestamp_field] = ts
+            if extra_fields:
+                for key, value in extra_fields.items():
+                    block_parsed[key] = value
             out_body = block_body if body is None else body
             rendered_blocks.append(digest._render_digest_block(block_parsed, out_body))
             replaced = True
 
         if replaced:
-            path.write_text(
-                digest.join_daily_wrapup(
-                    "\n\n".join(rendered_blocks).rstrip() + "\n",
-                    wrap_phrase,
-                ),
-                encoding="utf-8",
+            payload = digest.join_daily_wrapup(
+                "\n\n".join(rendered_blocks).rstrip() + "\n",
+                wrap_phrase,
             )
+            tmp = path.with_name(path.name + ".tmp")
+            try:
+                tmp.write_text(payload, encoding="utf-8")
+                os.replace(tmp, path)
+            except OSError:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                return False
             return True
 
     return False

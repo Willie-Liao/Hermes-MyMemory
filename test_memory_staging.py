@@ -382,3 +382,56 @@ def test_remove_daily_block_unlinks_file_when_last_block(tmp_path):
     assert snap["before_body"] == "drop me"
     assert snap["daily_date"] == "2026-06-16"
     assert not path.exists(), "last-block delete must unlink the daily file (not leave 0-byte stub)"
+
+
+def test_patch_daily_block_status_extra_fields_preserve_body(tmp_path):
+    ms = _load_memory_staging()
+    mem_id = "mem-2026-06-16-canteen-old"
+    path = _write_daily_block(
+        tmp_path, day="2026-06-16", mem_id=mem_id, body="Canteen is open."
+    )
+
+    ok = ms.patch_daily_block_status(
+        tmp_path,
+        mem_id,
+        status="rejected",
+        timestamp_field="superseded_at",
+        timestamp_value="2026-08-20",
+        extra_fields={
+            "valid_to": "2026-08-20",
+            "rejected_reason": "rejected by mem-2026-08-20-fact-bbbbbbbbbbbb",
+        },
+    )
+
+    assert ok is True
+    text = path.read_text(encoding="utf-8")
+    assert "status: rejected" in text
+    assert "valid_to: 2026-08-20" in text
+    assert "rejected_reason: rejected by mem-2026-08-20-fact-bbbbbbbbbbbb" in text
+    assert "Canteen is open." in text
+
+
+def test_patch_daily_block_status_replace_failure_leaves_original(tmp_path, monkeypatch):
+    ms = _load_memory_staging()
+    mem_id = "mem-2026-06-16-atomic"
+    path = _write_daily_block(
+        tmp_path, day="2026-06-16", mem_id=mem_id, body="original staging body"
+    )
+    before = path.read_text(encoding="utf-8")
+
+    def boom(src, dst):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(ms.os, "replace", boom)
+    try:
+        ok = ms.patch_daily_block_status(
+            tmp_path,
+            mem_id,
+            status="rejected",
+            timestamp_field="superseded_at",
+            extra_fields={"valid_to": "2026-08-20", "rejected_reason": "rejected by user's correction"},
+        )
+    except OSError:
+        ok = False
+    assert ok is False
+    assert path.read_text(encoding="utf-8") == before

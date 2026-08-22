@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from recall.conftest import HOP1, HOP2, OVERLAP, SEED, write_fake_staging
+from recall.lexical import rebuild_lexical
 from recall.tools import expand_memory, handle_tool, recall_memory
 
 
@@ -111,3 +112,35 @@ def test_handle_tool_writes_strength_fields(tmp_path, monkeypatch):
     assert "strength:" in text
     assert "last_recall_at:" in text
     assert "first_seen:" in text
+
+
+_REJECTED_ID = "mem-2026-08-21-fact-dddddddddddd"
+
+
+def test_recall_omits_rejected_except_exact_id(tmp_path, monkeypatch):
+    write_fake_staging(tmp_path)
+    daily = tmp_path / "daily"
+    daily.joinpath("2026-08-21.md").write_text(
+        "---\n"
+        f"id: {_REJECTED_ID}\n"
+        "type: fact\n"
+        "entity: Canteen\n"
+        "confidence: high\n"
+        "status: rejected\n"
+        "valid_from: 2026-08-01\n"
+        "valid_to: 2026-08-20\n"
+        "rejected_reason: rejected by mem-2026-08-20-fact-bbbbbbbbbbbb\n"
+        "sources: [session s-fake]\n"
+        "---\n"
+        "Canteen zxqvrejectedcanteen is open.\n",
+        encoding="utf-8",
+    )
+    rebuild_lexical(tmp_path)
+    fts = recall_memory("zxqvrejectedcanteen", staging=tmp_path)
+    assert _REJECTED_ID not in fts
+    ident = recall_memory(_REJECTED_ID, staging=tmp_path)
+    assert "channel=id" in ident
+    assert "status: rejected" in ident
+    assert "valid_to: 2026-08-20" in ident
+    assert "rejected_reason: rejected by mem-2026-08-20-fact-bbbbbbbbbbbb" in ident
+    assert "Canteen zxqvrejectedcanteen is open." in ident

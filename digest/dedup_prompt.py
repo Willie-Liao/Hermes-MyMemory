@@ -90,6 +90,24 @@ Rules for the array:
   existing. Internal duplication in the file is yours to fix.
 - Read a block's type from its `type` field. Never infer it from its id.
 - Merge/drop/supersede ids must share one type. Mixed-type ops are invalid.
+
+## Past-day contradiction (retrieval-grounded update)
+
+Do not merge complementary facts or historical evolution. A later card that
+*contradicts* an older same-type/same-entity card retrieved in the same recall
+set may emit a metadata-only `update` on the older id:
+
+- `valid_to`: the later card's date
+- `status`: rejected
+- `rejected_reason`: `rejected by <later-mem-id>`
+
+If the user explicitly says a freshly recalled older card is dated/wrong and
+exactly one eligible older target exists:
+
+- `rejected_reason`: `rejected by user's correction`
+
+Never change the old body. Never merge/drop/supersede across days. Leave
+complementary or evolving facts alone.
 """
 
 FEW_SHOT_BANK = """## Worked examples

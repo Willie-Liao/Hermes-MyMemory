@@ -147,6 +147,29 @@ def test_facts_absent_from_batches():
         assert "fact" not in types
 
 
+def test_load_all_blocks_skips_rejected_status():
+    from pathlib import Path
+    import os
+
+    home = Path(os.environ["HERMES_HOME"])
+    daily = home / "memories" / "staging" / "daily"
+    rejected_id = "mem-2026-08-22-fact-eeeeeeeeeeee"
+    daily.joinpath("2026-08-22.md").write_text(
+        "---\n"
+        f"id: {rejected_id}\n"
+        "type: decision\n"
+        "entity: Canteen\n"
+        "confidence: high\n"
+        "status: rejected\n"
+        "sources: [session s-fake]\n"
+        "---\n"
+        "Decision: user wants the old canteen hours.\n",
+        encoding="utf-8",
+    )
+    ids = {str(fm.get("id")) for _day, fm, _body in load_all_blocks()}
+    assert rejected_id not in ids
+
+
 def test_batch_composition_deterministic_and_carry_under_budget():
     from monthly_schema import CARRY_CARD_TOKEN_CAP
     from monthly_slice import carry_card
