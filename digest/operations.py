@@ -880,7 +880,11 @@ def build_update_operations(
     *,
     id_factory: Callable[[], str] | None = None,
 ) -> list[Operation]:
-    """Compare validated blocks and emit operations; never writes the daily file."""
+    """Emit creates plus same-file supersede so leftover on-disk pointers still overwrite.
+
+    Clock Phase-2 loads the whole today file with new_blocks empty; without an
+    existing-board scan those pointers would never become apply operations.
+    """
     existing = [dict(block) for block in existing_blocks]
     existing_by_id = {block.get("id"): block for block in existing}
     operations: list[Operation] = []
@@ -953,6 +957,47 @@ def build_update_operations(
                         confidence="explicit",
                     )
                 )
+
+    queued_pairs = {
+        (op.helper_id, op.target_id)
+        for op in operations
+        if op.operation == "supersede"
+    }
+    for block in existing:
+        block_id = block.get("id")
+        if not _nonempty_id(block_id):
+            continue
+        if str(block.get("type", "")).strip() == "hypothesis":
+            continue
+        raw_supersedes = block.get("supersedes", [])
+        if not isinstance(raw_supersedes, list):
+            continue
+        body = block.get("body")
+        if not isinstance(body, str):
+            continue
+        helper_type = _block_type(block)
+        for target_id in raw_supersedes:
+            target = existing_by_id.get(target_id)
+            if (
+                target is None
+                or target_id == block_id
+                or (str(block_id), str(target_id)) in queued_pairs
+            ):
+                continue
+            if str(target.get("type", "")).strip() == "hypothesis":
+                continue
+            if helper_type != _block_type(target):
+                continue
+            operations.append(
+                Operation(
+                    "supersede",
+                    helper_id=str(block_id),
+                    target_id=str(target_id),
+                    correction=body,
+                    confidence="explicit",
+                )
+            )
+            queued_pairs.add((str(block_id), str(target_id)))
 
     return finalize_operations(
         existing, operations, touched=prepared, id_factory=id_factory

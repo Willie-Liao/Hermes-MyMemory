@@ -499,6 +499,146 @@ def test_pipeline_persists_phase1_without_phase2(tmp_path, monkeypatch):
     assert entry["digest_in_flight"] is False
 
 
+def test_pipeline_same_day_prior_batch_overwrite(tmp_path, monkeypatch):
+    """Extract persist then overwrite the same-file prior-batch card; no LLM merge."""
+    digest = _load_digest()
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    _write_inflight_state(tmp_path)
+    daily = _daily_path(tmp_path)
+    daily.parent.mkdir(parents=True, exist_ok=True)
+    target_id = "mem-2026-08-22-fact-PRIOR1"
+    helper_id = "mem-2026-08-22-fact-CORR01"
+    daily.write_text(
+        "\n".join(
+            [
+                "---",
+                f"id: {target_id}",
+                "type: fact",
+                "entity: Thesis",
+                "confidence: high",
+                "status: candidate",
+                "sources: [session s1]",
+                "---",
+                "Factual: chapter grade is 5.",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    helper = {
+        "id": helper_id,
+        "type": "fact",
+        "entity": "Thesis",
+        "confidence": "explicit",
+        "status": "candidate",
+        "sources": ["session s1"],
+        "supersedes": [target_id],
+        "body": "Factual: chapter grade is 6 not 5.",
+    }
+
+    def fake_phase1(*_args, **_kwargs):
+        return digest.ValidatedWorkerResult(
+            worker_type="phase1",
+            session_id="s1",
+            run_id="run-overwrite",
+            attempts=1,
+            content=digest._content_from_blocks([helper]),
+            blocks=(dict(helper),),
+        )
+
+    monkeypatch.setattr(digest, "run_phase1_digest_blocks", fake_phase1)
+    phase2_calls: list[dict] = []
+
+    def capture_phase2(**kwargs):
+        phase2_calls.append(kwargs)
+        return False, ["should not run"]
+
+    monkeypatch.setattr(digest, "_run_phase2_consolidate", capture_phase2)
+    monkeypatch.setattr(
+        digest,
+        "run_manual_phase2",
+        lambda *a, **k: {"outcome": "should not run"},
+    )
+
+    result = digest._run_digest_pipeline(
+        session_id="s1",
+        platform="wecom",
+        transcript="TRANSCRIPT",
+        session_key="s1",
+        daily_path=daily,
+        batch_end_id=30,
+        run_id="run-overwrite",
+        reason="test",
+    )
+
+    assert result == "appended"
+    assert phase2_calls == []
+    text = daily.read_text(encoding="utf-8")
+    assert "Factual: chapter grade is 6 not 5." in text
+    assert "Factual: chapter grade is 5." not in text
+    assert helper_id not in text
+    assert target_id in text
+    entry = _read_entry(tmp_path)
+    assert entry["last_digest_message_id"] == 30
+    assert entry["digest_in_flight"] is False
+
+
+def test_phase2_leftover_same_file_supersede_overwrites(tmp_path, monkeypatch):
+    """Clock leftover: on-file pointer overwrites even when the LLM emits nothing."""
+    digest = _load_digest()
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    daily = _daily_path(tmp_path)
+    daily.parent.mkdir(parents=True, exist_ok=True)
+    target_id = "mem-2026-08-22-fact-PRIOR2"
+    helper_id = "mem-2026-08-22-fact-CORR02"
+    daily.write_text(
+        "\n".join(
+            [
+                "---",
+                f"id: {target_id}",
+                "type: fact",
+                "entity: Thesis",
+                "confidence: high",
+                "status: candidate",
+                "sources: [session s1]",
+                "---",
+                "Factual: chapter grade is 5.",
+                "",
+                "---",
+                f"id: {helper_id}",
+                "type: fact",
+                "entity: Thesis",
+                "confidence: explicit",
+                "status: candidate",
+                "sources: [session s1]",
+                "supersedes:",
+                f"  - {target_id}",
+                "---",
+                "Factual: chapter grade is 6 not 5.",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def empty_proposer(*_args, **_kwargs):
+        def proposer(_existing, _new, *, errors=(), attempt=1):
+            del errors, attempt
+            return []
+
+        return proposer
+
+    monkeypatch.setattr(digest, "make_oneshot_proposer", empty_proposer)
+
+    payload = digest.run_manual_phase2(daily, date_str=hermes_local_today_str())
+    assert payload["outcome"] == "rewritten"
+    text = daily.read_text(encoding="utf-8")
+    assert "Factual: chapter grade is 6 not 5." in text
+    assert "Factual: chapter grade is 5." not in text
+    assert helper_id not in text
+    assert target_id in text
+
+
 def test_event_worker_validates_before_detail_workers_start(tmp_path, monkeypatch):
     digest = _load_digest()
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)

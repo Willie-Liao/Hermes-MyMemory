@@ -328,7 +328,7 @@ Types: fact | procedure | decision | event. Never type: entity or hypothesis (en
 - Episode-first: one outcome event per completed user request (not one per tool step). Grade/scrape snapshot → fact; multi-file deliverable arc → one event.
 - entity: required on fact and event. involves: optional on non-event only (max {MAX_INVOLVES}; omit primary; entity collection with optional role). Do NOT use involves on event — use participants instead.
 - related: optional mem-ids (max {MAX_RELATED}); associative only — event→fact/procedure/decision only. NEVER put another event id in an event's related:. related: is associative only and NEVER deletes or supersedes a block.
-- supersedes: correction only (max {MAX_SUPERSEDES}); requires confidence: explicit. User correction: MUST set confidence: explicit and supersedes: [mem-…] from EXISTING BLOCK IDS (3-day). Prefer decision or corrected fact; never guess ids.
+- supersedes: correction only (max {MAX_SUPERSEDES}); requires confidence: explicit. User correction: MUST set confidence: explicit and supersedes: [mem-…] from EXISTING BLOCK IDS (today's daily file / earlier batches on today). Prefer decision or corrected fact; never guess ids.
 - Filename ≠ entity (paths in sources:). Roster >5: collective entity + ≤5 participants + related roster fact. Unconfirmed roles are not participants.
 
 Spans: absolute ISO dates only; time-bound facts need valid_from/valid_to (open ok); events always both; never `as of` in staging.
@@ -2098,10 +2098,16 @@ def _format_existing_id_snippet(body: str, block_type: str) -> str:
 
 
 def _build_existing_ids_section() -> str:
-    """List recent staging mem-ids for supersedes:/related: (tier-1 window)."""
+    """List today's daily mem-ids so supersedes: cannot aim at yesterday's cards.
+
+    related: may still cite week-alive ids; only this catalogue is same-civil-day.
+    Missing today's file stays empty rather than falling back to yesterday.
+    """
     id_lines: list[str] = []
     seen_ids: set[str] = set()
-    for path in _recent_daily_files(RECALL_DAYS):
+    today_path = daily_staging_path(_hermes_home(), hermes_local_today_str())
+    paths = [today_path] if today_path.exists() else []
+    for path in paths:
         try:
             existing_text = path.read_text(encoding="utf-8")
         except OSError:
@@ -2129,7 +2135,7 @@ def _build_existing_ids_section() -> str:
     if not id_lines:
         return ""
     return (
-        "EXISTING BLOCK IDS (recent 3-day staging for supersedes; "
+        "EXISTING BLOCK IDS (current-day staging for supersedes; "
         "related: may cite week-alive tier-1+tier-2 ids):\n"
         "Snippets may be truncated; fill tool-call slots with full "
         "validator-compliant values.\n"
@@ -4299,7 +4305,11 @@ def _run_phase2_consolidate(
 
 
 def run_manual_phase2(daily_path: Path, *, date_str: str) -> dict[str, Any]:
-    """Oneshot Phase-2 on an existing daily file. No Phase-1, no Hermes."""
+    """Clock/UI Phase-2: leftover same-file overwrite first, then LLM merge.
+
+    Extract already applied most supersedes; this prepend catches pointers that
+    landed without an extract-time commit. Tick gates stay in the clock caller.
+    """
     payload: dict[str, Any] = {
         "outcome": "rewritten",
         "path": str(daily_path),
@@ -4311,8 +4321,37 @@ def run_manual_phase2(daily_path: Path, *, date_str: str) -> dict[str, Any]:
     if not existing:
         return payload
     session_id = "weekly-ui-reorganise"
+    leftover_run_id = uuid.uuid4().hex[:12]
     run_id = uuid.uuid4().hex[:12]
     try:
+        leftover = [
+            op
+            for op in digest_operations.build_update_operations(existing, [])
+            if op.operation == "supersede"
+        ]
+        if leftover:
+            ok, errors = _commit_candidate_once(
+                daily_path,
+                [],
+                leftover,
+                session_id=session_id,
+                run_id=leftover_run_id,
+                base_content=None,
+            )
+            if not ok:
+                _log(
+                    f"digest leftover supersede fail-open session={session_id} "
+                    f"run={leftover_run_id} errors={errors}"
+                )
+            else:
+                content = (
+                    daily_path.read_text(encoding="utf-8")
+                    if daily_path.exists()
+                    else ""
+                )
+                existing = list(_daily_blocks(content))
+                if not existing:
+                    return payload
         proposer = make_oneshot_proposer(session_id=session_id, run_id=run_id)
         ok, errors = _run_phase2_consolidate(
             daily_path=daily_path,
@@ -4345,10 +4384,11 @@ def _run_digest_pipeline(
     assistant_count: int = 0,
     batch_start_id: int | None = None,
 ) -> str:
-    """Phase-1 extract → persist daily → bookmark. Merge is a separate clock.
+    """Phase-1 extract → persist → same-day supersede commit → bookmark.
 
-    Returns ``appended``, ``skip``, or ``failed``. Phase-2 no longer runs here
-    so a batch of twelve user messages cannot spend a merge budget on every extract.
+    Merge stays on the 08/12/16/20 clock. Apply overwrite here so a later
+    batch in the same civil day does not wait for that tick. Fail-open keeps
+    the helper card and still bookmarks so extract cannot stall.
     """
     try:
         phase1 = run_phase1_digest_blocks(
@@ -4383,6 +4423,14 @@ def _run_digest_pipeline(
         return "skip"
 
     try:
+        before_content = (
+            daily_path.read_text(encoding="utf-8") if daily_path.exists() else ""
+        )
+        prior_count = len(_daily_blocks(before_content))
+    except OSError:
+        prior_count = 0
+
+    try:
         _persist_phase1_candidates(daily_path, new_blocks)
     except Exception as exc:
         _finalize_digest_failure(
@@ -4390,10 +4438,40 @@ def _run_digest_pipeline(
         )
         return "failed"
 
+    try:
+        after_content = (
+            daily_path.read_text(encoding="utf-8") if daily_path.exists() else ""
+        )
+        on_file = list(_daily_blocks(after_content))
+        supersede_ops = [
+            op
+            for op in digest_operations.build_update_operations(on_file, [])
+            if op.operation == "supersede"
+        ]
+        if supersede_ops:
+            ok, errors = _commit_candidate_once(
+                daily_path,
+                [],
+                supersede_ops,
+                session_id=session_id,
+                run_id=run_id,
+                base_content=None,
+            )
+            if not ok:
+                _log(
+                    f"digest supersede fail-open session={session_id} "
+                    f"run={run_id} errors={errors}"
+                )
+    except Exception as exc:
+        _log(
+            f"digest supersede fail-open session={session_id} "
+            f"run={run_id} error={exc}"
+        )
+
     _finalize_digest_success(session_key, batch_end_id, session_id=session_id)
     _log(
         f"digest pipeline appended session={session_id} "
-        f"run={run_id} reason={reason}"
+        f"run={run_id} reason={reason} prior_cards={prior_count}"
     )
     return "appended"
 

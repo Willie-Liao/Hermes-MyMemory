@@ -340,6 +340,35 @@ def test_operator_emits_explicit_correction_supersede():
     assert proposed[1].helper_id == proposed[0].block["id"]
 
 
+def test_existing_board_supersede_emits_when_new_blocks_empty():
+    """Same-day leftover: helper already on the file still emits overwrite."""
+    operations = _operations()
+    target = _block("mem-target", "Incorrect note.")
+    helper = {
+        **_block("mem-helper", "Correct note."),
+        "supersedes": ["mem-target"],
+        "confidence": "explicit",
+    }
+    proposed = operations.build_update_operations([target, helper], [])
+    supersedes = [op for op in proposed if op.operation == "supersede"]
+    assert len(supersedes) == 1
+    assert supersedes[0].helper_id == "mem-helper"
+    assert supersedes[0].target_id == "mem-target"
+    assert supersedes[0].correction == "Correct note."
+
+
+def test_supersede_skips_target_not_on_board():
+    """Cross-day / missing ids stay pointers; apply cannot see another file."""
+    operations = _operations()
+    helper = {
+        **_block("mem-helper", "Correct note."),
+        "supersedes": ["mem-2026-08-21-fact-OTHER"],
+        "confidence": "explicit",
+    }
+    proposed = operations.build_update_operations([helper], [])
+    assert [op.operation for op in proposed if op.operation == "supersede"] == []
+
+
 def test_prepare_rewrites_custom_proposer_create_ids_and_references(tmp_path):
     operations = _operations()
 

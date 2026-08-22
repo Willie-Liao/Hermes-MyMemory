@@ -551,7 +551,7 @@ def test_prompt_includes_existing_block_ids(tmp_path, monkeypatch):
         digest.BOOKMARK_TRIGGER_REASON,
     )
 
-    assert "EXISTING BLOCK IDS (recent 3-day staging" in prompt
+    assert "EXISTING BLOCK IDS (current-day staging" in prompt
     assert "supersedes:" in prompt
     assert "mem-2026-06-30-prior-fact" in prompt
     assert "entity: Elsa" in prompt
@@ -588,7 +588,7 @@ def _write_daily_block(
 
 
 def test_prompt_existing_ids_include_yesterday_from_tier1(tmp_path, monkeypatch):
-    """Correction window: yesterday's id must appear when it is in the tier-1 span."""
+    """Same-day catalogue: yesterday's id must not appear even if the file exists."""
     digest = _load_digest()
     fixed = date(2026, 7, 26)
     yesterday = (fixed - timedelta(days=1)).isoformat()
@@ -619,14 +619,14 @@ def test_prompt_existing_ids_include_yesterday_from_tier1(tmp_path, monkeypatch)
         digest.BOOKMARK_TRIGGER_REASON,
     )
 
-    assert "EXISTING BLOCK IDS (recent 3-day staging" in prompt
-    assert "mem-2026-07-25-merge-result" in prompt
-    assert "type: fact | mem-2026-07-25-merge-result" in prompt
+    assert "EXISTING BLOCK IDS (current-day staging" in prompt
+    assert "mem-2026-07-25-merge-result" not in prompt
+    assert f"file: {yesterday}.md" not in prompt
     assert "Snippets may be truncated" in prompt
-    assert f"file: {yesterday}.md" in prompt
     assert "mem-2026-07-26-today-note" in prompt
     assert f"file: {today}.md" in prompt
     assert "EXISTING BLOCK IDS TODAY" not in prompt
+    assert "recent 3-day staging" not in prompt
 
 
 def test_prompt_related_allows_week_alive_cross_day_ids(tmp_path, monkeypatch):
@@ -661,23 +661,23 @@ def test_prompt_related_allows_week_alive_cross_day_ids(tmp_path, monkeypatch):
         digest.BOOKMARK_TRIGGER_REASON,
     )
 
-    # Section names yesterday for supersedes, but explicitly keeps related same-file.
-    assert "mem-2026-07-25-other-day" in prompt
+    # Yesterday is out of the supersedes catalogue; related may still be week-alive.
+    assert "mem-2026-07-25-other-day" not in prompt
     assert "related: stays same-file" not in prompt
     assert "week-alive" in prompt
     assert "supersedes" in prompt
+    assert "mem-2026-07-26-local" in prompt
 
 
 def test_prompt_existing_ids_exclude_files_outside_tier1(tmp_path, monkeypatch):
-    """Negative: tier-1 is last RECALL_DAYS files — older staging ids stay out of the window."""
+    """Negative: only today's daily file is in the supersedes catalogue."""
     digest = _load_digest()
     fixed = date(2026, 7, 26)
     today = fixed.isoformat()
     outside = (fixed - timedelta(days=4)).isoformat()  # 2026-07-22
-    days_in_window = [
+    other_days = [
         (fixed - timedelta(days=2)).isoformat(),  # 2026-07-24
         (fixed - timedelta(days=1)).isoformat(),  # 2026-07-25
-        today,
     ]
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(digest, "hermes_local_today", lambda: fixed)
@@ -688,16 +688,23 @@ def test_prompt_existing_ids_exclude_files_outside_tier1(tmp_path, monkeypatch):
         outside,
         block_id="mem-2026-07-22-too-old",
         entity="Old",
-        body="Outside the 3-day correction window.",
+        body="Outside the current-day correction window.",
     )
-    for day in days_in_window:
+    for day in other_days:
         _write_daily_block(
             tmp_path,
             day,
             block_id=f"mem-{day}-in-window",
             entity="Thesis",
-            body=f"In-window note for {day}.",
+            body=f"Prior-day note for {day}.",
         )
+    _write_daily_block(
+        tmp_path,
+        today,
+        block_id=f"mem-{today}-in-window",
+        entity="Thesis",
+        body=f"In-window note for {today}.",
+    )
 
     prompt = digest._build_prompt(
         "s1",
@@ -708,9 +715,11 @@ def test_prompt_existing_ids_exclude_files_outside_tier1(tmp_path, monkeypatch):
 
     assert "mem-2026-07-22-too-old" not in prompt
     assert f"file: {outside}.md" not in prompt
-    for day in days_in_window:
-        assert f"mem-{day}-in-window" in prompt
-        assert f"file: {day}.md" in prompt
+    for day in other_days:
+        assert f"mem-{day}-in-window" not in prompt
+        assert f"file: {day}.md" not in prompt
+    assert f"mem-{today}-in-window" in prompt
+    assert f"file: {today}.md" in prompt
 
 
 def _inflight_state(home: Path, *, session_id: str = "s1") -> None:
