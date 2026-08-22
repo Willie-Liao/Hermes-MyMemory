@@ -8,6 +8,9 @@ Subcommands (single flat ``/digest`` command, parsed from ``raw_args``):
     /digest bookmark set <id>    set bookmark to an absolute message id
     /digest bookmark rewind <n>  move bookmark back n message ids
     /digest bookmark reset --yes clear bookmark (re-digest whole session)
+    /digest history              estimate 1d / 7d / 30d / all (read-only)
+    /digest history <preset>     print one estimate; add --yes to run
+    /digest history status|resume --yes|stop --yes
 
 Every handler returns plain text and never raises.
 """
@@ -57,8 +60,12 @@ except ImportError:  # pragma: no cover - direct pytest collection path
     digest_run = _load("digest_run")
 
 
-def handle_digest(raw_args: str) -> str:
-    """Entry point registered as the ``/digest`` slash command handler."""
+def handle_digest(raw_args: str, *, history_sync: bool = False) -> str:
+    """Entry point registered as the ``/digest`` slash command handler.
+
+    ``history_sync`` is True for the CLI process so a confirmed backfill cannot
+    exit when the parent command returns; chat keeps the run in-process.
+    """
     try:
         tokens = shlex.split(raw_args or "")
     except ValueError:
@@ -70,6 +77,8 @@ def handle_digest(raw_args: str) -> str:
         return _status(raw_args)
     if sub == "bookmark":
         return _bookmark(tokens[1:], raw_args)
+    if sub == "history":
+        return _history(tokens[1:], history_sync=history_sync)
     if sub in ("help", "?"):
         return _help()
     if sub and not sub.startswith("-"):
@@ -178,6 +187,50 @@ def _bookmark_result(session_key: str, result: dict) -> str:
     )
 
 
+def _history(args: list[str], *, history_sync: bool) -> str:
+    yes = "--yes" in args
+    tokens = [t for t in args if t != "--yes"]
+    action = tokens[0].lower() if tokens else ""
+    if action in ("", "matrix"):
+        payload = digest_run.estimate_history()
+        return digest_run.format_history_matrix(payload)
+    if action == "status":
+        info = digest_run.get_history_status()
+        if not info:
+            return "/digest history: no backfill recorded."
+        return (
+            f"/digest history status: {info.get('status') or 'unknown'} "
+            f"preset={info.get('preset')} "
+            f"batches={len(info.get('completed_batches') or [])} "
+            f"days={len(info.get('completed_days') or [])}"
+        )
+    if action == "stop":
+        result = digest_run.stop_history(yes=yes)
+        if result.get("outcome") == "needs_confirm":
+            return "Refusing to stop without confirmation. Run: /digest history stop --yes"
+        return f"/digest history stop: {result.get('outcome')}"
+    if action == "resume":
+        result = digest_run.resume_history(yes=yes, sync=history_sync)
+        if result.get("outcome") == "needs_confirm":
+            return "Refusing to resume without confirmation. Run: /digest history resume --yes"
+        if result.get("outcome") == "started":
+            return "/digest history resume started in the background. Check with /digest history status"
+        return f"/digest history resume: {result.get('outcome')}"
+    preset = action
+    plan = digest_run.plan_history(preset)
+    if not yes:
+        return digest_run.format_history_plan(plan)
+    result = digest_run.request_history_run(preset, yes=True, sync=history_sync)
+    if result.get("outcome") == "started":
+        return (
+            f"/digest history {preset} started in the background. "
+            "Check with /digest history status"
+        )
+    if result.get("outcome") == "needs_confirm":
+        return digest_run.format_history_plan(result)
+    return f"/digest history {preset}: {result.get('outcome')}"
+
+
 def _help() -> str:
     return (
         "/digest commands:\n"
@@ -186,7 +239,12 @@ def _help() -> str:
         "  /digest bookmark show        current bookmark id\n"
         "  /digest bookmark set <id>    set bookmark to a message id\n"
         "  /digest bookmark rewind <n>  move bookmark back n ids\n"
-        "  /digest bookmark reset --yes clear bookmark (re-digest all)"
+        "  /digest bookmark reset --yes clear bookmark (re-digest all)\n"
+        "  /digest history              estimate 1d / 7d / 30d / all\n"
+        "  /digest history <preset>     one estimate; add --yes to run\n"
+        "  /digest history status       backfill progress\n"
+        "  /digest history resume --yes continue an interrupted run\n"
+        "  /digest history stop --yes   halt between batches"
     )
 
 

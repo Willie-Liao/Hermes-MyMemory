@@ -114,3 +114,73 @@ def test_unknown_subcommand(monkeypatch):
     _stub_session(slash, monkeypatch)
     out = slash.handle_digest("bogus")
     assert "Unknown /digest subcommand" in out
+
+
+def test_history_matrix_and_confirm_gate(monkeypatch):
+    slash = _load_slash()
+    _stub_session(slash, monkeypatch)
+    seen = {"run": 0}
+
+    monkeypatch.setattr(
+        slash.digest_run,
+        "estimate_history",
+        lambda: {
+            "outcome": "ok",
+            "plans": [
+                {
+                    "outcome": "ok",
+                    "preset": "1d",
+                    "message_count": 2,
+                    "session_count": 1,
+                    "batch_count": 1,
+                    "day_count": 1,
+                    "cutoff_iso": "2026-08-20T12:00:00+00:00",
+                    "digest_tokens": {"low": 1, "typical": 2, "high": 3},
+                    "consolidate_tokens": {"low": 4, "typical": 5, "high": 6},
+                    "total_elapsed_ms": {"low": 1000, "typical": 2000, "high": 3000},
+                    "calibration": {"disclaimer": "bands", "time_confidence": "low"},
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        slash.digest_run,
+        "plan_history",
+        lambda preset, **k: {
+            "outcome": "ok",
+            "preset": preset,
+            "cutoff_iso": "x",
+            "message_count": 2,
+            "session_count": 1,
+            "batch_count": 1,
+            "day_count": 1,
+            "digest_tokens": {"low": 1, "typical": 2, "high": 3},
+            "consolidate_tokens": {"low": 4, "typical": 5, "high": 6},
+            "total_elapsed_ms": {"low": 1000, "typical": 2000, "high": 3000},
+            "calibration": {"disclaimer": "bands", "time_confidence": "low"},
+        },
+    )
+
+    def fake_run(*_a, **kw):
+        seen["run"] += 1
+        return {"outcome": "started"}
+
+    monkeypatch.setattr(slash.digest_run, "request_history_run", fake_run)
+    matrix = slash.handle_digest("history")
+    assert "1d" in matrix
+    assert seen["run"] == 0
+    preview = slash.handle_digest("history 7d")
+    assert "--yes" in preview or "Confirm" in preview
+    assert seen["run"] == 0
+    bg = slash.handle_digest("history 7d --yes")
+    assert seen["run"] == 1
+    assert "background" in bg
+    cli = slash.handle_digest("history 7d --yes", history_sync=True)
+    assert seen["run"] == 2
+
+
+def test_history_help_lists_presets(monkeypatch):
+    slash = _load_slash()
+    out = slash.handle_digest("help")
+    assert "history" in out
+    assert "1d" in out

@@ -26,9 +26,9 @@ def register(ctx) -> None:
             "digest",
             digest_slash.handle_digest,
             description=(
-                "Force a digest run or manage bookmark / resummarise / recall / show"
+                "Force a digest run, manage bookmark, or estimate/run history backfill"
             ),
-            args_hint="[status|bookmark|help]",
+            args_hint="[status|bookmark|history|help]",
         )
         ctx.register_command(
             "weekly",

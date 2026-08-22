@@ -44,9 +44,9 @@ def sample_phase1_tool_args() -> dict:
             },
             {
                 "type": "fact",
-                "entity": "Gabby",
+                "entity": "Casey",
                 "kind": "Factual",
-                "content": "Gabby chose home-packed lunch.",
+                "content": "Casey chose home-packed lunch.",
                 "confidence": "high",
                 "importance": 3,
                 "related": ["tmp-e1"],

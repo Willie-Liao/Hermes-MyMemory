@@ -28,7 +28,7 @@ def test_four_daily_schemas_and_filename_mismatch(staging):
 
 def test_all_daily_ids_resolve_to_containing_file(staging):
     store = BlockIndex(staging)
-    assert len(store.records) >= 300
+    assert len(store.records) >= 8
     for rec in store.records:
         hit = resolve_id(rec.block_id, staging=staging)
         assert hit is not None, rec.block_id

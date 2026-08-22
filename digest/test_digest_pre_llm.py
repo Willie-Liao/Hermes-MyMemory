@@ -45,7 +45,7 @@ def _prefetch_ctx(digest, monkeypatch, **kwargs):
     return {"context": text}
 
 
-def _block(*, block_id: str, body: str, valid_to: str | None = None, entity: str = "Gabby") -> str:
+def _block(*, block_id: str, body: str, valid_to: str | None = None, entity: str = "Casey") -> str:
     lines = ["---", f"id: {block_id}", "type: fact", f"entity: {entity}"]
     if valid_to is not None:
         lines += ["valid_from: 2026-06-14", f"valid_to: {valid_to}"]
@@ -75,13 +75,13 @@ def test_session_with_open_fact_silent_span_without_watch(tmp_path, monkeypatch)
     """Open candidates alone do not inject a span ask until a watch is seeded (Task 3)."""
     digest = _load_digest()
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
-    _write_daily(tmp_path, _today(), _block(block_id="mem-1", body="Gabby canteen open.", valid_to="open"))
+    _write_daily(tmp_path, _today(), _block(block_id="mem-1", body="Casey canteen open.", valid_to="open"))
 
     result = _prefetch_ctx(digest, monkeypatch,user_message="hi", is_first_turn=True, session_id="s1")
 
     assert result is not None
     assert "context" in result
-    assert "Gabby" in result["context"]
+    assert "Casey" in result["context"]
     assert "## Span ask" not in result["context"]
     assert "## Span recall" not in result["context"]
 
@@ -114,7 +114,7 @@ def test_stable_fact_returns_recent_context(tmp_path, monkeypatch):
 
     assert result is not None
     assert "Memory / recent" in result["context"] or "Memory / entity" in result["context"]
-    assert "mem-stable" in result["context"] or "Gabby" in result["context"]
+    assert "mem-stable" in result["context"] or "Casey" in result["context"]
     assert "Span recall" not in result["context"]
 
 
@@ -129,13 +129,13 @@ def test_future_valid_to_omitted_from_span_recall(tmp_path, monkeypatch):
     assert result is not None
     assert "Span recall" not in result["context"]
     assert "mem-future" in result["context"]
-    assert "Gabby" in result["context"]
+    assert "Casey" in result["context"]
 
 
 def test_second_message_same_session_returns_none(tmp_path, monkeypatch):
     digest = _load_digest()
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
-    _write_daily(tmp_path, _today(), _block(block_id="mem-1", body="Gabby canteen open.", valid_to="open"))
+    _write_daily(tmp_path, _today(), _block(block_id="mem-1", body="Casey canteen open.", valid_to="open"))
 
     first = _prefetch_ctx(digest, monkeypatch,user_message="hi", is_first_turn=True, session_id="s1")
     assert first is not None
@@ -208,15 +208,15 @@ def test_only_last_three_days_scanned_for_span(tmp_path, monkeypatch):
     digest = _load_digest()
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
     _write_daily(tmp_path, _days_ago(10), _block(block_id="mem-old", body="Old open.", valid_to="open"))
-    _write_daily(tmp_path, _days_ago(2), _block(block_id="mem-recent", body="Recent stable.", entity="Willie"))
-    _write_daily(tmp_path, _days_ago(1), _block(block_id="mem-y", body="Yesterday stable.", entity="JCID-PE"))
-    _write_daily(tmp_path, _today(), _block(block_id="mem-t", body="Today stable.", entity="George"))
+    _write_daily(tmp_path, _days_ago(2), _block(block_id="mem-recent", body="Recent stable.", entity="Alex"))
+    _write_daily(tmp_path, _days_ago(1), _block(block_id="mem-y", body="Yesterday stable.", entity="Team-PE"))
+    _write_daily(tmp_path, _today(), _block(block_id="mem-t", body="Today stable.", entity="Riley"))
 
     result = _prefetch_ctx(digest, monkeypatch,user_message="hi", is_first_turn=True, session_id="s1")
 
     assert result is not None
     assert "mem-old" not in result["context"]
-    assert "Willie" in result["context"] or "mem-recent" in result["context"]
+    assert "Alex" in result["context"] or "mem-recent" in result["context"]
 
 
 def test_inject_excerpt_respects_cap(tmp_path, monkeypatch):
@@ -240,20 +240,20 @@ def test_skips_entity_already_in_hot_memory(tmp_path, monkeypatch):
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
     mem_dir = tmp_path / "memories"
     mem_dir.mkdir(parents=True, exist_ok=True)
-    (mem_dir / "MEMORY.md").write_text("George subject panel and grades.\n", encoding="utf-8")
-    _write_daily(tmp_path, _today(), _block(block_id="mem-g", body="George needs attention.", entity="George"))
+    (mem_dir / "MEMORY.md").write_text("Riley subject panel and grades.\n", encoding="utf-8")
+    _write_daily(tmp_path, _today(), _block(block_id="mem-g", body="Riley needs attention.", entity="Riley"))
     _write_daily(
         tmp_path,
         _days_ago(1),
-        _block(block_id="mem-w", body="Willie career pivot.", entity="Willie"),
+        _block(block_id="mem-w", body="Alex career pivot.", entity="Alex"),
     )
 
     result = _prefetch_ctx(digest, monkeypatch,user_message="hi", is_first_turn=True, session_id="s1")
 
     assert result is not None
-    assert "George" in result["context"]
+    assert "Riley" in result["context"]
     assert "also in hot memory" in result["context"]
-    assert "Willie" in result["context"]
+    assert "Alex" in result["context"]
 
 
 def test_involves_indexed_in_recent_context(tmp_path, monkeypatch):
@@ -262,10 +262,10 @@ def test_involves_indexed_in_recent_context(tmp_path, monkeypatch):
     block = "\n".join(
         [
             "---",
-            "id: mem-2026-06-26-george-draft",
+            "id: mem-2026-06-26-riley-draft",
             "type: fact",
-            "entity: George",
-            "involves: [Gary, George-mom]",
+            "entity: Riley",
+            "involves: [Morgan, Riley-mom]",
             "confidence: high",
             "status: candidate",
             "sources: [session 20260623_161751_3d4ad0]",
@@ -278,9 +278,9 @@ def test_involves_indexed_in_recent_context(tmp_path, monkeypatch):
     text = digest.build_recall_injection_context(session_id="s-inv")
 
     assert "Memory / recent" in text or "Memory / entity" in text
-    assert "Gary" in text
-    assert "George-mom" in text
-    assert "george" in text.casefold()
+    assert "Morgan" in text
+    assert "Riley-mom" in text
+    assert "riley" in text.casefold()
     assert "Narration: Agent drafted" not in text
 
 
@@ -291,13 +291,13 @@ def test_participants_not_indexed_on_manifest_entity_axis(tmp_path, monkeypatch)
     block = "\n".join(
         [
             "---",
-            "id: mem-2026-06-26-george-draft",
+            "id: mem-2026-06-26-riley-draft",
             "type: event",
-            "entity: George",
+            "entity: Riley",
             "predicate: grade_dispute",
             "participants:",
-            "  - {entity: Gary}",
-            "  - {entity: George-mom, role: escalator}",
+            "  - {entity: Morgan}",
+            "  - {entity: Riley-mom, role: escalator}",
             "valid_from: 2026-06-24",
             "valid_to: open",
             "confidence: high",
@@ -312,9 +312,9 @@ def test_participants_not_indexed_on_manifest_entity_axis(tmp_path, monkeypatch)
     text = digest.build_recall_injection_context(session_id="s-part")
 
     assert "Memory / recent" in text or "Memory / entity" in text
-    assert "George" in text
-    assert re.search(r"(?m)^- Gary\b", text) is None
-    assert re.search(r"(?m)^- George-mom\b", text) is None
+    assert "Riley" in text
+    assert re.search(r"(?m)^- Morgan\b", text) is None
+    assert re.search(r"(?m)^- Riley-mom\b", text) is None
     assert "Agent drafted parent WeChat reply" not in text
 
 
@@ -324,9 +324,9 @@ def test_session_hint_in_recent_context(tmp_path, monkeypatch):
     block = "\n".join(
         [
             "---",
-            "id: mem-2026-06-26-george-draft",
+            "id: mem-2026-06-26-riley-draft",
             "type: event",
-            "entity: George",
+            "entity: Riley",
             "predicate: grade_dispute",
             "valid_from: 2026-06-24",
             "valid_to: open",
@@ -342,7 +342,7 @@ def test_session_hint_in_recent_context(tmp_path, monkeypatch):
     result = _prefetch_ctx(digest, monkeypatch,user_message="hi", is_first_turn=True, session_id="s1")
 
     assert result is not None
-    assert "mem-2026-06-26-george-draft" in result["context"]
+    assert "mem-2026-06-26-riley-draft" in result["context"]
 
 
 def test_injects_again_on_new_calendar_day(tmp_path, monkeypatch):
@@ -387,14 +387,14 @@ def test_recall_cue_does_not_reinject_same_day(tmp_path, monkeypatch):
     _write_daily(
         tmp_path,
         _days_ago(1),
-        _block(block_id="mem-1", body="Cue recall fact.", entity="Gabby"),
+        _block(block_id="mem-1", body="Cue recall fact.", entity="Casey"),
     )
 
     first = _prefetch_ctx(digest, monkeypatch,user_message="hi", is_first_turn=True, session_id="s1", turn_id="t1")
     assert first is not None
     assert _prefetch_ctx(digest, monkeypatch,user_message="ok", is_first_turn=False, session_id="s1", turn_id="t2") is None
     assert _prefetch_ctx(digest, monkeypatch,
-        user_message="Gabby 昨天说了什么？",
+        user_message="Casey 昨天说了什么？",
         is_first_turn=False,
         session_id="s1",
         turn_id="t3",
@@ -415,7 +415,7 @@ def test_build_recall_injection_context_matches_hook_tier1_body(tmp_path, monkey
     assert "Recall policy" not in hook["context"]
 
 
-def _event_block(*, block_id: str, body: str, entity: str = "George", predicate: str = "grade_dispute") -> str:
+def _event_block(*, block_id: str, body: str, entity: str = "Riley", predicate: str = "grade_dispute") -> str:
     return "\n".join(
         [
             "---",
@@ -532,7 +532,7 @@ def test_bootstrap_inject_omits_retrieval_footer(tmp_path, monkeypatch):
 def test_bootstrap_omits_span_ask_when_open_fact_exists(tmp_path, monkeypatch):
     digest = _load_digest()
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
-    _write_daily(tmp_path, _today(), _block(block_id="mem-1", body="Gabby canteen open.", valid_to="open"))
+    _write_daily(tmp_path, _today(), _block(block_id="mem-1", body="Casey canteen open.", valid_to="open"))
 
     result = _prefetch_ctx(digest, monkeypatch,user_message="hi", is_first_turn=True, session_id="s1")
 

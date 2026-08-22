@@ -35,11 +35,11 @@ def _good_flat_fact() -> dict:
         "blocks": [
             {
                 "type": "fact",
-                "entity": "Jackie",
+                "entity": "Jordan",
                 "kind": "Narration",
-                "content": "Jackie and User planned a lunch.",
+                "content": "Jordan and User planned a lunch.",
                 "involves": [
-                    {"entity": "Jackie"},
+                    {"entity": "Jordan"},
                     {"entity": "User"},
                 ],
                 "confidence": "high",
@@ -74,7 +74,7 @@ def test_handle_patch_digest_blocks_merges_and_accepts():
             "blocks": [
                 {
                     "type": "fact",
-                    "entity": "Jackie",
+                    "entity": "Jordan",
                     "kind": "Factual",
                     "content": "x",
                     "confidence": "high",
@@ -104,7 +104,7 @@ def test_transform_phase1_ok_compact_fail_teach_and_recall_passthrough():
     )
     assert compact_out == json.dumps({"ok": True})
     assert "type: fact" not in compact_out
-    assert "Jackie" not in compact_out
+    assert "Jordan" not in compact_out
     assert "---" not in compact_out
 
     fail_json = tools.phase1_handler_payload(
@@ -137,7 +137,7 @@ def test_phase1_same_turn_repair_without_outer_patch_prompt(tmp_path, monkeypatc
     tools = _load("digest_tools")
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(digest, "digest_tools", tools)
-    bad = {"blocks": [{"type": "fact", "entity": "Jackie"}]}
+    bad = {"blocks": [{"type": "fact", "entity": "Jordan"}]}
     good = _good_flat_fact()
     invoke_count = {"n": 0}
 
@@ -169,7 +169,7 @@ def test_phase1_same_turn_repair_without_outer_patch_prompt(tmp_path, monkeypatc
     result = digest.run_phase1_digest_blocks(
         "s1",
         "cli",
-        "Jackie and User planned lunch",
+        "Jordan and User planned lunch",
         run_id="run-a",
     )
     assert invoke_count["n"] == 1
@@ -576,7 +576,7 @@ def test_accept_injects_event_roles():
     bag, errors, notes = tools.accept_phase1_args(
         {
             "blocks": [
-                _event_block(participants=[{"entity": "Jackie", "role": "guest"}])
+                _event_block(participants=[{"entity": "Jordan", "role": "guest"}])
             ]
         }
     )
@@ -598,8 +598,8 @@ def test_accept_factual_two_involves_becomes_narration():
             "blocks": [
                 _fact_block(
                     kind="Factual",
-                    involves=[{"entity": "Jackie"}, {"entity": "User"}],
-                    content="Jackie and User planned lunch.",
+                    involves=[{"entity": "Jordan"}, {"entity": "User"}],
+                    content="Jordan and User planned lunch.",
                 )
             ]
         }
@@ -655,7 +655,7 @@ def test_accept_strips_duplicate_decision_subject_from_ruling():
     assert any("stripped leading subject" in n for n in notes)
 
 
-def test_accept_jackie_as_ruling_agent_still_teaches():
+def test_accept_jordan_as_ruling_agent_still_teaches():
     tools = _load("digest_tools")
     _bag, errors, _notes = tools.accept_phase1_args(
         {
@@ -664,7 +664,7 @@ def test_accept_jackie_as_ruling_agent_still_teaches():
                     "type": "decision",
                     "kind": "Decision",
                     "subject": "user",
-                    "ruling": "Jackie dislikes cilantro",
+                    "ruling": "Jordan dislikes cilantro",
                     "confidence": "high",
                     "importance": 3,
                 }

@@ -29,7 +29,7 @@ def _block(*, block_id: str, body: str) -> str:
             "---",
             f"id: {block_id}",
             "type: fact",
-            "entity: Gabby",
+            "entity: Casey",
             "confidence: high",
             "status: candidate",
             "sources: [session s1]",
@@ -90,7 +90,7 @@ def test_prefetch_compose_no_prewrap(tmp_path, monkeypatch):
     from memory_staging import hermes_local_today_str
 
     (daily / f"{hermes_local_today_str()}.md").write_text(
-        _block(block_id="mem-1", body="Gabby canteen open.") + "\n",
+        _block(block_id="mem-1", body="Casey canteen open.") + "\n",
         encoding="utf-8",
     )
     from MyMemory.weekly import weekly

@@ -108,7 +108,7 @@ async function startServer() {
   // Simulated Chat transcripts for "session:*" source drill-downs
   const TRANSCRIPTS: Record<string, { user: string; agent: string; date: string; title: string }[]> = {
     '20260621_0930_abc': [
-      { date: '2026-06-21 09:30:15', user: 'Hello! I was looking at our architecture diagram. Can we make sure we use visual flowcharts or diagrams whenever we talk about complex services?', agent: 'Absolutely Gary. Using mermaid syntax or clear visual boxes makes architectural discussions significantly easier. I will remember to prefer flowcharts for complicated designs.', title: 'Architecture & Visual Flowcharts' }
+      { date: '2026-06-21 09:30:15', user: 'Hello! I was looking at our architecture diagram. Can we make sure we use visual flowcharts or diagrams whenever we talk about complex services?', agent: 'Absolutely Morgan. Using mermaid syntax or clear visual boxes makes architectural discussions significantly easier. I will remember to prefer flowcharts for complicated designs.', title: 'Architecture & Visual Flowcharts' }
     ],
     '20260621_1410_xyz': [
       { date: '2026-06-21 14:10:02', user: 'I am playing with Rust this weekend. Cargo build is incredibly fast and the type system feels so safe. I might migrate our telemetry service next month.', agent: 'Rust is excellent for performance and safety! Let me know if you would like me to draft a microservice migration plan or look at key crates.', title: 'Rust Telemetry Migration' }
@@ -117,10 +117,10 @@ async function startServer() {
       { date: '2026-06-22 10:20:44', user: 'Make sure all production containers bound external traffic solely to port 3000 and run behind the standard nginx proxy.', agent: 'Got it. This is a critical infrastructure constraint. I will document this decision constraint in our system policies immediately.', title: 'Port 3000 Ingress Policy' }
     ],
     '20260622_1615_grade': [
-      { date: '2026-06-22 16:15:10', user: 'My son George is having a dispute about his school grade with his teacher. Can you draft a polite WeChat reply for his mom to send to escalate this issue nicely?', agent: 'I have drafted a polite, balanced response for George-mom to send. It details the grade dispute objectively and requests an escalation meeting with the department head.', title: 'George Grade WeChat Draft' }
+      { date: '2026-06-22 16:15:10', user: 'My son Riley is having a dispute about his school grade with his teacher. Can you draft a polite WeChat reply for his mom to send to escalate this issue nicely?', agent: 'I have drafted a polite, balanced response for Riley-mom to send. It details the grade dispute objectively and requests an escalation meeting with the department head.', title: 'Riley Grade WeChat Draft' }
     ],
-    '20260623_1100_willie': [
-      { date: '2026-06-23 11:00:15', user: 'Willie was telling me he is getting bored of pure backend work. He spends half his time looking at elegant typography and Figma designs.', agent: 'That is interesting! A shift towards UX or full-stack design could be a major career pivot for Willie. I will log this context.', title: 'Willie Career Pivot Chat' }
+    '20260623_1100_alex': [
+      { date: '2026-06-23 11:00:15', user: 'Alex was telling me he is getting bored of pure backend work. He spends half his time looking at elegant typography and Figma designs.', agent: 'That is interesting! A shift towards UX or full-stack design could be a major career pivot for Alex. I will log this context.', title: 'Alex Career Pivot Chat' }
     ],
     '20260624_1500_test': [
       { date: '2026-06-24 15:00:30', user: 'I have configured Vitest for the backend tests. It is blazing fast compared to Jest.', agent: 'Excellent! Vitest is indeed much faster and has native ESM support. I will reinforce using Vitest for backend assertions.', title: 'Testing Framework Selection' }

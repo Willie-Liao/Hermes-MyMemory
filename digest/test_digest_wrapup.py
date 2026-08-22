@@ -18,7 +18,7 @@ def _digest():
 
 def _fence(block_id: str = "mem-a", body: str = "Factual: keep.") -> str:
     return (
-        f"---\nid: {block_id}\ntype: fact\nentity: Gabby\n"
+        f"---\nid: {block_id}\ntype: fact\nentity: Casey\n"
         "confidence: high\nimportance: 3\nstatus: candidate\n"
         "sources: [session s1]\n---\n"
         f"{body}\n"
@@ -155,7 +155,7 @@ def test_build_wrapup_prompt_lists_every_event_predicate():
                 "type": "event",
                 "predicate": "user_requested_progressive_recall_procedure",
             },
-            {"id": "mem-f1", "type": "fact", "entity": "Gabby"},
+            {"id": "mem-f1", "type": "fact", "entity": "Casey"},
         ]
     )
     assert "Events — cover each; related same-day events may share one bullet" in prompt

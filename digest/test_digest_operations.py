@@ -999,14 +999,14 @@ def test_merge_unions_involves_by_entity_and_keeps_narration_body():
     operations = _operations()
     survivor = {
         **_block("mem-survivor"),
-        "body": "Narration: Jackie lives in a school dorm so dates default outside.",
-        "involves": [{"entity": "Willie Liao", "role": "partner"}],
+        "body": "Narration: Jordan lives in a school dorm so dates default outside.",
+        "involves": [{"entity": "Alex Chen", "role": "partner"}],
         "importance": 4,
     }
     absorbed = {
         **_block("mem-absorbed"),
-        "body": "Jackie dislikes cilantro.",
-        "involves": [{"entity": "Willie Liao"}, {"entity": "Roommate"}],
+        "body": "Jordan dislikes cilantro.",
+        "involves": [{"entity": "Alex Chen"}, {"entity": "Roommate"}],
         "importance": 3,
     }
     merged = operations.apply_operation(
@@ -1014,14 +1014,14 @@ def test_merge_unions_involves_by_entity_and_keeps_narration_body():
             "operation": "merge",
             "survivor_id": "mem-survivor",
             "absorbed_ids": ["mem-absorbed"],
-            "reason": "same Jackie cast story",
+            "reason": "same Jordan cast story",
         },
         [survivor, absorbed],
     )
     out = next(block for block in merged if block["id"] == "mem-survivor")
     assert out["body"].startswith("Narration:")
     by_entity = {item["entity"]: item for item in out["involves"]}
-    assert by_entity["Willie Liao"]["role"] == "partner"
+    assert by_entity["Alex Chen"]["role"] == "partner"
     assert by_entity["Roommate"] == {"entity": "Roommate"}
 
 
@@ -1029,13 +1029,13 @@ def test_merge_two_plain_facts_with_cast_becomes_narration():
     operations = _operations()
     survivor = {
         **_block("mem-survivor"),
-        "body": "Jackie lives in a school dorm.",
-        "involves": [{"entity": "Willie Liao"}],
+        "body": "Jordan lives in a school dorm.",
+        "involves": [{"entity": "Alex Chen"}],
         "importance": 4,
     }
     absorbed = {
         **_block("mem-absorbed"),
-        "body": "Jackie dislikes cilantro.",
+        "body": "Jordan dislikes cilantro.",
         "involves": [{"entity": "Roommate"}],
         "importance": 3,
     }
@@ -1044,14 +1044,14 @@ def test_merge_two_plain_facts_with_cast_becomes_narration():
             "operation": "merge",
             "survivor_id": "mem-survivor",
             "absorbed_ids": ["mem-absorbed"],
-            "reason": "same Jackie cast story",
+            "reason": "same Jordan cast story",
         },
         [survivor, absorbed],
     )
     out = next(block for block in merged if block["id"] == "mem-survivor")
     assert out["body"].startswith("Narration:")
     entities = {item["entity"] for item in out["involves"]}
-    assert entities == {"Willie Liao", "Roommate"}
+    assert entities == {"Alex Chen", "Roommate"}
 
 
 def test_merge_nested_event_rewrites_body_without_concat():
@@ -1093,13 +1093,13 @@ def test_merge_nested_fact_factual_into_narration_drops_absorbed():
     operations = _operations()
     survivor = {
         **_block("mem-n-surv"),
-        "body": "Narration: Jackie lives in a school dorm so dates default outside.",
-        "involves": [{"entity": "Willie Liao"}, {"entity": "Roommate"}],
+        "body": "Narration: Jordan lives in a school dorm so dates default outside.",
+        "involves": [{"entity": "Alex Chen"}, {"entity": "Roommate"}],
         "importance": 4,
     }
     absorbed = {
         **_block("mem-f-abs"),
-        "body": "Factual: Jackie dislikes cilantro.",
+        "body": "Factual: Jordan dislikes cilantro.",
         "importance": 3,
     }
     op = {
@@ -1110,7 +1110,7 @@ def test_merge_nested_fact_factual_into_narration_drops_absorbed():
         "fact": {
             "kind": "Narration",
             "content": (
-                "Jackie lives in a school dorm so dates default outside; "
+                "Jordan lives in a school dorm so dates default outside; "
                 "dislikes cilantro"
             ),
         },
@@ -1170,12 +1170,12 @@ def test_merge_validate_requires_narration_kind_for_cast():
     operations = _operations()
     survivor = {
         **_block("mem-n-surv"),
-        "body": "Narration: Jackie lives in a school dorm.",
-        "involves": [{"entity": "Willie Liao"}, {"entity": "Roommate"}],
+        "body": "Narration: Jordan lives in a school dorm.",
+        "involves": [{"entity": "Alex Chen"}, {"entity": "Roommate"}],
     }
     absorbed = {
         **_block("mem-f-abs"),
-        "body": "Factual: Jackie dislikes cilantro.",
+        "body": "Factual: Jordan dislikes cilantro.",
     }
     blocks = {b["id"]: b for b in [survivor, absorbed]}
     errors = operations.validate_operation(
@@ -1217,12 +1217,12 @@ def test_merge_into_emits_nested_slots_from_survivor():
     existing = [
         {
             **_block("mem-survivor"),
-            "body": "Factual: Jackie prefers outdoor dates",
+            "body": "Factual: Jordan prefers outdoor dates",
             "importance": 4,
         },
         {
             **_block("mem-duplicate"),
-            "body": "Factual: Jackie prefers outdoor dates",
+            "body": "Factual: Jordan prefers outdoor dates",
             "importance": 3,
         },
     ]
@@ -1232,7 +1232,7 @@ def test_merge_into_emits_nested_slots_from_survivor():
             {
                 **_block("mem-duplicate"),
                 "merge_into": "mem-survivor",
-                "body": "Factual: Jackie prefers outdoor dates",
+                "body": "Factual: Jordan prefers outdoor dates",
             }
         ],
     )
@@ -1282,7 +1282,7 @@ def test_merge_decision_nest_rejects_third_party_ruling():
             "decision": {
                 "kind": "Decision",
                 "subject": "user",
-                "ruling": "Jackie dislikes cilantro",
+                "ruling": "Jordan dislikes cilantro",
             },
         },
         blocks,

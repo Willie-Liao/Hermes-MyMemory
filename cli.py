@@ -38,14 +38,19 @@ def register_cli(subparser) -> None:
 
 
 def MyMemory_command(args) -> None:
-    """Dispatch ``hermes MyMemory`` to digest or weekly slash handlers."""
+    """Dispatch ``hermes MyMemory`` to digest or weekly slash handlers.
+
+    Confirmed history runs stay on the CLI thread so the process cannot exit
+    while Phase-1/Phase-2 workers are still writing staging.
+    """
     cmd = str(getattr(args, "mymemory_command", "") or "")
     tokens = list(getattr(args, "tokens", None) or [])
     if tokens and tokens[0] == "--":
         tokens = tokens[1:]
     raw = " ".join(tokens)
     if cmd == "digest":
-        print(digest_slash.handle_digest(raw))
+        history_sync = bool(tokens) and tokens[0] == "history"
+        print(digest_slash.handle_digest(raw, history_sync=history_sync))
         return
     if cmd == "weekly":
         print(weekly_slash.handle_weekly(raw))

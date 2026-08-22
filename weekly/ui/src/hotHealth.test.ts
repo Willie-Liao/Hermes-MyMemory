@@ -127,8 +127,8 @@ assert.deepEqual(
 );
 
 assert.equal(
-  entryPreviewWords('Willie teaches IB MYP PE all grades since 2022'),
-  'Willie teaches IB MYP PE all…',
+  entryPreviewWords('Alex teaches IB MYP PE all grades since 2022'),
+  'Alex teaches IB MYP PE all…',
 );
 
 const prompt = buildMergePrompt({

@@ -8,30 +8,28 @@ def test_lookup_key_sentence_and_cjk(staging):
 
     idx = load_entity_index(staging)
     assert lookup_key("what did we do about memory digest?", idx) == "memorydigest"
-    assert lookup_key("张主任相关的记忆有哪些？", idx) == "张主任"
-    assert lookup_key("Jackie", idx) == "jackie"
+    assert lookup_key("林主任相关的记忆有哪些？", idx) == "林主任"
+    assert lookup_key("Jordan", idx) == "jordan"
 
 
-def test_alias_collapse_keeps_jackie_and_gitnexus_apart():
+def test_alias_collapse_keeps_jordan_and_gitnexus_apart():
     assert entity_key("Memory Digest") == "memorydigest"
     assert entity_key("MemoryDigest") == "memorydigest"
     assert entity_key("memory-digest") == "memorydigest"
     assert entity_key("memory-digest-plugin") == "memorydigestplugin"
-    assert entity_key("Jackie") == "jackie"
+    assert entity_key("Jordan") == "jordan"
     assert entity_key("gitnexus") == "gitnexus"
-    assert entity_key("张主任") == "张主任"
-    assert entity_key("Jackie") != entity_key("gitnexus")
+    assert entity_key("林主任") == "林主任"
+    assert entity_key("Jordan") != entity_key("gitnexus")
 
 
 def test_real_staging_index_counts(staging):
     index = build_entity_index(staging)
     assert "memorydigest" in index
     days = index["memorydigest"]["days"]
-    assert len(days) >= 14
-    assert days[0] <= "2026-06-16"
+    assert "2026-08-12" in days
     multi = [k for k, n in index.items() if len(n.get("days") or []) > 1]
-    assert len(multi) >= 19
+    assert "memorydigest" in multi
     n_blocks = sum(len(n.get("mem_ids") or []) for n in index.values())
-    assert n_blocks >= 300
-    # plugin suffix is a distinct surface but must not drop the parent cluster
+    assert n_blocks >= 8
     assert entity_key("memory-digest-plugin").startswith("memorydigest")

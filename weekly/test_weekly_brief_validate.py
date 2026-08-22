@@ -27,7 +27,7 @@ def test_format_brief_for_chat_leaves_four_part_day_headers():
     raw = (
         "Monday — 2026-08-03 · Events [1]\n"
         "**Digest stall**\n"
-        "Willie asked why digest stalled.\n\n"
+        "Alex asked why digest stalled.\n\n"
         "Conflict\n"
         "- None.\n"
     )

@@ -60,12 +60,12 @@ _VALID_BLOCK = "\n".join(
         "---",
         "id: mem-1",
         "type: fact",
-        "entity: Gabby",
+        "entity: Casey",
         "confidence: high",
         "status: candidate",
         "sources: [session s1]",
         "---",
-        "Gabby chose home-packed lunch.",
+        "Casey chose home-packed lunch.",
     ]
 )
 
@@ -351,3 +351,192 @@ def test_digest_oneshot_raises_completion_budget_for_four_type_ops(monkeypatch):
     )
     assert seen["max_tokens"] == digest.ONESHOT_DIGEST_MAX_TOKENS
     assert seen["max_tokens"] >= 8192
+
+
+def _write_messages_db(home: Path, rows: list[tuple]) -> None:
+    import sqlite3
+
+    db = home / "state.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE messages ("
+        "id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, "
+        "content TEXT, timestamp REAL, active INTEGER)"
+    )
+    conn.executemany(
+        "INSERT INTO messages (id, session_id, role, content, timestamp, active) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    conn.commit()
+    conn.close()
+
+
+def _ts(now, **delta):
+    from datetime import timedelta
+
+    return (now - timedelta(**delta)).timestamp()
+
+
+def test_history_plan_presets_bookmarks_and_batches(tmp_path, monkeypatch):
+    dr = _load_digest_run()
+    digest = dr.digest
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    now = __import__("datetime").datetime(2026, 8, 21, 12, 0, tzinfo=__import__("datetime").timezone.utc)
+    rows = []
+    mid = 1
+
+    def add(session, hours=None, days=None, role="user", active=1, content="hello"):
+        nonlocal mid
+        kw = {}
+        if hours is not None:
+            kw["hours"] = hours
+        if days is not None:
+            kw["days"] = days
+        rows.append((mid, session, role, content, _ts(now, **kw), active))
+        mid += 1
+
+    add("s-day", hours=2)
+    add("s-day", hours=2, role="assistant")
+    add("s-week", days=3)
+    add("s-week", days=3, role="assistant")
+    add("s-month", days=20)
+    add("s-month", days=20, role="assistant")
+    add("s-old", days=40)
+    add("s-old", days=40, role="assistant")
+    add("s-tool", hours=1, role="tool")
+    add("s-inactive", hours=1, active=0)
+    for i in range(13):
+        add("s-batch", hours=1, content=f"u{i}")
+        add("s-batch", hours=1, role="assistant", content=f"a{i}")
+    _write_messages_db(tmp_path, rows)
+    _write_state(tmp_path, session_id="s-week", last_id=4)
+
+    before = (tmp_path / "state.db").stat().st_mtime
+    state_path = _state_path(tmp_path)
+    state_mtime = state_path.stat().st_mtime
+
+    p1 = dr.plan_history("1d", now=now, home=tmp_path)
+    p7 = dr.plan_history("7d", now=now, home=tmp_path)
+    p30 = dr.plan_history("30d", now=now, home=tmp_path)
+    pall = dr.plan_history("all", now=now, home=tmp_path)
+    assert p1["outcome"] == "ok"
+    assert p1["message_count"] <= p7["message_count"] <= p30["message_count"] <= pall["message_count"]
+    assert pall["session_count"] >= p1["session_count"]
+    assert "s-old" in pall["sessions"]
+    assert "s-old" not in p30["sessions"]
+    assert "s-week" not in p7["sessions"]  # bookmarked through id 3 (only those two msgs)
+    assert p1["digest_tokens"]["typical"] > 0 or p1["batch_count"] == 0
+    batch_session = [b for b in p1["batches"] if b["session_id"] == "s-batch"]
+    assert len(batch_session) >= 2
+    assert all(b["user"] <= 12 and len(b["message_ids"]) <= 40 for b in p1["batches"])
+    assert (tmp_path / "state.db").stat().st_mtime == before
+    assert state_path.stat().st_mtime == state_mtime
+
+
+def test_history_estimate_invalid_and_missing_db(tmp_path, monkeypatch):
+    dr = _load_digest_run()
+    monkeypatch.setattr(dr.digest, "get_hermes_home", lambda: tmp_path)
+    now = __import__("datetime").datetime(2026, 8, 21, 12, 0, tzinfo=__import__("datetime").timezone.utc)
+    empty = dr.plan_history("all", now=now, home=tmp_path)
+    assert empty["outcome"] == "ok"
+    assert empty["message_count"] == 0
+    bad = dr.plan_history("2y", now=now, home=tmp_path)
+    assert bad["outcome"] == "invalid_preset"
+
+
+def test_history_calibration_schema_has_no_private_paths():
+    import json
+    from pathlib import Path
+
+    path = Path(__file__).with_name("history_calibration.json")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    blob = path.read_text(encoding="utf-8")
+    assert data["profile_version"] == 1
+    assert data["regime"]
+    assert data["phase1"]["n_eligible"] >= 1
+    assert data["phase2"]["n_excluded"] >= 1
+    assert "exclusions" in data
+    assert "/Users/" not in blob
+    assert "wil" + "lie" not in blob.lower()
+    assert "session:" not in blob
+
+
+def test_history_run_resume_stop_checkpoint(tmp_path, monkeypatch):
+    dr = _load_digest_run()
+    digest = dr.digest
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    now = __import__("datetime").datetime(2026, 8, 21, 12, 0, tzinfo=__import__("datetime").timezone.utc)
+    rows = []
+    mid = 1
+    for hours, sid in ((2, "s1"), (3, "s2")):
+        rows.append((mid, sid, "user", "u", _ts(now, hours=hours), 1))
+        mid += 1
+        rows.append((mid, sid, "assistant", "a", _ts(now, hours=hours), 1))
+        mid += 1
+    _write_messages_db(tmp_path, rows)
+    calls: list[str] = []
+    phase2: list[str] = []
+
+    def fake_pipeline(*args, **kwargs):
+        daily = args[3]
+        calls.append(str(args[1]))
+        if len(calls) == 1:
+            dr.stop_history(yes=True)
+        return "appended"
+
+    monkeypatch.setattr(digest, "_run_digest_pipeline_entry", fake_pipeline)
+    monkeypatch.setattr(
+        digest,
+        "run_manual_phase2",
+        lambda path, date_str="": phase2.append(date_str) or {"outcome": "rewritten"},
+    )
+
+    refused = dr.request_history_run("1d", yes=False, sync=True, now=now)
+    assert refused["outcome"] == "needs_confirm"
+    assert calls == []
+
+    result = dr.request_history_run("1d", yes=True, sync=True, now=now)
+    assert result["outcome"] == "stopped"
+    assert len(calls) == 1
+    assert phase2 == []
+
+    resumed = dr.resume_history(yes=True, sync=True)
+    assert resumed["outcome"] == "completed"
+    assert len(calls) == 2
+    assert len(phase2) >= 1
+
+    again = dr.resume_history(yes=True, sync=True)
+    assert again["outcome"] == "completed"
+    assert len(calls) == 2
+
+
+def test_history_run_phase2_once_per_day(tmp_path, monkeypatch):
+    dr = _load_digest_run()
+    digest = dr.digest
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    now = __import__("datetime").datetime(2026, 8, 21, 12, 0, tzinfo=__import__("datetime").timezone.utc)
+    rows = []
+    mid = 1
+    for i in range(13):
+        rows.append((mid, "s1", "user", f"u{i}", _ts(now, hours=1), 1))
+        mid += 1
+        rows.append((mid, "s1", "assistant", f"a{i}", _ts(now, hours=1), 1))
+        mid += 1
+    _write_messages_db(tmp_path, rows)
+    p1_calls = []
+    p2_calls = []
+    monkeypatch.setattr(
+        digest,
+        "_run_digest_pipeline_entry",
+        lambda *a, **k: p1_calls.append(a) or "appended",
+    )
+    monkeypatch.setattr(
+        digest,
+        "run_manual_phase2",
+        lambda path, date_str="": p2_calls.append(date_str) or {"outcome": "rewritten"},
+    )
+    out = dr.request_history_run("1d", yes=True, sync=True, now=now)
+    assert out["outcome"] == "completed"
+    assert len(p1_calls) >= 2
+    assert p2_calls == [p2_calls[0]]

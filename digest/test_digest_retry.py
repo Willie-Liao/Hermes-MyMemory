@@ -32,8 +32,8 @@ def _load_digest():
 def _block(
     *,
     status: str = "candidate",
-    entity: str | None = "Gabby",
-    body: str = "Gabby chose home-packed lunch.",
+    entity: str | None = "Casey",
+    body: str = "Casey chose home-packed lunch.",
 ) -> str:
     lines = [
         "---",

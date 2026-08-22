@@ -1,8 +1,10 @@
-"""Live Xiaomi oneshot on the full 2026-08-15 daily board (opt-in).
+"""Live Phase-2 oneshot on the full 2026-08-15 daily board (opt-in).
 
-Enable with ``HERMES_DIGEST_LIVE_LLM=1``. Copies the production daily file
-byte-for-byte; fails if the copy was truncated. Prints a token comparison
-for mixed-list baseline vs typed-array Phase 2 vs wrap-up.
+Enable with ``HERMES_DIGEST_LIVE_LLM=1``. Default model is kimi-k3 (Kimi Code,
+thinking off, temperature 0.6 so tool_choice works). Override with
+``HERMES_DIGEST_LIVE_MODEL``. Copies the
+production daily file byte-for-byte; fails if the copy was truncated. Prints
+token savings vs the last ungated k3 heavy-day Phase-2 attempt.
 """
 
 from __future__ import annotations
@@ -38,6 +40,20 @@ _MIXED_BASELINE = {
     "wall_seconds": 232,
     "max_tokens": None,
 }
+
+# Last ungated kimi-k3 Phase-2 on a heavy daytime board
+# (hermes-home/metrics/digest-day-cost-k3.jsonl).
+_LAST_K3_HEAVY_PHASE2 = {
+    "label": "last k3 Phase 2 heavy daytime (ungated)",
+    "input_tokens": 9468,
+    "output_tokens": 4435,
+    "reasoning_tokens": 0,
+    "total_tokens": 13903,
+    "wall_seconds": 152.3,
+    "max_tokens": None,
+}
+
+_K3_CODING_BASE = "https://api.kimi.com/coding/v1"
 
 
 def _digest():
@@ -76,6 +92,60 @@ def test_live_typed_phase2_and_wrapup_on_full_2026_08_15(tmp_path, monkeypatch):
     assert "submit_operations" in prompt
 
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    live_model = (
+        os.environ.get("HERMES_DIGEST_LIVE_MODEL", "").strip() or "kimi-k3"
+    )
+    import worker_llm as wl
+
+    orig_runtime = wl._plugin_worker_runtime
+    orig_creds = wl._oneshot_credentials
+    orig_oneshot = digest.run_worker_llm_oneshot
+
+    def overlay_runtime(plugin, purpose=""):
+        out = dict(orig_runtime(plugin, purpose) or {})
+        out["model"] = live_model
+        if live_model.startswith("kimi"):
+            out["provider"] = "kimi-coding"
+        return out
+
+    def overlay_creds(provider):
+        plug = str(provider or "").strip().lower()
+        if plug == "kimi-coding":
+            key = (
+                os.environ.get("KIMI_API_KEY")
+                or os.environ.get("KIMI_CODING_API_KEY")
+                or ""
+            ).strip()
+            if not key:
+                raise ValueError("missing KIMI_API_KEY for kimi-k3 live Phase 2")
+            base = (
+                os.environ.get("KIMI_BASE_URL") or _K3_CODING_BASE
+            ).strip()
+            return key, base
+        return orig_creds(provider)
+
+    def overlay_oneshot(*args, **kwargs):
+        if live_model == "kimi-k3":
+            kwargs["temperature"] = 0.6
+        return orig_oneshot(*args, **kwargs)
+
+    from openai.resources.chat.completions import Completions
+
+    orig_create = Completions.create
+
+    def patched_create(self, *args, **kwargs):
+        if live_model == "kimi-k3":
+            kwargs["temperature"] = 0.6
+            extra = dict(kwargs.get("extra_body") or {})
+            extra["thinking"] = {"type": "disabled"}
+            kwargs["extra_body"] = extra
+        return orig_create(self, *args, **kwargs)
+
+    monkeypatch.setattr(Completions, "create", patched_create)
+    monkeypatch.setattr(wl, "_plugin_worker_runtime", overlay_runtime)
+    monkeypatch.setattr(wl, "_oneshot_credentials", overlay_creds)
+    monkeypatch.setattr(digest, "run_worker_llm_oneshot", overlay_oneshot)
+
     captures: list[dict] = []
     orig = digest._invoke_digest_oneshot_tool
 
@@ -102,10 +172,25 @@ def test_live_typed_phase2_and_wrapup_on_full_2026_08_15(tmp_path, monkeypatch):
     ops = proposer(blocks, [], attempt=1)
     p2_wall = round(time.perf_counter() - t_p2, 1)
     assert isinstance(ops, list)
-    p2 = next(c for c in captures if c.get("force_tool_name") == "submit_operations")
-    assert p2.get("failed") is False
-    args = p2.get("tool_args") or {}
-    assert isinstance(args.get("operations"), list)
+    p2_caps = [
+        c for c in captures if c.get("force_tool_name") == "submit_operations"
+    ]
+    skipped = not p2_caps
+    if skipped:
+        p2 = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_tokens": 0,
+            "total_tokens": 0,
+            "wall_seconds": p2_wall,
+            "failed": False,
+            "finish_reason": "skip",
+        }
+    else:
+        p2 = p2_caps[0]
+        assert p2.get("failed") is False
+        args = p2.get("tool_args") or {}
+        assert isinstance(args.get("operations"), list)
 
     t_w = time.perf_counter()
     wrap = digest.run_day_wrapup(dest)
@@ -129,9 +214,18 @@ def test_live_typed_phase2_and_wrapup_on_full_2026_08_15(tmp_path, monkeypatch):
     base_reason = int(_MIXED_BASELINE["reasoning_tokens"])
     delta = p2_reason - base_reason
     pct = (100.0 * delta / base_reason) if base_reason else 0.0
+    k3_in = int(_LAST_K3_HEAVY_PHASE2["input_tokens"])
+    k3_tot = int(_LAST_K3_HEAVY_PHASE2["total_tokens"])
+    this_in = int(p2.get("input_tokens") or 0)
+    this_tot = int(p2.get("total_tokens") or 0)
+    in_delta = this_in - k3_in
+    tot_delta = this_tot - k3_tot
+    in_pct = (100.0 * in_delta / k3_in) if k3_in else 0.0
+    tot_pct = (100.0 * tot_delta / k3_tot) if k3_tot else 0.0
     summary = "\n".join(
         [
             "=== STEP7 TOKEN COMPARISON (full 2026-08-15.md, 34 cards) ===",
+            f"live model={live_model} skipped_llm={skipped}",
             _row(
                 _MIXED_BASELINE["label"],
                 _MIXED_BASELINE,
@@ -139,7 +233,13 @@ def test_live_typed_phase2_and_wrapup_on_full_2026_08_15(tmp_path, monkeypatch):
                 _MIXED_BASELINE["max_tokens"],
             ),
             _row(
-                "typed-array Phase 2 (this run)",
+                _LAST_K3_HEAVY_PHASE2["label"],
+                _LAST_K3_HEAVY_PHASE2,
+                _LAST_K3_HEAVY_PHASE2["wall_seconds"],
+                _LAST_K3_HEAVY_PHASE2["max_tokens"],
+            ),
+            _row(
+                "gated Phase 2 (this run, 2026-08-15)",
                 p2,
                 p2.get("wall_seconds") or p2_wall,
                 digest.ONESHOT_DIGEST_MAX_TOKENS,
@@ -151,6 +251,8 @@ def test_live_typed_phase2_and_wrapup_on_full_2026_08_15(tmp_path, monkeypatch):
                 digest.ONESHOT_WRAPUP_MAX_TOKENS,
             ),
             f"reasoning delta vs mixed-list: {delta:+d} ({pct:+.1f}%)",
+            f"input delta vs last k3 heavy: {in_delta:+d} ({in_pct:+.1f}%)",
+            f"total delta vs last k3 heavy: {tot_delta:+d} ({tot_pct:+.1f}%)",
             f"wrap-up phrase: {phrase}",
         ]
     )

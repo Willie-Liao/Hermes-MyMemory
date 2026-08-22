@@ -46,7 +46,7 @@ def _block(
     *,
     block_id: str,
     body: str,
-    entity: str = "Gabby",
+    entity: str = "Casey",
     involves: list[str] | None = None,
     related: list[str] | None = None,
     sources: str = "session abc-123",
@@ -167,13 +167,13 @@ def test_index_anchor_set_includes_narration_involves():
     digest = _load_digest()
     narration = {
         "type": "fact",
-        "entity": "George",
+        "entity": "Riley",
         "involves": [
-            {"entity": "Gary"},
-            {"entity": "George-mom"},
+            {"entity": "Morgan"},
+            {"entity": "Riley-mom"},
         ],
     }
-    assert digest._index_anchor_set(narration) == {"George", "Gary", "George-mom"}
+    assert digest._index_anchor_set(narration) == {"Riley", "Morgan", "Riley-mom"}
 
-    plain = {"type": "fact", "entity": "George", "involves": []}
-    assert digest._index_anchor_set(plain) == {"George"}
+    plain = {"type": "fact", "entity": "Riley", "involves": []}
+    assert digest._index_anchor_set(plain) == {"Riley"}

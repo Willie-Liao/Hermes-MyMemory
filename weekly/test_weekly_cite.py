@@ -48,7 +48,7 @@ Andrae feedback landed [1]. Parent grading package delivered [2].
 ---
 id: evt-follow
 type: event
-entity: Willie
+entity: Alex
 related:
   - "[3] mem-2026-06-30-career-pivot-note"
 sources:

@@ -169,7 +169,7 @@ export function parseMDBlock(fileContent: string, filePath: string): MemoryBlock
       if (participantsYaml.length > 0) {
         const parsedParticipants: Participant[] = [];
         for (const py of participantsYaml) {
-          // Format is typically: - {entity: Gary, role: escalator}
+          // Format is typically: - {entity: Morgan, role: escalator}
           const match = py.match(/\{\s*entity:\s*([^,}]+)(?:,\s*role:\s*([^}]+))?\s*\}/);
           if (match) {
             parsedParticipants.push({
@@ -279,9 +279,9 @@ export function seedData() {
     fs.writeFileSync(userPath, `# User Profile & Preferences
 (as of 2026-06-15)
 
-§ Gary prefers TypeScript for new web projects (as of 2026-06-15)
-§ Gary drinks espresso in the morning around 8:30 AM (as of 2026-06-18)
-§ Gary uses Vitest for unit testing on backend projects (as of 2026-06-24)
+§ Morgan prefers TypeScript for new web projects (as of 2026-06-15)
+§ Morgan drinks espresso in the morning around 8:30 AM (as of 2026-06-18)
+§ Morgan uses Vitest for unit testing on backend projects (as of 2026-06-24)
 `);
   }
 
@@ -296,8 +296,8 @@ export function seedData() {
           confidence: 'high' as ConfidenceType,
           status: 'candidate' as MemoryStatus,
           sources: ['session:20260621_0930_abc'],
-          entity: 'Gary',
-          body: 'Gary prefers visual flowcharts (mermaid) for complex architecture discussions.'
+          entity: 'Morgan',
+          body: 'Morgan prefers visual flowcharts (mermaid) for complex architecture discussions.'
         },
         {
           id: 'mem-2026-06-21-rust-hypothesis',
@@ -305,8 +305,8 @@ export function seedData() {
           confidence: 'medium' as ConfidenceType,
           status: 'candidate' as MemoryStatus,
           sources: ['session:20260621_1410_xyz'],
-          entity: 'Gary',
-          body: 'Gary might be migrating his microservices backend to Rust next month.'
+          entity: 'Morgan',
+          body: 'Morgan might be migrating his microservices backend to Rust next month.'
         }
       ]
     },
@@ -328,15 +328,15 @@ export function seedData() {
           confidence: 'high' as ConfidenceType,
           status: 'candidate' as MemoryStatus,
           sources: ['session:20260622_1615_grade'],
-          entity: 'George',
+          entity: 'Riley',
           predicate: 'grade_dispute',
           participants: [
-            { entity: 'Gary' },
-            { entity: 'George-mom', role: 'escalator' }
+            { entity: 'Morgan' },
+            { entity: 'Riley-mom', role: 'escalator' }
           ],
           valid_from: '2026-06-22',
           valid_to: 'open',
-          body: 'Agent drafted parent WeChat reply regarding George grade dispute.'
+          body: 'Agent drafted parent WeChat reply regarding Riley grade dispute.'
         }
       ]
     },
@@ -344,25 +344,25 @@ export function seedData() {
       file: '2026-06-23.md',
       blocks: [
         {
-          id: 'mem-2026-06-23-willie-career',
+          id: 'mem-2026-06-23-alex-career',
           type: 'event' as MemoryType,
           confidence: 'high' as ConfidenceType,
           status: 'candidate' as MemoryStatus,
-          sources: ['session:20260623_1100_willie'],
-          entity: 'Willie',
+          sources: ['session:20260623_1100_alex'],
+          entity: 'Alex',
           predicate: 'career_pivot',
           participants: [
-            { entity: 'Willie', role: 'explorer' }
+            { entity: 'Alex', role: 'explorer' }
           ],
-          body: 'Willie mentioned changing career paths from backend engineering.'
+          body: 'Alex mentioned changing career paths from backend engineering.'
         },
         {
-          id: 'mem-2026-06-23-willie-ux-hypothesis',
+          id: 'mem-2026-06-23-alex-ux-hypothesis',
           type: 'hypothesis' as MemoryType,
           confidence: 'low' as ConfidenceType,
           status: 'candidate' as MemoryStatus,
-          sources: ['session:20260623_1100_willie'],
-          body: 'Willie might pivot to UX design based on interest in typography and Figma.'
+          sources: ['session:20260623_1100_alex'],
+          body: 'Alex might pivot to UX design based on interest in typography and Figma.'
         }
       ]
     },
@@ -375,7 +375,7 @@ export function seedData() {
           confidence: 'explicit' as ConfidenceType,
           status: 'approved' as MemoryStatus, // already approved
           sources: ['session:20260624_1500_test'],
-          body: 'Gary uses Vitest for unit testing on backend projects.',
+          body: 'Morgan uses Vitest for unit testing on backend projects.',
           promoted_at: '2026-06-24'
         },
         {

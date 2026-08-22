@@ -5,7 +5,7 @@ import json
 import sys
 from pathlib import Path
 
-from conftest import load_plugin_module
+from conftest import fail_closed_tool_capture, load_plugin_module
 
 
 def _load_digest():
@@ -16,8 +16,8 @@ def _block(
     *,
     block_id: str = "mem-1",
     type_: str = "fact",
-    entity: str | None = "Gabby",
-    body: str = "Gabby chose home-packed lunch.",
+    entity: str | None = "Casey",
+    body: str = "Casey chose home-packed lunch.",
     status: str = "candidate",
     extra: str = "",
 ) -> str:
@@ -92,14 +92,14 @@ def test_worker_validator_accepts_each_assigned_worker_contract():
     }
     narration = _block(
         type_="fact",
-        entity="Jackie",
+        entity="Jordan",
         body=(
-            "Narration: Jackie is Willie's partner; lives in a school dorm; "
+            "Narration: Jordan is Alex's partner; lives in a school dorm; "
             "dislikes cilantro."
         ),
         extra=(
             "involves:\n"
-            "  - {entity: Willie Liao, role: partner}\n"
+            "  - {entity: Alex Chen, role: partner}\n"
             "  - {entity: Roommate}\n"
         ),
     )
@@ -109,8 +109,8 @@ def test_worker_validator_accepts_each_assigned_worker_contract():
     assert digest._validate_worker_output(narration, "fact") == []
     third_party = _block(
         type_="decision",
-        entity="Jackie",
-        body="Preference: Jackie dislikes cilantro.",
+        entity="Jordan",
+        body="Preference: Jordan dislikes cilantro.",
     )
     assert any(
         "user/User" in error or "USER.md" in error or "user" in error.lower()
@@ -143,11 +143,11 @@ def test_worker_validator_accepts_factual_prefix_and_legacy_plain():
     digest = _load_digest()
     factual = _block(
         type_="fact",
-        body="Factual: Jackie lives in a school dorm.",
+        body="Factual: Jordan lives in a school dorm.",
     )
     legacy = _block(
         type_="fact",
-        body="Jackie lives in a school dorm.",
+        body="Jordan lives in a school dorm.",
     )
     assert digest._validate_worker_output(factual, "fact") == []
     assert digest._validate_worker_output(legacy, "fact") == []
@@ -195,8 +195,8 @@ def test_worker_validator_rejects_missing_type_specific_fields():
             "decision",
             _block(
                 type_="decision",
-                entity="Jackie",
-                body="Preference: Jackie dislikes cilantro.",
+                entity="Jordan",
+                body="Preference: Jordan dislikes cilantro.",
             ),
             "user/User",
         ),
@@ -204,11 +204,11 @@ def test_worker_validator_rejects_missing_type_specific_fields():
             "fact",
             _block(
                 type_="fact",
-                entity="Jackie",
-                body="Jackie lives in a dorm.",
+                entity="Jordan",
+                body="Jordan lives in a dorm.",
                 extra=(
                     "involves:\n"
-                    "  - {entity: Willie Liao}\n"
+                    "  - {entity: Alex Chen}\n"
                     "  - {entity: Roommate}\n"
                 ),
             ),
@@ -308,12 +308,12 @@ def test_event_first_worker_contract_rejects_new_hypothesis_output():
     digest = _load_digest()
     content = _block(
         type_="hypothesis",
-        body="Gabby may opt out of the canteen.",
+        body="Casey may opt out of the canteen.",
     )
 
     prompt = digest._worker_prompt(
         "fact",
-        "Gabby discussed lunch.",
+        "Casey discussed lunch.",
         session_id="s1",
         platform="cli",
         run_id="r1",
@@ -368,7 +368,7 @@ def test_event_requires_entity_and_span():
 
     missing_span = _block(
         type_="event",
-        entity="George",
+        entity="Riley",
         body="Drafted parent reply.",
     )
     errors = digest._validate_digest_content(missing_span)
@@ -376,7 +376,7 @@ def test_event_requires_entity_and_span():
 
     valid_event = _block(
         type_="event",
-        entity="George",
+        entity="Riley",
         body="Drafted parent reply.",
         extra="predicate: grade_dispute\nvalid_from: 2026-06-24\nvalid_to: open",
     )
@@ -387,7 +387,7 @@ def test_event_requires_predicate():
     digest = _load_digest()
     content = _block(
         type_="event",
-        entity="George",
+        entity="Riley",
         body="Drafted parent reply.",
         extra="valid_from: 2026-06-24\nvalid_to: open",
     )
@@ -399,12 +399,12 @@ def test_sparse_event_participants_pass():
     digest = _load_digest()
     content = _block(
         type_="event",
-        entity="George",
-        body="Gary laoshi commented Design D 0.",
+        entity="Riley",
+        body="Morgan laoshi commented Design D 0.",
         extra=(
             "predicate: grade_dispute\n"
             "participants:\n"
-            "  - {entity: Gary}\n"
+            "  - {entity: Morgan}\n"
             "valid_from: 2026-06-24\n"
             "valid_to: open"
         ),
@@ -416,11 +416,11 @@ def test_event_rejects_involves():
     digest = _load_digest()
     content = _block(
         type_="event",
-        entity="George",
+        entity="Riley",
         body="Drafted parent reply.",
         extra=(
             "predicate: grade_dispute\n"
-            "involves: [Gary]\n"
+            "involves: [Morgan]\n"
             "valid_from: 2026-06-24\n"
             "valid_to: open"
         ),
@@ -449,21 +449,21 @@ def test_normalize_dedupes_participants_and_strips_primary():
     digest = _load_digest()
     raw = _block(
         type_="event",
-        entity="George",
+        entity="Riley",
         body="Grade dispute ongoing.",
         extra=(
             "predicate: grade_dispute\n"
             "participants:\n"
-            "  - {entity: George}\n"
-            "  - {entity: Gary}\n"
-            "  - {entity: Gary}\n"
+            "  - {entity: Riley}\n"
+            "  - {entity: Morgan}\n"
+            "  - {entity: Morgan}\n"
             "valid_from: 2026-06-24\n"
             "valid_to: open"
         ),
     )
     normalized = digest._normalize_digest_content(raw, session_id="s1")
     assert "participants:" in normalized
-    assert "{entity: Gary}" in normalized
+    assert "{entity: Morgan}" in normalized
     assert "involves:" not in normalized
     assert digest._validate_digest_content(normalized) == []
 
@@ -498,7 +498,7 @@ def test_reject_fact_missing_entity():
 
 def test_hypothesis_is_banned_type():
     digest = _load_digest()
-    content = _block(type_="hypothesis", entity="Gabby", body="Gabby may opt out.")
+    content = _block(type_="hypothesis", entity="Casey", body="Casey may opt out.")
     errors = digest._validate_digest_content(content)
     assert any("banned type" in e.lower() or "invalid type" in e.lower() or "hypothesis" in e.lower() for e in errors)
 
@@ -544,7 +544,7 @@ def test_valid_open_span():
 def test_valid_closed_span():
     digest = _load_digest()
     content = _block(
-        body="Gabby canteen opt-out window applies.",
+        body="Casey canteen opt-out window applies.",
         extra="valid_from: 2026-06-01\nvalid_to: 2026-06-30",
     )
     assert digest._validate_digest_content(content) == []
@@ -552,7 +552,7 @@ def test_valid_closed_span():
 
 def test_reject_timebound_body_without_span():
     digest = _load_digest()
-    content = _block(body="Gabby canteen application deadline is near.")
+    content = _block(body="Casey canteen application deadline is near.")
     errors = digest._validate_digest_content(content)
     assert any("time-bound" in e for e in errors)
 
@@ -631,16 +631,16 @@ def test_chinese_before_not_timebound_hint():
 def test_valid_involves_and_related():
     digest = _load_digest()
     content = _block(
-        block_id="mem-2026-06-26-george-draft",
+        block_id="mem-2026-06-26-riley-draft",
         type_="fact",
-        entity="George",
-        body="Narration: Agent drafted parent reply re grade dispute with Gary and George-mom.",
+        entity="Riley",
+        body="Narration: Agent drafted parent reply re grade dispute with Morgan and Riley-mom.",
         extra=(
             "confidence: explicit\n"
             "involves:\n"
-            "  - {entity: Gary}\n"
-            "  - {entity: George-mom}\n"
-            "related: [mem-2026-06-26-george-grade]"
+            "  - {entity: Morgan}\n"
+            "  - {entity: Riley-mom}\n"
+            "related: [mem-2026-06-26-riley-grade]"
         ),
     )
     assert digest._validate_digest_content(content) == []
@@ -650,17 +650,17 @@ def test_valid_involves_and_related():
 def test_valid_event_predicate_participants_and_related():
     digest = _load_digest()
     content = _block(
-        block_id="mem-2026-06-26-george-draft",
+        block_id="mem-2026-06-26-riley-draft",
         type_="event",
-        entity="George",
+        entity="Riley",
         body="Agent drafted parent reply re grade dispute.",
         extra=(
             "confidence: explicit\n"
             "predicate: grade_dispute\n"
             "participants:\n"
-            "  - {entity: Gary, role: teacher}\n"
-            "  - {entity: George-mom, role: escalator}\n"
-            "related: [mem-2026-06-26-george-grade]\n"
+            "  - {entity: Morgan, role: teacher}\n"
+            "  - {entity: Riley-mom, role: escalator}\n"
+            "related: [mem-2026-06-26-riley-grade]\n"
             "valid_from: 2026-06-24\n"
             "valid_to: open"
         ),
@@ -671,19 +671,19 @@ def test_valid_event_predicate_participants_and_related():
 def test_reject_entity_duplicated_in_involves():
     digest = _load_digest()
     content = _block(
-        entity="George",
-        extra="involves: [George, Gary]",
+        entity="Riley",
+        extra="involves: [Riley, Morgan]",
     )
     errors = digest._validate_digest_content(content)
     assert any("must not repeat primary entity" in e for e in errors)
 
     map_content = _block(
-        entity="George",
-        body="Narration: George and Gary discussed the grade.",
+        entity="Riley",
+        body="Narration: Riley and Morgan discussed the grade.",
         extra=(
             "involves:\n"
-            "  - {entity: George}\n"
-            "  - {entity: Gary}\n"
+            "  - {entity: Riley}\n"
+            "  - {entity: Morgan}\n"
         ),
     )
     map_errors = digest._validate_digest_content(map_content)
@@ -700,7 +700,7 @@ def test_reject_bad_related_id():
 def test_related_without_explicit_passes():
     digest = _load_digest()
     content = _block(
-        extra="related: [mem-2026-06-26-george-grade]",
+        extra="related: [mem-2026-06-26-riley-grade]",
     )
     assert digest._validate_digest_content(content) == []
 
@@ -711,7 +711,7 @@ def test_medium_confidence_may_carry_related():
     content = _block(
         extra=(
             "confidence: medium\n"
-            "related: [mem-2026-06-26-george-grade]"
+            "related: [mem-2026-06-26-riley-grade]"
         ),
     )
     assert digest._validate_digest_content(content) == []
@@ -722,7 +722,7 @@ def test_explicit_and_related_passes():
     content = _block(
         extra=(
             "confidence: explicit\n"
-            "related: [mem-2026-06-26-george-grade]"
+            "related: [mem-2026-06-26-riley-grade]"
         ),
     )
     assert digest._validate_digest_content(content) == []
@@ -731,7 +731,7 @@ def test_explicit_and_related_passes():
 def test_reject_supersedes_without_explicit():
     digest = _load_digest()
     content = _block(
-        extra="supersedes: [mem-2026-06-26-george-grade]",
+        extra="supersedes: [mem-2026-06-26-riley-grade]",
     )
     errors = digest._validate_digest_content(content)
     assert any("supersedes links require confidence: explicit" in e for e in errors)
@@ -742,7 +742,7 @@ def test_explicit_and_supersedes_passes():
     content = _block(
         extra=(
             "confidence: explicit\n"
-            "supersedes: [mem-2026-06-26-george-grade]"
+            "supersedes: [mem-2026-06-26-riley-grade]"
         ),
     )
     assert digest._validate_digest_content(content) == []
@@ -802,39 +802,39 @@ def test_normalize_keeps_supersedes_list():
 def test_normalize_dedupes_involves_and_strips_primary():
     digest = _load_digest()
     raw = _block(
-        entity="George",
-        extra="involves: [George, Gary, Gary]",
+        entity="Riley",
+        extra="involves: [Riley, Morgan, Morgan]",
     )
     normalized = digest._normalize_digest_content(raw, session_id="s1")
     assert "involves:" in normalized
-    assert "{entity: Gary}" in normalized
-    assert "George," not in normalized.split("involves:", 1)[1].split("---", 1)[0]
+    assert "{entity: Morgan}" in normalized
+    assert "Riley," not in normalized.split("involves:", 1)[1].split("---", 1)[0]
     assert digest._validate_digest_content(normalized) == []
 
 
 def test_normalize_involves_string_to_entity_map():
     digest = _load_digest()
-    raw = _block(entity="George", extra="involves: [Gary]")
+    raw = _block(entity="Riley", extra="involves: [Morgan]")
     normalized = digest._normalize_digest_content(raw, session_id="s1")
-    assert "{entity: Gary}" in normalized
+    assert "{entity: Morgan}" in normalized
     assert "role:" not in normalized.split("involves:", 1)[1].split("---", 1)[0]
 
 
 def test_normalize_involves_keeps_clear_role():
     digest = _load_digest()
     raw = _block(
-        entity="Jackie",
+        entity="Jordan",
         extra=(
             "involves:\n"
-            "  - entity: Willie Liao\n"
+            "  - entity: Alex Chen\n"
             "    role: partner\n"
             "  - entity: Roommate\n"
             "    role: ''\n"
         ),
-        body="Narration: Jackie is Willie's partner and shares a dorm with Roommate.",
+        body="Narration: Jordan is Alex's partner and shares a dorm with Roommate.",
     )
     normalized = digest._normalize_digest_content(raw, session_id="s1")
-    assert "{entity: Willie Liao, role: partner}" in normalized
+    assert "{entity: Alex Chen, role: partner}" in normalized
     assert "{entity: Roommate}" in normalized
     involves_section = normalized.split("involves:", 1)[1].split("---", 1)[0]
     assert "role: }" not in involves_section
@@ -844,11 +844,11 @@ def test_normalize_involves_keeps_clear_role():
 def test_fact_worker_rejects_multi_involves_without_narration():
     digest = _load_digest()
     content = _block(
-        entity="Jackie",
-        body="Jackie lives in a school dorm.",
+        entity="Jordan",
+        body="Jordan lives in a school dorm.",
         extra=(
             "involves:\n"
-            "  - {entity: Willie Liao, role: partner}\n"
+            "  - {entity: Alex Chen, role: partner}\n"
             "  - {entity: Roommate}\n"
         ),
     )
@@ -859,8 +859,8 @@ def test_fact_worker_rejects_multi_involves_without_narration():
 def test_fact_worker_rejects_narration_without_involves():
     digest = _load_digest()
     content = _block(
-        entity="Jackie",
-        body="Narration: Jackie is Willie's partner and dislikes cilantro.",
+        entity="Jordan",
+        body="Narration: Jordan is Alex's partner and dislikes cilantro.",
     )
     errors = digest._validate_worker_output(content, "fact")
     assert any("Narration:" in error for error in errors)
@@ -869,14 +869,14 @@ def test_fact_worker_rejects_narration_without_involves():
 def test_fact_worker_accepts_narration_with_optional_roles():
     digest = _load_digest()
     content = _block(
-        entity="Jackie",
+        entity="Jordan",
         body=(
-            "Narration: Jackie is Willie's partner; lives in a school dorm; "
+            "Narration: Jordan is Alex's partner; lives in a school dorm; "
             "dislikes cilantro."
         ),
         extra=(
             "involves:\n"
-            "  - {entity: Willie Liao, role: partner}\n"
+            "  - {entity: Alex Chen, role: partner}\n"
             "  - {entity: Roommate}\n"
         ),
     )
@@ -887,8 +887,8 @@ def test_decision_worker_rejects_third_party_preference_subject():
     digest = _load_digest()
     content = _block(
         type_="decision",
-        entity="Jackie",
-        body="Preference: Jackie dislikes cilantro and green onion.",
+        entity="Jordan",
+        body="Preference: Jordan dislikes cilantro and green onion.",
     )
     errors = digest._validate_worker_output(content, "decision")
     assert any("user/User" in error or "USER.md" in error or "user" in error.lower() for error in errors)
@@ -898,8 +898,8 @@ def test_decision_worker_rejects_observational_user_stated_trait():
     digest = _load_digest()
     content = _block(
         type_="decision",
-        entity="Jackie",
-        body="Decision: user stated Jackie lives in a school dorm.",
+        entity="Jordan",
+        body="Decision: user stated Jordan lives in a school dorm.",
     )
     errors = digest._validate_worker_output(content, "decision")
     assert any("user/User" in error or "USER.md" in error or "user" in error.lower() or "Narration:" in error for error in errors)
@@ -909,9 +909,9 @@ def test_decision_worker_accepts_user_ruling_about_third_party_topic():
     digest = _load_digest()
     content = _block(
         type_="decision",
-        entity="Willie Liao",
+        entity="Alex Chen",
         body=(
-            "Decision: user ruled that any Jackie/dating question must first "
+            "Decision: user ruled that any Jordan/dating question must first "
             "read the dating knowledge directory."
         ),
     )
@@ -933,6 +933,7 @@ def test_dedup_prompt_compares_same_type_only():
     prompt = dedup.build_proposer_prompt([], [])
     folded = prompt.casefold()
     assert "same type only" in folded
+    assert "candidate pairs" in folded
     assert "Cross type plus extension" not in prompt
     assert "### Cross-type extension (drop, not merge)" not in prompt
 
@@ -1011,6 +1012,7 @@ def test_failure_path_does_not_touch_daily_file(tmp_path, monkeypatch):
         "_invoke_digest_llm",
         lambda prompt, platform: "",
     )
+    monkeypatch.setattr(digest, "_invoke_digest_worker_tool", fail_closed_tool_capture)
 
     prompt = digest._worker_prompt(
         "fact", "prompt", session_id="s1", platform="cli", run_id="r1"
@@ -1032,6 +1034,7 @@ def test_dirty_accept_worker_does_not_touch_daily_file(tmp_path, monkeypatch):
         "_invoke_digest_llm",
         lambda prompt, platform: _block(type_="entity", entity=None, body="junk"),
     )
+    monkeypatch.setattr(digest, "_invoke_digest_worker_tool", fail_closed_tool_capture)
 
     prompt = digest._worker_prompt(
         "fact", "prompt", session_id="s1", platform="cli", run_id="r1"
@@ -1053,7 +1056,7 @@ def test_well_formed_block_validates_and_passes_worker_gate(tmp_path, monkeypatc
     well_formed = _block(
         block_id="mem-2026-06-26-correction",
         type_="decision_constraint",
-        entity="George",
+        entity="Riley",
         body="Decision: user ruled that the grade dispute was resolved in parent's favor.",
         extra=(
             "confidence: explicit\n"
@@ -1065,6 +1068,7 @@ def test_well_formed_block_validates_and_passes_worker_gate(tmp_path, monkeypatc
     monkeypatch.setattr(
         digest, "_invoke_digest_llm", lambda prompt, platform: well_formed
     )
+    monkeypatch.setattr(digest, "_invoke_digest_worker_tool", fail_closed_tool_capture)
 
     prompt = digest._worker_prompt(
         "decision", "prompt", session_id="s1", platform="cli", run_id="r1"
@@ -1081,7 +1085,7 @@ def _event_block_for_related(
     *,
     block_id: str,
     related: str,
-    entity: str = "Willie Liao",
+    entity: str = "Alex Chen",
 ) -> str:
     return "\n".join(
         [
@@ -1109,13 +1113,13 @@ def test_event_related_to_event_fails_validate_digest_file():
     """Negative: event.related must not point at another event."""
     digest = _load_digest()
     fact = _block(
-        block_id="mem-20260726-willie-resume-delivered",
-        entity="Willie Liao",
-        body="Resume facts for Willie.",
+        block_id="mem-20260726-alex-resume-delivered",
+        entity="Alex Chen",
+        body="Resume facts for Alex.",
     )
     v3 = _event_block_for_related(
         block_id="mem-20260726-resume-v3",
-        related="mem-20260726-willie-resume-delivered",
+        related="mem-20260726-alex-resume-delivered",
     )
     v4 = _event_block_for_related(
         block_id="mem-20260726-resume-v4",
@@ -1132,13 +1136,13 @@ def test_event_related_to_event_fails_validate_digest_file():
 def test_event_related_to_fact_passes_validate_digest_file():
     digest = _load_digest()
     fact = _block(
-        block_id="mem-20260726-willie-resume-delivered",
-        entity="Willie Liao",
-        body="Resume facts for Willie.",
+        block_id="mem-20260726-alex-resume-delivered",
+        entity="Alex Chen",
+        body="Resume facts for Alex.",
     )
     event = _event_block_for_related(
         block_id="mem-20260726-resume-outcome",
-        related="mem-20260726-willie-resume-delivered",
+        related="mem-20260726-alex-resume-delivered",
     )
     content = "\n\n".join([fact, event]) + "\n"
     assert digest._validate_digest_file(content) == []
@@ -1530,7 +1534,7 @@ def test_append_rejects_event_related_to_existing_daily_event(tmp_path, monkeypa
             "---",
             "id: mem-20260726-resume-v3",
             "type: event",
-            "entity: Willie Liao",
+            "entity: Alex Chen",
             "predicate: user_requested_resume_v3",
             "participants:",
             "  - {entity: User, role: requester}",

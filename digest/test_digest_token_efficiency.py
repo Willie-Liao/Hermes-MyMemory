@@ -111,19 +111,19 @@ def test_render_fact_kind_enum_and_slot_validation():
     factual = digest_tools.render_worker_yaml_from_args(
         "fact",
         {
-            "entity": "Jackie",
+            "entity": "Jordan",
             "kind": "Factual",
-            "content": "Jackie lives in a school dorm",
+            "content": "Jordan lives in a school dorm",
             "confidence": "high",
             "importance": 3,
         },
         session_id="s1",
         today="2026-08-11",
     )
-    assert "Factual: Jackie lives in a school dorm" in factual
+    assert "Factual: Jordan lives in a school dorm" in factual
     assert digest_tools.validate_worker_slot_args(
         "fact",
-        {"kind": "Factual", "content": "Jackie lives in a school dorm"},
+        {"kind": "Factual", "content": "Jordan lives in a school dorm"},
     ) == []
     assert any(
         "invalid kind" in e
@@ -531,9 +531,12 @@ def test_proposer_tool_loop_submit_then_patch(tmp_path, monkeypatch):
     digest = _load("digest")
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
     calls: list[str] = []
+    prompts: list[str] = []
 
     def fake_tool(prompt, platform, *, purpose, force_tool_name):
+        del platform, purpose
         calls.append(force_tool_name)
+        prompts.append(prompt)
         if force_tool_name == "submit_operations":
             return {
                 "tool_name": "submit_operations",
@@ -553,22 +556,133 @@ def test_proposer_tool_loop_submit_then_patch(tmp_path, monkeypatch):
         }
 
     monkeypatch.setattr(digest, "_invoke_digest_worker_tool", fake_tool)
+
+    class _StubMiniLM:
+        def encode(self, texts, normalize_embeddings=True):
+            del normalize_embeddings
+            rows = []
+            for raw in texts:
+                text = str(raw)
+                if "Apple" in text or "alpha-apple" in text:
+                    rows.append([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                elif "Banana" in text:
+                    rows.append([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                elif "Zebra" in text:
+                    rows.append([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+                elif "Proc" in text:
+                    rows.append([0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                elif "Event" in text:
+                    rows.append([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                else:
+                    rows.append([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            return rows
+
+    monkeypatch.setattr(digest, "_PHASE2_MINILM", _StubMiniLM())
+    monkeypatch.setattr(digest, "_PHASE2_EMBED_CACHE", {})
+
+    skipper = digest.make_llm_proposer("cli", session_id="s1", run_id="r-skip")
+    singleton = {
+        "id": "mem-2026-08-11-fact-x",
+        "type": "fact",
+        "entity": "Topic",
+        "confidence": "high",
+        "importance": 3,
+        "status": "candidate",
+        "sources": ["session s1"],
+        "body": "Fixed.",
+    }
+    skipped = skipper([], [singleton], errors=(), attempt=1)
+    assert calls == []
+    assert skipped == []
+
+    class _BoomMiniLM:
+        def encode(self, texts, normalize_embeddings=True):
+            del texts, normalize_embeddings
+            raise RuntimeError("minilm unavailable")
+
+    monkeypatch.setattr(digest, "_PHASE2_MINILM", _BoomMiniLM())
+    monkeypatch.setattr(digest, "_PHASE2_EMBED_CACHE", {})
+    opener = digest.make_llm_proposer("cli", session_id="s1", run_id="r-open")
+    opener([], [singleton], errors=(), attempt=1)
+    assert calls[-1] == "submit_operations"
+    assert "mem-2026-08-11-fact-x" in prompts[-1]
+    assert "Compare only these same-type pairs" not in prompts[-1]
+
+    monkeypatch.setattr(digest, "_PHASE2_MINILM", _StubMiniLM())
+    monkeypatch.setattr(digest, "_PHASE2_EMBED_CACHE", {})
     proposer = digest.make_llm_proposer("cli", session_id="s1", run_id="r1")
     existing = []
     new = [
         {
-            "id": "mem-2026-08-11-fact-x",
+            "id": "mem-fact-apple",
             "type": "fact",
             "entity": "Topic",
             "confidence": "high",
             "importance": 3,
             "status": "candidate",
             "sources": ["session s1"],
-            "body": "Fixed.",
-        }
+            "body": "Apple related note alpha-apple.",
+        },
+        {
+            "id": "mem-fact-banana",
+            "type": "fact",
+            "entity": "Topic",
+            "confidence": "high",
+            "importance": 3,
+            "status": "candidate",
+            "sources": ["session s1"],
+            "body": "Banana related note.",
+        },
+        {
+            "id": "mem-fact-zebra",
+            "type": "fact",
+            "entity": "Topic",
+            "confidence": "high",
+            "importance": 3,
+            "status": "candidate",
+            "sources": ["session s1"],
+            "body": "Zebra unrelated note.",
+        },
+        {
+            "id": "mem-proc-a",
+            "type": "procedure",
+            "entity": "Lock",
+            "confidence": "high",
+            "importance": 3,
+            "status": "candidate",
+            "sources": ["session s1"],
+            "body": "Proc recover lock.",
+        },
+        {
+            "id": "mem-proc-b",
+            "type": "procedure",
+            "entity": "Lock",
+            "confidence": "high",
+            "importance": 3,
+            "status": "candidate",
+            "sources": ["session s1"],
+            "body": "Proc recover lock again.",
+        },
+        {
+            "id": "mem-event-apple",
+            "type": "event",
+            "entity": "Topic",
+            "confidence": "high",
+            "importance": 3,
+            "status": "candidate",
+            "sources": ["session s1"],
+            "body": "Event about Apple.",
+        },
     ]
     first = proposer(existing, new, errors=(), attempt=1)
     assert calls[-1] == "submit_operations"
+    gated = prompts[-1]
+    assert "Compare only these same-type pairs" in gated
+    assert "mem-fact-apple" in gated
+    assert "mem-fact-banana" in gated
+    assert "mem-fact-zebra" not in gated
+    assert "mem-event-apple" not in gated
+    assert "mem-proc-a" in gated and "mem-proc-b" in gated
     second = proposer(
         existing, new, errors=("operation[0]: unknown id",), attempt=2
     )
@@ -609,6 +723,13 @@ def test_oneshot_attempt2_uses_teach_and_foul_touched_patch(monkeypatch, tmp_pat
     proposer = digest.make_oneshot_proposer(
         session_id="s1", run_id="r1", invoke_tool=fake_oneshot
     )
+    class _StubMiniLM:
+        def encode(self, texts, normalize_embeddings=True):
+            del texts, normalize_embeddings
+            return [[1.0, 0.0, 0.0, 0.0], [0.99, 0.14, 0.0, 0.0]]
+
+    monkeypatch.setattr(digest, "_PHASE2_MINILM", _StubMiniLM())
+    monkeypatch.setattr(digest, "_PHASE2_EMBED_CACHE", {})
     keep = {
         "id": "mem-keep",
         "type": "fact",
@@ -649,12 +770,12 @@ def test_oneshot_attempt2_uses_teach_and_foul_touched_patch(monkeypatch, tmp_pat
 
 
 
-def test_validate_worker_tool_args_rejects_jackie_decision():
+def test_validate_worker_tool_args_rejects_jordan_decision():
     errs = digest_tools.validate_worker_tool_args(
         "decision",
         {
             "kind": "Decision",
-            "subject": "Jackie",
+            "subject": "Jordan",
             "ruling": "dislikes cilantro",
             "confidence": "high",
             "importance": 4,

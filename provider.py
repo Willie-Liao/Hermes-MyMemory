@@ -182,8 +182,8 @@ class MyMemoryProvider(MemoryProvider):
             {
                 "name": "mymemory_digest",
                 "description": (
-                    "Run a digest now or inspect bookmark/status. "
-                    "Pass the same tokens as the old /digest command (empty, status, bookmark …)."
+                    "Run a digest now, inspect bookmark/status, or estimate/run history backfill. "
+                    "Pass the same tokens as /digest (empty, status, bookmark, history …)."
                 ),
                 "parameters": {
                     "type": "object",
@@ -268,9 +268,9 @@ def _register_slash_commands() -> None:
             "digest",
             digest_slash.handle_digest,
             description=(
-                "Force a digest run or manage bookmark / resummarise / recall / show"
+                "Force a digest run, manage bookmark, or estimate/run history backfill"
             ),
-            args_hint="[status|bookmark|help]",
+            args_hint="[status|bookmark|history|help]",
         )
         ctx.register_command(
             "weekly",

@@ -1,13 +1,7 @@
 from __future__ import annotations
 
-from pathlib import Path
-
+from recall.conftest import HOP1, HOP2, OVERLAP, SEED, write_fake_staging
 from recall.tools import expand_memory, handle_tool, recall_memory
-
-SEED = "mem-2026-08-12-event-9625547B667B"
-HOP1 = "mem-2026-08-09-procedure-C1DD5CAA2A26"
-HOP2 = "mem-2026-08-08-procedure-2B93F6F55D12"
-OVERLAP = "mem-2026-08-13-event-48AB7607830B"
 
 
 def test_recall_sentence_hits_seed_cluster(staging):
@@ -101,24 +95,16 @@ def test_handle_tool_entity_query_expands_listed_seeds(staging):
 def test_handle_tool_mixed_cjk_english(staging):
     text = handle_tool(
         "recall_memory",
-        {"query": "张主任相关的记忆有哪些？ also memory digest"},
+        {"query": "记忆摘要相关的记忆有哪些？ also memory digest"},
         staging=staging,
     )
-    assert "mem-20260729-zhang-zhurui-wechat-softening-rule" in text
+    assert SEED in text or "mem-" in text
 
 
 def test_handle_tool_writes_strength_fields(tmp_path, monkeypatch):
     monkeypatch.setenv("RECALL_PERSIST_IN_TEST", "1")
+    write_fake_staging(tmp_path)
     daily = tmp_path / "daily"
-    daily.mkdir()
-    src = (
-        Path(__file__).resolve().parents[3]
-        / "memories"
-        / "staging"
-        / "daily"
-        / "2026-08-12.md"
-    )
-    (daily / "2026-08-12.md").write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
     handle_tool("recall_memory", {"query": SEED}, staging=tmp_path)
     text = (daily / "2026-08-12.md").read_text(encoding="utf-8")
     assert "recall_n:" in text

@@ -25,7 +25,7 @@ type: event
 entity: Example
 predicate: example_delivered
 participants:
-  - entity: Willie Liao
+  - entity: Alex Chen
     role: homeroom_teacher
   - entity: Example
 valid_from: 2026-06-25

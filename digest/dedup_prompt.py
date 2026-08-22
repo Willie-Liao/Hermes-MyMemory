@@ -26,8 +26,10 @@ decision (or any other mixed-type pair). Different types may `related:` each
 other; that is coexistence, not a duplicate. Cross-type drop/merge is legacy
 from when four extractors wrote the four types separately.
 
-Within one type, for each pair ask: does one block EXTEND the other, or
-RESTATE it? Consolidate only then.
+If `## Candidate pairs` is present, compare **only those listed pairs**.
+If that section is absent, compare every same-type pair. For each compared
+pair ask: does one block EXTEND the other, or RESTATE it? Consolidate only
+then.
 
 An extension is any of:
 - A follow-up or addition — same episode, later stage. "asked the contact about
@@ -226,7 +228,7 @@ Shape (connected same-day sitting — preferred when true):
 
 Shape (unrelated events — keep separate):
 - "The user asked for commonly spoken dialects listed in a table."
-- "The user requested a WeChat reminder draft to 张主任."
+- "The user requested a WeChat reminder draft to 林主任."
 
 Start with "The user …" when it is the user's action. One sentence per
 bullet. At most 200 characters. No second sentence inside a bullet
@@ -400,11 +402,13 @@ def build_proposer_prompt(
     previous_operations: Iterable[Any] | None = None,
     pending_account_ids: Iterable[str] | None = None,
     already_persisted_new: bool = False,
+    candidate_pairs: Iterable[tuple[str, str]] | None = None,
 ) -> str:
     """Assemble the proposer prompt: rules, examples, live blocks, then retries.
 
-    The static rules and examples come first so a provider can cache the prefix
-    across attempts; only the tail changes between retries.
+    Explicit candidate pairs constrain attention to Pearson/MI survivors so the
+    model does not spend tokens comparing every same-type pair. ``None`` keeps
+    the full-board fail-open wording. Static rules stay first for caching.
 
     Attempt >= 2 with ``previous_operations``: caller should pass already
     filtered existing/new (foul-touched closure only). Pending new ids appear
@@ -429,6 +433,20 @@ def build_proposer_prompt(
             render_typed_board("New", new_blocks),
         ]
     )
+    if candidate_pairs is not None:
+        lines = []
+        for pair in candidate_pairs:
+            left, right = pair[0], pair[1]
+            a = str(left).strip()
+            b = str(right).strip()
+            if a and b:
+                lines.append(f"- {a} — {b}")
+        if lines:
+            sections.append(
+                "## Candidate pairs\n\n"
+                "Compare only these same-type pairs:\n\n"
+                + "\n".join(lines)
+            )
     if previous_operations is not None and attempt >= 2:
         try:
             prev_payload = [

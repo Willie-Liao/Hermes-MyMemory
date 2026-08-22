@@ -24,6 +24,7 @@ import hashlib
 import importlib.util
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -132,6 +133,11 @@ MAX_ERRORS_IN_PROMPT = 8
 MAX_RETRY_ERROR_CHARS = 800
 # Clear a stuck in-flight flag if the worker never finished (e.g. gateway crash).
 IN_FLIGHT_STALE_SECONDS = 600
+# Phase-2 Pearson/MI prefilter (ES-Mem eqs 1–2). Lazy MiniLM; in-memory only.
+PHASE2_MINILM_MODEL = "all-MiniLM-L6-v2"
+PHASE2_MI_QUANTILE = 0.35
+_PHASE2_MINILM: Any = None
+_PHASE2_EMBED_CACHE: dict[str, list[float]] = {}
 
 # Civil-day event bullets after YAML fences — not a fifth memory type.
 DAY_WRAPUP_HEADING = "## Day wrap-up"
@@ -1783,9 +1789,9 @@ def _staging_output_example() -> str:
     return (
         "EXAMPLE (fact with span):\n"
         "---\n"
-        "id: mem-20260617-gabby-canteen\n"
+        "id: mem-20260617-casey-canteen\n"
         "type: fact\n"
-        "entity: Gabby\n"
+        "entity: Casey\n"
         "valid_from: 2026-06-14\n"
         "valid_to: open\n"
         "confidence: high\n"
@@ -1793,7 +1799,7 @@ def _staging_output_example() -> str:
         "status: candidate\n"
         "sources: [session example]\n"
         "---\n"
-        "Gabby (student): parents chose home-packed lunch; school card is binary canteen vs gate-only.\n"
+        "Casey (student): parents chose home-packed lunch; school card is binary canteen vs gate-only.\n"
         "\n"
         "EXAMPLE (event + linked procedure):\n"
         "---\n"
@@ -2742,12 +2748,12 @@ def _commit_candidate_once(
                 )
                 if not expected_type:
                     raise ValueError("worker artifact filename is not canonical")
-                    _load_validated_worker_artifact(
-                        artifact,
-                        session_id=session_id,
-                        run_id=run_id,
-                        expected_worker_type=expected_type,
-                    )
+                _load_validated_worker_artifact(
+                    artifact,
+                    session_id=session_id,
+                    run_id=run_id,
+                    expected_worker_type=expected_type,
+                )
             operations = _resolve_commit_operations(
                 operation_artifact, session_id=session_id, run_id=run_id
             )
@@ -2992,13 +2998,13 @@ def _phase2_prompt_and_tool(
     previous_ops: list[dict[str, Any]],
     max_attempts: int,
 ) -> tuple[str, str, str]:
-    """Build Phase-2 submit/patch prompt with teach + foul-touched card shrink.
+    """Build Phase-2 submit/patch prompt after a local Pearson/MI pair filter.
 
-    Shared so oneshot and Hermes proposers cannot drift: attempt 1 is
-    ``submit_operations`` on the full board; later attempts force
-    ``patch_operations``, append ``operations_failed_teach``, and keep only
-    foul-touched cards when that closure is non-empty.
+    Without a same-type MI gate every daily card would enter the LLM context.
+    Embed or math failure fail-opens to the full board so merge quality is not
+    lost. Attempt ≥2 still shrinks to foul-touched cards only.
     """
+    global _PHASE2_MINILM
     mode = "submit" if attempt == 1 or not previous_ops else "patch"
     force_name = (
         "submit_operations" if mode == "submit" else "patch_operations"
@@ -3014,6 +3020,7 @@ def _phase2_prompt_and_tool(
     prompt_new = new_blocks
     pending_ids: list[str] | None = None
     previous_for_prompt: list[dict[str, Any]] | None = None
+    candidate_pairs: list[tuple[str, str]] | None = None
     if attempt >= 2 and previous_ops:
         closure = digest_dedup_prompt.foul_touched_block_ids(
             errors, previous_ops, existing_blocks, new_blocks
@@ -3038,6 +3045,112 @@ def _phase2_prompt_and_tool(
                 new_blocks, closure
             )
             previous_for_prompt = list(previous_ops)
+    elif attempt == 1:
+        try:
+            board = [
+                dict(b)
+                for b in list(existing_blocks) + list(new_blocks)
+                if str(b.get("id") or "").strip()
+            ]
+            grouped = digest_dedup_prompt._group_blocks_by_type(board)
+            texts: list[str] = []
+            keys: list[str] = []
+            for block in board:
+                bits = [str(block.get("type") or "").strip()]
+                for field in ("entity", "predicate", "body"):
+                    val = str(block.get(field) or "").strip()
+                    if val:
+                        bits.append(val)
+                text = " ".join(bits)
+                keys.append(
+                    hashlib.sha256(text.encode("utf-8")).hexdigest()
+                )
+                texts.append(text)
+            missing_i = [
+                i for i, key in enumerate(keys) if key not in _PHASE2_EMBED_CACHE
+            ]
+            if missing_i:
+                if _PHASE2_MINILM is None:
+                    from sentence_transformers import SentenceTransformer
+
+                    _PHASE2_MINILM = SentenceTransformer(PHASE2_MINILM_MODEL)
+                encoded = _PHASE2_MINILM.encode(
+                    [texts[i] for i in missing_i],
+                    normalize_embeddings=True,
+                )
+                for pos, idx in enumerate(missing_i):
+                    row = encoded[pos]
+                    _PHASE2_EMBED_CACHE[keys[idx]] = [
+                        float(v) for v in row
+                    ]
+            vectors = [_PHASE2_EMBED_CACHE[key] for key in keys]
+            by_id = {
+                str(block.get("id")): (block, vectors[i])
+                for i, block in enumerate(board)
+            }
+            kept: list[tuple[str, str]] = []
+            for kind in digest_dedup_prompt.BLOCK_TYPE_ORDER:
+                cards = [
+                    str(b.get("id"))
+                    for b in grouped.get(kind, [])
+                    if str(b.get("id") or "").strip()
+                ]
+                if len(cards) < 2:
+                    continue
+                scores: list[tuple[str, str, float]] = []
+                for i, left in enumerate(cards):
+                    for right in cards[i + 1 :]:
+                        x = by_id[left][1]
+                        y = by_id[right][1]
+                        n = min(len(x), len(y))
+                        if n < 2:
+                            rho = 0.0
+                        else:
+                            mx = sum(x[:n]) / n
+                            my = sum(y[:n]) / n
+                            num = sum(
+                                (x[j] - mx) * (y[j] - my) for j in range(n)
+                            )
+                            vx = sum((x[j] - mx) ** 2 for j in range(n))
+                            vy = sum((y[j] - my) ** 2 for j in range(n))
+                            den = math.sqrt(vx * vy)
+                            rho = 0.0 if den == 0.0 else num / den
+                        rho = max(-1.0, min(1.0, rho))
+                        rho2 = min(rho * rho, 1.0 - 1e-12)
+                        mi = -0.5 * math.log(1.0 - rho2)
+                        scores.append((left, right, mi))
+                if len(scores) == 1:
+                    kept.append((scores[0][0], scores[0][1]))
+                    continue
+                values = sorted(item[2] for item in scores)
+                pos = PHASE2_MI_QUANTILE * (len(values) - 1)
+                lo = int(pos)
+                hi = min(lo + 1, len(values) - 1)
+                frac = pos - lo
+                threshold = values[lo] * (1.0 - frac) + values[hi] * frac
+                for left, right, mi in scores:
+                    if mi > threshold:
+                        kept.append((left, right))
+            if not kept:
+                _log(
+                    "phase2 Pearson/MI gate: no candidate pairs; skip LLM"
+                )
+                return ("", force_name, "skip")
+            keep_ids = {a for a, _b in kept} | {b for _a, b in kept}
+            prompt_existing = [
+                b
+                for b in existing_blocks
+                if str(b.get("id") or "") in keep_ids
+            ]
+            prompt_new = [
+                b for b in new_blocks if str(b.get("id") or "") in keep_ids
+            ]
+            candidate_pairs = kept
+        except Exception as exc:
+            _log(
+                f"phase2 Pearson/MI gate failed; full-board prompt: {exc}"
+            )
+            candidate_pairs = None
     prompt = digest_dedup_prompt.build_proposer_prompt(
         prompt_existing,
         prompt_new,
@@ -3046,6 +3159,7 @@ def _phase2_prompt_and_tool(
         previous_operations=previous_for_prompt,
         pending_account_ids=pending_ids,
         already_persisted_new=True,
+        candidate_pairs=candidate_pairs,
     )
     if teach:
         prompt = f"{prompt}\n\n{teach}"
@@ -3061,6 +3175,10 @@ def make_llm_proposer(
     max_attempts: int = MAX_PROPOSER_VALIDATION_ATTEMPTS,
 ) -> Any:
     """Build the duplicate-consolidation proposer for one digest.
+
+    Skip-mode from the Pearson/MI gate returns no ops without an LLM call so
+    empty-candidate boards do not burn tokens, while prepare_operations still
+    runs decay and validation.
 
     Preferred I/O: forced ``submit_operations`` (attempt 1) then
     ``patch_operations`` (attempts 2–5) via ``run_worker_llm_tools``. Text
@@ -3094,6 +3212,8 @@ def make_llm_proposer(
                 previous_ops=previous_ops,
                 max_attempts=max_attempts,
             )
+            if mode == "skip":
+                return []
         except Exception as exc:
             if attempt < max_attempts:
                 raise
@@ -3209,7 +3329,11 @@ def make_oneshot_proposer(
     invoke_tool: Any = None,
     max_attempts: int = 2,
 ) -> Any:
-    """Phase-2 oneshot proposer: same teach/patch as Hermes, no AIAgent."""
+    """Phase-2 oneshot proposer: same teach/patch as Hermes, no AIAgent.
+
+    Skip-mode from the Pearson/MI gate returns no ops without an LLM call so
+    empty-candidate boards still reach prepare_operations decay.
+    """
     caller = invoke_tool or _invoke_digest_oneshot_tool
     previous_ops: list[dict[str, Any]] = []
 
@@ -3229,6 +3353,8 @@ def make_oneshot_proposer(
             previous_ops=previous_ops,
             max_attempts=max_attempts,
         )
+        if mode == "skip":
+            return []
         capture = caller(
             prompt,
             "cli",

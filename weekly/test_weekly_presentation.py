@@ -886,7 +886,7 @@ def test_hot_edit_agree_writes_memory_without_recall_batch(tmp_path, monkeypatch
     cite = _load_cite_for_hot(tmp_path, monkeypatch)
     entries = (
         "Unrelated weather note.",
-        "Science grade dispute with George remains open.",
+        "Science grade dispute with Riley remains open.",
     )
     path, before = _arm_hot_for_apply(
         cite, weekly, tmp_path, entries=entries, index=1
@@ -894,11 +894,11 @@ def test_hot_edit_agree_writes_memory_without_recall_batch(tmp_path, monkeypatch
 
     menu = _hot_action_menu_question(index=1)
     _clarify_q(weekly, menu, weekly.WEEKLY_ACTION_EDIT)
-    _clarify_q(weekly, weekly.WEEKLY_EDIT_OPEN_QUESTION, "George grade dispute resolved.")
+    _clarify_q(weekly, weekly.WEEKLY_EDIT_OPEN_QUESTION, "Riley grade dispute resolved.")
     _clarify_q(weekly, weekly.WEEKLY_EDIT_CONFIRM_QUESTION, "A · Agree")
 
     written = path.read_text(encoding="utf-8")
-    assert "George grade dispute resolved." in written
+    assert "Riley grade dispute resolved." in written
     assert before not in written
 
     recall_path = (
@@ -920,7 +920,7 @@ def test_hot_edit_agree_mismatch_before_skips_write(tmp_path, monkeypatch):
     cite = _load_cite_for_hot(tmp_path, monkeypatch)
     entries = (
         "Unrelated weather note.",
-        "Science grade dispute with George remains open.",
+        "Science grade dispute with Riley remains open.",
     )
     path, _before = _arm_hot_for_apply(
         cite, weekly, tmp_path, entries=entries, index=1

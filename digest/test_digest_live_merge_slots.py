@@ -64,8 +64,8 @@ def test_live_merge_slots_factual_into_narration_fixture():
     survivor = {
         "id": "mem-n-surv",
         "type": "fact",
-        "body": "Narration: Jackie lives in a school dorm so dates default outside.",
-        "involves": [{"entity": "Willie Liao"}, {"entity": "Roommate"}],
+        "body": "Narration: Jordan lives in a school dorm so dates default outside.",
+        "involves": [{"entity": "Alex Chen"}, {"entity": "Roommate"}],
         "importance": 4,
         "sources": ["s1"],
         "confidence": "high",
@@ -74,7 +74,7 @@ def test_live_merge_slots_factual_into_narration_fixture():
     absorbed = {
         "id": "mem-f-abs",
         "type": "fact",
-        "body": "Factual: Jackie dislikes cilantro.",
+        "body": "Factual: Jordan dislikes cilantro.",
         "importance": 3,
         "sources": ["s2"],
         "confidence": "high",
@@ -101,7 +101,7 @@ def test_live_merge_slots_factual_into_narration_fixture():
         "fact": {
             "kind": "Narration",
             "content": (
-                "Jackie lives in a school dorm so dates default outside; "
+                "Jordan lives in a school dorm so dates default outside; "
                 "dislikes cilantro"
             ),
         },

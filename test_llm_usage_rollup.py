@@ -57,3 +57,58 @@ def test_rollup_day_missing_ledger(tmp_path):
     assert out["cost_usd"] == 0.0
     assert out["by_plugin"] == {}
     assert out["by_purpose"] == {}
+
+
+def test_rollup_range_skips_bench_and_zero_and_other_plugins(tmp_path):
+    from llm_usage_rollup import rollup_range
+
+    p = tmp_path / "llm-usage.jsonl"
+    rows = [
+        {
+            "ts": "2026-08-12T01:00:00+00:00",
+            "plugin": "memory-digest",
+            "purpose": "digest-phase1",
+            "total_tokens": 100,
+            "cost_usd": 0.0,
+        },
+        {
+            "ts": "2026-08-12T02:00:00+00:00",
+            "plugin": "memory-digest",
+            "purpose": "bench-old-event",
+            "total_tokens": 50,
+            "cost_usd": 0.0,
+        },
+        {
+            "ts": "2026-08-12T03:00:00+00:00",
+            "plugin": "memory-digest",
+            "purpose": "digest-phase1",
+            "total_tokens": 0,
+            "cost_usd": 0.0,
+        },
+        {
+            "ts": "2026-08-12T04:00:00+00:00",
+            "plugin": "memory-weekly",
+            "purpose": "worker2_brief",
+            "total_tokens": 9,
+            "cost_usd": 0.0,
+        },
+        {
+            "ts": "2026-08-10T04:00:00+00:00",
+            "plugin": "memory-digest",
+            "purpose": "digest-phase1",
+            "total_tokens": 999,
+            "cost_usd": 0.0,
+        },
+    ]
+    p.write_text("\n".join(__import__("json").dumps(r) for r in rows) + "\n", encoding="utf-8")
+    out = rollup_range(
+        date(2026, 8, 11),
+        date(2026, 8, 12),
+        ledger_path=p,
+        plugins=["memory-digest"],
+        purposes=["digest-phase1"],
+    )
+    assert out["total_tokens"] == 100
+    assert out["n"] == 1
+    assert out["skipped"] >= 3
+    assert "bench-old-event" not in out["by_purpose"]

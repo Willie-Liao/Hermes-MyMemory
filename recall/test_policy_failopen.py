@@ -13,7 +13,7 @@ def test_policy_failopen_and_out_of_range():
     assert parse_gate_keep("keep 0 99 1", 3) in ([0, 1], [0, 1])
     kept = parse_gate_keep("99 100", 3)
     assert kept == []
-    cands = [{"id": "a"}, {"id": "b"}, {"id": "Jackie"}]
+    cands = [{"id": "a"}, {"id": "b"}, {"id": "Jordan"}]
     all_kept = gate_candidates("q", cands, force_raw="")
     assert all_kept == cands
     dropped = gate_candidates("q", cands, force_raw="0 1")
