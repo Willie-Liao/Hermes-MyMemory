@@ -1,0 +1,34 @@
+{
+  "profile_version": 1,
+  "regime": "mimo_unified_typeA",
+  "disclaimer": "Bands from current-pipeline benches (Type-A Phase-1 plus separate Phase-2). Not a point forecast. Legacy MiniMax/Kimi ledger totals, bench-* purposes, zero-token failures, weekly/monthly jobs, and private identifiers are excluded.",
+  "time_confidence": "low",
+  "phase1": {
+    "tokens_per_batch_low": 20000,
+    "tokens_per_batch_typical": 33000,
+    "tokens_per_batch_high": 60000,
+    "elapsed_ms_per_batch_low": 90000,
+    "elapsed_ms_per_batch_typical": 216000,
+    "elapsed_ms_per_batch_high": 600000,
+    "ref_transcript_chars": 6036,
+    "n_eligible": 5,
+    "n_excluded": 8
+  },
+  "phase2": {
+    "tokens_per_day_low": 12000,
+    "tokens_per_day_typical": 70000,
+    "tokens_per_day_high": 140000,
+    "elapsed_ms_per_day_low": 50000,
+    "elapsed_ms_per_day_typical": 221000,
+    "elapsed_ms_per_day_high": 460000,
+    "n_eligible": 4,
+    "n_excluded": 6
+  },
+  "exclusions": [
+    {"reason": "legacy_minimax_era", "count": 3},
+    {"reason": "kimi_transition_era", "count": 2},
+    {"reason": "bench_purpose_mixed_into_ledger", "count": 4},
+    {"reason": "zero_token_failures", "count": 2},
+    {"reason": "weekly_or_monthly_not_digest", "count": 3}
+  ]
+}

@@ -1,0 +1,203 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import "tailwindcss";
+
+:root {
+  --bg-color: #0b0f19;
+  --text-color: #cbd5e1;
+  --card-bg: #111726;
+  --card-border: #1e293b;
+  --bg-deep: #070a13;
+  --text-muted: #94a3b8;
+  --text-bright: #f8fafc;
+}
+
+.light-theme {
+  --bg-color: #f8fafc;
+  --text-color: #334155;
+  --card-bg: #ffffff;
+  --card-border: #cbd5e1;
+  --bg-deep: #f1f5f9;
+  --text-muted: #64748b;
+  --text-bright: #0f172a;
+}
+
+/* Elegant Day Mode (Light Theme) Container Overrides */
+.light-theme {
+  background-color: var(--bg-color);
+  color: var(--text-color);
+}
+
+/* Header & Footer */
+.light-theme header,
+.light-theme footer {
+  background-color: var(--card-bg) !important;
+  background-image: none !important;
+  border-color: var(--card-border) !important;
+}
+
+/* Cards & Section Containers */
+.light-theme #weekly-chronicle-card,
+.light-theme #read-by-date-container,
+.light-theme #retention-policy-section,
+.light-theme #hot-memory-editor-section,
+.light-theme #memory-approval-section,
+.light-theme #transcript-drawer-container,
+.light-theme #transcript-drawer-container .bg-slate-950 {
+  background-color: var(--card-bg) !important;
+  background-image: none !important;
+  border-color: var(--card-border) !important;
+  box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.05), 0 2px 4px -2px rgb(0 0 0 / 0.05) !important;
+}
+
+/* Inner elements with gradients / dark classes */
+.light-theme .bg-gradient-to-b,
+.light-theme .bg-gradient-to-r,
+.light-theme .bg-gradient-to-br,
+.light-theme .bg-slate-900,
+.light-theme .bg-slate-950 {
+  background-image: none !important;
+  background-color: var(--card-bg) !important;
+}
+
+/* Inner lists / segments / child items */
+.light-theme .bg-slate-950\/40,
+.light-theme .bg-slate-950\/60,
+.light-theme .bg-slate-900\/60,
+.light-theme .bg-slate-800\/40,
+.light-theme .bg-slate-850 {
+  background-color: var(--bg-deep) !important;
+}
+
+.light-theme .border-slate-800,
+.light-theme .border-slate-850,
+.light-theme .border-slate-900,
+.light-theme .border-slate-850\/80,
+.light-theme .border-slate-800\/60,
+.light-theme .border-slate-800\/80 {
+  border-color: var(--card-border) !important;
+}
+
+/* Text and active elements */
+.light-theme .text-slate-100 {
+  color: var(--text-bright) !important;
+}
+
+.light-theme .text-slate-200,
+.light-theme .text-slate-300 {
+  color: var(--text-color) !important;
+}
+
+/* Primary/Success Colored Buttons and Badges - Ensure perfect readability */
+.light-theme .bg-indigo-600,
+.light-theme .bg-emerald-600,
+.light-theme .bg-purple-600,
+.light-theme .bg-sky-600 {
+  color: #ffffff !important;
+}
+
+.light-theme .text-indigo-400 {
+  color: #4f46e5 !important;
+}
+.light-theme .text-emerald-400 {
+  color: #166534 !important;
+}
+.light-theme .text-red-400 {
+  color: #991b1b !important;
+}
+.light-theme .text-amber-400 {
+  color: #9a3412 !important;
+}
+.light-theme .text-purple-400 {
+  color: #6b21a8 !important;
+}
+.light-theme .text-sky-400 {
+  color: #075985 !important;
+}
+
+/* Keep the destructive Close UI action legible at rest and darker on hover. */
+.light-theme .weekly-ui-close-button:hover {
+  color: #be123c !important;
+}
+
+.light-theme .bg-indigo-500\/10,
+.light-theme .bg-indigo-600\/10,
+.light-theme .bg-indigo-500\/15 {
+  background-color: rgba(79, 70, 229, 0.08) !important;
+}
+.light-theme .bg-emerald-500\/10,
+.light-theme .bg-emerald-500\/5 {
+  background-color: rgba(22, 101, 52, 0.08) !important;
+}
+.light-theme .bg-red-500\/10 {
+  background-color: rgba(153, 27, 27, 0.08) !important;
+}
+.light-theme .bg-amber-500\/10 {
+  background-color: rgba(154, 52, 18, 0.08) !important;
+}
+.light-theme .bg-purple-500\/10 {
+  background-color: rgba(107, 33, 168, 0.08) !important;
+}
+.light-theme .bg-sky-500\/10 {
+  background-color: rgba(7, 89, 133, 0.08) !important;
+}
+
+/* Day Mode Scrollbar */
+.light-theme ::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+.light-theme ::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+}
+.light-theme ::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  
+  --color-slate-950: var(--bg-deep);
+  --color-slate-900: var(--card-bg);
+  --color-slate-800: var(--card-border);
+  --color-slate-850: var(--card-border);
+  --color-slate-100: var(--text-bright);
+  --color-slate-200: var(--text-color);
+  --color-slate-300: var(--text-color);
+  --color-slate-400: var(--text-muted);
+  --color-slate-500: var(--text-muted);
+}
+
+/* Base styling */
+body {
+  font-family: var(--font-sans);
+  background-color: var(--bg-color);
+  color: var(--text-color);
+  overflow-x: hidden;
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+/* Styled scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #0f172a;
+}
+::-webkit-scrollbar-thumb {
+  background: #334155;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #475569;
+}
+
+/* Custom fade animations */
+.fade-in {
+  animation: fadeIn 0.3s ease-out forwards;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}

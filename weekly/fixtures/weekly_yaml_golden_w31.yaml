@@ -1,0 +1,24 @@
+schema_version: 1
+cycle: weekly
+week_key: 2026-W31
+belongs_to: 2026-07
+range:
+  start: '2026-07-27'
+  end: '2026-08-02'
+generated_at: '2026-08-19T00:00:00+08:00'
+generator:
+  model: ''
+  authored: []
+entities:
+- key: digest
+  canonical: digest
+  aliases: []
+  first_seen: null
+  last_seen: null
+  week_blocks:
+  - mem-2026-07-27-event-aaaa
+  embedding: null
+legend:
+  '1': mem-2026-07-27-event-aaaa
+cross-day-thread: []
+intra-day-thread: []

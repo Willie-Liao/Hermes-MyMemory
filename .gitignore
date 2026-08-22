@@ -1,0 +1,45 @@
+# Secrets and local runtime — never publish a live Hermes home
+.env
+.env.*
+!.env.example
+auth.json
+*.pem
+*.key
+*credentials*
+config.yaml
+shell-hooks-allowlist.json
+SOUL.md
+HERMES.md
+
+# Personal memory / session data
+memories/
+logs/
+sessions/
+state/
+state.db
+state.db-*
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Node / weekly UI
+node_modules/
+coverage/
+weekly/ui/dist/
+weekly/ui/build/
+.vite/
+*.log
+.DS_Store
+.gitnexus/
