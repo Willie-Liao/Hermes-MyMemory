@@ -98,6 +98,8 @@ hermes MyMemory digest history 7d --yes    # confirmed CLI run (synchronous)
 
 Estimate-only forms never write staging or start workers. Confirmed runs skip messages already past each session bookmark, write cards to the message's civil-day file, then consolidate that day once. Back up `memories/staging/` first: Phase-2 may rewrite affected daily files.
 
+**Phase-2 first-attempt prompt (Pearson/MI gated).** After the local pair filter, the LLM sees one `## Filtered candidate board` JSON object: survivor cards grouped by type, `pairs` as local indexes into that type's `cards` array. Types with no surviving pair are omitted; unpaired cards stay on disk and are not sent. Fail-open (embed error), retry/patch, and wrap-up still use the four typed JSON arrays (`### Existing events` …), including empty `[]`.
+
 ## Same-day supersede vs past-day contradiction
 
 **Current (unchanged) same-day supersede.** On today's daily file, Phase-1 persist then `supersede` overwrites the target body, stamps `superseded_at`, and purges the helper. Clock/UI leftover Phase-2 still applies same-file supersedes the same way. Do not use this path to rewrite history.

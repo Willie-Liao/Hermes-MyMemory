@@ -26,7 +26,9 @@ decision (or any other mixed-type pair). Different types may `related:` each
 other; that is coexistence, not a duplicate. Cross-type drop/merge is legacy
 from when four extractors wrote the four types separately.
 
-If `## Candidate pairs` is present, compare **only those listed pairs**.
+If `## Filtered candidate board` is present, compare **only those listed
+candidate pairs**. `pairs[k] = [i, j]` means compare `cards[i]` with
+`cards[j]`; emit operations using `cards[i].id` / `cards[j].id`.
 If that section is absent, compare every same-type pair. For each compared
 pair ask: does one block EXTEND the other, or RESTATE it? Consolidate only
 then.
@@ -424,9 +426,10 @@ def build_proposer_prompt(
 ) -> str:
     """Assemble the proposer prompt: rules, examples, live blocks, then retries.
 
-    Explicit candidate pairs constrain attention to Pearson/MI survivors so the
-    model does not spend tokens comparing every same-type pair. ``None`` keeps
-    the full-board fail-open wording. Static rules stay first for caching.
+    Gated first-attempt boards must not pay for empty type arrays or a second
+    mem-id pair list; unpaired cards stay on disk unprompted. ``candidate_pairs
+    is None`` keeps the full typed-board fail-open wording. Static rules stay
+    first for caching.
 
     Attempt >= 2 with ``previous_operations``: caller should pass already
     filtered existing/new (foul-touched closure only). Pending new ids appear
@@ -444,27 +447,71 @@ def build_proposer_prompt(
             "New blocks from this session are **already written** to the daily "
             "file. Emit only merge / update / drop / supersede. Never create."
         )
-    sections.extend(
-        [
-            "## Blocks in play",
-            render_typed_board("Existing", existing_blocks),
-            render_typed_board("New", new_blocks),
-        ]
-    )
-    if candidate_pairs is not None:
-        lines = []
+    if candidate_pairs is None:
+        sections.extend(
+            [
+                "## Blocks in play",
+                render_typed_board("Existing", existing_blocks),
+                render_typed_board("New", new_blocks),
+            ]
+        )
+    else:
+        board_cards = list(existing_blocks) + list(new_blocks)
+        by_id = {
+            str(block.get("id") or "").strip(): dict(block)
+            for block in board_cards
+            if str(block.get("id") or "").strip()
+        }
+        pair_ids: list[tuple[str, str]] = []
+        involved: set[str] = set()
         for pair in candidate_pairs:
             left, right = pair[0], pair[1]
             a = str(left).strip()
             b = str(right).strip()
-            if a and b:
-                lines.append(f"- {a} — {b}")
-        if lines:
-            sections.append(
-                "## Candidate pairs\n\n"
-                "Compare only these same-type pairs:\n\n"
-                + "\n".join(lines)
+            if a and b and a in by_id and b in by_id:
+                pair_ids.append((a, b))
+                involved.add(a)
+                involved.add(b)
+        grouped = _group_blocks_by_type(
+            block
+            for block in board_cards
+            if str(block.get("id") or "").strip() in involved
+        )
+        compact: dict[str, Any] = {}
+        for kind in BLOCK_TYPE_ORDER:
+            cards = grouped.get(kind) or []
+            if not cards:
+                continue
+            index_of = {
+                str(card.get("id") or "").strip(): i
+                for i, card in enumerate(cards)
+            }
+            pairs_idx: list[list[int]] = []
+            for a, b in pair_ids:
+                ia = index_of.get(a)
+                ib = index_of.get(b)
+                if ia is None or ib is None or ia == ib:
+                    continue
+                pairs_idx.append([ia, ib])
+            if not pairs_idx:
+                continue
+            compact[kind] = {
+                "cards": [json.loads(_render_block(card)) for card in cards],
+                "pairs": pairs_idx,
+            }
+        sections.append(
+            "## Filtered candidate board\n\n"
+            "Survivor cards only, keyed by type. Empty types are omitted. "
+            "`pairs[k] = [i, j]` means compare `cards[i]` with `cards[j]`. "
+            "Emit merge/update/drop/supersede using `cards[i].id` / "
+            "`cards[j].id`, not the indexes.\n\n"
+            + json.dumps(
+                compact,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
             )
+        )
     if previous_operations is not None and attempt >= 2:
         try:
             prev_payload = [

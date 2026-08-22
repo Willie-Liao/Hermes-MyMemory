@@ -41,8 +41,17 @@ _MIXED_BASELINE = {
     "max_tokens": None,
 }
 
-# Last ungated kimi-k3 Phase-2 on a heavy daytime board
-# (hermes-home/metrics/digest-day-cost-k3.jsonl).
+# Last gated kimi-k3 Phase-2 on the same 34-card file with typed arrays
+# plus a Markdown mem-id pair list (2026-08-22 live pytest).
+_LAST_K3_GATED_TYPED = {
+    "label": "gated Phase 2 typed arrays + id pairs (2026-08-22)",
+    "input_tokens": 12925,
+    "output_tokens": 1928,
+    "reasoning_tokens": 0,
+    "total_tokens": 14853,
+    "wall_seconds": 55.8,
+    "max_tokens": 8192,
+}
 _LAST_K3_HEAVY_PHASE2 = {
     "label": "last k3 Phase 2 heavy daytime (ungated)",
     "input_tokens": 9468,
@@ -162,6 +171,7 @@ def test_live_typed_phase2_and_wrapup_on_full_2026_08_15(tmp_path, monkeypatch):
         packed["wall_seconds"] = round(time.perf_counter() - t0, 1)
         packed["purpose"] = purpose
         packed["force_tool_name"] = force_tool_name
+        packed["prompt"] = prompt_text
         captures.append(packed)
         return packed
 
@@ -191,6 +201,20 @@ def test_live_typed_phase2_and_wrapup_on_full_2026_08_15(tmp_path, monkeypatch):
         assert p2.get("failed") is False
         args = p2.get("tool_args") or {}
         assert isinstance(args.get("operations"), list)
+        gated_prompt = str(p2.get("prompt") or "")
+        assert "## Filtered candidate board" in gated_prompt
+        live_board = gated_prompt.rsplit("## Filtered candidate board", 1)[1]
+        assert "### Existing events" not in live_board
+        assert "Compare only these same-type pairs" not in live_board
+        start = live_board.find("{")
+        end = live_board.rfind("}")
+        assert start >= 0 and end > start
+        compact_board = json.loads(live_board[start : end + 1])
+        assert compact_board
+        for bucket in compact_board.values():
+            assert bucket.get("cards")
+            for left, right in bucket.get("pairs") or []:
+                assert isinstance(left, int) and isinstance(right, int)
 
     t_w = time.perf_counter()
     wrap = digest.run_day_wrapup(dest)
@@ -222,6 +246,12 @@ def test_live_typed_phase2_and_wrapup_on_full_2026_08_15(tmp_path, monkeypatch):
     tot_delta = this_tot - k3_tot
     in_pct = (100.0 * in_delta / k3_in) if k3_in else 0.0
     tot_pct = (100.0 * tot_delta / k3_tot) if k3_tot else 0.0
+    gated_in = int(_LAST_K3_GATED_TYPED["input_tokens"])
+    gated_tot = int(_LAST_K3_GATED_TYPED["total_tokens"])
+    vs_gated_in = this_in - gated_in
+    vs_gated_tot = this_tot - gated_tot
+    vs_gated_in_pct = (100.0 * vs_gated_in / gated_in) if gated_in else 0.0
+    vs_gated_tot_pct = (100.0 * vs_gated_tot / gated_tot) if gated_tot else 0.0
     summary = "\n".join(
         [
             "=== STEP7 TOKEN COMPARISON (full 2026-08-15.md, 34 cards) ===",
@@ -239,6 +269,12 @@ def test_live_typed_phase2_and_wrapup_on_full_2026_08_15(tmp_path, monkeypatch):
                 _LAST_K3_HEAVY_PHASE2["max_tokens"],
             ),
             _row(
+                _LAST_K3_GATED_TYPED["label"],
+                _LAST_K3_GATED_TYPED,
+                _LAST_K3_GATED_TYPED["wall_seconds"],
+                _LAST_K3_GATED_TYPED["max_tokens"],
+            ),
+            _row(
                 "gated Phase 2 (this run, 2026-08-15)",
                 p2,
                 p2.get("wall_seconds") or p2_wall,
@@ -253,6 +289,8 @@ def test_live_typed_phase2_and_wrapup_on_full_2026_08_15(tmp_path, monkeypatch):
             f"reasoning delta vs mixed-list: {delta:+d} ({pct:+.1f}%)",
             f"input delta vs last k3 heavy: {in_delta:+d} ({in_pct:+.1f}%)",
             f"total delta vs last k3 heavy: {tot_delta:+d} ({tot_pct:+.1f}%)",
+            f"input delta vs last gated typed: {vs_gated_in:+d} ({vs_gated_in_pct:+.1f}%)",
+            f"total delta vs last gated typed: {vs_gated_tot:+d} ({vs_gated_tot_pct:+.1f}%)",
             f"wrap-up phrase: {phrase}",
         ]
     )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import json
 import sys
 from pathlib import Path
 
@@ -677,12 +678,47 @@ def test_proposer_tool_loop_submit_then_patch(tmp_path, monkeypatch):
     first = proposer(existing, new, errors=(), attempt=1)
     assert calls[-1] == "submit_operations"
     gated = prompts[-1]
-    assert "Compare only these same-type pairs" in gated
-    assert "mem-fact-apple" in gated
-    assert "mem-fact-banana" in gated
-    assert "mem-fact-zebra" not in gated
-    assert "mem-event-apple" not in gated
-    assert "mem-proc-a" in gated and "mem-proc-b" in gated
+    assert "## Filtered candidate board" in gated
+    assert "### Existing events" not in gated
+    assert "### Existing facts" not in gated
+    assert "Compare only these same-type pairs" not in gated
+    assert gated.count("## Filtered candidate board") >= 2
+    blob = gated.rsplit("## Filtered candidate board", 1)[1]
+    blob = blob.split("\n## ", 1)[0].strip()
+    start = blob.find("{")
+    end = blob.rfind("}")
+    assert start >= 0 and end > start
+    board = json.loads(blob[start : end + 1])
+    assert set(board) <= {"event", "fact", "procedure", "decision"}
+    assert "event" not in board
+    assert "decision" not in board
+    assert "fact" in board and "procedure" in board
+    fact_ids = [card["id"] for card in board["fact"]["cards"]]
+    proc_ids = [card["id"] for card in board["procedure"]["cards"]]
+    assert fact_ids == ["mem-fact-apple", "mem-fact-banana"]
+    assert proc_ids == ["mem-proc-a", "mem-proc-b"]
+    assert "mem-fact-zebra" not in json.dumps(board)
+    assert "mem-event-apple" not in json.dumps(board)
+    for bucket in board.values():
+        cards = bucket["cards"]
+        for left, right in bucket["pairs"]:
+            assert isinstance(left, int) and isinstance(right, int)
+            assert 0 <= left < len(cards)
+            assert 0 <= right < len(cards)
+            assert left != right
+    compact = json.dumps(board, ensure_ascii=False, separators=(",", ":"))
+    id_pairs = {
+        kind: {
+            "cards": bucket["cards"],
+            "pairs": [
+                [bucket["cards"][i]["id"], bucket["cards"][j]["id"]]
+                for i, j in bucket["pairs"]
+            ],
+        }
+        for kind, bucket in board.items()
+    }
+    verbose = json.dumps(id_pairs, ensure_ascii=False, separators=(",", ":"))
+    assert len(compact) <= len(verbose)
     second = proposer(
         existing, new, errors=("operation[0]: unknown id",), attempt=2
     )
