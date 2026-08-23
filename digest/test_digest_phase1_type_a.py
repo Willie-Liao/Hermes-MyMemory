@@ -678,6 +678,55 @@ def test_accept_jordan_as_ruling_agent_still_teaches():
     )
 
 
+def test_run_phase1_leftover_date_str_owns_prompt_and_ids(tmp_path, monkeypatch):
+    """08:00 catch-up / midnight-crossing leftover must mint the leftover civil day."""
+    digest = _load("digest")
+    tools = _load("digest_tools")
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(digest, "digest_tools", tools)
+    monkeypatch.setattr(digest, "hermes_local_today_str", lambda: "2026-08-17")
+    daily_dir = tmp_path / "memories" / "staging" / "daily"
+    daily_dir.mkdir(parents=True)
+    (daily_dir / "2026-08-16.md").write_text(
+        "---\n"
+        "id: mem-2026-08-16-fact-OLD000000001\n"
+        "type: fact\n"
+        "entity: Topic\n"
+        "confidence: high\n"
+        "status: candidate\n"
+        "sources: []\n"
+        "---\n"
+        "Factual: leftover board card\n",
+        encoding="utf-8",
+    )
+    prompts: list[str] = []
+
+    def fake_tool(prompt, *_a, **_k):
+        prompts.append(prompt)
+        return {
+            "tool_name": "submit_digest_blocks",
+            "tool_args": _good_flat_fact(),
+            "tool_calls": [("submit_digest_blocks", _good_flat_fact())],
+            "messages": [],
+        }
+
+    monkeypatch.setattr(digest, "_invoke_digest_worker_tool", fake_tool)
+    result = digest.run_phase1_digest_blocks(
+        "s1",
+        "weixin",
+        "Jordan and User planned lunch",
+        run_id="run-leftover",
+        date_str="2026-08-16",
+    )
+    assert prompts, "phase1 must invoke the worker"
+    assert "2026-08-16.md" in prompts[0]
+    assert "2026-08-17.md" not in prompts[0]
+    assert "mem-2026-08-16-fact-OLD000000001" in prompts[0]
+    assert isinstance(result, digest.ValidatedWorkerResult)
+    assert result.blocks
+    assert str(result.blocks[0].get("id") or "").startswith("mem-2026-08-16-")
+
+
 def test_accept_empty_decision_ruling_still_teaches():
     tools = _load("digest_tools")
     _bag, errors, _notes = tools.accept_phase1_args(

@@ -460,6 +460,44 @@ def test_build_commit_retry_section_labels_commit_failure():
     assert "body too long" in section
 
 
+def test_pipeline_passes_board_date_into_phase1(tmp_path, monkeypatch):
+    """Leftover daily_path.stem must reach Phase-1 so IDs match the persist file."""
+    digest = _load_digest()
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(digest, "hermes_local_today_str", lambda: "2026-08-17")
+    _write_inflight_state(tmp_path)
+    seen: dict = {}
+
+    def fake_phase1(*_a, **kwargs):
+        seen.update(kwargs)
+        return digest.ValidatedWorkerResult(
+            worker_type="phase1",
+            session_id="s1",
+            run_id="r-board",
+            attempts=1,
+            content="skip",
+            blocks=(),
+            path=None,
+        )
+
+    monkeypatch.setattr(digest, "run_phase1_digest_blocks", fake_phase1)
+    leftover = tmp_path / "memories" / "staging" / "daily" / "2026-08-16.md"
+    leftover.parent.mkdir(parents=True, exist_ok=True)
+    leftover.write_text("", encoding="utf-8")
+    result = digest._run_digest_pipeline(
+        session_id="s1",
+        platform="wecom",
+        transcript="TRANSCRIPT",
+        session_key="s1",
+        daily_path=leftover,
+        batch_end_id=9,
+        run_id="r-board",
+        reason="nightly_leftover",
+    )
+    assert result == "skip"
+    assert seen.get("date_str") == "2026-08-16"
+
+
 def test_pipeline_persists_phase1_without_phase2(tmp_path, monkeypatch):
     """Extract path writes cards and bookmarks; merge stays off this call."""
     digest = _load_digest()

@@ -9,7 +9,8 @@ blocks whose sole ``session:`` source is missing from ``state.db``.
 Purge rules:
   - approved_for_removal → delete on next sweep (no git gate)
   - active + age >= 7d → flag over_retention for weekly review (no auto-delete)
-  - .digest-state.json session maps: drop keys with YYYYMMDD_ prefix age >= 7d
+  - .digest-state.json session maps: drop YYYYMMDD_ keys age >= 7d unless
+    that session id is still in state.db (live bookmark must not rewind)
   - orphan daily_block (single dead session:) → remove + queue as purged
 """
 
@@ -412,9 +413,13 @@ def _session_id_date(sid: str):
 
 
 def _sweep_digest_state() -> int:
-    """Drop session-keyed entries in ``.digest-state.json`` older than RETENTION_DAYS.
+    """Drop idle dated digest-state keys; never the bookmark of a still-open session.
 
-    Returns number of keys removed. Missing/corrupt file → 0 (no-op).
+    Session ids encode the *open* day (``20260811_…``). Age-only trim then
+    deletes a live WeChat cursor after 7 days, so the next turn re-extracts
+    old cards onto today. Skip keys (or nested ``session_id``) still in
+    ``state.db``. Missing DB keeps age-only trim so tests and a broken
+    store still drain dead maps.
     """
     path = _digest_state_path()
     if not path.is_file():
@@ -429,15 +434,24 @@ def _sweep_digest_state() -> int:
 
     today = hermes_local_today()
     cutoff = today - timedelta(days=RETENTION_DAYS)
+    live_ids = list_live_session_ids(_hermes_home())
     removed = 0
     for _map_name, mapping in raw.items():
         if not isinstance(mapping, dict):
             continue
-        dead = [
-            sid
-            for sid in list(mapping.keys())
-            if (d := _session_id_date(sid)) is not None and d <= cutoff
-        ]
+        dead = []
+        for sid in list(mapping.keys()):
+            opened = _session_id_date(sid)
+            if opened is None or opened > cutoff:
+                continue
+            if live_ids is not None:
+                nested = ""
+                value = mapping.get(sid)
+                if isinstance(value, dict):
+                    nested = str(value.get("session_id") or "")
+                if sid in live_ids or (nested and nested in live_ids):
+                    continue
+            dead.append(sid)
         for sid in dead:
             mapping.pop(sid, None)
             removed += 1

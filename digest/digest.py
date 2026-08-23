@@ -654,7 +654,11 @@ def stop_digest_clock_thread() -> None:
 
 
 def _digest_clock_loop() -> None:
-    """Sleep until next_clock_at; a 60s poll hid a sleeping thread from state."""
+    """Sleep until next_clock_at; a 60s poll hid a sleeping thread from state.
+
+    Fire the slept-for tick as ``now`` so a wake a few minutes past midnight
+    still leftover-extracts that 23:55 civil day instead of skipping until 08:00.
+    """
     global _clock_thread
     while not _clock_stop.is_set():
         try:
@@ -684,7 +688,7 @@ def _digest_clock_loop() -> None:
                     state["clock_stopped_at"] = datetime.now(timezone.utc).isoformat()
                     _save_state(state)
                 break
-            maybe_run_digest_clock(sync=True)
+            maybe_run_digest_clock(now=stored, sync=True)
         except Exception as exc:
             _log(f"digest clock died: {exc}")
             with _digest_lock:
@@ -2105,15 +2109,17 @@ def _format_existing_id_snippet(body: str, block_type: str) -> str:
     return snippet
 
 
-def _build_existing_ids_section() -> str:
-    """List today's daily mem-ids so supersedes: cannot aim at yesterday's cards.
+def _build_existing_ids_section(date_str: str | None = None) -> str:
+    """List this board day's mem-ids so leftover catch-up cannot supersede wall-today cards.
 
-    related: may still cite week-alive ids; only this catalogue is same-civil-day.
-    Missing today's file stays empty rather than falling back to yesterday.
+    related: may still cite week-alive ids; only this catalogue is the leftover
+    civil day. Missing that file stays empty rather than falling back to wall today.
     """
     id_lines: list[str] = []
     seen_ids: set[str] = set()
-    today_path = daily_staging_path(_hermes_home(), hermes_local_today_str())
+    today_path = daily_staging_path(
+        _hermes_home(), date_str or hermes_local_today_str()
+    )
     paths = [today_path] if today_path.exists() else []
     for path in paths:
         try:
@@ -2173,7 +2179,7 @@ def _build_digest_shared_context(
         f"Assistant messages in window: {assistant_count}\n\n"
         "DIGEST POLICY:\n"
         f"{DIGEST_POLICY}\n\n"
-        f"{_build_existing_ids_section()}"
+        f"{_build_existing_ids_section(date_str=daily_path.stem)}"
         f"Target daily file (must be .md, never .yaml): {daily_path}\n"
     )
 
@@ -3918,9 +3924,11 @@ def _phase1_prompt(
     assistant_count: int = 0,
     mode: str = "submit",
     teach: str = "",
+    date_str: str | None = None,
 ) -> str:
-    today = hermes_local_today_str()
-    daily_path = daily_staging_path(_hermes_home(), today)
+    """Point Phase-1 at the leftover board date so 08:00 catch-up cannot target wall today."""
+    board_date = date_str or hermes_local_today_str()
+    daily_path = daily_staging_path(_hermes_home(), board_date)
     shared = _build_digest_shared_context(
             session_id,
             platform,
@@ -3962,8 +3970,17 @@ def _phase1_prompt(
     )
 
 
-def _mint_phase1_block_id(block_type: str, occupied: set[str]) -> str:
-    return digest_operations._new_id(None, occupied, block_type)
+def _mint_phase1_block_id(
+    block_type: str, occupied: set[str], date_str: str | None = None
+) -> str:
+    """Mint on the leftover/board civil day so a midnight-crossing extract cannot stamp tomorrow."""
+    board = date_str or hermes_local_today_str()
+    type_seg = digest_operations._id_type_segment(block_type)
+
+    def _factory() -> str:
+        return f"mem-{board}-{type_seg}-{uuid.uuid4().hex[:12].upper()}"
+
+    return digest_operations._new_id(_factory, occupied, block_type)
 
 
 def _resolve_temp_ids_in_refs(
@@ -3982,9 +3999,10 @@ def _blocks_from_digest_args(
     session_id: str,
     message_start_id: int | None = None,
     message_end_id: int | None = None,
+    date_str: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Render validated digest_blocks args into block dicts with real mem-ids."""
-    today = hermes_local_today_str()
+    """Render validated digest_blocks args into block dicts with leftover-day mem-ids."""
+    today = date_str or hermes_local_today_str()
     raw_blocks = args.get("blocks") if isinstance(args.get("blocks"), list) else []
     occupied: set[str] = set()
     temp_map: dict[str, str] = {}
@@ -3997,7 +4015,7 @@ def _blocks_from_digest_args(
         if wt not in NEW_OUTPUT_TYPES:
             continue
         temp_id = str(item.get("temp_id") or flat.pop("temp_id", "") or "").strip()
-        mem_id = _mint_phase1_block_id(wt, occupied)
+        mem_id = _mint_phase1_block_id(wt, occupied, date_str=today)
         occupied.add(mem_id)
         if temp_id:
             temp_map[temp_id] = mem_id
@@ -4053,6 +4071,7 @@ def run_phase1_digest_blocks(
     assistant_count: int = 0,
     message_start_id: int | None = None,
     message_end_id: int | None = None,
+    date_str: str | None = None,
 ) -> ValidatedWorkerResult | WorkerFailure:
     """Phase-1 type A: one worker turn (submit|patch|skip) → block list.
 
@@ -4061,6 +4080,8 @@ def run_phase1_digest_blocks(
     (``worker_type='phase1'``) or ``WorkerFailure`` when nothing usable remains.
     After ``PHASE1_MAX_VALIDATION_ATTEMPTS`` failed validations, last args are
     soft-accepted with ``importance=2`` (dirty).
+    ``date_str`` is the leftover board civil day so 08:00 catch-up cannot mint
+    wall-today ids or point the prompt at tomorrow's file.
     """
     run_id = run_id or uuid.uuid4().hex
     max_attempts = digest_tools.PHASE1_MAX_VALIDATION_ATTEMPTS
@@ -4073,6 +4094,7 @@ def run_phase1_digest_blocks(
         reason=reason,
         user_count=user_count,
         assistant_count=assistant_count,
+        date_str=date_str,
     )
     previous_args: dict[str, Any] = {}
     last_errors: list[str] = []
@@ -4152,6 +4174,7 @@ def run_phase1_digest_blocks(
                 session_id=session_id,
                 message_start_id=message_start_id,
                 message_end_id=message_end_id,
+                date_str=date_str,
             )
             content = _content_from_blocks(blocks) if blocks else "skip"
         except Exception as render_exc:
@@ -4203,6 +4226,7 @@ def run_phase1_digest_blocks(
                     session_id=session_id,
                     message_start_id=message_start_id,
                     message_end_id=message_end_id,
+                    date_str=date_str,
                 )
             except Exception:
                 dirty_blocks = list(last_blocks)
@@ -4571,6 +4595,8 @@ def _run_digest_pipeline(
     Merge stays on the 08/12/16/20 clock. Apply overwrite here so a later
     batch in the same civil day does not wait for that tick. Fail-open keeps
     the helper card and still bookmarks so extract cannot stall.
+    Passes ``daily_path.stem`` into Phase-1 so leftover persist and minted
+    ids stay on that board date when wall-clock today has already rolled.
     """
     try:
         phase1 = run_phase1_digest_blocks(
@@ -4583,6 +4609,7 @@ def _run_digest_pipeline(
             assistant_count=assistant_count,
             message_start_id=batch_start_id,
             message_end_id=batch_end_id,
+            date_str=daily_path.stem,
         )
     except Exception as exc:
         _finalize_digest_failure(
