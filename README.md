@@ -17,8 +17,6 @@ bash scripts/install.sh
 
 Override the install target with `HERMES_HOME=/path/to/.hermes`. Use `--skip-tests` or `--force` if needed. After install, merge the sample `plugins.entries.MyMemory` block below into `$HERMES_HOME/config.yaml` (do not overwrite the whole file) and put worker keys in `$HERMES_HOME/.env`.
 
-This repository is the **plugin root**. Copy or clone it to `$HERMES_HOME/plugins/MyMemory`.
-
 ## Install
 
 1. Install [Hermes](https://github.com/NousResearch/hermes-agent) and know your home (`~/.hermes` or `$HERMES_HOME`).

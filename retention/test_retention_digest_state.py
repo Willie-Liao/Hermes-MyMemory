@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sqlite3
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -64,6 +65,55 @@ def test_sweep_digest_state_drops_old_keeps_young_and_undated(tmp_path, monkeypa
     assert young in data["span_watches"]
     assert old not in data["span_watches"]
     assert data["not_a_map"] == "skip-me"
+
+
+def test_sweep_digest_state_keeps_old_key_still_in_state_db(tmp_path, monkeypatch):
+    """Live WeChat sessions keep YYYYMMDD_ ids from the open day; age-trim must not drop their bookmark."""
+    ret = _load_retention()
+    monkeypatch.setattr(ret, "get_hermes_home", lambda: tmp_path)
+    today = date(2026, 8, 21)
+    monkeypatch.setattr(ret, "hermes_local_today", lambda: today)
+
+    live = _sid(date(2026, 8, 11), "fdef935a")
+    dead = _sid(date(2026, 8, 11), "deadold")
+    con = sqlite3.connect(tmp_path / "state.db")
+    con.execute(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT NOT NULL, "
+        "started_at REAL NOT NULL)"
+    )
+    con.execute(
+        "INSERT INTO sessions (id, source, started_at) VALUES (?, 'weixin', 0.0)",
+        (live,),
+    )
+    con.commit()
+    con.close()
+
+    state_path = tmp_path / "memories" / "staging" / ".digest-state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "sessions": {
+                    live: {
+                        "session_id": live,
+                        "last_digest_message_id": 66185,
+                    },
+                    dead: {
+                        "session_id": dead,
+                        "last_digest_message_id": 12,
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    removed = ret._sweep_digest_state()
+    assert removed == 1
+    data = json.loads(state_path.read_text(encoding="utf-8"))
+    assert live in data["sessions"]
+    assert data["sessions"][live]["last_digest_message_id"] == 66185
+    assert dead not in data["sessions"]
 
 
 def test_sweep_digest_state_missing_file_noop(tmp_path, monkeypatch):

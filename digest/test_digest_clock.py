@@ -572,6 +572,48 @@ def test_clock_loop_death_writes_error(tmp_path, monkeypatch):
     assert saved.get("clock_stopped_at")
 
 
+def test_clock_loop_passes_stored_tick_as_now(tmp_path, monkeypatch):
+    """A wake after midnight must leftover the slept-for 23:55 civil day, not wall today."""
+    digest = _load_digest()
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    (tmp_path / "memories" / "staging").mkdir(parents=True)
+    digest._clock_stop.clear()
+    calls: list[dict] = []
+    n = {"i": 0}
+
+    def fake_wait(timeout=None):
+        n["i"] += 1
+        return n["i"] > 1
+
+    def fake_clock(**kwargs):
+        calls.append(kwargs)
+        return {"outcome": "idle"}
+
+    monkeypatch.setattr(digest._clock_stop, "wait", fake_wait)
+    monkeypatch.setattr(digest, "maybe_run_digest_clock", fake_clock)
+    monkeypatch.setattr(
+        digest.digest_clock, "digest_clock_tz", lambda **_k: SHANGHAI
+    )
+    stored = datetime(2026, 8, 16, 23, 55, tzinfo=SHANGHAI)
+    wall = datetime(2026, 8, 17, 0, 5, tzinfo=SHANGHAI)
+    state_path = tmp_path / "memories" / "staging" / ".digest-state.json"
+    state_path.write_text(
+        json.dumps({"next_clock_at": stored.isoformat(), "sessions": {}}),
+        encoding="utf-8",
+    )
+
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return wall if tz is None else wall.astimezone(tz)
+
+    monkeypatch.setattr(digest, "datetime", FrozenDateTime)
+    digest._digest_clock_loop()
+    assert calls, "clock loop must fire the stored tick"
+    assert calls[0].get("sync") is True
+    assert calls[0].get("now") == stored
+
+
 def test_on_agent_end_records_observed_dead_clock(tmp_path, monkeypatch):
     digest = _load_digest()
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
