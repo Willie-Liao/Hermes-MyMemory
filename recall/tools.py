@@ -406,15 +406,35 @@ def render_bands(
                 except Exception:
                     payload = {}
                 threads = payload.get("cross-day-thread") or []
+                summary_rows = payload.get("summary") or []
+                if (
+                    summary_rows
+                    and isinstance(summary_rows, list)
+                    and isinstance(summary_rows[0], dict)
+                ):
+                    headline = str(summary_rows[0].get("text") or "").strip() or headline
                 if threads and isinstance(threads, list) and isinstance(threads[0], dict):
-                    headline = str(threads[0].get("label") or "").strip() or headline
+                    if headline in {"(no wrap-up)", "(no brief)", ""}:
+                        headline = str(threads[0].get("label") or "").strip() or headline
                 if headline in {"(no wrap-up)", "(no brief)", ""}:
                     for row in payload.get("intra-day-thread") or []:
                         if isinstance(row, dict) and str(row.get("text") or "").strip():
                             headline = " ".join(str(row.get("text")).split())[:72]
                             break
+                ids: set[str] = set()
                 legend = payload.get("legend") or {}
-                n_evt = len(legend) if isinstance(legend, dict) else 0
+                if isinstance(legend, dict):
+                    ids.update(str(v).strip() for v in legend.values() if str(v).strip())
+                if isinstance(threads, list):
+                    for thread in threads:
+                        if not isinstance(thread, dict):
+                            continue
+                        for step in thread.get("steps") or []:
+                            if isinstance(step, dict):
+                                mid = str(step.get("event_id") or "").strip()
+                                if mid:
+                                    ids.add(mid)
+                n_evt = len(ids)
                 ents = payload.get("entities") or []
                 names = []
                 if isinstance(ents, list):

@@ -153,8 +153,9 @@ describe('Memory Approval action queue placement (source fixture)', () => {
     expect(queue).not.toContain('onJumpApprovalCite');
     expect(queue).not.toContain('Open this block in Read by Date');
 
-    expect(chronicle).toContain('cross-day-thread');
-    expect(chronicle).toContain('intra-day-thread');
+    expect(chronicle).toContain('payload.summary');
+    expect(chronicle).toContain('weekly-chronicle-summary');
+    expect(chronicle).not.toContain('Cross-day-thread');
     expect(chronicle).not.toContain('Weekly Brief');
     expect(chronicle).not.toContain('Conflict');
 

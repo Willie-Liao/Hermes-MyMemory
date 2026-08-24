@@ -161,6 +161,33 @@ def _extract_brief_section(md_text: str) -> str:
     return str(extract_brief(md_text) or "").strip()
 
 
+def _summary_from_week_schema(md_text: str) -> str:
+    """Prefer dumped YAML summary so Chronicle LLM never re-reads the whole week file."""
+    try:
+        from . import weekly_json
+    except ImportError:  # pragma: no cover
+        json_path = Path(__file__).with_name("weekly_json.py")
+        spec = importlib.util.spec_from_file_location(
+            "memory_weekly_json_chronicle", json_path
+        )
+        if spec is None or spec.loader is None:
+            return ""
+        weekly_json = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(weekly_json)
+    try:
+        payload = weekly_json.loads(md_text)
+    except Exception:
+        return ""
+    lines: list[str] = []
+    for row in payload.summary:
+        days = ", ".join(row.weekdays)
+        line = f"- {row.text}"
+        if days:
+            line = f"{line} ({days})"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def get_or_refresh_chronicle(
     week_key: str | None = None, *, force: bool = False
 ) -> dict[str, Any]:
@@ -218,49 +245,53 @@ def get_or_refresh_chronicle(
             "generated_at": entry.get("generated_at"),
         }
 
-    brief = _extract_brief_section(md_text)
-    if brief:
-        summary = brief
+    schema_summary = _summary_from_week_schema(md_text)
+    if schema_summary:
+        summary = schema_summary
     else:
-        try:
-            summary = _summary_from_items(
-                _parse_chronicle_items(_call_llm(_build_prompt(resolved, md_text)))
-            )
-        except Exception:  # noqa: BLE001 - soft-fail to last good summary
-            if isinstance(entry, dict) and str(entry.get("summary") or "").strip():
+        brief = _extract_brief_section(md_text)
+        if brief:
+            summary = brief
+        else:
+            try:
+                summary = _summary_from_items(
+                    _parse_chronicle_items(_call_llm(_build_prompt(resolved, md_text)))
+                )
+            except Exception:  # noqa: BLE001 - soft-fail to last good summary
+                if isinstance(entry, dict) and str(entry.get("summary") or "").strip():
+                    return {
+                        "outcome": "llm_failed",
+                        "week": resolved,
+                        "cached": True,
+                        "summary": str(entry["summary"]).strip(),
+                        "md_hash": str(entry.get("md_hash") or ""),
+                        "generated_at": entry.get("generated_at"),
+                    }
                 return {
                     "outcome": "llm_failed",
                     "week": resolved,
-                    "cached": True,
-                    "summary": str(entry["summary"]).strip(),
-                    "md_hash": str(entry.get("md_hash") or ""),
-                    "generated_at": entry.get("generated_at"),
+                    "cached": False,
+                    "summary": "",
+                    "md_hash": digest,
                 }
-            return {
-                "outcome": "llm_failed",
-                "week": resolved,
-                "cached": False,
-                "summary": "",
-                "md_hash": digest,
-            }
 
-        if not summary:
-            if isinstance(entry, dict) and str(entry.get("summary") or "").strip():
+            if not summary:
+                if isinstance(entry, dict) and str(entry.get("summary") or "").strip():
+                    return {
+                        "outcome": "llm_failed",
+                        "week": resolved,
+                        "cached": True,
+                        "summary": str(entry["summary"]).strip(),
+                        "md_hash": str(entry.get("md_hash") or ""),
+                        "generated_at": entry.get("generated_at"),
+                    }
                 return {
                     "outcome": "llm_failed",
                     "week": resolved,
-                    "cached": True,
-                    "summary": str(entry["summary"]).strip(),
-                    "md_hash": str(entry.get("md_hash") or ""),
-                    "generated_at": entry.get("generated_at"),
+                    "cached": False,
+                    "summary": "",
+                    "md_hash": digest,
                 }
-            return {
-                "outcome": "llm_failed",
-                "week": resolved,
-                "cached": False,
-                "summary": "",
-                "md_hash": digest,
-            }
 
     generated_at = _now_iso()
     sidecar[resolved] = {

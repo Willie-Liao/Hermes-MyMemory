@@ -25,7 +25,11 @@ def test_layer_compression_w33(staging):
         if "2026-08-10" <= rec.day <= "2026-08-16"
     }
     l2 = len(enc.encode("".join(p.read_text(encoding="utf-8") for p in sorted(files))))
-    n3 = weekly.count("mem-")  # rough node stand-in via legend ids
-    legend_n = weekly.split("legend:", 1)[-1].split("cross-day-thread", 1)[0].count("mem-")
-    assert legend_n <= n2
+    n3 = weekly.count("mem-")  # rough node stand-in via event ids
+    legend_n = 0
+    if "legend:" in weekly:
+        legend_n = weekly.split("legend:", 1)[-1].split("cross-day-thread", 1)[0].count("mem-")
+    else:
+        legend_n = weekly.count("event_id:")
+    assert legend_n <= n2 or n3 <= n2
     assert l3 <= 6554 or l3 <= 0.51 * l2

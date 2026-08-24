@@ -39,12 +39,28 @@ def _weekly_legend_ids(staging: Path) -> list[tuple[str, str, str]]:
         load_sidecar = None
     for path in sorted(weekly.glob("*.md")):
         legend: dict[Any, Any] = {}
+        payload: dict[Any, Any] = {}
         if load_sidecar is not None:
             try:
-                payload = load_sidecar(path)
-                legend = payload.get("legend") or {}
+                loaded = load_sidecar(path)
+                if isinstance(loaded, dict):
+                    payload = loaded
+                    legend = payload.get("legend") or {}
             except Exception:
                 legend = {}
+                payload = {}
+        if not legend:
+            threads = payload.get("cross-day-thread") or []
+            if isinstance(threads, list):
+                for thread in threads:
+                    if not isinstance(thread, dict):
+                        continue
+                    for step in thread.get("steps") or []:
+                        if not isinstance(step, dict):
+                            continue
+                        mid = str(step.get("event_id") or "").strip()
+                        if mid:
+                            legend[mid] = mid
         if not legend:
             continue
         src = f"weekly/{path.name}#citemap"

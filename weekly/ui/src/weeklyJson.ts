@@ -1,4 +1,4 @@
-/** Shared weekly JSON types for Chronicle thread paint. */
+/** Shared weekly JSON types for Chronicle summary paint. */
 
 export type ThreadVia = 'evolves' | 'invalidates';
 
@@ -30,13 +30,27 @@ export type WeeklyIntraDayThread = {
   empty?: boolean;
 };
 
+export type WeeklySummaryItem = {
+  text: string;
+  weekdays?: string[];
+};
+
 export type WeeklyJsonPayload = {
   week_key?: string;
   legend?: Record<string, string>;
   'cross-day-thread'?: WeeklyCrossDayThread[];
   'intra-day-thread'?: WeeklyIntraDayThread[];
+  summary?: WeeklySummaryItem[];
   entities?: unknown[];
 };
+
+/** Paint `- text (Monday, Tuesday)` so Chronicle does not parse hops. */
+export function formatSummaryLine(row: WeeklySummaryItem): string {
+  const text = (row.text || '').trim();
+  const days = (row.weekdays || []).filter(Boolean).join(', ');
+  if (!text) return '- None.';
+  return days ? `- ${text} (${days})` : `- ${text}`;
+}
 
 /** Badge the superseded step (to_seq, else former seq) only when via is invalidates. */
 export function invalidatesBadgeSeq(step: WeeklyThreadStep): number | null {

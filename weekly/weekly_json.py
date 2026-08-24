@@ -29,6 +29,7 @@ try:
         ThreadStep,
         WeeklyEntity,
         WeeklyReviewPayload,
+        WeeklySummaryItem,
     )
 except ImportError:  # pragma: no cover - flat pytest load
     from weekly_event_schema import (  # type: ignore[no-redef]
@@ -37,11 +38,13 @@ except ImportError:  # pragma: no cover - flat pytest load
         ThreadStep,
         WeeklyEntity,
         WeeklyReviewPayload,
+        WeeklySummaryItem,
     )
 
 JSON_CROSS = "cross-day-thread"
 JSON_INTRA = "intra-day-thread"
-SCHEMA_VERSION = 1
+JSON_SUMMARY = "summary"
+SCHEMA_VERSION = 2
 _KEY_ORDER = (
     "schema_version",
     "cycle",
@@ -51,9 +54,9 @@ _KEY_ORDER = (
     "generated_at",
     "generator",
     "entities",
-    "legend",
     JSON_CROSS,
     JSON_INTRA,
+    JSON_SUMMARY,
 )
 
 
@@ -148,12 +151,19 @@ def _to_dict(payload: WeeklyReviewPayload, *, generated_at: str | None) -> dict[
         "generated_at": stamp,
         "generator": {
             "model": "",
-            "authored": ["cross-day-thread"] if payload.cross_day_thread else [],
+            "authored": [
+                key
+                for key, present in (
+                    ("cross-day-thread", bool(payload.cross_day_thread)),
+                    ("summary", bool(payload.summary)),
+                )
+                if present
+            ],
         },
         "entities": [_entity_dict(e) for e in payload.entities],
-        "legend": {str(n): mem_id for n, mem_id in sorted(payload.legend.items())},
         JSON_CROSS: [_thread_dict(t) for t in payload.cross_day_thread],
         JSON_INTRA: [_intra_dict(row) for row in payload.intra_day_thread],
+        JSON_SUMMARY: [_summary_dict(row) for row in payload.summary],
     }
     return {key: data[key] for key in _KEY_ORDER}
 
@@ -190,8 +200,6 @@ def _step_dict(step: ThreadStep) -> dict[str, Any]:
         "event_id": step.event_id,
         "text": step.text,
     }
-    if step.cite_n is not None:
-        row["cite_n"] = step.cite_n
     if step.via is not None:
         row["via"] = step.via
     if step.to_seq is not None:
@@ -209,6 +217,14 @@ def _intra_dict(row: IntraDayThread) -> dict[str, Any]:
     }
 
 
+def _summary_dict(row: WeeklySummaryItem) -> dict[str, Any]:
+    """Dump Chronicle bullets last so YAML order matches generate (threads then summary)."""
+    return {
+        "text": row.text,
+        "weekdays": list(row.weekdays),
+    }
+
+
 def _from_dict(obj: dict[str, Any]) -> WeeklyReviewPayload:
     legend_raw = obj.get("legend") or {}
     legend = {int(k): str(v) for k, v in legend_raw.items()}
@@ -219,7 +235,19 @@ def _from_dict(obj: dict[str, Any]) -> WeeklyReviewPayload:
         cross_day_thread=tuple(_thread_from(item) for item in obj.get(JSON_CROSS) or ()),
         intra_day_thread=tuple(_intra_from(item) for item in obj.get(JSON_INTRA) or ()),
         entities=tuple(_entity_from(item) for item in obj.get("entities") or ()),
+        summary=tuple(
+            _summary_from(item)
+            for item in obj.get(JSON_SUMMARY) or ()
+            if isinstance(item, dict) and str(item.get("text") or "").strip()
+        ),
     )
+
+
+def _summary_from(item: dict[str, Any]) -> WeeklySummaryItem:
+    weekdays = tuple(
+        str(name) for name in (item.get("weekdays") or ()) if str(name).strip()
+    )
+    return WeeklySummaryItem(text=str(item.get("text") or "").strip(), weekdays=weekdays)
 
 
 def _parse_day(value: Any) -> date:

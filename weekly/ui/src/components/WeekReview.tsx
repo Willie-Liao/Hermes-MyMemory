@@ -1573,7 +1573,7 @@ export default function WeekReview({
                       </h3>
                       <p className="text-[10px] text-slate-500 font-mono mt-0.5">
                         {weeklyJson
-                          ? `cross-day-thread · wrap-up · overdue · ${selectedWeek.week}`
+                          ? `summary · overdue · ${selectedWeek.week}`
                           : isFourPartBrief(chronicleSummary)
                           ? `Brief · Conflict · ${selectedWeek.week}`
                           : `What you did · ${selectedWeek.week}`}
@@ -1597,12 +1597,6 @@ export default function WeekReview({
                         {NEWSROOM_EMPTY_COPY.body}
                       </p>
                     </div>
-                  ) : chronicleLoading || spansLoading ? (
-                    <p className="text-xs font-mono text-slate-500">
-                      {isFourPartBrief(chronicleSummary) || chronicleLoading
-                        ? 'Loading weekly review…'
-                        : 'Loading chronicle…'}
-                    </p>
                   ) : weeklyJson ? (
                     <FourPartWeeklyCard payload={weeklyJson}>
                     <MemoryApprovalActionQueue
@@ -1636,9 +1630,15 @@ export default function WeekReview({
                       </button>
                     </div>
                     </FourPartWeeklyCard>
+                  ) : chronicleLoading || spansLoading ? (
+                    <p className="text-xs font-mono text-slate-500">
+                      {isFourPartBrief(chronicleSummary) || chronicleLoading
+                        ? 'Loading weekly review…'
+                        : 'Loading chronicle…'}
+                    </p>
                   ) : chronicleSummary.trim() && isFourPartBrief(chronicleSummary) ? (
                     <FourPartWeeklyCard
-                      payload={{ legend: {}, 'cross-day-thread': [], 'intra-day-thread': [] }}
+                      payload={{ legend: {}, 'cross-day-thread': [], 'intra-day-thread': [], summary: [] }}
                     />
                   ) : chronicleSummary.trim() ? (
                     <p className="text-xs md:text-sm text-slate-300 leading-relaxed font-sans font-medium whitespace-pre-wrap">

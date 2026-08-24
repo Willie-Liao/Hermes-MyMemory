@@ -16,10 +16,18 @@ def test_thread_cites_are_events(staging):
     for path in sorted(weekly.glob("*.md")):
         payload = load_sidecar(path)
         legend = payload.get("legend") or {}
-        if not isinstance(legend, dict):
-            continue
-        for _n, mem in legend.items():
-            mid = str(mem or "")
+        event_ids: list[str] = []
+        if isinstance(legend, dict):
+            event_ids.extend(str(mem or "") for mem in legend.values())
+        threads = payload.get("cross-day-thread") or []
+        if isinstance(threads, list):
+            for thread in threads:
+                if not isinstance(thread, dict):
+                    continue
+                for step in thread.get("steps") or []:
+                    if isinstance(step, dict):
+                        event_ids.append(str(step.get("event_id") or ""))
+        for mid in event_ids:
             if not mid or "-event-" not in mid:
                 continue
             rec = resolve_id(mid, staging=staging)

@@ -58,6 +58,35 @@ def test_build_prompt_asks_for_json_items():
     assert "news-anchor" not in lowered
 
 
+def test_chronicle_schema_summary_skips_llm(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    staging = tmp_path / "memories" / "staging"
+    weekly = staging / "weekly"
+    weekly.mkdir(parents=True)
+    md = (
+        "schema_version: 2\n"
+        "week_key: 2026-W34\n"
+        "cross-day-thread: []\n"
+        "intra-day-thread: []\n"
+        "summary:\n"
+        "  - text: weekly ui has been updated to second version discarding legend and jump to\n"
+        "    weekdays:\n"
+        "      - Monday\n"
+        "      - Tuesday\n"
+    )
+    (weekly / "2026-W34.md").write_text(md, encoding="utf-8")
+    chronicle = _load_chronicle()
+    calls: list[str] = []
+    monkeypatch.setattr(
+        chronicle, "_call_llm", lambda prompt: calls.append(prompt) or "should not run"
+    )
+    out = chronicle.get_or_refresh_chronicle("2026-W34")
+    assert out["outcome"] == "ok"
+    assert "weekly ui has been updated" in out["summary"]
+    assert "(Monday, Tuesday)" in out["summary"]
+    assert calls == []
+
+
 def test_parse_chronicle_items_accepts_fenced_json():
     chronicle = _load_chronicle()
     items = chronicle._parse_chronicle_items(

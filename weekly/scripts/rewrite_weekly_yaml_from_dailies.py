@@ -92,10 +92,11 @@ def main() -> int:
         obj = load_sidecar(path)
         assert set(obj) >= {
             "entities",
-            "legend",
             "cross-day-thread",
             "intra-day-thread",
+            "summary",
         }
+        assert "legend" not in obj
         assert "## Distill" not in path.read_text(encoding="utf-8")
         print(week, "ok", path)
     return 0

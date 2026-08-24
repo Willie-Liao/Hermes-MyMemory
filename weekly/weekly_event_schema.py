@@ -212,6 +212,27 @@ class IntraDayThread:
 
 
 @dataclass(frozen=True)
+class WeeklySummaryItem:
+    """One Chronicle bullet so the UI does not parse legend hops or raw thread dumps.
+
+    Weekdays stay English Monday–Sunday so paint can append parentheses without a calendar.
+    """
+
+    text: str
+    weekdays: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not str(self.text).strip():
+            raise ValueError("WeeklySummaryItem.text must be non-empty")
+        allowed = set(WEEKDAY_NAMES)
+        for name in self.weekdays:
+            if name not in allowed:
+                raise ValueError(
+                    f"WeeklySummaryItem.weekdays {name!r} not in {WEEKDAY_NAMES}"
+                )
+
+
+@dataclass(frozen=True)
 class WeeklyEntity:
     """Collapse alias surfaces onto one key so weekly JSON and recall share a roster.
 
@@ -308,6 +329,7 @@ class WeeklyReviewPayload:
     cross_day_thread: tuple[SpanCandidate, ...] = ()
     intra_day_thread: tuple["IntraDayThread", ...] = ()
     entities: tuple["WeeklyEntity", ...] = ()
+    summary: tuple["WeeklySummaryItem", ...] = ()
 
 
 # ---------------------------------------------------------------------------

@@ -235,6 +235,62 @@ def patch_weekly_thread_schema() -> dict[str, Any]:
     )
 
 
+def _summary_item_props() -> dict[str, Any]:
+    return {
+        "text": {"type": "string"},
+        "weekdays": {
+            "type": "array",
+            "items": {
+                "type": "string",
+                "enum": [
+                    "Monday",
+                    "Tuesday",
+                    "Wednesday",
+                    "Thursday",
+                    "Friday",
+                    "Saturday",
+                    "Sunday",
+                ],
+            },
+        },
+    }
+
+
+def submit_weekly_summary_schema() -> dict[str, Any]:
+    return _schema(
+        "submit_weekly_summary",
+        "Submit weekday-ordered summary bullets from intra-day and cross-day threads. Do not emit legend or new events.",
+        {
+            "summary": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": _summary_item_props(),
+                    "required": ["text", "weekdays"],
+                },
+            }
+        },
+        ["summary"],
+    )
+
+
+def patch_weekly_summary_schema() -> dict[str, Any]:
+    return _schema(
+        "patch_weekly_summary",
+        "Patch ONLY changed fields on previous submit_weekly_summary args.",
+        {
+            "summary": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": _summary_item_props(),
+                },
+            }
+        },
+        [],
+    )
+
+
 def all_tool_schemas() -> list[dict[str, Any]]:
     try:
         from . import tighten_tools
@@ -247,6 +303,8 @@ def all_tool_schemas() -> list[dict[str, Any]]:
         skip_weekly_event_schema(),
         submit_weekly_thread_schema(),
         patch_weekly_thread_schema(),
+        submit_weekly_summary_schema(),
+        patch_weekly_summary_schema(),
         *tighten_tools.all_tighten_tool_schemas(),
     ]
 
@@ -302,6 +360,7 @@ def validate_closed_choice_args(args: Mapping[str, Any], *, role: str) -> list[s
         "conflict": "conflicts",
         "hypothesis": "hypotheses",
         "thread": "cross-day-thread",
+        "summary": "summary",
     }.get(role, "")
     items = args.get(items_key) if items_key else None
     if not isinstance(items, list):
@@ -327,8 +386,30 @@ def validate_closed_choice_args(args: Mapping[str, Any], *, role: str) -> list[s
                 via = step.get("via")
                 if via is not None and str(via).strip() not in {"evolves", "invalidates"}:
                     errors.append(
-                        f"{role}[{i}] step via must be evolves|invalidates"
+                        f"{role}[{i}] step via must be evolves or invalidates"
                     )
+        if role == "summary":
+            text = str(item.get("text") or "").strip()
+            if not text:
+                errors.append(f"summary[{i}] text must be non-empty")
+            raw_days = item.get("weekdays")
+            if not isinstance(raw_days, list) or not raw_days:
+                errors.append(f"summary[{i}] weekdays must be a non-empty list")
+            else:
+                allowed = {
+                    "Monday",
+                    "Tuesday",
+                    "Wednesday",
+                    "Thursday",
+                    "Friday",
+                    "Saturday",
+                    "Sunday",
+                }
+                for name in raw_days:
+                    if str(name).strip() not in allowed:
+                        errors.append(
+                            f"summary[{i}] weekday {name!r} must be Monday–Sunday"
+                        )
         if role == "event":
             parts = item.get("participants")
             if isinstance(parts, list):
@@ -486,6 +567,8 @@ __all__ = [
     "patch_weekly_event_schema",
     "patch_weekly_thread_schema",
     "submit_weekly_thread_schema",
+    "patch_weekly_summary_schema",
+    "submit_weekly_summary_schema",
     "render_events_from_tool_args",
     "submit_weekly_event_schema",
     "validate_closed_choice_args",
