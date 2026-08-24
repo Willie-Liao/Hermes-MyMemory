@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -28,7 +28,12 @@ _FRONTMATTER_RE = re.compile(r"(?ms)^---\n(.*?)\n---\n(.*?)(?=^---|\Z)")
 
 @dataclass
 class BlockRecord:
-    """One daily YAML card plus the file that actually contains it (not the id date hint)."""
+    """One daily YAML card plus the file that actually contains it (not the id date hint).
+
+    occurred_start / occurred_end exist so recall can compare a user-mentioned
+    window to the conversation clocks without a second index. Missing clocks
+    fall back to the daily filename as a civil day so legacy cards stay searchable.
+    """
 
     block_id: str
     path: Path
@@ -39,6 +44,8 @@ class BlockRecord:
     entity: str
     related: list[str] = field(default_factory=list)
     involves: list[str] = field(default_factory=list)
+    occurred_start: datetime | None = None
+    occurred_end: datetime | None = None
 
 
 def staging_root(explicit: Path | str | None = None) -> Path:
@@ -134,6 +141,80 @@ def _parse_related(parsed: dict[str, Any]) -> list[str]:
     return []
 
 
+def parse_iso_datetime(raw: Any, *, end_of_day: bool = False) -> datetime | None:
+    """Parse agent or frontmatter clocks; date-only strings become UTC civil bounds.
+
+    Naive values would compare unequal to offset-aware message clocks and drop
+    the time branch, so they are stamped UTC. Invalid text returns None so
+    recall can fail open to the existing ladder.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        if len(text) == 10 and text[4] == "-" and text[7] == "-":
+            day = date.fromisoformat(text)
+            start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+            if end_of_day:
+                return start + timedelta(days=1) - timedelta(microseconds=1)
+            return start
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _civil_day_interval(day_text: str) -> tuple[datetime, datetime] | None:
+    """Filename stem as [midnight, next midnight) so unclocked cards still overlap a date query."""
+    try:
+        day = date.fromisoformat(str(day_text or "")[:10])
+    except ValueError:
+        return None
+    start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+    return start, start + timedelta(days=1)
+
+
+def occurrence_interval(
+    parsed: dict[str, Any], day_text: str
+) -> tuple[datetime | None, datetime | None]:
+    """Prefer conversation clocks, then generated_at, then the daily filename.
+
+    Without this fallback a backfilled-noon miss would hide the card from
+    approximate-time recall even though the file date is known.
+    """
+    start = parse_iso_datetime(parsed.get("user_message_at"))
+    end = parse_iso_datetime(parsed.get("assistant_response_at"))
+    generated = parse_iso_datetime(parsed.get("generated_at"))
+    if start is None:
+        start = generated
+    if end is None:
+        end = generated if generated is not None else start
+    if start is None or end is None:
+        civil = _civil_day_interval(day_text)
+        if civil is None:
+            return None, None
+        return civil
+    if end < start:
+        start, end = end, start
+    return start, end
+
+
+def intervals_overlap(
+    start: datetime | None,
+    end: datetime | None,
+    lo: datetime,
+    hi: datetime,
+) -> bool:
+    """Inclusive overlap so a point generated_at still matches its civil day."""
+    if start is None or end is None:
+        return False
+    return start <= hi and lo <= end
+
+
 def _parse_involves(parsed: dict[str, Any]) -> list[str]:
     """Involves surfaces join the entity index; participants stay off Band B."""
     raw = parsed.get("involves")
@@ -172,10 +253,6 @@ def load_blocks(staging: Path | None = None) -> list[BlockRecord]:
         return out
     for path in sorted(daily.glob("*.md")):
         try:
-            file_day = date.fromisoformat(path.stem).isoformat()
-        except ValueError:
-            file_day = path.stem
-        try:
             text = path.read_text(encoding="utf-8")
         except OSError:
             continue
@@ -183,20 +260,7 @@ def load_blocks(staging: Path | None = None) -> list[BlockRecord]:
             block_id = str(parsed.get("id") or "").strip()
             if not block_id:
                 continue
-            day = file_day
-            out.append(
-                BlockRecord(
-                    block_id=block_id,
-                    path=path,
-                    parsed=parsed,
-                    body=body,
-                    day=day[:10] if day else file_day,
-                    item_type=str(parsed.get("type") or "").strip(),
-                    entity=str(parsed.get("entity") or "").strip(),
-                    related=_parse_related(parsed),
-                    involves=_parse_involves(parsed),
-                )
-            )
+            out.append(_record_from_file(path, block_id, parsed, body))
     return out
 
 
@@ -237,17 +301,20 @@ def _record_from_file(
         file_day = date.fromisoformat(path.stem).isoformat()
     except ValueError:
         file_day = path.stem
-    day = file_day
+    day = (file_day[:10] if file_day else path.stem)
+    start, end = occurrence_interval(parsed, day)
     return BlockRecord(
         block_id=mem_id,
         path=path,
         parsed=parsed,
         body=body,
-        day=day[:10] if day else file_day,
+        day=day,
         item_type=str(parsed.get("type") or "").strip(),
         entity=str(parsed.get("entity") or "").strip(),
         related=_parse_related(parsed),
         involves=_parse_involves(parsed),
+        occurred_start=start,
+        occurred_end=end,
     )
 
 

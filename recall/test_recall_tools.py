@@ -1,10 +1,98 @@
 from __future__ import annotations
 
-from recall.conftest import HOP1, HOP2, OVERLAP, SEED, write_fake_staging
+from datetime import datetime, timezone
+from pathlib import Path
+
+from recall.conftest import HOP1, HOP2, OVERLAP, SEED, _block, write_fake_staging
 from recall.embed import DEFAULT_MODEL, rerank_embed
 from recall.ids import BlockIndex
 from recall.lexical import rebuild_lexical
-from recall.tools import expand_memory, handle_tool, recall_memory
+from recall.tools import TOOL_SCHEMAS, expand_memory, handle_tool, recall_memory
+
+DIGEST_LEGACY = "mem-2026-06-01-fact-aaaaaaaaaaaa"
+CANTEEN_EVENT = "mem-2026-08-10-event-bbbbbbbbbbbb"
+PICNIC_EVENT = "mem-2026-08-16-event-cccccccccccc"
+WEATHER_FACT = "mem-2026-08-16-fact-dddddddddddd"
+TOO_FAR_EVENT = "mem-2026-08-18-event-eeeeeeeeeeee"
+REJECTED_TIME = "mem-2026-08-10-fact-ffffffffffff"
+
+
+def _clocked_time_staging(root: Path) -> Path:
+    """Sparse notebook so exact/±3 ranges stay under three time hits."""
+    daily = root / "daily"
+    daily.mkdir(parents=True)
+    (root / "weekly").mkdir(exist_ok=True)
+    (root / "monthly").mkdir(exist_ok=True)
+    (daily / "2026-06-01.md").write_text(
+        _block(
+            mem_id=DIGEST_LEGACY,
+            type_="fact",
+            entity="Memory Digest",
+            body="Memory Digest plugin shipped in June.",
+            extra=(
+                "user_message_at: '2026-06-01T12:00:00+00:00'\n"
+                "assistant_response_at: '2026-06-01T12:05:00+00:00'\n"
+                "generated_at: '2026-06-01T12:06:00+00:00'\n"
+            ),
+        ),
+        encoding="utf-8",
+    )
+    (daily / "2026-08-10.md").write_text(
+        _block(
+            mem_id=CANTEEN_EVENT,
+            type_="event",
+            entity="Canteen",
+            body="Beginning: canteen lunch; Course: ate; Outcome: noted.",
+            extra=(
+                "predicate: lunch\n"
+                "user_message_at: '2026-08-10T09:00:00+08:00'\n"
+                "assistant_response_at: '2026-08-10T09:05:00+08:00'\n"
+                "generated_at: '2026-08-10T09:06:00+08:00'\n"
+            ),
+        )
+        + "\n"
+        + _block(
+            mem_id=REJECTED_TIME,
+            type_="fact",
+            entity="Canteen",
+            body="Rejected canteen rumor.",
+        ).replace("status: candidate\n", "status: rejected\n", 1),
+        encoding="utf-8",
+    )
+    (daily / "2026-08-16.md").write_text(
+        _block(
+            mem_id=PICNIC_EVENT,
+            type_="event",
+            entity="Picnic",
+            body="Beginning: picnic; Course: park; Outcome: done.",
+            extra=(
+                "predicate: picnic\n"
+                "user_message_at: '2026-08-16T15:00:00+00:00'\n"
+                "assistant_response_at: '2026-08-16T15:20:00+00:00'\n"
+            ),
+        )
+        + "\n"
+        + _block(
+            mem_id=WEATHER_FACT,
+            type_="fact",
+            entity="Weather",
+            body="It rained during the picnic.",
+            extra="generated_at: '2026-08-16T18:00:00+00:00'\n",
+        ),
+        encoding="utf-8",
+    )
+    (daily / "2026-08-18.md").write_text(
+        _block(
+            mem_id=TOO_FAR_EVENT,
+            type_="event",
+            entity="Far",
+            body="Beginning: eight days later; Course: outside; Outcome: excluded.",
+            extra="predicate: too_far\n",
+        ),
+        encoding="utf-8",
+    )
+    rebuild_lexical(root)
+    return root
 
 
 def test_recall_sentence_hits_seed_cluster(staging):
@@ -157,6 +245,101 @@ def test_rerank_embed_missing_onnx_failopen(tmp_path, monkeypatch):
     write_fake_staging(tmp_path)
     live = BlockIndex(tmp_path).records
     assert rerank_embed("quantum pineapple recipe", live, k=8) == []
+
+
+def test_block_index_derives_occurrence_interval(tmp_path):
+    root = _clocked_time_staging(tmp_path)
+    store = BlockIndex(root)
+    clocked = store.get(CANTEEN_EVENT)
+    assert clocked is not None
+    assert clocked.occurred_start.isoformat() == "2026-08-10T09:00:00+08:00"
+    assert clocked.occurred_end.isoformat() == "2026-08-10T09:05:00+08:00"
+    legacy = store.get(TOO_FAR_EVENT)
+    assert legacy is not None
+    assert legacy.occurred_start == datetime(2026, 8, 18, tzinfo=timezone.utc)
+    assert legacy.occurred_end == datetime(2026, 8, 19, tzinfo=timezone.utc)
+    generated = store.get(WEATHER_FACT)
+    assert generated is not None
+    assert generated.occurred_start.isoformat() == "2026-08-16T18:00:00+00:00"
+    assert generated.occurred_end.isoformat() == "2026-08-16T18:00:00+00:00"
+
+
+def test_recall_time_or_entity_progressively_widens_to_seven_days(tmp_path):
+    root = _clocked_time_staging(tmp_path)
+    text = recall_memory(
+        "Memory Digest",
+        time_from="2026-08-10",
+        time_to="2026-08-10",
+        staging=root,
+    )
+    assert DIGEST_LEGACY in text
+    assert CANTEEN_EVENT in text
+    assert PICNIC_EVENT in text
+    assert TOO_FAR_EVENT not in text
+    assert REJECTED_TIME not in text
+    assert "widen_days=7" in text
+    assert DIGEST_LEGACY in text.split(CANTEEN_EVENT)[0]
+    unbounded = recall_memory("Memory Digest", staging=root)
+    assert "channel=entity_key" in unbounded
+    assert "widen_days=" not in unbounded
+    malformed = recall_memory(
+        "Memory Digest",
+        time_from="not-a-date",
+        time_to="2026-08-10",
+        staging=root,
+    )
+    assert malformed == unbounded
+
+
+def test_recall_time_only_ranks_events_first(tmp_path):
+    root = _clocked_time_staging(tmp_path)
+    text = recall_memory(
+        "Memory Digest",
+        time_from="2026-08-10",
+        time_to="2026-08-10",
+        staging=root,
+    )
+    picnic = text.find(PICNIC_EVENT)
+    weather = text.find(WEATHER_FACT)
+    assert picnic != -1 and weather != -1
+    assert picnic < weather
+
+
+def test_recall_exact_id_ignores_time_bounds(tmp_path):
+    root = _clocked_time_staging(tmp_path)
+    text = recall_memory(
+        DIGEST_LEGACY,
+        time_from="2026-08-10",
+        time_to="2026-08-10",
+        staging=root,
+    )
+    assert "channel=id" in text
+    assert DIGEST_LEGACY in text
+
+
+def test_handle_tool_forwards_time_bounds(tmp_path):
+    root = _clocked_time_staging(tmp_path)
+    text = handle_tool(
+        "recall_memory",
+        {
+            "query": "Memory Digest",
+            "time_from": "2026-08-10",
+            "time_to": "2026-08-10",
+        },
+        staging=root,
+    )
+    assert PICNIC_EVENT in text
+    assert TOO_FAR_EVENT not in text
+    assert "time_from=" in text and "time_to=" in text
+
+
+def test_recall_tool_schema_exposes_optional_time_bounds():
+    schema = next(row for row in TOOL_SCHEMAS if row["name"] == "recall_memory")
+    props = schema["parameters"]["properties"]
+    assert schema["parameters"]["required"] == ["query"]
+    assert "time_from" in props and "time_to" in props
+    assert "time_from" not in schema["parameters"]["required"]
+    assert "time_to" not in schema["parameters"]["required"]
 
 
 def test_recall_channel_embed_when_fts_misses(staging, monkeypatch):

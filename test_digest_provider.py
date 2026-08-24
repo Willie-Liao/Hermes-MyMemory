@@ -447,3 +447,14 @@ def test_failed_external_patch_keeps_retrieval_for_retry(tmp_path, monkeypatch):
     entry = _retrieval_state(tmp_path)
     recorded = (entry.get("retrieval") or {}).get("ids")
     assert recorded, "failed Phase-2 must retain the retrieval set for retry"
+
+
+def test_recall_tool_schema_exposes_optional_time_bounds():
+    from recall.tools import TOOL_SCHEMAS
+
+    schema = next(row for row in TOOL_SCHEMAS if row["name"] == "recall_memory")
+    props = schema["parameters"]["properties"]
+    assert schema["parameters"]["required"] == ["query"]
+    assert "time_from" in props and "time_to" in props
+    assert "time_from" not in schema["parameters"]["required"]
+    assert "time_to" not in schema["parameters"]["required"]
