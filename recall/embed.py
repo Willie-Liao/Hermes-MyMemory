@@ -38,6 +38,7 @@ FORBIDDEN_MODEL = "BAAI/bge-small-zh-v1.5"
 CANDIDATE_CAP = 48
 ENCODE_BATCH = 8
 COSINE_FLOOR = 0.30
+COSINE_GAP = 0.02
 MAX_LENGTH = 512
 
 _SESSION: Any = None
@@ -266,7 +267,11 @@ def rerank_embed(
     *_a,
     **_k,
 ) -> list | str:
-    """Cosine-rerank live cards; [] fail-open so L1 still runs on the Hermes box."""
+    """Cosine-rerank live cards; drop int8 pile-up tails so the LLM never sees a 0.82 sibling of a 0.83 hit.
+
+    COSINE_FLOOR is only a prefilter. A flat top-2 gap below COSINE_GAP keeps rank 1;
+    a real peak keeps through the first cliff, still fail-open [] so L1 can run.
+    """
     q = str(query or "").strip()
     live = list(records or [])
     if _k.get("live") is not None and not live:
@@ -291,7 +296,18 @@ def rerank_embed(
             if score >= COSINE_FLOOR:
                 scored.append((score, rec))
         scored.sort(key=lambda row: row[0], reverse=True)
-        top = scored[: max(1, int(k))]
+        cap = max(1, int(k))
+        if len(scored) >= 2 and (scored[0][0] - scored[1][0]) < COSINE_GAP:
+            top = scored[:1]
+        else:
+            top1 = scored[0][0] if scored else 0.0
+            top = []
+            for row in scored:
+                if len(top) >= cap:
+                    break
+                top.append(row)
+                if top1 - row[0] >= COSINE_GAP:
+                    break
         if not top:
             return []
         lines = [f"## Memory / recall  channel=embed  q={q}"]
