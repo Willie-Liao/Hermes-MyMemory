@@ -1588,16 +1588,7 @@ export default function WeekReview({
 
                 {!isHighlightsFolded && (
                 <div className="space-y-3 pt-4 border-t border-slate-850 fade-in">
-                  {emptyDigests ? (
-                    <div className="space-y-1.5">
-                      <p className="text-sm font-sans font-semibold text-slate-200">
-                        {NEWSROOM_EMPTY_COPY.title}
-                      </p>
-                      <p className="text-xs md:text-sm text-slate-400 leading-relaxed font-sans">
-                        {NEWSROOM_EMPTY_COPY.body}
-                      </p>
-                    </div>
-                  ) : weeklyJson ? (
+                  {weeklyJson ? (
                     <FourPartWeeklyCard payload={weeklyJson}>
                     <MemoryApprovalActionQueue
                       weekKey={selectedWeek.week}
@@ -1630,6 +1621,15 @@ export default function WeekReview({
                       </button>
                     </div>
                     </FourPartWeeklyCard>
+                  ) : emptyDigests ? (
+                    <div className="space-y-1.5">
+                      <p className="text-sm font-sans font-semibold text-slate-200">
+                        {NEWSROOM_EMPTY_COPY.title}
+                      </p>
+                      <p className="text-xs md:text-sm text-slate-400 leading-relaxed font-sans">
+                        {NEWSROOM_EMPTY_COPY.body}
+                      </p>
+                    </div>
                   ) : chronicleLoading || spansLoading ? (
                     <p className="text-xs font-mono text-slate-500">
                       {isFourPartBrief(chronicleSummary) || chronicleLoading
