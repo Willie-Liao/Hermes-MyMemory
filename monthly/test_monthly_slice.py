@@ -108,6 +108,48 @@ def test_august_entity_week_spans():
     assert "entity_weeks:" in facts.rendered()
 
 
+def test_mechanical_facts_bilingual_aliases_do_not_split_keys(monkeypatch):
+    from datetime import date
+
+    from monthly_slice import mechanical_facts
+
+    rows = [
+        (
+            date(2026, 7, 27),
+            {
+                "id": "mem-2026-07-27-fact-aaaaaaaaaaaa",
+                "type": "fact",
+                "entity": "记忆摘要",
+                "confidence": "high",
+                "status": "candidate",
+            },
+            "Factual: legacy Chinese-only Memory Digest card.",
+        ),
+        (
+            date(2026, 8, 24),
+            {
+                "id": "mem-2026-08-24-event-bbbbbbbbbbbb",
+                "type": "event",
+                "entity": "Memory Digest",
+                "entity_aliases": ["记忆摘要"],
+                "confidence": "high",
+                "status": "candidate",
+                "predicate": "user_requested_memory_recall",
+                "participants": [],
+            },
+            "Beginning: asked; Course: traced; Outcome: recalled.",
+        ),
+    ]
+    monkeypatch.setattr("monthly_slice.load_all_blocks", lambda: rows)
+    facts = mechanical_facts("2026-08")
+    by_key = {row["key"]: row for row in facts.cross_month_entities}
+    assert "memorydigest" in by_key
+    assert "记忆摘要" not in by_key
+    assert by_key["memorydigest"]["canonical"] == "Memory Digest"
+    assert "记忆摘要" in by_key["memorydigest"]["aliases"]
+    assert by_key["memorydigest"]["month_count"] == 1
+
+
 def test_parse_blocks_alias_matches_weekly():
     sample = next(iter(iter_daily_files())).read_text(encoding="utf-8")
     assert parse_blocks is weekly_parse_blocks or parse_blocks(sample) == weekly_parse_blocks(sample)

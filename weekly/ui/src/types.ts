@@ -11,6 +11,7 @@ export interface Participant {
 export type ImportanceLevel = 0 | 1 | 2 | 3 | 4 | 5;
 
 export interface MemoryBlock {
+  /** Daily YAML card. entity_aliases keeps original-language surfaces so a UI rewrite cannot drop them. */
   id: string;
   type: MemoryType;
   confidence: ConfidenceType;
@@ -19,6 +20,7 @@ export interface MemoryBlock {
   status: MemoryStatus;
   sources: string[];
   entity?: string;
+  entity_aliases?: string[];
   valid_from?: string;
   valid_to?: string;
   involves?: string[];
@@ -28,6 +30,9 @@ export interface MemoryBlock {
   participants?: Participant[];
   promoted_at?: string;
   discarded_at?: string;
+  user_message_at?: string;
+  assistant_response_at?: string;
+  generated_at?: string;
   body: string;
   filePath: string; // which daily md file it belongs to
 }
@@ -79,7 +84,7 @@ export interface WeeklyProposal {
   block_ids?: string[];
   label?: string;
   source?: string;
-  /** Staging block type — Approval Hub keeps ``event`` only. */
+  /** Staging block type. */
   type?: MemoryType | string;
   tier?: 'proposed' | 'not_proposed' | 'hypothesis' | 'procedure' | string;
   proposed_text?: string;

@@ -6,26 +6,20 @@ import {
   Sliders, 
   Edit2,
   Sparkles,
-  ExternalLink,
   CheckSquare,
   RefreshCw,
   Trash2,
   Unlock,
-  Quote,
 } from 'lucide-react';
 import {
   WeekOverview,
   MemoryBlock,
   SystemStatus,
-  WeeklyProposal,
-  type ApprovalAction,
   type ImportanceLevel,
-  type StagedAction,
   type StagingUiPendingOp,
 } from '../types';
 import { formatStagingFrontmatter } from '../stagingFrontmatter';
 import HotMemoryEditor from './HotMemoryEditor';
-import { filterApprovalHubProposals, proposalKey } from '../weeklyTidyDecisions';
 import {
   formatWeekCascadeOptionLabel,
   formatWeekOptionLabel,
@@ -39,8 +33,6 @@ import {
   resolveDefaultWeekSelection,
 } from '../softWeek';
 import {
-  approvalCiteAnchorId,
-  briefCiteAnchorId,
   dailyBlockAnchorId,
   splitBriefDisplaySegments,
 } from '../briefCiteNav';
@@ -53,7 +45,6 @@ import type { WeeklyJsonPayload } from '../weeklyJson';
 import type { WeeklySpanBridgeRow } from '../overdueActions';
 import FourPartWeeklyCard from './FourPartWeeklyCard';
 import MemoryApprovalActionQueue from './MemoryApprovalActionQueue';
-import { RECALL_LIMIT_MESSAGE } from '../approvalRecall';
 import type { WeeklyReviewPendingOp } from '../weeklyReviewRecall';
 import { clearReviewPendingTarget } from '../weeklyReviewOps';
 import {
@@ -147,7 +138,6 @@ export default function WeekReview({
   const [pickerMonth, setPickerMonth] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [weeksLoading, setWeeksLoading] = useState(false);
-  const [weeklyProposals, setWeeklyProposals] = useState<WeeklyProposal[]>([]);
   const [allBlocks, setAllBlocks] = useState<MemoryBlock[]>([]);
   const [hotHealthCounts, setHotHealthCounts] = useState({
     memoryOutdated: 0,
@@ -159,24 +149,6 @@ export default function WeekReview({
   
   // Tab toggle for small screens or focused layouts
   const [viewMode, setViewMode] = useState<WeekViewMode>('approve');
-
-  // Unified review queue state — staged Save/Recall (Task 5+)
-  const [stagedActions, setStagedActions] = useState<Record<string, StagedAction>>({});
-  const [savedByRecordId, setSavedByRecordId] = useState<Record<string, ApprovalAction>>({});
-  const [recallAvailable, setRecallAvailable] = useState(false);
-  const [candidateBullets, setCandidateBullets] = useState<Record<string, string>>({});
-  const [editingBulletId, setEditingBulletId] = useState<string | null>(null);
-  /** Pended card edits awaiting footer Save → staging write + 3-step recall. */
-  const [pendingEdits, setPendingEdits] = useState<
-    Record<string, { blockId: string; beforeText: string; afterText: string }>
-  >({});
-  /** Text when Edit opened — Undo / unchanged Pend compare against this. */
-  const [editBaselines, setEditBaselines] = useState<Record<string, string>>({});
-  const [approvalTightenComposerId, setApprovalTightenComposerId] = useState<string | null>(null);
-  const [approvalTightenGuidance, setApprovalTightenGuidance] = useState('');
-  const [approvalTightenDraftId, setApprovalTightenDraftId] = useState<string | null>(null);
-  const [approvalTightenDraft, setApprovalTightenDraft] = useState<string | null>(null);
-  const [approvalTightening, setApprovalTightening] = useState(false);
 
   const [message, setMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
   const [rescanLoading, setRescanLoading] = useState(false);
@@ -206,7 +178,6 @@ export default function WeekReview({
   const editingPauseRef = useRef(false);
   const [hotComposeActive, setHotComposeActive] = useState(false);
   /** Nested list scrollers — window.scrollY alone misses halfway scroll inside these. */
-  const approvalListScrollRef = useRef<HTMLDivElement>(null);
   const stagingListScrollRef = useRef<HTMLDivElement>(null);
 
   const weekKeys = useMemo(() => weeks.map((w) => w.week), [weeks]);
@@ -492,7 +463,6 @@ export default function WeekReview({
         text: `Recalled last review save (${count} action(s)).`,
       });
       await refreshFourPartSurfaces(selectedWeek.week);
-      fetchCandidates();
     } catch (err: unknown) {
       setMessage({
         type: 'error',
@@ -506,7 +476,7 @@ export default function WeekReview({
 
   const captureViewScroll = () =>
     captureViewScrollSnapshot(
-      approvalListScrollRef.current,
+      null,
       stagingListScrollRef.current,
     );
 
@@ -514,7 +484,7 @@ export default function WeekReview({
     const apply = () =>
       applyViewScrollSnapshot(
         snap,
-        approvalListScrollRef.current,
+        null,
         stagingListScrollRef.current,
       );
     // Two frames: first after React paint, second after message/banner height settles.
@@ -649,15 +619,6 @@ export default function WeekReview({
 
   // Read by date states
   const [activeDate, setActiveDate] = useState<string>('');
-  const [pendingDailyBlockJump, setPendingDailyBlockJump] = useState<string | null>(null);
-  /** After Brief/Approval → Read by Date, quote mark returns to the source cite. */
-  const [dailyNavReturn, setDailyNavReturn] = useState<{
-    blockId: string;
-    mode: 'approval' | 'brief';
-    n: number;
-  } | null>(null);
-  const [pendingBriefCiteJump, setPendingBriefCiteJump] = useState<number | null>(null);
-  const [pendingApprovalCiteJump, setPendingApprovalCiteJump] = useState<number | null>(null);
 
   // Retention close options (sent with UI Close)
   const [cleanupRetentionRecords, setCleanupRetentionRecords] = useState(true);
@@ -665,116 +626,8 @@ export default function WeekReview({
   const [cleanupLogs, setCleanupLogs] = useState(false);
   const [cleanupLogsMonths, setCleanupLogsMonths] = useState<1 | 2 | 3 | 6 | 12>(3);
   const [isRetentionFolded, setIsRetentionFolded] = useState<boolean>(false);
-  // Chronicle expanded by default on Approval Hub
+  // Chronicle expanded by default on Weekly Chronicle tab
   const [isHighlightsFolded, setIsHighlightsFolded] = useState<boolean>(false);
-  const [isApprovalFolded, setIsApprovalFolded] = useState<boolean>(false);
-
-  const jumpToBriefCite = (n: number) => {
-    changeViewMode('approve');
-    setIsHighlightsFolded(false);
-    setPendingBriefCiteJump(n);
-  };
-
-  const jumpToApprovalCite = (n: number) => {
-    changeViewMode('approve');
-    setIsApprovalFolded(false);
-    setPendingApprovalCiteJump(n);
-  };
-
-  const jumpToDailyBlock = (
-    block: MemoryBlock,
-    returnTo?: { mode: 'approval' | 'brief'; n: number },
-  ) => {
-    const date = block.filePath.match(/(\d{4}-\d{2}-\d{2})/)?.[1];
-    if (!date) return;
-    changeViewMode('read');
-    setActiveDate(date);
-    setPendingDailyBlockJump(block.id);
-    setDailyNavReturn(
-      returnTo && returnTo.n >= 1
-        ? { blockId: block.id, mode: returnTo.mode, n: returnTo.n }
-        : null,
-    );
-  };
-
-  const jumpBackFromDailyQuote = () => {
-    if (!dailyNavReturn) return;
-    const { mode, n } = dailyNavReturn;
-    setDailyNavReturn(null);
-    if (mode === 'approval') {
-      changeViewMode('approve');
-      setIsApprovalFolded(false);
-      jumpToApprovalCite(n);
-      return;
-    }
-    jumpToBriefCite(n);
-  };
-
-  useEffect(() => {
-    if (pendingBriefCiteJump == null || viewMode !== 'approve') return;
-    const n = pendingBriefCiteJump;
-    let tries = 0;
-    const attempt = () => {
-      const el = document.getElementById(briefCiteAnchorId(n));
-      if (el) {
-        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        el.classList.add('ring-2', 'ring-indigo-400');
-        window.setTimeout(() => el.classList.remove('ring-2', 'ring-indigo-400'), 1200);
-        setPendingBriefCiteJump(null);
-        return;
-      }
-      if (tries++ < 20) {
-        window.setTimeout(attempt, 50);
-      } else {
-        setPendingBriefCiteJump(null);
-      }
-    };
-    requestAnimationFrame(attempt);
-  }, [pendingBriefCiteJump, viewMode, isHighlightsFolded]);
-
-  useEffect(() => {
-    if (pendingApprovalCiteJump == null || viewMode !== 'approve') return;
-    const n = pendingApprovalCiteJump;
-    let tries = 0;
-    const attempt = () => {
-      const el = document.getElementById(approvalCiteAnchorId(n));
-      if (el) {
-        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        el.classList.add('ring-2', 'ring-indigo-400');
-        window.setTimeout(() => el.classList.remove('ring-2', 'ring-indigo-400'), 1200);
-        setPendingApprovalCiteJump(null);
-        return;
-      }
-      if (tries++ < 24) {
-        window.setTimeout(attempt, 50);
-      } else {
-        setPendingApprovalCiteJump(null);
-      }
-    };
-    requestAnimationFrame(attempt);
-  }, [pendingApprovalCiteJump, viewMode, isApprovalFolded, weeklyProposals.length]);
-
-  useEffect(() => {
-    if (!pendingDailyBlockJump || viewMode !== 'read') return;
-    const targetId = pendingDailyBlockJump;
-    let tries = 0;
-    const attempt = () => {
-      const el = document.getElementById(dailyBlockAnchorId(targetId));
-      if (el) {
-        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        el.classList.add('ring-2', 'ring-indigo-400');
-        window.setTimeout(() => el.classList.remove('ring-2', 'ring-indigo-400'), 1200);
-        setPendingDailyBlockJump(null);
-        return;
-      }
-      if (tries++ < 20) {
-        window.setTimeout(attempt, 50);
-      } else {
-        setPendingDailyBlockJump(null);
-      }
-    };
-    requestAnimationFrame(attempt);
-  }, [pendingDailyBlockJump, viewMode, activeDate]);
 
   const getBlocksForSelectedWeek = () => {
     if (!selectedWeek) return [];
@@ -978,44 +831,11 @@ export default function WeekReview({
         if (data.empty_digests) {
           setEmptyDigests(true);
         }
-        const proposalKeys = new Set<string>();
-        const proposals: WeeklyProposal[] = filterApprovalHubProposals(
-          (data.candidates ?? data.decisions ?? [])
-            .filter((proposal: WeeklyProposal) =>
-              proposal.tier !== 'not_proposed'
-              && Boolean(proposal.block_id || proposal.block_ids?.[0])
-              && Boolean(proposalKey(proposal)))
-            .filter((proposal: WeeklyProposal) => {
-              const key = proposalKey(proposal);
-              if (proposalKeys.has(key)) return false;
-              proposalKeys.add(key);
-              return true;
-            }),
-        );
-        const initialBullets: Record<string, string> = {};
-
-        proposals.forEach((proposal) => {
-          const key = proposalKey(proposal);
-          initialBullets[key] = proposal.proposed_text || proposal.label || proposal.block_id || key;
-        });
-
-        setWeeklyProposals(proposals);
-        setStagedActions({});
-        setSavedByRecordId({});
-        setRecallAvailable(false);
-        setCandidateBullets(initialBullets);
-        setPendingEdits({});
-        setEditBaselines({});
-        setApprovalTightenComposerId(null);
-        setApprovalTightenGuidance('');
-        setApprovalTightenDraftId(null);
-        setApprovalTightenDraft(null);
         setReviewPendingOps([]);
         setSavedReviewOps([]);
         fetchHotHealth();
         void refreshFourPartSurfaces(week.week);
         void checkStaleness(week.week);
-        void fetchApprovalRecall(week.week);
         void fetchReviewRecall(week.week);
       })
       .catch((err) => {
@@ -1249,15 +1069,11 @@ export default function WeekReview({
 
   useEffect(() => {
     editingPauseRef.current = Boolean(
-      editingBulletId
-      || approvalTightenComposerId
-      || editingBlockId
+      editingBlockId
       || stagingTightenComposerId
       || hotComposeActive,
     );
   }, [
-    editingBulletId,
-    approvalTightenComposerId,
     editingBlockId,
     stagingTightenComposerId,
     hotComposeActive,
@@ -1303,12 +1119,6 @@ export default function WeekReview({
             fileContent: soft.fileContent,
             decisions: soft.decisions ?? [],
           });
-          setWeeklyProposals([]);
-          setStagedActions({});
-          setSavedByRecordId({});
-          setCandidateBullets({});
-          setPendingEdits({});
-          setEditBaselines({});
           void fetchWeeks({ silent: true });
           if (hotChanged) {
             await fetch('/api/hot/health/refresh', {
@@ -1346,12 +1156,6 @@ export default function WeekReview({
               fileContent: soft.fileContent,
               decisions: soft.decisions ?? [],
             });
-            setWeeklyProposals([]);
-            setStagedActions({});
-            setSavedByRecordId({});
-            setCandidateBullets({});
-            setPendingEdits({});
-            setEditBaselines({});
             void fetchWeeks({ silent: true });
           } else if (!updRes.ok) {
             throw new Error(data.error || 'Failed to re-scan the chosen week.');
@@ -1465,129 +1269,31 @@ export default function WeekReview({
     }
   };
 
-  const fetchApprovalRecall = async (weekKey: string) => {
-    try {
-      const res = await fetch(`/api/weekly/weeks/${weekKey}/approval/recall`);
-      if (!res.ok) {
-        setRecallAvailable(false);
-        return;
-      }
-      const data = await res.json();
-      const batches = Array.isArray(data?.batches) ? data.batches : [];
-      setRecallAvailable(batches.length > 0);
-      const saved: Record<string, ApprovalAction> = {};
-      for (const batch of batches) {
-        for (const op of batch.operations ?? []) {
-          if (op?.recordId && (op.action === 'memory' || op.action === 'user' || op.action === 'delete')) {
-            saved[op.recordId] = op.action;
-          }
-        }
-      }
-      setSavedByRecordId(saved);
-    } catch {
-      setRecallAvailable(false);
-    }
-  };
-
   const refreshStatusOnly = () => {
     (onStatusRefresh ?? onRefresh)();
   };
 
-  const handleApprovalSave = async () => {
+  /** Persist overdue/review pends after Memory Approval hub retired. */
+  const handleReviewSave = async () => {
     if (!selectedWeek) return;
-    const stagedPromote = Object.values(stagedActions)
-      .filter((item) => item.action !== 'edit')
-      .map((item) => ({
-        ...item,
-        bulletText: candidateBullets[item.recordId] ?? item.bulletText,
-      }));
-    const stagedEdits = Object.entries(pendingEdits).map(([recordId, pend]) => ({
-      blockId: pend.blockId,
-      recordId,
-      action: 'edit' as const,
-      bulletText: pend.afterText,
-      beforeBody: pend.beforeText,
-    }));
-    const staged = [...stagedPromote, ...stagedEdits];
     const reviewOps = [...reviewPendingOps];
-    if (!staged.length && !reviewOps.length) {
+    if (!reviewOps.length) {
       setMessage({
         type: 'error',
-        text: 'Pend a Weekly Review action, or stage Add to memory / user / Delete before Save.',
+        text: 'Pend a Weekly Review action before Save.',
       });
       return;
     }
     const scrollSnap = captureViewScroll();
     setLoading(true);
     setMessage(null);
-
     try {
-      let approvalCount = 0;
-      if (staged.length) {
-        // Always open/refresh the 15m instant window before Approval Save.
-        const gateRes = await fetch('/api/weekly/gate/start', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ type: 'instant' }),
-        });
-        if (!gateRes.ok) throw new Error('Gate pre-authorization failed.');
-
-        const res = await fetch(`/api/weekly/weeks/${selectedWeek.week}/approval/save`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ staged }),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          throw new Error(data.error || 'Failed to save approval batch.');
-        }
-
-        const ops = data.batch?.operations ?? staged;
-        approvalCount = ops.length;
-        setSavedByRecordId((prev) => {
-          const next = { ...prev };
-          for (const op of ops) {
-            if (op?.recordId && op?.action) next[op.recordId] = op.action;
-          }
-          return next;
-        });
-        setCandidateBullets((prev) => {
-          const next = { ...prev };
-          for (const edit of stagedEdits) {
-            next[edit.recordId] = edit.bulletText;
-          }
-          return next;
-        });
-        setStagedActions({});
-        setPendingEdits({});
-        setEditBaselines({});
-        const batches = data.store?.batches;
-        setRecallAvailable(Array.isArray(batches) ? batches.length > 0 : true);
-      }
-
-      let reviewCount = 0;
-      if (reviewOps.length) {
-        const saved = await runWeeklyReviewSave(selectedWeek.week, reviewOps);
-        reviewCount = saved.count;
-        await refreshFourPartSurfaces(selectedWeek.week);
-      }
-
-      const parts: string[] = [];
-      if (approvalCount) {
-        parts.push(
-          `${approvalCount} approval action${approvalCount === 1 ? '' : 's'}`,
-        );
-      }
-      if (reviewCount) {
-        parts.push(
-          `${reviewCount} review action${reviewCount === 1 ? '' : 's'}`,
-        );
-      }
+      const saved = await runWeeklyReviewSave(selectedWeek.week, reviewOps);
+      await refreshFourPartSurfaces(selectedWeek.week);
       setMessage({
         type: 'success',
-        text: `Saved ${parts.join(' + ')}. Week stays open.`,
+        text: `Saved ${saved.count} review action${saved.count === 1 ? '' : 's'}. Week stays open.`,
       });
-      fetchCandidates();
       fetchHotHealth();
       refreshStatusOnly();
       restoreViewScroll(scrollSnap);
@@ -1598,12 +1304,12 @@ export default function WeekReview({
     }
   };
 
-  const handleApprovalRecall = async () => {
+  const handleReviewRecall = async () => {
     if (!selectedWeek) return;
-    if (!recallAvailable && !reviewRecallAvailable) {
+    if (!reviewRecallAvailable) {
       setMessage({
         type: 'error',
-        text: 'Nothing to recall yet — Save a staged batch first.',
+        text: 'Nothing to recall yet — Save a review batch first.',
       });
       return;
     }
@@ -1611,54 +1317,12 @@ export default function WeekReview({
     setLoading(true);
     setMessage(null);
     try {
-      const parts: string[] = [];
-      if (recallAvailable) {
-        const res = await fetch(`/api/weekly/weeks/${selectedWeek.week}/approval/recall`, {
-          method: 'POST',
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          const errText = data.error || 'Recall failed.';
-          setMessage({ type: 'error', text: errText });
-          if (errText === RECALL_LIMIT_MESSAGE) {
-            setRecallAvailable(false);
-          }
-          return;
-        }
-        const recalled = data.batch?.operations ?? [];
-        if (recalled.length) {
-          setCandidateBullets((prev) => {
-            const next = { ...prev };
-            for (const op of recalled) {
-              if (op?.action === 'edit' && op.recordId && typeof op.beforeBody === 'string') {
-                next[op.recordId] = op.beforeBody;
-              }
-            }
-            return next;
-          });
-          setSavedByRecordId((prev) => {
-            const next = { ...prev };
-            for (const op of recalled) {
-              if (op?.recordId) delete next[op.recordId];
-            }
-            return next;
-          });
-        }
-        await fetchApprovalRecall(selectedWeek.week);
-        parts.push('approval');
-      }
-
-      if (reviewRecallAvailable) {
-        const { count } = await runWeeklyReviewRecall(selectedWeek.week);
-        parts.push(`review (${count})`);
-        await refreshFourPartSurfaces(selectedWeek.week);
-      }
-
+      const { count } = await runWeeklyReviewRecall(selectedWeek.week);
+      await refreshFourPartSurfaces(selectedWeek.week);
       setMessage({
         type: 'success',
-        text: `Recalled last save batch (${parts.join(' + ')}).`,
+        text: `Recalled last review save (${count} action(s)).`,
       });
-      fetchCandidates();
       fetchHotHealth();
       refreshStatusOnly();
       restoreViewScroll(scrollSnap);
@@ -1669,250 +1333,7 @@ export default function WeekReview({
     }
   };
 
-  const handleApprovalRecallCard = async (recordId: string) => {
-    if (!selectedWeek) return;
-    const scrollSnap = captureViewScroll();
-    setLoading(true);
-    setMessage(null);
-    try {
-      const res = await fetch(`/api/weekly/weeks/${selectedWeek.week}/approval/recall-card`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ recordId }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        const errText = data.error || 'Card recall failed.';
-        setMessage({ type: 'error', text: errText });
-        if (errText === RECALL_LIMIT_MESSAGE) {
-          setRecallAvailable(false);
-        }
-        return;
-      }
-      setSavedByRecordId((prev) => {
-        const next = { ...prev };
-        delete next[recordId];
-        return next;
-      });
-      if (data.operation?.action === 'edit' && typeof data.operation.beforeBody === 'string') {
-        setCandidateBullets((prev) => ({
-          ...prev,
-          [recordId]: data.operation.beforeBody,
-        }));
-      }
-      setMessage({ type: 'success', text: `Recalled card ${recordId}.` });
-      await fetchApprovalRecall(selectedWeek.week);
-      fetchCandidates();
-      fetchHotHealth();
-      refreshStatusOnly();
-      restoreViewScroll(scrollSnap);
-    } catch (err: any) {
-      setMessage({ type: 'error', text: err.message });
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const stageAction = (
-    recordId: string,
-    action: ApprovalAction,
-    blockId: string,
-    linkedBlock?: MemoryBlock,
-  ) => {
-    if (!blockId) return;
-    const bulletText = candidateBullets[recordId] || recordId;
-    setStagedActions((prev) => ({
-      ...prev,
-      [recordId]: {
-        blockId,
-        recordId,
-        action,
-        bulletText,
-        validFrom: linkedBlock?.valid_from?.trim() || 'open',
-        validTo: linkedBlock?.valid_to?.trim() || 'open',
-      },
-    }));
-  };
-
-  const unstageAction = (recordId: string) => {
-    setStagedActions((prev) => {
-      if (!prev[recordId]) return prev;
-      const next = { ...prev };
-      delete next[recordId];
-      return next;
-    });
-  };
-
-  const startApprovalBulletEdit = (recordId: string) => {
-    const current = candidateBullets[recordId] ?? '';
-    const pend = pendingEdits[recordId];
-    const baseline = pend?.beforeText ?? current;
-    // If already pended, reopen with the pended after-text in the box.
-    if (pend) {
-      setCandidateBullets((prev) => ({ ...prev, [recordId]: pend.afterText }));
-    }
-    setEditBaselines((prev) => ({ ...prev, [recordId]: baseline }));
-    setEditingBulletId(recordId);
-  };
-
-  const pendApprovalBulletEdit = (recordId: string, blockId: string) => {
-    const after = (candidateBullets[recordId] ?? '').trim();
-    if (!after) {
-      setMessage({ type: 'error', text: 'Bullet is empty — nothing to pend.' });
-      return;
-    }
-    if (!blockId) {
-      setMessage({ type: 'error', text: 'No linked daily block to edit.' });
-      return;
-    }
-    const before = (
-      pendingEdits[recordId]?.beforeText
-      ?? editBaselines[recordId]
-      ?? after
-    );
-    setEditingBulletId(null);
-    if (approvalTightenComposerId === recordId) {
-      cancelApprovalTightenComposer();
-    }
-    if (after === before.trim()) {
-      setPendingEdits((prev) => {
-        const next = { ...prev };
-        delete next[recordId];
-        return next;
-      });
-      setCandidateBullets((prev) => ({ ...prev, [recordId]: before }));
-      setMessage({ type: 'success', text: 'No text change — nothing pended.' });
-      return;
-    }
-    // Keep the pended text visible; `beforeText` is retained exclusively for
-    // Undo and persisted recall after the footer Save.
-    setPendingEdits((prev) => ({
-      ...prev,
-      [recordId]: { blockId, beforeText: before, afterText: after },
-    }));
-  };
-
-  const undoPendingApprovalEdit = (recordId: string) => {
-    const pend = pendingEdits[recordId];
-    if (!pend) return;
-    setCandidateBullets((prev) => ({ ...prev, [recordId]: pend.beforeText }));
-    setPendingEdits((prev) => {
-      const next = { ...prev };
-      delete next[recordId];
-      return next;
-    });
-    setEditingBulletId(null);
-  };
-
-  const openApprovalTightenComposer = (recordId: string) => {
-    setApprovalTightenComposerId(recordId);
-    setApprovalTightenGuidance('');
-    setApprovalTightenDraftId(null);
-    setApprovalTightenDraft(null);
-    setMessage(null);
-  };
-
-  const cancelApprovalTightenComposer = () => {
-    setApprovalTightenComposerId(null);
-    setApprovalTightenGuidance('');
-  };
-
-  const handleApprovalTighten = async (recordId: string, guidance: string) => {
-    const text = (candidateBullets[recordId] ?? '').trim();
-    if (!text) {
-      setMessage({ type: 'error', text: 'Bullet is empty — nothing to tighten.' });
-      return;
-    }
-    const resolvedGuidance = resolveTightenGuidance(guidance);
-    setApprovalTightening(true);
-    setMessage({
-      type: 'info',
-      text: 'Waiting for LLM worker to polish.',
-    });
-    setApprovalTightenDraftId(recordId);
-    setApprovalTightenDraft(null);
-    try {
-      const res = await fetch('/api/approval/tighten', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, guidance: resolvedGuidance, entryType: 'event' }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        throw new Error(data.error || 'Tighten failed');
-      }
-      const next = String(data.tightened ?? '').replace(/§/g, '');
-      if (!next.trim()) throw new Error('Tighten returned an empty bullet.');
-      setApprovalTightenDraft(next);
-      setApprovalTightenComposerId(null);
-      setApprovalTightenGuidance('');
-      setMessage({ type: 'success', text: 'Tighten draft ready — Accept or Discard.' });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Tighten failed';
-      setMessage({ type: 'error', text: msg });
-      setApprovalTightenDraftId(null);
-    } finally {
-      setApprovalTightening(false);
-    }
-  };
-
-  const acceptApprovalTighten = (recordId: string) => {
-    if (approvalTightenDraftId !== recordId || approvalTightenDraft === null) return;
-    const text = approvalTightenDraft;
-    setCandidateBullets((prev) => ({ ...prev, [recordId]: text }));
-    setStagedActions((prev) => {
-      const current = prev[recordId];
-      if (!current) return prev;
-      return { ...prev, [recordId]: { ...current, bulletText: text } };
-    });
-    setApprovalTightenDraftId(null);
-    setApprovalTightenDraft(null);
-    setEditingBulletId(recordId);
-  };
-
-  const discardApprovalTighten = () => {
-    setApprovalTightenDraftId(null);
-    setApprovalTightenDraft(null);
-  };
-
-  const updateStagedValidity = (
-    recordId: string,
-    field: 'validFrom' | 'validTo',
-    value: string,
-  ) => {
-    setStagedActions((prev) => {
-      const current = prev[recordId];
-      if (!current) return prev;
-      return { ...prev, [recordId]: { ...current, [field]: value } };
-    });
-  };
-
-  const recallLabelFor = (action: ApprovalAction): string => {
-    if (action === 'memory') return 'Recall from memory';
-    if (action === 'user') return 'Recall from user';
-    if (action === 'edit') return 'Recall edit';
-    return 'Recall from delete';
-  };
-
-  // Helper counters (staged intents)
-  const totalToMemory = Object.values(stagedActions).filter((v) => v.action === 'memory').length;
-  const totalToUser = Object.values(stagedActions).filter((v) => v.action === 'user').length;
-  const totalToDelete = Object.values(stagedActions).filter((v) => v.action === 'delete').length;
-  const stagedCount = Object.keys(stagedActions).length;
-  const pendingEditCount = Object.keys(pendingEdits).length;
   const reviewPendingCount = reviewPendingOps.length;
-  const saveReadyCount = stagedCount + pendingEditCount + reviewPendingCount;
-  const savedCount = Object.keys(savedByRecordId).length;
-  const approvalReminderText =
-    saveReadyCount > 0
-      ? `${saveReadyCount} item${saveReadyCount === 1 ? '' : 's'} ready — click Save to apply${
-          reviewPendingCount
-            ? ` (${reviewPendingCount} from Weekly Review)`
-            : ''
-        }.`
-      : recallAvailable || reviewRecallAvailable
-        ? 'Last save applied. Recall undoes the batch (approval and/or weekly review).'
-        : 'Pend Weekly Review actions or stage card actions, then save.';
 
   return (
     <div className="space-y-6 fade-in">
@@ -2057,7 +1478,7 @@ export default function WeekReview({
                   : 'text-slate-400 hover:text-slate-200'
               }`}
             >
-              ⚡ Approval Hub ({weeklyProposals.length})
+              ⚡ Weekly Chronicle
             </button>
             <button
               onClick={() => changeViewMode('read')}
@@ -2152,7 +1573,7 @@ export default function WeekReview({
                       </h3>
                       <p className="text-[10px] text-slate-500 font-mono mt-0.5">
                         {weeklyJson
-                          ? `cross-day-thread · wrap-up · overdue · ${selectedWeek.week}`
+                          ? `summary · overdue · ${selectedWeek.week}`
                           : isFourPartBrief(chronicleSummary)
                           ? `Brief · Conflict · ${selectedWeek.week}`
                           : `What you did · ${selectedWeek.week}`}
@@ -2176,19 +1597,8 @@ export default function WeekReview({
                         {NEWSROOM_EMPTY_COPY.body}
                       </p>
                     </div>
-                  ) : chronicleLoading || spansLoading ? (
-                    <p className="text-xs font-mono text-slate-500">
-                      {isFourPartBrief(chronicleSummary) || chronicleLoading
-                        ? 'Loading weekly review…'
-                        : 'Loading chronicle…'}
-                    </p>
                   ) : weeklyJson ? (
-                    <FourPartWeeklyCard
-                      payload={weeklyJson}
-                      allBlocks={allBlocks}
-                      onJumpApprovalCite={jumpToApprovalCite}
-                      onJumpDailyBlock={jumpToDailyBlock}
-                    >
+                    <FourPartWeeklyCard payload={weeklyJson}>
                     <MemoryApprovalActionQueue
                       weekKey={selectedWeek.week}
                       bridgeSpans={spanBridgeRows}
@@ -2198,16 +1608,37 @@ export default function WeekReview({
                       onPendOp={handleReviewPendOp}
                       onClearPendingOp={handleClearReviewPendingOp}
                       onRecallSavedReview={() => void handleRecallSavedReview()}
-                      onJumpApprovalCite={jumpToApprovalCite}
-                      onJumpDailyBlock={jumpToDailyBlock}
                     />
+                    <div className="flex gap-2 pt-3">
+                      <button
+                        type="button"
+                        onClick={() => void handleReviewSave()}
+                        disabled={loading || !selectedWeek || reviewPendingCount === 0}
+                        className="flex-1 px-4 py-3 bg-indigo-600 hover:bg-indigo-500 text-slate-100 text-xs font-bold rounded-xl font-mono flex items-center justify-center gap-2 shadow-lg shadow-indigo-950/40 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        <CheckSquare className="w-4 h-4" />
+                        <span>Save</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleReviewRecall()}
+                        disabled={loading || !selectedWeek || !reviewRecallAvailable}
+                        className="flex-1 px-4 py-3 bg-slate-800 hover:bg-slate-700 text-slate-100 text-xs font-bold rounded-xl font-mono flex items-center justify-center gap-2 border border-slate-700 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        <RefreshCw className="w-4 h-4" />
+                        <span>Recall</span>
+                      </button>
+                    </div>
                     </FourPartWeeklyCard>
+                  ) : chronicleLoading || spansLoading ? (
+                    <p className="text-xs font-mono text-slate-500">
+                      {isFourPartBrief(chronicleSummary) || chronicleLoading
+                        ? 'Loading weekly review…'
+                        : 'Loading chronicle…'}
+                    </p>
                   ) : chronicleSummary.trim() && isFourPartBrief(chronicleSummary) ? (
                     <FourPartWeeklyCard
-                      payload={{ legend: {}, 'cross-day-thread': [], 'intra-day-thread': [] }}
-                      allBlocks={allBlocks}
-                      onJumpApprovalCite={jumpToApprovalCite}
-                      onJumpDailyBlock={jumpToDailyBlock}
+                      payload={{ legend: {}, 'cross-day-thread': [], 'intra-day-thread': [], summary: [] }}
                     />
                   ) : chronicleSummary.trim() ? (
                     <p className="text-xs md:text-sm text-slate-300 leading-relaxed font-sans font-medium whitespace-pre-wrap">
@@ -2219,19 +1650,8 @@ export default function WeekReview({
                           >
                             {seg.title}
                           </strong>
-                        ) : seg.kind === 'text' ? (
-                          <span key={i}>{seg.value}</span>
                         ) : (
-                          <button
-                            key={i}
-                            type="button"
-                            id={briefCiteAnchorId(seg.n)}
-                            onClick={() => jumpToApprovalCite(seg.n)}
-                            className="text-indigo-400 hover:text-indigo-300 font-mono text-[11px] px-0.5 rounded"
-                            title={`Open approval card [${seg.n}]`}
-                          >
-                            {seg.value}
-                          </button>
+                          <span key={i}>{seg.kind === 'text' ? seg.value : seg.value}</span>
                         ),
                       )}
                     </p>
@@ -2317,7 +1737,7 @@ export default function WeekReview({
                               <p className="text-xs font-mono text-slate-500 text-center py-6">
                                 No cognitive blocks recorded on this date.
                               </p>
-                              {/* Always show Save/Recall (same as Approval Hub footer). */}
+                              {/* Always show Save/Recall for staging day edits. */}
                               <div className="bg-gradient-to-r from-[#111625] to-slate-900 border border-amber-500/20 p-4 rounded-2xl shadow-xl">
                                 <div className="space-y-3 w-full">
                                   <div className="space-y-1 text-center sm:text-left">
@@ -2386,9 +1806,6 @@ export default function WeekReview({
                                     op.kind === 'edit' &&
                                     (op.after.id === block.id || op.before.id === block.id),
                                 );
-                                const citeRaw = weeklyProposals.find((p) => p.block_id === block.id)?.cite_n;
-                                const citeN = citeRaw != null && citeRaw !== '' ? Number(citeRaw) : undefined;
-                                const hasCite = citeN != null && !Number.isNaN(citeN);
 
                                 return (
                                   <div 
@@ -2436,30 +1853,6 @@ export default function WeekReview({
                                           }`}>
                                             {block.status}
                                           </span>
-                                          {dailyNavReturn?.blockId === block.id ? (
-                                            <button
-                                              type="button"
-                                              onClick={() => jumpBackFromDailyQuote()}
-                                              title={
-                                                dailyNavReturn.mode === 'approval'
-                                                  ? `Back to Approval cite [${dailyNavReturn.n}]`
-                                                  : `Back to Brief cite [${dailyNavReturn.n}]`
-                                              }
-                                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-indigo-500/15 text-indigo-200 border border-indigo-500/40 hover:bg-indigo-500/25 cursor-pointer"
-                                            >
-                                              <Quote className="w-3 h-3" />
-                                              [{dailyNavReturn.n}]
-                                            </button>
-                                          ) : hasCite ? (
-                                            <button
-                                              type="button"
-                                              onClick={() => jumpToBriefCite(citeN)}
-                                              title="To brief"
-                                              className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-slate-800 text-indigo-300 border border-indigo-500/30 hover:border-indigo-400 hover:text-indigo-200 transition-colors cursor-pointer"
-                                            >
-                                              [{citeN}]
-                                            </button>
-                                          ) : null}
                                         </div>
 
                                         {isEditingThis && editingBlockData ? (
@@ -2757,7 +2150,7 @@ export default function WeekReview({
               <HotMemoryEditor onComposeActiveChange={setHotComposeActive} />
             </div>
           ) : (
-            /* 2. FAST APPROVAL HUB (Essence of a premium approval platform) */
+            /* 2. WEEKLY CHRONICLE TAB (hot editor + retention; no Memory Approval hub) */
             <div className="space-y-6">
               
               {selectedWeek?.status === 'reviewed' || selectedWeek?.status === 'completed' || selectedWeek?.tidyState === 'tidy: done' ? (
@@ -2793,455 +2186,7 @@ export default function WeekReview({
                 /* INTERACTIVE REVIEW PLATFORM */
                 <div className="space-y-6">
                   
-                  <div id="memory-approval-section" className="bg-slate-900 border border-slate-800 rounded-2xl p-5 md:p-6 space-y-4">
-                    <button
-                      onClick={() => setIsApprovalFolded(!isApprovalFolded)}
-                      className="w-full flex items-center justify-between text-left focus:outline-none group cursor-pointer"
-                    >
-                      <div className="flex items-center gap-2">
-                        <CheckSquare className="w-4.5 h-4.5 text-indigo-400 group-hover:text-indigo-300 transition-colors" />
-                        <div>
-                          <h4 className="text-xs font-mono font-bold text-slate-200 group-hover:text-slate-100 transition-colors">
-                            Memory Approval
-                          </h4>
-                          <p className="text-[10px] text-slate-500 font-mono mt-0.5">
-                            {weeklyProposals.length} proposals ·{' '}
-                            <span className="text-indigo-400">{stagedCount}</span> staged ·{' '}
-                            <span className="text-amber-300">{pendingEditCount}</span> pended ·{' '}
-                            <span className="text-amber-200">{reviewPendingCount}</span> review ·{' '}
-                            <span className="text-indigo-300">{totalToMemory}</span> memory ·{' '}
-                            <span className="text-emerald-400">{totalToUser}</span> user ·{' '}
-                            <span className="text-red-400">{totalToDelete}</span> delete ·{' '}
-                            <span className="text-slate-300">{savedCount}</span> saved
-                          </p>
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-2 bg-slate-950/60 border border-slate-850 px-2 py-1 rounded-lg text-[10px] font-mono text-slate-400 group-hover:text-slate-200 transition-colors">
-                        <span>{isApprovalFolded ? 'Expand' : 'Collapse'}</span>
-                        <ChevronRight className={`w-3.5 h-3.5 transform transition-transform duration-200 ${isApprovalFolded ? '' : 'rotate-90'}`} />
-                      </div>
-                    </button>
-
-                    {!isApprovalFolded && (
-                    <div className="space-y-4 pt-4 border-t border-slate-850 fade-in">
-                  {/* Candidate list queue */}
-                  {weeklyProposals.length === 0 ? (
-                    <div className="bg-slate-950/40 border border-slate-850 rounded-2xl p-8 text-center text-xs text-slate-500 font-mono">
-                      No event candidates for this week. Fact / procedure / decision stay off Approval Hub unless quoted as Events in legend. Overdue actions live in Chronicle.
-                    </div>
-                  ) : (
-                    <div
-                      ref={approvalListScrollRef}
-                      className={
-                        weeklyProposals.length > 7
-                          ? 'space-y-3 max-h-[min(70vh,900px)] overflow-y-auto overscroll-contain pr-1'
-                          : 'space-y-3'
-                      }
-                    >
-                      {weeklyProposals.map((item) => {
-                        const itemId = proposalKey(item);
-                        const staged = stagedActions[itemId];
-                        const savedAction = savedByRecordId[itemId];
-                        const linkedBlockId = item.block_id || item.block_ids?.[0] || '';
-                        const linkedBlock = allBlocks.find((block) => block.id === linkedBlockId);
-                        const isEditing = editingBulletId === itemId;
-                        const isPendingEdit = Boolean(pendingEdits[itemId]);
-                        const citeN = item.cite_n ? Number(item.cite_n) : undefined;
-                        const isStaged = Boolean(staged);
-
-                        return (
-                          <div 
-                            key={itemId}
-                            id={citeN ? approvalCiteAnchorId(citeN) : undefined}
-                            className={`bg-slate-900 border transition-all rounded-2xl p-4 md:p-5 space-y-3 ${
-                              isStaged
-                                ? staged.action === 'delete'
-                                  ? 'border-red-500/30 bg-slate-900/60'
-                                  : 'border-indigo-500/30 bg-gradient-to-br from-slate-900 to-[#121624]'
-                                : savedAction === 'delete'
-                                ? 'border-red-500/25 bg-slate-950/80 opacity-80'
-                                : savedAction
-                                ? 'border-emerald-500/25 bg-slate-900'
-                                : 'border-slate-800'
-                            }`}
-                          >
-                            {/* Card Header row: badges + action pills */}
-                            <div className="flex flex-col sm:flex-row items-start justify-between gap-3">
-                              <div className="flex items-center gap-2 flex-wrap min-w-0">
-                                <span className="px-2 py-0.5 rounded text-[9px] font-mono font-bold uppercase tracking-wider bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
-                                  {item.tier || item.source || 'proposal'}
-                                </span>
-                                {citeN ? (
-                                  <span className="px-2 py-0.5 rounded text-[9px] font-mono font-bold bg-slate-800 text-indigo-300 border border-indigo-500/30">
-                                    [{citeN}]
-                                  </span>
-                                ) : null}
-                                {item.hot_target === 'MEMORY.md' && item.valid_to && (
-                                  <span className="px-2 py-0.5 rounded-full text-[9px] font-mono font-bold bg-amber-500/10 text-amber-300 border border-amber-500/20">
-                                    TTL {item.valid_to}
-                                  </span>
-                                )}
-                                {isPendingEdit && (
-                                  <span className="px-2 py-0.5 rounded-full text-[9px] font-mono font-bold bg-amber-950/40 text-amber-100/90 border border-amber-700/40">
-                                    edit pending
-                                  </span>
-                                )}
-                                {isStaged && (
-                                  <span className="px-2 py-0.5 rounded-full text-[9px] font-mono font-bold bg-amber-950/40 text-amber-100/90 border border-amber-700/40">
-                                    pending save
-                                  </span>
-                                )}
-                                {savedAction === 'delete' && (
-                                  <span className="px-2 py-0.5 rounded-full text-[9px] font-mono font-bold bg-red-500/15 text-red-300 border border-red-500/30">
-                                    deleted
-                                  </span>
-                                )}
-                                {linkedBlock && (
-                                  <button
-                                    onClick={() =>
-                                      jumpToDailyBlock(
-                                        linkedBlock,
-                                        citeN
-                                          ? { mode: 'approval', n: citeN }
-                                          : undefined,
-                                      )
-                                    }
-                                    className="text-[10px] font-mono text-slate-400 hover:text-indigo-400 flex items-center gap-1 transition-colors"
-                                    title="Open the source daily block"
-                                  >
-                                    <ExternalLink className="w-3 h-3" /> Daily block
-                                  </button>
-                                )}
-                                {citeN ? (
-                                  <button
-                                    type="button"
-                                    onClick={() => jumpToBriefCite(citeN)}
-                                    className="text-[10px] font-mono text-slate-400 hover:text-indigo-400 flex items-center gap-1 transition-colors"
-                                    title="Jump to this cite in Weekly Chronicle Brief"
-                                  >
-                                    <ExternalLink className="w-3 h-3" /> In brief
-                                  </button>
-                                ) : null}
-                              </div>
-
-                              {/* Action Pills — stage immediately; after Save show per-card Recall */}
-                              <div className="flex flex-col items-stretch sm:items-end gap-1.5 shrink-0 w-full sm:w-auto">
-                                <div className="flex flex-wrap gap-1.5 bg-slate-950 p-1 rounded-xl border border-slate-850 w-full sm:w-auto">
-                                  {savedAction ? (
-                                    <button
-                                      type="button"
-                                      onClick={() => void handleApprovalRecallCard(itemId)}
-                                      disabled={loading}
-                                      className="px-3 py-1.5 rounded-lg text-[10px] font-mono font-bold transition-all bg-slate-800 text-amber-200 border border-amber-500/30 hover:bg-slate-700 disabled:opacity-40"
-                                    >
-                                      {recallLabelFor(savedAction)}
-                                    </button>
-                                  ) : (
-                                    <>
-                                      <button
-                                        type="button"
-                                        onClick={() =>
-                                          stageAction(itemId, 'memory', linkedBlockId, linkedBlock)
-                                        }
-                                        onDoubleClick={(e) => {
-                                          e.preventDefault();
-                                          if (staged?.action === 'memory') unstageAction(itemId);
-                                        }}
-                                        disabled={!linkedBlockId}
-                                        title={
-                                          staged?.action === 'memory'
-                                            ? 'Double-click to clear selection'
-                                            : undefined
-                                        }
-                                        className={`px-3 py-1.5 rounded-lg text-[10px] font-mono font-bold transition-all disabled:opacity-40 ${
-                                          staged?.action === 'memory'
-                                            ? 'bg-indigo-600 text-slate-100 shadow-sm'
-                                            : 'text-slate-400 hover:text-slate-200'
-                                        }`}
-                                      >
-                                        Add to memory
-                                      </button>
-                                      <button
-                                        type="button"
-                                        onClick={() =>
-                                          stageAction(itemId, 'user', linkedBlockId, linkedBlock)
-                                        }
-                                        onDoubleClick={(e) => {
-                                          e.preventDefault();
-                                          if (staged?.action === 'user') unstageAction(itemId);
-                                        }}
-                                        disabled={!linkedBlockId}
-                                        title={
-                                          staged?.action === 'user'
-                                            ? 'Double-click to clear selection'
-                                            : undefined
-                                        }
-                                        className={`px-3 py-1.5 rounded-lg text-[10px] font-mono font-bold transition-all disabled:opacity-40 ${
-                                          staged?.action === 'user'
-                                            ? 'bg-emerald-600 text-slate-100 shadow-sm'
-                                            : 'text-slate-400 hover:text-slate-200'
-                                        }`}
-                                      >
-                                        Add to user
-                                      </button>
-                                      <button
-                                        type="button"
-                                        onClick={() =>
-                                          stageAction(itemId, 'delete', linkedBlockId, linkedBlock)
-                                        }
-                                        onDoubleClick={(e) => {
-                                          e.preventDefault();
-                                          if (staged?.action === 'delete') unstageAction(itemId);
-                                        }}
-                                        disabled={!linkedBlockId}
-                                        title={
-                                          staged?.action === 'delete'
-                                            ? 'Double-click to clear selection'
-                                            : undefined
-                                        }
-                                        className={`px-3 py-1.5 rounded-lg text-[10px] font-mono font-bold transition-all disabled:opacity-40 ${
-                                          staged?.action === 'delete'
-                                            ? 'bg-red-950/45 text-red-400 border border-red-900/10'
-                                            : 'text-slate-400 hover:text-slate-200'
-                                        }`}
-                                      >
-                                        Delete
-                                      </button>
-                                    </>
-                                  )}
-                                </div>
-                              </div>
-                            </div>
-
-                            {/* Full-width hot bullet body */}
-                            <div className="flex items-start gap-2 w-full min-w-0">
-                              <div className="flex-1 min-w-0 w-full space-y-2">
-                                {isEditing ? (
-                                  <textarea
-                                    value={candidateBullets[itemId] || ''}
-                                    onChange={(e) => {
-                                      const text = e.target.value;
-                                      setCandidateBullets((prev) => ({ ...prev, [itemId]: text }));
-                                      setStagedActions((prev) => {
-                                        const current = prev[itemId];
-                                        if (!current) return prev;
-                                        return { ...prev, [itemId]: { ...current, bulletText: text } };
-                                      });
-                                    }}
-                                    className="w-full max-w-full box-border max-h-32 min-h-[4.5rem] overflow-y-auto resize-y bg-slate-950/40 border border-slate-800 rounded-lg px-2.5 py-1.5 text-slate-100 font-sans text-xs md:text-sm leading-relaxed whitespace-pre-wrap break-words focus:outline-none focus:border-indigo-500"
-                                    autoFocus
-                                  />
-                                ) : (
-                                  <p
-                                    className={`text-xs md:text-sm leading-relaxed font-sans font-medium whitespace-pre-wrap break-words ${
-                                      savedAction === 'delete'
-                                        ? 'text-slate-500 line-through'
-                                        : 'text-slate-100'
-                                    }`}
-                                  >
-                                    {candidateBullets[itemId] || item.label || item.proposed_text || itemId}
-                                  </p>
-                                )}
-                                {approvalTightenDraftId === itemId && approvalTightenDraft !== null && (
-                                  <div className="rounded-lg border border-indigo-500/30 bg-indigo-500/5 p-2.5 space-y-2">
-                                    <span className="text-[9px] font-mono text-indigo-400 uppercase tracking-wider block">
-                                      Tighten draft
-                                    </span>
-                                    <p className="text-xs font-sans text-slate-300 whitespace-pre-wrap break-words">
-                                      {approvalTightenDraft}
-                                    </p>
-                                    <div className="flex gap-1.5">
-                                      <button
-                                        type="button"
-                                        onClick={() => acceptApprovalTighten(itemId)}
-                                        className="px-2.5 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-slate-100 text-[10px] font-mono font-bold cursor-pointer"
-                                      >
-                                        Accept
-                                      </button>
-                                      <button
-                                        type="button"
-                                        onClick={discardApprovalTighten}
-                                        className="px-2.5 py-1 rounded-lg bg-slate-950 border border-slate-850 text-slate-400 hover:text-slate-200 text-[10px] font-mono font-bold cursor-pointer"
-                                      >
-                                        Discard
-                                      </button>
-                                    </div>
-                                  </div>
-                                )}
-                                {isEditing && approvalTightenComposerId === itemId && (
-                                  <div className="space-y-1.5">
-                                    <textarea
-                                      value={approvalTightenGuidance}
-                                      onChange={(e) => setApprovalTightenGuidance(e.target.value)}
-                                      placeholder={DEFAULT_TIGHTEN_GUIDANCE}
-                                      className="w-full min-h-[4.5rem] rounded-lg border border-slate-700 bg-slate-950 px-2 py-1.5 text-[10px] font-mono text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-indigo-500 resize-y"
-                                      autoFocus
-                                    />
-                                    <div className="flex flex-wrap gap-1">
-                                      <button
-                                        type="button"
-                                        disabled={
-                                          approvalTightening
-                                          || !canRunTightenGuidance(approvalTightenGuidance)
-                                        }
-                                        onClick={() =>
-                                          void handleApprovalTighten(itemId, approvalTightenGuidance)
-                                        }
-                                        className="px-2 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-slate-100 text-[10px] font-mono font-bold cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-                                      >
-                                        {approvalTightening ? 'Running…' : 'Run'}
-                                      </button>
-                                      <button
-                                        type="button"
-                                        disabled={approvalTightening}
-                                        onClick={cancelApprovalTightenComposer}
-                                        className="px-2 py-1 rounded-lg bg-slate-950 border border-slate-850 text-slate-400 hover:text-slate-200 text-[10px] font-mono font-bold cursor-pointer disabled:opacity-40"
-                                      >
-                                        Cancel
-                                      </button>
-                                    </div>
-                                  </div>
-                                )}
-                              </div>
-                              <div className="flex flex-col gap-1.5 shrink-0 self-start">
-                                {isEditing ? (
-                                  <button
-                                    type="button"
-                                    onClick={() => pendApprovalBulletEdit(itemId, linkedBlockId)}
-                                    className="px-2.5 py-1 rounded font-mono text-[10px] flex items-center justify-center gap-1 border transition-colors cursor-pointer bg-indigo-500/10 border-indigo-500/20 text-indigo-400 hover:bg-indigo-500/20"
-                                  >
-                                    <Edit2 className="w-3 h-3" />
-                                    <span>Pend</span>
-                                  </button>
-                                ) : isPendingEdit ? (
-                                  <button
-                                    type="button"
-                                    onClick={() => undoPendingApprovalEdit(itemId)}
-                                    className="px-2.5 py-1 rounded font-mono text-[10px] flex items-center justify-center gap-1 border transition-colors cursor-pointer bg-amber-500/10 border-amber-500/30 text-amber-200 hover:bg-amber-500/20"
-                                    title="Drop pended edit and keep original text"
-                                  >
-                                    <span>Undo</span>
-                                  </button>
-                                ) : (
-                                  <button
-                                    type="button"
-                                    disabled={Boolean(savedAction)}
-                                    onClick={() => startApprovalBulletEdit(itemId)}
-                                    className="px-2.5 py-1 rounded font-mono text-[10px] flex items-center justify-center gap-1 border transition-colors cursor-pointer bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700 disabled:opacity-40"
-                                  >
-                                    <Edit2 className="w-3 h-3" />
-                                    <span>Edit</span>
-                                  </button>
-                                )}
-                                {isEditing && approvalTightenComposerId !== itemId && (
-                                  <button
-                                    type="button"
-                                    disabled={approvalTightening || Boolean(savedAction)}
-                                    onClick={() => openApprovalTightenComposer(itemId)}
-                                    className="px-2.5 py-1 rounded font-mono text-[10px] flex items-center justify-center gap-1 border bg-slate-900 border-slate-800 text-slate-400 hover:text-indigo-400 hover:border-slate-700 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-                                    title="Tighten proposed bullet with guidance"
-                                  >
-                                    <Sparkles className="w-3 h-3" />
-                                    <span>Tighten</span>
-                                  </button>
-                                )}
-                                {isPendingEdit && !isEditing && (
-                                  <button
-                                    type="button"
-                                    onClick={() => startApprovalBulletEdit(itemId)}
-                                    className="px-2.5 py-1 rounded font-mono text-[10px] flex items-center justify-center gap-1 border bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200 transition-colors cursor-pointer"
-                                    title="Re-open pended edit"
-                                  >
-                                    <Edit2 className="w-3 h-3" />
-                                    <span>Edit</span>
-                                  </button>
-                                )}
-                              </div>
-                            </div>
-
-                            {isStaged && (
-                              <div className="flex flex-wrap gap-3 pt-1">
-                                <label className="flex flex-col gap-1 min-w-[110px]">
-                                  <span className="text-[9px] font-mono uppercase tracking-wider text-slate-500">
-                                    valid_from
-                                  </span>
-                                  <input
-                                    type="text"
-                                    value={staged.validFrom ?? ''}
-                                    onChange={(e) => updateStagedValidity(itemId, 'validFrom', e.target.value)}
-                                    className="bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-[11px] font-mono text-slate-200 focus:outline-none focus:border-indigo-500"
-                                    placeholder="open"
-                                  />
-                                </label>
-                                <label className="flex flex-col gap-1 min-w-[110px]">
-                                  <span className="text-[9px] font-mono uppercase tracking-wider text-slate-500">
-                                    valid_to
-                                  </span>
-                                  <input
-                                    type="text"
-                                    value={staged.validTo ?? ''}
-                                    onChange={(e) => updateStagedValidity(itemId, 'validTo', e.target.value)}
-                                    className="bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-[11px] font-mono text-slate-200 focus:outline-none focus:border-indigo-500"
-                                    placeholder="open"
-                                  />
-                                </label>
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-
-                  {/* Fast-Track container — always show Save/Recall (events-only hub may be empty). */}
-                  <div className="bg-gradient-to-r from-[#111625] to-slate-900 border border-indigo-500/20 p-5 rounded-2xl shadow-xl">
-                      <div className="space-y-4 w-full">
-                        <div className="space-y-1.5 text-center md:text-left">
-                          <h4 className="text-xs font-mono font-bold text-slate-300 flex items-center justify-center md:justify-start gap-1.5">
-                            <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
-                            <span>Memory Approval Save / Recall</span>
-                          </h4>
-                          <p className="text-[11px] text-slate-400 leading-relaxed">
-                            {approvalReminderText}
-                          </p>
-                        </div>
-                        <div className="flex gap-2 w-full">
-                          <button
-                            type="button"
-                            onClick={() => void handleApprovalSave()}
-                            disabled={loading || !selectedWeek || saveReadyCount === 0}
-                            title={
-                              saveReadyCount === 0
-                                ? 'Pend a Weekly Review action or stage Add to memory / user / Delete, then Save'
-                                : 'Apply pended Weekly Review and staged card actions'
-                            }
-                            className="flex-1 px-4 py-3 bg-indigo-600 hover:bg-indigo-500 text-slate-100 text-xs font-bold rounded-xl font-mono flex items-center justify-center gap-2 shadow-lg shadow-indigo-950/40 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-                          >
-                            <CheckSquare className="w-4 h-4" />
-                            <span>Save</span>
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => void handleApprovalRecall()}
-                            disabled={loading || !selectedWeek || (!recallAvailable && !reviewRecallAvailable)}
-                            title={
-                              recallAvailable || reviewRecallAvailable
-                                ? 'Undo the last Save batch'
-                                : 'Nothing to recall — Save a staged batch first'
-                            }
-                            className="flex-1 px-4 py-3 bg-slate-800 hover:bg-slate-700 text-slate-100 text-xs font-bold rounded-xl font-mono flex items-center justify-center gap-2 border border-slate-700 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-                          >
-                            <RefreshCw className="w-4 h-4" />
-                            <span>Recall</span>
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                    </div>
-                    )}
-                  </div>
-
-                  {/* Hot memory editor — always on Approval Hub */}
+                  {/* Hot memory editor — Chronicle tab */}
                   <HotMemoryEditor onComposeActiveChange={setHotComposeActive} />
 
                   {/* Dynamic Staging Retention & Compliance Policy (NEW RETENTION SECTION) */}

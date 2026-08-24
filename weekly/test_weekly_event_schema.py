@@ -262,6 +262,7 @@ def test_payload_defaults_omit_cross_day_thread():
     assert payload.cross_day_thread == ()
     assert payload.intra_day_thread == ()
     assert payload.entities == ()
+    assert payload.summary == ()
 
 
 def test_span_candidate_defaults_omit_steps_outcome_entity_keys():

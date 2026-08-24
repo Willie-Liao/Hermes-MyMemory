@@ -38,6 +38,7 @@ def test_payload_round_trip_without_arcs():
                 key="memorydigest",
                 canonical="memory-digest",
                 weeks=("2026-W31", "2026-W32", "2026-W33"),
+                aliases=("记忆摘要",),
             ),
         ),
         state=(
@@ -59,6 +60,7 @@ def test_payload_round_trip_without_arcs():
 
     restored = loads(dump_yaml(payload))
     assert restored.entities[0].weeks == ("2026-W31", "2026-W32", "2026-W33")
+    assert restored.entities[0].aliases == ("记忆摘要",)
     assert "week_blocks" not in dump_yaml(payload)
 
 

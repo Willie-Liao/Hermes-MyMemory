@@ -247,7 +247,10 @@ WORKER_FAILURE_FILENAMES = {
     "decision": "decision-failures.jsonl",
     "phase1": "phase1-failures.jsonl",
 }
-LIST_FRONTMATTER_KEYS = frozenset({"sources", "related", "supersedes"})
+LIST_FRONTMATTER_KEYS = frozenset({"sources", "related", "supersedes", "entity_aliases"})
+CLOCK_FRONTMATTER_KEYS = frozenset(
+    {"user_message_at", "assistant_response_at", "generated_at"}
+)
 # Body keywords implying a time-bound fact — both span keys then required.
 # Narrow hints — avoid broad Chinese substrings (e.g. 之前) that fire on venting.
 TEMPORAL_REQUIRED_HINTS = (
@@ -273,6 +276,7 @@ _FRONTMATTER_KEY_ORDER = (
     "id",
     "type",
     "entity",
+    "entity_aliases",
     "predicate",
     "participants",
     "involves",
@@ -288,6 +292,9 @@ _FRONTMATTER_KEY_ORDER = (
     "discarded_at",
     "superseded_at",
     "sources",
+    "user_message_at",
+    "assistant_response_at",
+    "generated_at",
     "strength",
     "recall_n",
     "last_recall_at",
@@ -334,7 +341,7 @@ Types: fact | procedure | decision | event. Never type: entity or hypothesis (en
 - decision: user-only rulings and preferences for agent behavior (must/must-not), including decision_constraint: user feedback on that procedure, corrections, and standing prefs. Scan the transcript for the user's must / must-not / standing prefs and emit them as subject=user plus a predicate ruling so Preference:/Decision: {{subject}} {{ruling}} is one clause. First subject after Preference:/Decision: must be user/User (plus USER.md aliases). Third-party traits/living/likes → fact (`Narration:` / kind=Narration), even when the user reported them. Do not duplicate the full procedure or event summary. Corrections use supersedes: + confidence: explicit. `decision_constraint` is accepted only as a legacy input alias and is normalized to canonical `decision`.
 - Legacy input alias detail: decision_constraint: user feedback on that procedure; it is never emitted as the canonical output type.
 - Episode-first: one outcome event per completed user request (not one per tool step). Grade/scrape snapshot → fact; multi-file deliverable arc → one event.
-- entity: required on fact and event. involves: optional on non-event only (max {MAX_INVOLVES}; omit primary; entity collection with optional role). Do NOT use involves on event — use participants instead.
+- entity: required on fact and event (English canonical). entity_aliases: optional original-language surfaces; omit when identical to entity. involves: optional on non-event only (max {MAX_INVOLVES}; omit primary; entity collection with optional role). Do NOT use involves on event — use participants instead.
 - related: optional mem-ids (max {MAX_RELATED}); associative only — event→fact/procedure/decision only. NEVER put another event id in an event's related:. related: is associative only and NEVER deletes or supersedes a block.
 - supersedes: correction only (max {MAX_SUPERSEDES}); requires confidence: explicit. User correction: MUST set confidence: explicit and supersedes: [mem-…] from EXISTING BLOCK IDS (today's daily file / earlier batches on today). Prefer decision or corrected fact; never guess ids.
 - Filename ≠ entity (paths in sources:). Roster >5: collective entity + ≤5 participants + related roster fact. Unconfirmed roles are not participants.
@@ -723,6 +730,7 @@ def _seconds_since(ts: datetime | None) -> float:
 
 
 def _fetch_messages(session_id: str, after_id: int = 0) -> list[dict[str, Any]]:
+    """Load active user/assistant rows including timestamp for source-window clocks."""
     db_path = _hermes_home() / "state.db"
     if not db_path.exists():
         return []
@@ -749,8 +757,209 @@ def _fetch_messages(session_id: str, after_id: int = 0) -> list[dict[str, Any]]:
         content = (row["content"] or "").strip()
         if role not in ("user", "assistant") or not content:
             continue
-        out.append({"id": row["id"], "role": role, "content": content[:2000]})
+        out.append(
+            {
+                "id": row["id"],
+                "role": role,
+                "content": content[:2000],
+                "timestamp": row["timestamp"],
+            }
+        )
     return out
+
+
+def _iso_from_message_ts(raw: Any) -> str | None:
+    """Turn SQLite messages.timestamp into offset ISO-8601 seconds."""
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, datetime):
+        dt = raw
+    elif isinstance(raw, (int, float)):
+        dt = datetime.fromtimestamp(float(raw), tz=timezone.utc)
+    else:
+        text = str(raw).strip().replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().isoformat(timespec="seconds")
+
+
+def _iso_clocks_for_window(
+    session_id: str,
+    start_id: int | None,
+    end_id: int | None,
+    *,
+    on_day: date | None = None,
+) -> tuple[str | None, str | None]:
+    """First user / last assistant clocks in the cited message id range."""
+    if start_id is None or end_id is None:
+        return None, None
+    lo, hi = (start_id, end_id) if start_id <= end_id else (end_id, start_id)
+    user_at: str | None = None
+    assistant_at: str | None = None
+    for row in _fetch_messages(session_id, after_id=max(0, lo - 1)):
+        try:
+            mid = int(row["id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if mid < lo or mid > hi:
+            continue
+        stamp = _iso_from_message_ts(row.get("timestamp"))
+        if not stamp:
+            continue
+        parsed_stamp = _parse_frontmatter_clock(stamp)
+        if on_day is not None and (
+            parsed_stamp is None or parsed_stamp.astimezone().date() != on_day
+        ):
+            continue
+        if row.get("role") == "user" and user_at is None:
+            user_at = stamp
+        if row.get("role") == "assistant":
+            assistant_at = stamp
+    return user_at, assistant_at
+
+
+def _parse_frontmatter_clock(value: Any) -> datetime | None:
+    """Parse an optional wall-clock frontmatter value; None if blank."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, (int, float)):
+        dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
+    else:
+        text = str(value).strip().strip("'\"")
+        if not text:
+            return None
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _civil_noon_iso(day: date) -> str:
+    """Fallback wall clock when state.db has no row for the cited window."""
+    tz = datetime.now().astimezone().tzinfo or timezone.utc
+    return datetime(day.year, day.month, day.day, 12, 0, 0, tzinfo=tz).isoformat(
+        timespec="seconds"
+    )
+
+
+def _clocks_from_source_tags(
+    sources: Any, day: date
+) -> tuple[str | None, str | None]:
+    """Earliest user / latest assistant ISO from session source tags via state.db."""
+    if isinstance(sources, list):
+        tags = [str(item).strip() for item in sources if str(item).strip()]
+    elif sources in (None, ""):
+        tags = []
+    else:
+        tags = [str(sources).strip()]
+    user_dt: datetime | None = None
+    asst_dt: datetime | None = None
+    for tag in tags:
+        session_id = digest_tools.session_id_from_source_tag(tag)
+        if not session_id:
+            continue
+        rng = digest_tools.message_range_from_source_tag(tag)
+        if rng:
+            user_iso, asst_iso = _iso_clocks_for_window(
+                session_id, rng[0], rng[1]
+            )
+        else:
+            user_iso, asst_iso = None, None
+        if not user_iso and not asst_iso:
+            user_iso, asst_iso = _iso_clocks_for_window(
+                session_id, 1, 2_147_483_647, on_day=day
+            )
+        user_parsed = _parse_frontmatter_clock(user_iso)
+        asst_parsed = _parse_frontmatter_clock(asst_iso)
+        if user_parsed is not None and (user_dt is None or user_parsed < user_dt):
+            user_dt = user_parsed
+        if asst_parsed is not None and (asst_dt is None or asst_parsed > asst_dt):
+            asst_dt = asst_parsed
+    user_out = user_dt.isoformat(timespec="seconds") if user_dt else None
+    asst_out = asst_dt.isoformat(timespec="seconds") if asst_dt else None
+    return user_out, asst_out
+
+
+def _stamp_block_clocks(parsed: dict[str, Any], day: date) -> bool:
+    """Fill missing message clocks from state.db; civil noon when lookup misses."""
+    changed = False
+    user_iso, asst_iso = _clocks_from_source_tags(parsed.get("sources"), day)
+    noon = _civil_noon_iso(day)
+    wanted = {
+        "user_message_at": user_iso or noon,
+        "assistant_response_at": asst_iso or noon,
+        "generated_at": asst_iso or noon,
+    }
+    for key, stamp in wanted.items():
+        current = parsed.get(key)
+        if _parse_frontmatter_clock(current) == _parse_frontmatter_clock(stamp):
+            continue
+        parsed[key] = stamp
+        changed = True
+    return changed
+
+
+def backfill_daily_file_clocks(path: Path | str) -> int:
+    """Rewrite one daily staging file with plugin-stamped clocks. Returns cards changed."""
+    file_path = Path(path)
+    try:
+        day = date.fromisoformat(file_path.stem)
+    except ValueError:
+        return 0
+    try:
+        original = file_path.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    _fences, wrapup = split_daily_wrapup(original)
+    blocks = _frontmatter_blocks(original)
+    if not blocks:
+        return 0
+    stamped: list[str] = []
+    changed_n = 0
+    for _line_no, raw_frontmatter, body in blocks:
+        try:
+            parsed = yaml.safe_load(raw_frontmatter)
+        except yaml.YAMLError:
+            stamped.append(
+                _render_digest_block({"id": f"mem-{day.isoformat()}-digest"}, body)
+            )
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        if _stamp_block_clocks(parsed, day):
+            changed_n += 1
+        stamped.append(_render_digest_block(parsed, body))
+    if changed_n == 0:
+        return 0
+    new_fences = "\n\n".join(stamped).rstrip() + "\n"
+    updated = join_daily_wrapup(new_fences, wrapup) if wrapup else new_fences
+    if updated != original:
+        file_path.write_text(updated, encoding="utf-8")
+    return changed_n
+
+
+def backfill_daily_dir_clocks(daily_dir: Path | str) -> dict[str, int]:
+    """Walk YYYY-MM-DD.md files and stamp clocks. No LLM."""
+    root = Path(daily_dir)
+    files = 0
+    cards = 0
+    if not root.is_dir():
+        return {"files": 0, "cards": 0}
+    for path in sorted(root.glob("*.md")):
+        n = backfill_daily_file_clocks(path)
+        if n:
+            files += 1
+            cards += n
+    return {"files": files, "cards": cards}
 
 
 def _format_transcript(messages: list[dict[str, Any]]) -> str:
@@ -823,6 +1032,7 @@ def _format_entity_collection_lines(key: str, items: Any) -> list[str]:
 
 
 def _render_digest_block(parsed: dict[str, Any], body: str) -> str:
+    """Keep entity_aliases in list form after entity so a rewrite cannot drop the original-language surface."""
     lines = ["---"]
     seen: set[str] = set()
     for key in _FRONTMATTER_KEY_ORDER:
@@ -833,6 +1043,8 @@ def _render_digest_block(parsed: dict[str, Any], body: str) -> str:
             lines.append(f"{key}: {_format_sources(parsed[key])}")
         elif key in {"participants", "involves"}:
             lines.extend(_format_entity_collection_lines(key, parsed[key]))
+        elif key in CLOCK_FRONTMATTER_KEYS:
+            lines.append(f"{key}: {digest_tools._yaml_scalar(parsed[key])}")
         else:
             lines.append(f"{key}: {parsed[key]}")
     for key, value in parsed.items():
@@ -842,6 +1054,8 @@ def _render_digest_block(parsed: dict[str, Any], body: str) -> str:
             lines.append(f"{key}: {_format_sources(value)}")
         elif key in {"participants", "involves"}:
             lines.extend(_format_entity_collection_lines(key, value))
+        elif key in CLOCK_FRONTMATTER_KEYS:
+            lines.append(f"{key}: {digest_tools._yaml_scalar(value)}")
         else:
             lines.append(f"{key}: {value}")
     lines.extend(["---", body])
@@ -916,6 +1130,17 @@ def _normalize_digest_content(
         )
         extras = digest_tools._extra_file_sources(parsed.get("sources"))
         parsed["sources"] = [locator, *extras]
+        user_at, assistant_at = _iso_clocks_for_window(
+            session_id, message_start_id, message_end_id
+        )
+        if user_at:
+            parsed["user_message_at"] = user_at
+        if assistant_at:
+            parsed["assistant_response_at"] = assistant_at
+        parsed.setdefault(
+            "generated_at",
+            datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        )
 
         body = _truncate_body(body.strip())
         item_type = str(parsed.get("type", "")).strip()
@@ -1105,6 +1330,11 @@ def _validate_block(
     body: str,
     seen_ids: set[str],
 ) -> list[str]:
+    """Reject malformed cards so bad YAML cannot enter daily staging.
+
+    Optional wall clocks are format-checked here; missing clocks stay valid so
+    older cards and pre-stamp worker YAML do not fail.
+    """
     errors: list[str] = []
     try:
         parsed = yaml.safe_load(raw_frontmatter)
@@ -1161,6 +1391,28 @@ def _validate_block(
         if not _DATE_RE.match(stamp):
             errors.append(
                 f"line {line_no}: superseded_at must be YYYY-MM-DD, got {stamp!r}"
+            )
+
+    clock_values: dict[str, datetime] = {}
+    for key in ("user_message_at", "assistant_response_at", "generated_at"):
+        if key not in parsed:
+            continue
+        raw = parsed.get(key)
+        if raw in (None, ""):
+            continue
+        parsed_clock = _parse_frontmatter_clock(raw)
+        if parsed_clock is None:
+            errors.append(
+                f"line {line_no}: {key} must be ISO-8601, got {raw!r}"
+            )
+        else:
+            clock_values[key] = parsed_clock
+    user_clock = clock_values.get("user_message_at")
+    assistant_clock = clock_values.get("assistant_response_at")
+    if user_clock is not None and assistant_clock is not None:
+        if user_clock > assistant_clock:
+            errors.append(
+                f"line {line_no}: user_message_at must be <= assistant_response_at"
             )
 
     sources = parsed.get("sources")
@@ -1859,6 +2111,7 @@ def _staging_output_example() -> str:
 
 
 def _staging_output_contract(daily_path: Path) -> str:
+    """Teach the worker the bilingual entity field so original-language names are not lost on English canonicalization."""
     return (
         "OUTPUT CONTRACT (reference / legacy text path):\n"
         "- Prefer forced tool calls (submit_*/patch_*/skip_digest_worker) for workers.\n"
@@ -1867,7 +2120,8 @@ def _staging_output_contract(daily_path: Path) -> str:
         "  ---\n"
         "  id: mem-<YYYY-MM-DD>-<slug>\n"
         "  type: fact | procedure | decision | event\n"
-        "  entity: <Person|Class|Project>  # required on fact and event\n"
+        "  entity: <Person|Class|Project>  # required on fact and event; English canonical\n"
+        "  entity_aliases: [<original-language surface>]  # optional; omit when identical to entity\n"
         "  predicate: <snake_case>  # required on event only (e.g. grade_dispute)\n"
         "  participants:\n"
         "    - {entity: <Name>, role: <optional>}  # event only; max 5; role optional\n"
@@ -3518,6 +3772,8 @@ def _run_validated_worker(
     reason: str = "digest",
     user_count: int = 0,
     assistant_count: int = 0,
+    message_start_id: int | None = None,
+    message_end_id: int | None = None,
 ) -> ValidatedWorkerResult | WorkerFailure:
     """Validate worker output via forced submit/patch tool calls + code render."""
     last_content = ""
@@ -3525,6 +3781,9 @@ def _run_validated_worker(
     previous_args: dict[str, Any] = {}
     active_type = worker_type
     use_rebuild = transcript is not None
+    user_at, assistant_at = _iso_clocks_for_window(
+        session_id, message_start_id, message_end_id
+    )
 
     for attempt in range(1, MAX_WORKER_VALIDATION_ATTEMPTS + 1):
         mode = "submit" if attempt == 1 or not previous_args else "patch"
@@ -3618,6 +3877,10 @@ def _run_validated_worker(
                         previous_args,
                         session_id=session_id,
                         today=hermes_local_today_str(),
+                        message_start_id=message_start_id,
+                        message_end_id=message_end_id,
+                        user_message_at=user_at,
+                        assistant_response_at=assistant_at,
                     )
                 except Exception as render_exc:
                     content = ""
@@ -3628,7 +3891,10 @@ def _run_validated_worker(
                     errors = [f"renderer defect: {render_exc}"]
                 else:
                     content = _normalize_digest_content(
-                        content, session_id=session_id
+                        content,
+                        session_id=session_id,
+                        message_start_id=message_start_id,
+                        message_end_id=message_end_id,
                     )
                     smoke = _smoke_rendered_worker_yaml(active_type, content)
                     if smoke:
@@ -3646,14 +3912,26 @@ def _run_validated_worker(
                         previous_args,
                         session_id=session_id,
                         today=hermes_local_today_str(),
+                        message_start_id=message_start_id,
+                        message_end_id=message_end_id,
+                        user_message_at=user_at,
+                        assistant_response_at=assistant_at,
                     )
                     content = _normalize_digest_content(
-                        content, session_id=session_id
+                        content,
+                        session_id=session_id,
+                        message_start_id=message_start_id,
+                        message_end_id=message_end_id,
                     )
                 except Exception:
                     content = content or ""
         elif content:
-            content = _normalize_digest_content(content, session_id=session_id)
+            content = _normalize_digest_content(
+                content,
+                session_id=session_id,
+                message_start_id=message_start_id,
+                message_end_id=message_end_id,
+            )
             errors = list(_validate_worker_output(content, active_type))
             for err in errors:
                 m = re.search(r"returned type (\S+)", err)
@@ -3717,12 +3995,19 @@ def _run_validated_worker(
                 previous_args,
                 session_id=session_id,
                 today=hermes_local_today_str(),
+                message_start_id=message_start_id,
+                message_end_id=message_end_id,
+                user_message_at=user_at,
+                assistant_response_at=assistant_at,
             )
         except Exception:
             dirty_content = ""
     if dirty_content.strip():
         dirty_content = _normalize_digest_content(
-            dirty_content, session_id=session_id
+            dirty_content,
+            session_id=session_id,
+            message_start_id=message_start_id,
+            message_end_id=message_end_id,
         )
         blocks = _worker_result_blocks(dirty_content)
         usable = bool(blocks) or _is_skip_only_content(dirty_content)
@@ -4007,6 +4292,9 @@ def _blocks_from_digest_args(
     occupied: set[str] = set()
     temp_map: dict[str, str] = {}
     rendered: list[dict[str, Any]] = []
+    user_at, assistant_at = _iso_clocks_for_window(
+        session_id, message_start_id, message_end_id
+    )
 
     for item in raw_blocks:
         if not isinstance(item, Mapping):
@@ -4026,6 +4314,8 @@ def _blocks_from_digest_args(
             today=today,
             message_start_id=message_start_id,
             message_end_id=message_end_id,
+            user_message_at=user_at,
+            assistant_response_at=assistant_at,
         )
         blocks = list(_worker_result_blocks(yaml_text))
         if not blocks:
@@ -4263,12 +4553,21 @@ def _persist_phase1_candidates(
     daily_path: Path,
     blocks: Sequence[Mapping[str, Any]],
 ) -> None:
-    """Append validated Phase-1 candidate blocks to the daily staging file."""
+    """Append Phase-1 cards then refresh the entity index so original-language aliases are searchable the same day.
+
+    Index rebuild is fail-open: a digest write must not roll back if recall indexing fails.
+    """
     if not blocks:
         return
     content = _content_from_blocks(blocks)
     if content.strip():
         _append_daily_digest(daily_path, content)
+        try:
+            from recall.normalize import write_entity_index
+
+            write_entity_index(_hermes_home() / "memories" / "staging")
+        except Exception as exc:
+            _log(f"entity index refresh fail-open: {exc}")
 
 
 def _filter_redundant_phase1_creates(

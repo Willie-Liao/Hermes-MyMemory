@@ -348,12 +348,7 @@ def load_weekly_json(week_key: str | None = None) -> dict[str, Any]:
     try:
         from . import weekly_json
     except ImportError:
-        from weekly_json import load_sidecar  # type: ignore
-
-        class _W:
-            load_sidecar = load_sidecar
-
-        weekly_json = _W()  # type: ignore
+        import weekly_json as weekly_json  # type: ignore
     parsed = weekly._parse_week_key(str(week_key or ""))
     if parsed is None:
         return {"outcome": "bad_week", "week": week_key or ""}

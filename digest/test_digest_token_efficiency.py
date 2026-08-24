@@ -58,6 +58,15 @@ def test_submit_and_patch_schemas_enums():
     )
     assert "kind" in fact["parameters"]["required"]
     assert "content" in fact["parameters"]["required"]
+    for schema in (submit, fact):
+        aliases = schema["parameters"]["properties"]["entity_aliases"]
+        assert aliases["type"] == "array"
+        assert aliases["minItems"] == 1
+        assert aliases["uniqueItems"] is True
+        assert aliases["items"]["type"] == "string"
+        assert "entity_aliases" not in schema["parameters"]["required"]
+    procedure = digest_tools.submit_schema("procedure")
+    assert "entity_aliases" not in procedure["parameters"]["properties"]
 
 
 def test_submit_operations_schema_exposes_nested_merge_slots():
@@ -163,6 +172,33 @@ def test_render_event_from_args_and_skip():
     assert "type: event" in yaml_text
     assert "Beginning: User asked;" in yaml_text
     assert "confidence: high" in yaml_text
+    assert "entity_aliases:" not in yaml_text
+    bilingual = digest_tools.render_worker_yaml_from_args(
+        "event",
+        {
+            "entity": "Memory Digest",
+            "entity_aliases": ["记忆摘要"],
+            "predicate": "user_requested_memory_recall",
+            "participants": [
+                {"entity": "User", "role": "requester"},
+                {"entity": "Assistant", "role": "executor"},
+            ],
+            "valid_from": "2026-08-24",
+            "valid_to": "2026-08-24",
+            "beginning": "User asked about 记忆摘要",
+            "course": "Assistant traced retrieval",
+            "outcome": "The entity was recalled",
+            "confidence": "high",
+            "importance": 3,
+        },
+        session_id="s-example",
+        today="2026-08-24",
+    )
+    assert "entity: Memory Digest" in bilingual
+    assert "entity_aliases: [记忆摘要]" in bilingual
+    assert bilingual.index("entity: Memory Digest") < bilingual.index(
+        "entity_aliases: [记忆摘要]"
+    )
     assert (
         digest_tools.render_worker_yaml_from_args(
             "event", {"skip": True}, session_id="s1", today="2026-08-11"
@@ -186,8 +222,18 @@ def test_render_stamps_session_source_with_message_range():
         today="2026-08-15",
         message_start_id=64989,
         message_end_id=65117,
+        user_message_at="2026-08-22T16:01:12+08:00",
+        assistant_response_at="2026-08-22T17:10:44+08:00",
+        generated_at="2026-08-22T17:16:08+08:00",
     )
     assert "session 20260811_170325_fdef935a#64989-65117" in yaml_text
+    assert "user_message_at:" in yaml_text
+    assert "2026-08-22T16:01:12+08:00" in yaml_text
+    assert "assistant_response_at:" in yaml_text
+    assert "2026-08-22T17:10:44+08:00" in yaml_text
+    assert "generated_at:" in yaml_text
+    assert "2026-08-22T17:16:08+08:00" in yaml_text
+    assert yaml_text.index("sources:") < yaml_text.index("user_message_at:")
     assert "transcript:2026-08-15" not in yaml_text
     assert "conversation" not in yaml_text
     assert "file:/tmp/a.html" in yaml_text
@@ -856,6 +902,37 @@ def test_validate_worker_tool_args_event_participants():
         ],
     }
     assert digest_tools.validate_worker_tool_args("event", good) == []
+    clocked = {
+        **good,
+        "user_message_at": "2026-08-22T16:01:12+08:00",
+        "assistant_response_at": "2026-08-22T17:10:44+08:00",
+        "generated_at": "2026-08-22T17:16:08+08:00",
+    }
+    assert digest_tools.validate_worker_tool_args("event", clocked) == []
+    with_entity = {**good, "entity": "Memory Digest"}
+    assert digest_tools.validate_worker_tool_args(
+        "event", {**with_entity, "entity_aliases": ["记忆摘要"]}
+    ) == []
+    dup = digest_tools.validate_worker_tool_args(
+        "event", {**with_entity, "entity_aliases": ["记忆摘要", "记忆摘要"]}
+    )
+    assert any("unique" in e or "duplicate" in e for e in dup)
+    repeat = digest_tools.validate_worker_tool_args(
+        "event", {**with_entity, "entity_aliases": ["Memory Digest"]}
+    )
+    assert any("canonical" in e or "entity" in e for e in repeat)
+    empty = digest_tools.validate_worker_tool_args(
+        "event", {**with_entity, "entity_aliases": []}
+    )
+    assert any("entity_aliases" in e for e in empty)
+    blank = digest_tools.validate_worker_tool_args(
+        "event", {**with_entity, "entity_aliases": [" "]}
+    )
+    assert any("entity_aliases" in e for e in blank)
+    schema = json.dumps(digest_tools.submit_schema("event"))
+    assert "user_message_at" not in schema
+    assert "assistant_response_at" not in schema
+    assert "generated_at" not in schema
 
 
 def test_render_worker_yaml_quotes_at_session_and_default_sources():

@@ -6,7 +6,6 @@ import {
   findReviewMark,
   hypMarkedIn,
   hypothesisIdFor,
-  resolveReviewCiteJump,
   spanMarkedIn,
 } from './memoryApprovalActionQueue.ts';
 import { PUT_OFF_OPTIONS, putOffLabels } from './overdueActions.ts';
@@ -17,7 +16,6 @@ import {
   type WeeklyReviewPendingOp,
 } from './weeklyReviewOps.ts';
 import type { CiteMapEntry } from './fourPartBrief.ts';
-import type { MemoryBlock } from './types.ts';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 
@@ -38,18 +36,6 @@ describe('memoryApprovalActionQueue helpers', () => {
     expect(
       hypothesisIdFor({ text: 'Maybe Launch Pipeline!', cite: null }, citeMap),
     ).toBe('hyp-maybe-launch-pipeline');
-  });
-
-  it('routes event cites to daily block when mem-id exists', () => {
-    const block = { id: 'evt-ship' } as MemoryBlock;
-    const jump = resolveReviewCiteJump(1, citeMap, [block]);
-    expect(jump).toEqual({ kind: 'daily', block });
-  });
-
-  it('routes missing event / non-event cites to approval', () => {
-    expect(resolveReviewCiteJump(1, citeMap, []).kind).toBe('approval');
-    expect(resolveReviewCiteJump(2, citeMap, []).kind).toBe('approval');
-    expect(resolveReviewCiteJump(3, citeMap, []).kind).toBe('approval');
   });
 
   it('exposes exact four put-off values', () => {
@@ -164,9 +150,12 @@ describe('Memory Approval action queue placement (source fixture)', () => {
     expect(queue).not.toContain('Hypothesis');
     expect(queue).toContain('Possible overdue report');
     expect(queue).toContain('id="chronicle-overdue-queue"');
+    expect(queue).not.toContain('onJumpApprovalCite');
+    expect(queue).not.toContain('Open this block in Read by Date');
 
-    expect(chronicle).toContain('cross-day-thread');
-    expect(chronicle).toContain('intra-day-thread');
+    expect(chronicle).toContain('payload.summary');
+    expect(chronicle).toContain('weekly-chronicle-summary');
+    expect(chronicle).not.toContain('Cross-day-thread');
     expect(chronicle).not.toContain('Weekly Brief');
     expect(chronicle).not.toContain('Conflict');
 
@@ -175,12 +164,11 @@ describe('Memory Approval action queue placement (source fixture)', () => {
     )?.[0] ?? '';
     expect(chronicleCall).toContain('payload={weeklyJson}');
     expect(chronicleCall).toContain('<MemoryApprovalActionQueue');
+    expect(chronicleCall).toContain('handleReviewSave');
 
-    const approvalIdx = weekReview.indexOf('id="memory-approval-section"');
-    const queueIdx = weekReview.indexOf('<MemoryApprovalActionQueue');
-    const saveIdx = weekReview.indexOf('<span>Memory Approval Save / Recall</span>');
-    expect(queueIdx).toBeGreaterThan(-1);
-    expect(queueIdx).toBeLessThan(approvalIdx);
-    expect(saveIdx).toBeGreaterThan(approvalIdx);
+    expect(weekReview).not.toContain('id="memory-approval-section"');
+    expect(weekReview).toContain('id="read-by-date-container"');
+    expect(weekReview).toContain('Weekly Chronicle');
+    expect(weekReview).not.toContain('Approval Hub');
   });
 });

@@ -118,7 +118,7 @@ export function reviewPendingButtonLabel(op: WeeklyReviewPendingOp): string {
   }
 }
 
-/** After Memory Approval Save — per-row Recall labels (Approval Hub style). */
+/** After weekly review Save — per-row Recall labels. */
 export function reviewRecallButtonLabel(op: WeeklyReviewPendingOp): string {
   switch (op.kind) {
     case 'hyp_confirm':

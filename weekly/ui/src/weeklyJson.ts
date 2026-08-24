@@ -1,4 +1,4 @@
-/** Shared weekly JSON types so Chronicle and tests paint the same [N] as Approval Hub. */
+/** Shared weekly JSON types for Chronicle summary paint. */
 
 export type ThreadVia = 'evolves' | 'invalidates';
 
@@ -30,32 +30,26 @@ export type WeeklyIntraDayThread = {
   empty?: boolean;
 };
 
+export type WeeklySummaryItem = {
+  text: string;
+  weekdays?: string[];
+};
+
 export type WeeklyJsonPayload = {
   week_key?: string;
   legend?: Record<string, string>;
   'cross-day-thread'?: WeeklyCrossDayThread[];
   'intra-day-thread'?: WeeklyIntraDayThread[];
+  summary?: WeeklySummaryItem[];
   entities?: unknown[];
 };
 
-/** Look up week-global [N] from legend so a thread step cannot mint a local index. */
-export function citeNForEventId(
-  legend: Record<string, string> | undefined,
-  eventId: string,
-  denorm?: number | null,
-): number | null {
-  if (denorm != null && legend) {
-    const mapped = legend[String(denorm)];
-    if (mapped === eventId) return denorm;
-  }
-  if (!legend) return denorm ?? null;
-  for (const [n, mem] of Object.entries(legend)) {
-    if (mem === eventId) {
-      const parsed = Number(n);
-      return Number.isFinite(parsed) ? parsed : null;
-    }
-  }
-  return null;
+/** Paint `- text (Monday, Tuesday)` so Chronicle does not parse hops. */
+export function formatSummaryLine(row: WeeklySummaryItem): string {
+  const text = (row.text || '').trim();
+  const days = (row.weekdays || []).filter(Boolean).join(', ');
+  if (!text) return '- None.';
+  return days ? `- ${text} (${days})` : `- ${text}`;
 }
 
 /** Badge the superseded step (to_seq, else former seq) only when via is invalidates. */

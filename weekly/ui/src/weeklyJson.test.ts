@@ -2,28 +2,11 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { citeNForEventId, invalidatesBadgeSeq } from './weeklyJson.ts';
+import { formatSummaryLine, invalidatesBadgeSeq } from './weeklyJson.ts';
 
 const root = dirname(fileURLToPath(import.meta.url));
 
 describe('weekly JSON cite helpers', () => {
-  const legend = {
-    '1': 'mem-a',
-    '4': 'mem-wed',
-  };
-
-  it('paints step [4] from legend so Chronicle jumps to Approval Hub [4]', () => {
-    expect(citeNForEventId(legend, 'mem-wed')).toBe(4);
-  });
-
-  it('omits a button when the event id is missing from legend', () => {
-    expect(citeNForEventId(legend, 'mem-unknown')).toBeNull();
-  });
-
-  it('rejects a denormalized cite_n that does not match legend', () => {
-    expect(citeNForEventId(legend, 'mem-wed', 1)).toBe(4);
-  });
-
   it('badges former step when invalidates omits to_seq', () => {
     expect(
       invalidatesBadgeSeq({
@@ -63,13 +46,28 @@ describe('weekly JSON cite helpers', () => {
 });
 
 describe('Chronicle source wiring', () => {
-  it('FourPartWeeklyCard reads JSON keys, not Distill/Brief sections', () => {
+  it('formats summary weekdays in parentheses', () => {
+    expect(
+      formatSummaryLine({
+        text: 'weekly ui has been updated to second version discarding legend and jump to',
+        weekdays: ['Monday', 'Tuesday'],
+      }),
+    ).toBe(
+      '- weekly ui has been updated to second version discarding legend and jump to (Monday, Tuesday)',
+    );
+  });
+
+  it('FourPartWeeklyCard reads JSON summary, not Distill/Brief sections', () => {
     const card = readFileSync(join(root, 'components/FourPartWeeklyCard.tsx'), 'utf8');
-    expect(card).toContain('cross-day-thread');
-    expect(card).toContain('intra-day-thread');
+    expect(card).toContain('payload.summary');
+    expect(card).toContain('weekly-chronicle-summary');
+    expect(card).toContain('formatSummaryLine');
+    expect(card).not.toContain('Cross-day-thread');
+    expect(card).not.toContain('Intra-day-thread');
     expect(card).not.toContain('parseFourPartBrief');
     expect(card).not.toContain('Weekly Brief');
-    expect(card).not.toContain('Conflict');
+    expect(card).not.toContain('citeNForEventId');
+    expect(card).not.toContain('onJumpApprovalCite');
   });
 
   it('queue is overdue-only with no Hypothesis Confirm/Delete', () => {

@@ -73,22 +73,33 @@ def test_dumps_uses_hyphenated_keys_and_omits_distill_fields():
         cross_day_thread=(span,),
         intra_day_thread=(wrap,),
         entities=(entity,),
+        summary=(
+            schema.WeeklySummaryItem(
+                text="digest kickoff then workers",
+                weekdays=("Monday", "Tuesday"),
+            ),
+        ),
     )
     raw = wj.dumps(payload)
     obj = json.loads(raw)
     assert "cross-day-thread" in obj
     assert "intra-day-thread" in obj
+    assert "summary" in obj
+    assert "legend" not in obj
     assert "threads" not in obj
     assert "singles" not in obj
     for banned in ("days", "conflicts", "hypotheses", "blocks", "overdue", "typed_legend"):
         assert banned not in obj
-    assert obj["legend"]["1"] == "mem-2026-07-27-a"
+    assert obj["summary"][0]["weekdays"] == ["Monday", "Tuesday"]
+    assert "cite_n" not in obj["cross-day-thread"][0]["steps"][0]
     round_trip = wj.loads(raw)
     assert round_trip.cross_day_thread[0].steps[1].via == "evolves"
     assert round_trip.intra_day_thread[0].text == "- wrap"
+    assert round_trip.summary[0].text == "digest kickoff then workers"
     yaml_text = wj.dump_yaml(payload)
     yobj = yaml.safe_load(yaml_text)
     assert set(yobj) == set(obj)
+    assert list(yobj.keys())[-1] == "summary"
 
 
 def test_entity_key_collapses_digest_aliases():
@@ -99,6 +110,45 @@ def test_entity_key_collapses_digest_aliases():
         wj.normalize_entity_key("memory-digest"),
     }
     assert keys == {"memorydigest"}
+
+
+def test_entities_from_event_blocks_keep_bilingual_aliases():
+    workers_path = Path(__file__).with_name("weekly_event_workers.py")
+    spec = importlib.util.spec_from_file_location(
+        "memory_weekly_workers_bilingual", workers_path
+    )
+    assert spec is not None and spec.loader is not None
+    workers = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = workers
+    spec.loader.exec_module(workers)
+    entities = workers._entities_from_event_blocks(
+        [
+            {
+                "frontmatter": {
+                    "id": "mem-2026-08-01-fact-aaaaaaaaaaaa",
+                    "type": "fact",
+                    "entity": "记忆摘要",
+                    "valid_from": "2026-08-01",
+                }
+            },
+            {
+                "frontmatter": {
+                    "id": "mem-2026-08-24-event-bbbbbbbbbbbb",
+                    "type": "event",
+                    "entity": "Memory Digest",
+                    "entity_aliases": ["记忆摘要"],
+                    "valid_from": "2026-08-24",
+                }
+            },
+        ]
+    )
+    assert [row.key for row in entities] == ["memorydigest"]
+    assert entities[0].canonical == "Memory Digest"
+    assert entities[0].aliases == ("记忆摘要",)
+    assert entities[0].week_blocks == (
+        "mem-2026-08-01-fact-aaaaaaaaaaaa",
+        "mem-2026-08-24-event-bbbbbbbbbbbb",
+    )
 
 
 def test_write_sidecars_deletes_json_and_yaml_leaves_md(tmp_path):
@@ -356,6 +406,99 @@ def test_run_analyst_attempt2_calls_patch_not_second_submit():
         "2026-08-12",
         "2026-08-13",
     }
+
+
+def test_summary_worker_fills_rows_and_fail_open_on_bad_tool():
+    workers_path = Path(__file__).with_name("weekly_event_workers.py")
+    spec = importlib.util.spec_from_file_location(
+        "memory_weekly_workers_summary", workers_path
+    )
+    assert spec is not None and spec.loader is not None
+    workers = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = workers
+    spec.loader.exec_module(workers)
+    schema = _load()
+    intra = (
+        schema.IntraDayThread(
+            date=date(2026, 8, 17),
+            weekday="Monday",
+            source_field="day_wrapup",
+            text="- parent photos",
+            empty=False,
+        ),
+    )
+    cross = (
+        schema.SpanCandidate(
+            id="t1",
+            label="ui hops",
+            start_date=date(2026, 8, 17),
+            end_date=date(2026, 8, 18),
+            confidence="high",
+            steps=(
+                schema.ThreadStep(
+                    seq=1,
+                    date=date(2026, 8, 17),
+                    event_id="mem-2026-08-17-a",
+                    text="drop hops",
+                ),
+                schema.ThreadStep(
+                    seq=2,
+                    date=date(2026, 8, 18),
+                    event_id="mem-2026-08-18-b",
+                    text="chronicle tab",
+                    via="evolves",
+                ),
+            ),
+        ),
+    )
+
+    def call_ok(prompt, *, purpose, force_tool_name):
+        _ = prompt, purpose
+        assert force_tool_name == "submit_weekly_summary"
+        return {
+            "tool_name": "submit_weekly_summary",
+            "tool_args": {
+                "summary": [
+                    {
+                        "text": "parent photo notifications",
+                        "weekdays": ["Monday"],
+                    },
+                    {
+                        "text": (
+                            "the weekly ui has been updated to second version "
+                            "discarding legend and jump to"
+                        ),
+                        "weekdays": ["Tuesday", "Monday"],
+                    },
+                ]
+            },
+        }
+
+    rows = workers._run_summary_worker(
+        week_key="2026-W34",
+        intra=intra,
+        cross=cross,
+        call_llm_tools=call_ok,
+        log=lambda _m: None,
+    )
+    assert [r.text for r in rows] == [
+        "parent photo notifications",
+        "the weekly ui has been updated to second version discarding legend and jump to",
+    ]
+    assert rows[1].weekdays == ("Monday", "Tuesday")
+
+    def call_bad(prompt, *, purpose, force_tool_name):
+        _ = prompt, purpose, force_tool_name
+        return {"tool_name": "submit_weekly_thread", "tool_args": {}}
+
+    empty = workers._run_summary_worker(
+        week_key="2026-W34",
+        intra=intra,
+        cross=cross,
+        call_llm_tools=call_bad,
+        log=lambda _m: None,
+    )
+    assert empty == ()
 
 
 def test_run_analyst_rejects_second_submit_on_attempt2():

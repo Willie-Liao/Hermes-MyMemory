@@ -186,7 +186,7 @@ export default function App() {
             <div className="flex items-center gap-2">
               <h1 className="font-bold text-slate-100 tracking-tight text-sm uppercase">Hermes Memory Controller</h1>
               <span className="bg-indigo-500/15 text-indigo-400 text-[10px] font-mono px-1.5 py-0.2 rounded border border-indigo-500/20 font-bold">
-                v5.0
+                v6.0
               </span>
             </div>
             <p className="text-xs text-slate-500 font-mono">Weekly Review Hub & Compliant Gated Promotion</p>

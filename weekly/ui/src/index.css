@@ -40,7 +40,6 @@
 .light-theme #read-by-date-container,
 .light-theme #retention-policy-section,
 .light-theme #hot-memory-editor-section,
-.light-theme #memory-approval-section,
 .light-theme #transcript-drawer-container,
 .light-theme #transcript-drawer-container .bg-slate-950 {
   background-color: var(--card-bg) !important;

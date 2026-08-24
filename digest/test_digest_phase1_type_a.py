@@ -262,6 +262,40 @@ def test_run_phase1_persist_uses_sanitized_capture(tmp_path, monkeypatch):
     assert "Z" * 600 not in str(facts[0])
 
 
+def test_persist_phase1_candidates_refreshes_entity_index(tmp_path, monkeypatch):
+    digest = _load("digest")
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    calls: list[Path] = []
+
+    def fake_write(root):
+        calls.append(root)
+
+    monkeypatch.setattr("recall.normalize.write_entity_index", fake_write)
+    daily = tmp_path / "memories" / "staging" / "2026-08-24.md"
+    daily.parent.mkdir(parents=True)
+    digest._persist_phase1_candidates(
+        daily,
+        [
+            {
+                "id": "mem-2026-08-24-event-ABC123DEF456",
+                "type": "event",
+                "entity": "Memory Digest",
+                "entity_aliases": ["记忆摘要"],
+                "predicate": "user_requested_memory_recall",
+                "confidence": "high",
+                "importance": 3,
+                "status": "candidate",
+                "sources": ["session s-example"],
+                "body": "Beginning: User asked; Course: traced; Outcome: recalled.",
+            }
+        ],
+    )
+    assert daily.exists()
+    text = daily.read_text(encoding="utf-8")
+    assert "entity_aliases: [记忆摘要]" in text
+    assert calls == [tmp_path / "memories" / "staging"]
+
+
 def test_accept_phase1_args_truncates_and_strips_event_related():
     tools = _load("digest_tools")
     bag, errors, notes = tools.accept_phase1_args(

@@ -1,5 +1,4 @@
 import React, { useMemo, useState } from 'react';
-import { briefCiteAnchorId } from '../briefCiteNav';
 import {
   PUT_OFF_OPTIONS,
   buildSpanConfirmPending,
@@ -31,11 +30,6 @@ export type MemoryApprovalActionQueueProps = {
   onPendOp: (op: WeeklyReviewPendingOp) => void;
   onClearPendingOp: (op: WeeklyReviewPendingOp) => void;
   onRecallSavedReview: () => void;
-  onJumpApprovalCite: (n: number) => void;
-  onJumpDailyBlock: (
-    block: MemoryBlock,
-    returnTo?: { mode: 'approval' | 'brief'; n: number },
-  ) => void;
 };
 
 /**
@@ -50,8 +44,6 @@ export default function MemoryApprovalActionQueue({
   onPendOp,
   onClearPendingOp,
   onRecallSavedReview,
-  onJumpDailyBlock,
-  onJumpApprovalCite,
 }: MemoryApprovalActionQueueProps) {
   const rows = useMemo(
     () =>
@@ -152,14 +144,6 @@ export default function MemoryApprovalActionQueue({
             const block = allBlocks.find((b) => b.id === row.blockId);
             const bridge = bridgeSpans.find((b) => b.block_id === row.blockId);
             const bodyText = String(block?.body || bridge?.body || '').trim();
-            const jumpCiteToDaily = () => {
-              if (row.cite == null) return;
-              if (block) {
-                onJumpDailyBlock(block, { mode: 'brief', n: row.cite });
-                return;
-              }
-              onJumpApprovalCite(row.cite);
-            };
             return (
               <div
                 key={row.key}
@@ -182,15 +166,7 @@ export default function MemoryApprovalActionQueue({
                     <span>· proposed end {row.proposedEnd || '—'}</span>
                     <span className="text-amber-400/90">{row.confidence}</span>
                     {row.cite != null ? (
-                      <button
-                        type="button"
-                        id={briefCiteAnchorId(row.cite)}
-                        onClick={jumpCiteToDaily}
-                        className="text-indigo-400 hover:text-indigo-300 font-mono"
-                        title="Open this block in Read by Date"
-                      >
-                        [{row.cite}]
-                      </button>
+                      <span className="font-mono text-slate-500">[{row.cite}]</span>
                     ) : null}
                     {row.stagingMissing ? (
                       <span className="text-red-400">not in daily staging</span>
@@ -231,7 +207,7 @@ export default function MemoryApprovalActionQueue({
                     <button
                       type="button"
                       disabled={row.confirmDisabled || actionsLocked}
-                      title={row.confirmDisabledReason || 'Pend Confirm — Save in Memory Approval'}
+                      title={row.confirmDisabledReason || 'Pend Confirm — Save on Chronicle'}
                       onClick={() => onConfirm(row)}
                       className="px-2.5 py-1.5 rounded-lg text-[11px] font-mono font-bold bg-emerald-600/80 hover:bg-emerald-500 disabled:opacity-40 text-slate-100 cursor-pointer"
                     >
@@ -316,12 +292,12 @@ export default function MemoryApprovalActionQueue({
 
       {pendingCount > 0 ? (
         <p className="text-[10px] font-mono text-amber-300/90">
-          {pendingCount} review action{pendingCount === 1 ? '' : 's'} pended — Save below.
+          {pendingCount} review action{pendingCount === 1 ? '' : 's'} pended — Save on Chronicle.
         </p>
       ) : null}
       {savedCount > 0 && pendingCount === 0 ? (
         <p className="text-[10px] font-mono text-emerald-400/90">
-          {savedCount} saved — Recall confirm / put off / set due date undoes the batch (or use Memory Approval Recall).
+          {savedCount} saved — Recall confirm / put off / set due date undoes the batch.
         </p>
       ) : null}
     </div>

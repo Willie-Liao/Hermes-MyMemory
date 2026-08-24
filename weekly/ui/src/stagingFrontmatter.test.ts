@@ -46,13 +46,51 @@ describe('staging frontmatter display', () => {
       /sources: \[session 20260722_172657_c54f77a8, file:Grading\/assistant\/cocoindex_codebase\.py\]/,
     );
 
-    // Digest order: related before valid_from; sources last.
+    // Digest order: related before valid_from; clocks after sources.
     const relatedIdx = yaml.indexOf('related:');
     const validFromIdx = yaml.indexOf('valid_from:');
     const sourcesIdx = yaml.indexOf('sources:');
     assert.ok(relatedIdx > 0 && relatedIdx < validFromIdx);
     assert.ok(sourcesIdx > validFromIdx);
     assert.ok(STAGING_FRONTMATTER_KEY_ORDER.includes('supersedes'));
+    assert.ok(STAGING_FRONTMATTER_KEY_ORDER.includes('entity_aliases'));
+  });
+
+  it('emits optional message clocks after sources and omits them when unset', () => {
+    const withClocks: MemoryBlock = {
+      id: 'mem-clock',
+      type: 'fact',
+      entity: 'Topic',
+      confidence: 'high',
+      importance: 3,
+      status: 'candidate',
+      sources: ['session s1#1-2'],
+      user_message_at: '2026-08-22T16:01:12+08:00',
+      assistant_response_at: '2026-08-22T17:10:44+08:00',
+      generated_at: '2026-08-22T17:16:08+08:00',
+      body: 'an observation',
+      filePath: '2026-08-22.md',
+    };
+    const yaml = formatStagingFrontmatter(withClocks);
+    assert.match(yaml, /user_message_at: ['"]2026-08-22T16:01:12\+08:00['"]/);
+    assert.match(yaml, /assistant_response_at: ['"]2026-08-22T17:10:44\+08:00['"]/);
+    assert.match(yaml, /generated_at: ['"]2026-08-22T17:16:08\+08:00['"]/);
+    assert.ok(yaml.indexOf('sources:') < yaml.indexOf('user_message_at:'));
+    assert.ok(STAGING_FRONTMATTER_KEY_ORDER.includes('generated_at'));
+
+    const bare: MemoryBlock = {
+      id: 'mem-clock-bare',
+      type: 'fact',
+      confidence: 'high',
+      importance: 3,
+      status: 'candidate',
+      sources: ['session s1'],
+      body: 'bare',
+      filePath: '2026-08-22.md',
+    };
+    const bareYaml = formatStagingFrontmatter(bare);
+    assert.equal(bareYaml.includes('user_message_at:'), false);
+    assert.equal(bareYaml.includes('generated_at:'), false);
   });
 
   it('parse + stringify round-trips supersedes and discarded_at', () => {
@@ -77,5 +115,28 @@ Spent helper.
     assert.match(out, /discarded_at: 2026-07-26/);
     // sources last
     assert.ok(out.indexOf('discarded_at:') < out.indexOf('sources:'));
+  });
+
+  it('parse + stringify preserves Unicode entity_aliases after entity', () => {
+    const raw = `---
+id: mem-2026-08-24-event-bbbbbbbbbbbb
+type: event
+entity: Memory Digest
+entity_aliases: [记忆摘要]
+predicate: user_requested_memory_recall
+confidence: high
+importance: 3
+status: candidate
+sources: [session s-example]
+---
+Beginning: asked; Course: traced; Outcome: recalled.
+`;
+    const parsed = parseMDBlock(raw, '2026-08-24.md');
+    assert.deepEqual(parsed[0]?.entity_aliases, ['记忆摘要']);
+    const out = stringifyMDBlock(parsed[0]!);
+    assert.match(out, /entity: Memory Digest\nentity_aliases: \[记忆摘要\]/);
+    const again = parseMDBlock(out, '2026-08-24.md');
+    assert.deepEqual(again[0]?.entity_aliases, ['记忆摘要']);
+    assert.equal(again[0]?.entity, 'Memory Digest');
   });
 });

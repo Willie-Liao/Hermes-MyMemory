@@ -164,6 +164,7 @@ def payload_from_synthesis(
     reduce_tokens: int,
     generated_at: str,
 ) -> MonthlyPayload:
+    """Bind synthesis args onto mechanical facts, including bilingual aliases, so monthly YAML cannot drop original-language surfaces."""
     from monthly_slice import calendar_range
 
     allowed = allowed_ids_from_facts(facts, [])
@@ -387,6 +388,7 @@ def payload_from_synthesis(
             month_count=int(row["month_count"]),
             first_seen=row.get("first_seen"),
             last_seen=row.get("last_seen"),
+            aliases=tuple(row.get("aliases") or ()),
         )
         for row in facts.cross_month_entities
     )

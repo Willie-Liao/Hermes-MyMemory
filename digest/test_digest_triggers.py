@@ -365,6 +365,7 @@ def test_prompt_includes_light_digest_contract(tmp_path, monkeypatch):
     assert "Stage when durable" in prompt
     assert "User correction:" in prompt
     assert "entity:" in prompt
+    assert "entity_aliases:" in prompt
     assert "predicate:" in prompt
     assert "participants:" in prompt
     assert "involves:" in prompt
@@ -404,6 +405,8 @@ def test_event_first_worker_contracts_are_explicit(tmp_path, monkeypatch):
     assert "Hypothesis is preserved legacy-only data" not in combined
     assert "hypothesis belongs to the weekly worker" in combined or "Do NOT emit type: hypothesis" in combined
     assert "type: fact | procedure | decision | hypothesis | event" not in combined
+    assert "entity_aliases:" in combined
+    assert "omit when identical to entity" in combined
 
 
 def test_staging_contract_has_temporary_worker_envelope():

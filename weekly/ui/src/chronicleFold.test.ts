@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import { nextChronicleFoldedOnTabChange } from './chronicleFold.ts';
 
-// Approval Hub → expanded by default (folded = false)
+// Weekly Chronicle tab → expanded by default (folded = false)
 assert.equal(nextChronicleFoldedOnTabChange('approve', true), false);
 assert.equal(nextChronicleFoldedOnTabChange('approve', false), false);
 
-// Leave Approval Hub while expanded → collapse
+// Leave Chronicle while expanded → collapse
 assert.equal(nextChronicleFoldedOnTabChange('read', false), true);
 assert.equal(nextChronicleFoldedOnTabChange('hot', false), true);
 

@@ -621,7 +621,8 @@ def test_generate_weekly_content_fills_brief_after_w1(tmp_path, monkeypatch):
     assert result is not None
     assert "cross-day-thread" in result
     assert "intra-day-thread" in result
-    assert "legend:" in result
+    assert "summary:" in result
+    assert "legend:" not in result
     assert "Conflict" not in result
     assert "Hypothesis" not in result
     assert not any(c["purpose"] == "worker2_brief" for c in calls)

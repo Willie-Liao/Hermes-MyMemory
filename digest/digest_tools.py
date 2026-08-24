@@ -16,6 +16,7 @@ import logging
 import re
 import uuid
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 from typing import Any
 
 logger = logging.getLogger("plugins.memory-digest")
@@ -417,7 +418,7 @@ def validate_worker_tool_args(
     *,
     user_subjects: frozenset[str] | set[str] | None = None,
 ) -> list[str]:
-    """Primary worker gate on tool-arg dict (slots + semantic ownership rules)."""
+    """Reject unusable bilingual aliases so recall cannot mint a second key from the original-language surface."""
     wt = worker_type.strip().lower()
     errors = list(validate_worker_slot_args(wt, args))
     bag = dict(args or {})
@@ -481,6 +482,29 @@ def validate_worker_tool_args(
             errors.append(FACT_NARRATION_TEACH)
         elif is_narration and involve_count < 1:
             errors.append(FACT_NARRATION_TEACH)
+
+    if "entity_aliases" in bag:
+        aliases = bag.get("entity_aliases")
+        canonical = str(bag.get("entity") or "").strip().casefold()
+        if not isinstance(aliases, list) or not aliases:
+            errors.append("entity_aliases must be a non-empty unique string list")
+        else:
+            seen: set[str] = set()
+            for item in aliases:
+                text = item.strip() if isinstance(item, str) else ""
+                if not text:
+                    errors.append("entity_aliases items must be non-empty strings")
+                    break
+                folded = text.casefold()
+                if folded in seen:
+                    errors.append("entity_aliases must be unique")
+                    break
+                seen.add(folded)
+                if canonical and folded == canonical:
+                    errors.append(
+                        "entity_aliases must not repeat the canonical entity"
+                    )
+                    break
 
     return list(dict.fromkeys(errors))
 
@@ -718,8 +742,22 @@ def _shared_optional_props() -> dict[str, Any]:
 
 
 def _event_props(*, required: bool) -> dict[str, Any]:
+    """Keep English entity required while exposing optional original-language aliases on the event tool."""
     props = {
-        "entity": {"type": "string"},
+        "entity": {
+            "type": "string",
+            "description": "Stable English canonical entity name",
+        },
+        "entity_aliases": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "minItems": 1,
+            "uniqueItems": True,
+            "description": (
+                "Exact original-language entity surfaces used by the user; "
+                "omit when identical to entity"
+            ),
+        },
         "predicate": {
             "type": "string",
             "description": "snake_case user intent (e.g. user_requested_*)",
@@ -751,8 +789,22 @@ def _event_props(*, required: bool) -> dict[str, Any]:
 
 
 def _fact_props() -> dict[str, Any]:
+    """Keep English entity required while exposing optional original-language aliases on the fact tool."""
     return {
-        "entity": {"type": "string"},
+        "entity": {
+            "type": "string",
+            "description": "Stable English canonical entity name",
+        },
+        "entity_aliases": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "minItems": 1,
+            "uniqueItems": True,
+            "description": (
+                "Exact original-language entity surfaces used by the user; "
+                "omit when identical to entity"
+            ),
+        },
         "kind": _fact_kind_prop(),
         "content": _slot_string(
             "Fact text after the Factual:/Narration: prefix; assembled body <= 500 chars",
@@ -1884,6 +1936,18 @@ def session_id_from_source_tag(tag: str) -> str:
     return rest.split("#", 1)[0].strip()
 
 
+_SOURCE_RANGE_RE = re.compile(r"#(\d+)-(\d+)\s*$")
+
+
+def message_range_from_source_tag(tag: str) -> tuple[int, int] | None:
+    """Read ``#start-end`` from a session source tag; None when the tag has no range."""
+    text = str(tag or "").strip()
+    match = _SOURCE_RANGE_RE.search(text)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
 _STAGING_PATH_RE = re.compile(r"memories[/\\]staging", re.IGNORECASE)
 _STAGING_BASENAME_RE = re.compile(
     r"^(?:file:)?(?:\./)?(?:\d{4}-\d{2}-\d{2}|\d{4}-W\d{2})\.md$",
@@ -1931,8 +1995,14 @@ def render_worker_yaml_from_args(
     today: str,
     message_start_id: int | None = None,
     message_end_id: int | None = None,
+    user_message_at: str | None = None,
+    assistant_response_at: str | None = None,
+    generated_at: str | None = None,
 ) -> str:
-    """Code-owned YAML frontmatter + one-line body from accepted tool args."""
+    """Serialize accepted args so original-language aliases survive into daily YAML beside English entity.
+
+    Wall clocks are plugin-stamped so the worker never invents send/reply times.
+    """
     wt = worker_type.strip().lower()
     bag = dict(args)
     if is_skip_tool("skip_digest_worker", bag) or bag.get("skip") is True:
@@ -1951,9 +2021,18 @@ def render_worker_yaml_from_args(
         message_end_id=message_end_id,
     )
     parsed["sources"] = [locator, *_extra_file_sources(bag.get("sources"))]
+    if user_message_at:
+        parsed["user_message_at"] = str(user_message_at).strip()
+    if assistant_response_at:
+        parsed["assistant_response_at"] = str(assistant_response_at).strip()
+    parsed["generated_at"] = str(
+        generated_at
+        or datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    ).strip()
 
     for key in (
         "entity",
+        "entity_aliases",
         "predicate",
         "valid_from",
         "valid_to",
@@ -1972,6 +2051,7 @@ def render_worker_yaml_from_args(
         "id",
         "type",
         "entity",
+        "entity_aliases",
         "predicate",
         "confidence",
         "importance",
@@ -1979,6 +2059,9 @@ def render_worker_yaml_from_args(
         "valid_from",
         "valid_to",
         "sources",
+        "user_message_at",
+        "assistant_response_at",
+        "generated_at",
         "related",
         "supersedes",
     ]
@@ -1988,7 +2071,7 @@ def render_worker_yaml_from_args(
             continue
         seen.add(key)
         val = parsed[key]
-        if key in {"sources", "related", "supersedes"}:
+        if key in {"sources", "related", "supersedes", "entity_aliases"}:
             lines.append(f"{key}: {_format_list(val)}")
         else:
             lines.append(f"{key}: {_yaml_scalar(val)}")

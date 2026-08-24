@@ -9,6 +9,7 @@ export const STAGING_FRONTMATTER_KEY_ORDER = [
   'id',
   'type',
   'entity',
+  'entity_aliases',
   'predicate',
   'participants',
   'involves',
@@ -22,6 +23,9 @@ export const STAGING_FRONTMATTER_KEY_ORDER = [
   'promoted_at',
   'discarded_at',
   'sources',
+  'user_message_at',
+  'assistant_response_at',
+  'generated_at',
 ] as const;
 
 export function yamlQuoteIfNeeded(value: string): string {
@@ -58,13 +62,18 @@ function normalizeImportanceLocal(value: unknown): ImportanceLevel {
   return 3;
 }
 
-/** Frontmatter only (opening `---` … closing `---`), no body. */
+/** Frontmatter only (opening `---` … closing `---`), no body.
+ * entity_aliases is written immediately after entity so a save cannot drop the original-language surface.
+ */
 export function formatStagingFrontmatter(block: MemoryBlock): string {
   const lines: string[] = ['---'];
 
   lines.push(`id: ${block.id}`);
   lines.push(`type: ${block.type}`);
   if (block.entity) lines.push(`entity: ${yamlQuoteIfNeeded(block.entity)}`);
+  if (block.entity_aliases && block.entity_aliases.length > 0) {
+    lines.push(`entity_aliases: ${formatStagingFlowList(block.entity_aliases)}`);
+  }
   if (block.predicate) lines.push(`predicate: ${yamlQuoteIfNeeded(block.predicate)}`);
   if (block.participants && block.participants.length > 0) {
     lines.push(formatParticipants(block.participants));
@@ -87,6 +96,15 @@ export function formatStagingFrontmatter(block: MemoryBlock): string {
   if (block.discarded_at) lines.push(`discarded_at: ${block.discarded_at}`);
   if (block.sources && block.sources.length > 0) {
     lines.push(`sources: ${formatStagingFlowList(block.sources)}`);
+  }
+  if (block.user_message_at) {
+    lines.push(`user_message_at: ${yamlQuoteIfNeeded(block.user_message_at)}`);
+  }
+  if (block.assistant_response_at) {
+    lines.push(`assistant_response_at: ${yamlQuoteIfNeeded(block.assistant_response_at)}`);
+  }
+  if (block.generated_at) {
+    lines.push(`generated_at: ${yamlQuoteIfNeeded(block.generated_at)}`);
   }
 
   lines.push('---');

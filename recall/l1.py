@@ -12,7 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .ids import hermes_home
+from .ids import hermes_home, parse_iso_datetime
 
 
 def _ro_connect(db_path: Path) -> sqlite3.Connection:
@@ -27,34 +27,48 @@ def search_l1(
     k: int = 8,
     home: Path | None = None,
     window_days: int = 3,
+    time_from: str | None = None,
+    time_to: str | None = None,
 ) -> list[dict[str, Any]]:
-    """FTS5 over messages_fts joined to messages; never opens the DB writable."""
+    """FTS5 over messages_fts joined to messages; never opens the DB writable.
+
+    Explicit time_from/time_to override the valid_from ±window_days fallback so
+    approximate-time recall does not reopen a three-day default around a miss.
+    """
     q = str(query or "").strip()
     if not q:
         return []
     db = hermes_home(home) / "state.db"
     if not db.is_file():
         return []
-    day: date | None
-    if isinstance(valid_from, date):
-        day = valid_from
-    elif valid_from:
-        try:
-            day = date.fromisoformat(str(valid_from)[:10])
-        except ValueError:
-            day = None
-    else:
-        day = None
     start_ts = end_ts = None
-    if day is not None:
-        start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc) - timedelta(
-            days=window_days
-        )
-        end = datetime(day.year, day.month, day.day, tzinfo=timezone.utc) + timedelta(
-            days=window_days + 1
-        )
-        start_ts = start.timestamp()
-        end_ts = end.timestamp()
+    lo = parse_iso_datetime(time_from, end_of_day=False) if time_from else None
+    hi = parse_iso_datetime(time_to, end_of_day=True) if time_to else None
+    if lo is not None and hi is not None:
+        if hi < lo:
+            lo, hi = hi, lo
+        start_ts = lo.timestamp()
+        end_ts = (hi + timedelta(microseconds=1)).timestamp()
+    else:
+        day: date | None
+        if isinstance(valid_from, date):
+            day = valid_from
+        elif valid_from:
+            try:
+                day = date.fromisoformat(str(valid_from)[:10])
+            except ValueError:
+                day = None
+        else:
+            day = None
+        if day is not None:
+            start = datetime(day.year, day.month, day.day, tzinfo=timezone.utc) - timedelta(
+                days=window_days
+            )
+            end = datetime(day.year, day.month, day.day, tzinfo=timezone.utc) + timedelta(
+                days=window_days + 1
+            )
+            start_ts = start.timestamp()
+            end_ts = end.timestamp()
     con = _ro_connect(db)
     try:
         con.execute("PRAGMA query_only=ON")

@@ -7,7 +7,6 @@ import {
   type FourPartBrief,
   type FourPartBullet,
 } from './fourPartBrief';
-import type { MemoryBlock } from './types';
 import type { WeeklyReviewPendingOp } from './weeklyReviewOps';
 
 export function hypothesisIdFor(
@@ -55,18 +54,4 @@ export function spanMarkedIn(
         || op.kind === 'span_set_due_date')
       && op.blockId === blockId,
   );
-}
-
-/** Citation jump: event mem-id → daily block when present; else Approval Hub cite. */
-export function resolveReviewCiteJump(
-  n: number,
-  citeMap: FourPartBrief['citeMap'],
-  allBlocks: MemoryBlock[],
-): { kind: 'daily'; block: MemoryBlock } | { kind: 'approval'; n: number } {
-  const entry = citeTargetId(citeMap, n);
-  if (entry?.kind === 'event') {
-    const block = allBlocks.find((b) => b.id === entry.targetId);
-    if (block) return { kind: 'daily', block };
-  }
-  return { kind: 'approval', n };
 }

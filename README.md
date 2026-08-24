@@ -1,21 +1,8 @@
 # MyMemory
 
-Hermes memory **provider**: digest (Phase-1 extract), consolidate (Phase-2), weekly, monthly, retention, and recall. MIT licensed.
+Hermes memory provider: digest (Phase-1 extract), consolidate (Phase-2), weekly, monthly, retention, and recall. MIT licensed.
 
-This repository is **only the plugin**. It does not contain a live Hermes home, conversation DB, hot memory, staging files, `config.yaml`, or `.env`.
-
-## One-click install (macOS)
-
-1. Install [Hermes](https://github.com/NousResearch/hermes-agent) and run `hermes setup` once.
-2. Clone this repo, then double-click **`Install MyMemory.command`**.
-
-```bash
-git clone https://github.com/Willie-Liao/Hermes-MyMemory.git
-cd Hermes-MyMemory
-bash scripts/install.sh
-```
-
-Override the install target with `HERMES_HOME=/path/to/.hermes`. Use `--skip-tests` or `--force` if needed. After install, merge the sample `plugins.entries.MyMemory` block below into `$HERMES_HOME/config.yaml` (do not overwrite the whole file) and put worker keys in `$HERMES_HOME/.env`.
+This repository is the **plugin root**. Copy or clone it to `$HERMES_HOME/plugins/MyMemory`. Do not publish a live Hermes home (conversation DB, hot memory, staging, `.env`). Prefer a **fresh git snapshot** of this folder, not monorepo history.
 
 ## Install
 

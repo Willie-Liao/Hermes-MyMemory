@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -19,8 +19,10 @@ from .ids import (
     BlockRecord,
     classify_daily_id,
     classify_weekly_id,
+    intervals_overlap,
     iso_week,
     one_line,
+    parse_iso_datetime,
     resolve_id,
     staging_root,
 )
@@ -36,6 +38,8 @@ PPR_ITERS = 40
 EXPAND_K = 8
 MAX_DEPTH = 2
 INDEX_TYPES = {"fact", "procedure", "decision", "event", "decision_constraint"}
+TIME_WIDEN_STAGES = (0, 3, 7)
+TIME_HIT_FLOOR = 3
 
 
 def _week(rec: BlockRecord) -> str:
@@ -67,6 +71,119 @@ def format_id_block(rec: BlockRecord) -> str:
     return "\n".join(lines)
 
 
+def _parse_recall_bounds(
+    time_from: str | None, time_to: str | None
+) -> tuple[datetime, datetime] | None:
+    """Require both ISO bounds; otherwise keep the existing no-time ladder.
+
+    A half-specified or garbage window must not silently drop entity hits.
+    """
+    if not str(time_from or "").strip() or not str(time_to or "").strip():
+        return None
+    lo = parse_iso_datetime(time_from, end_of_day=False)
+    hi = parse_iso_datetime(time_to, end_of_day=True)
+    if lo is None or hi is None:
+        return None
+    if hi < lo:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def _is_rejected(rec: BlockRecord) -> bool:
+    return str(rec.parsed.get("status") or "").strip() == "rejected"
+
+
+def _time_hits(store: BlockIndex, lo: datetime, hi: datetime) -> list[BlockRecord]:
+    hits = [
+        rec
+        for rec in store.records
+        if not _is_rejected(rec)
+        and intervals_overlap(rec.occurred_start, rec.occurred_end, lo, hi)
+    ]
+    hits.sort(
+        key=lambda rec: (
+            rec.occurred_start or datetime.min.replace(tzinfo=timezone.utc),
+            rec.block_id,
+        )
+    )
+    return hits
+
+
+def _widen_bounds(lo: datetime, hi: datetime, days: int) -> tuple[datetime, datetime]:
+    delta = timedelta(days=days)
+    return lo - delta, hi + delta
+
+
+def _select_time_window(
+    store: BlockIndex, lo: datetime, hi: datetime
+) -> tuple[list[BlockRecord], int, datetime, datetime]:
+    """Progressive 0/3/7-day widen; stop at three hits or the seven-day cap."""
+    chosen: list[BlockRecord] = []
+    widen = 0
+    applied_lo, applied_hi = lo, hi
+    for days in TIME_WIDEN_STAGES:
+        applied_lo, applied_hi = _widen_bounds(lo, hi, days)
+        chosen = _time_hits(store, applied_lo, applied_hi)
+        widen = days
+        if len(chosen) >= TIME_HIT_FLOOR or days == TIME_WIDEN_STAGES[-1]:
+            break
+    return chosen, widen, applied_lo, applied_hi
+
+
+def _rank_or_union(
+    semantic: Sequence[BlockRecord],
+    timed: Sequence[BlockRecord],
+) -> list[BlockRecord]:
+    """semantic∩time, then semantic-only, then time-only events, then other time-only."""
+    sem_ids = {rec.block_id for rec in semantic}
+    time_ids = {rec.block_id for rec in timed}
+    seen: set[str] = set()
+    out: list[BlockRecord] = []
+
+    def _take(recs: Sequence[BlockRecord]) -> None:
+        for rec in recs:
+            if rec.block_id in seen:
+                continue
+            seen.add(rec.block_id)
+            out.append(rec)
+
+    _take([rec for rec in semantic if rec.block_id in time_ids])
+    _take([rec for rec in semantic if rec.block_id not in time_ids])
+    _take(
+        [
+            rec
+            for rec in timed
+            if rec.block_id not in sem_ids and rec.item_type == "event"
+        ]
+    )
+    _take([rec for rec in timed if rec.block_id not in sem_ids])
+    return out
+
+
+def _format_time_or(
+    query: str,
+    recs: Sequence[BlockRecord],
+    *,
+    lo: datetime,
+    hi: datetime,
+    widen_days: int,
+    cap: int,
+) -> str:
+    """Surface the applied window so the agent can tell a widened hit from an exact day."""
+    lines = [
+        (
+            f"## Memory / recall  channel=time_or  q={query}  "
+            f"time_from={lo.isoformat()}  time_to={hi.isoformat()}  "
+            f"widen_days={widen_days}"
+        )
+    ]
+    for rec in recs[:cap]:
+        lines.append(
+            f"- {rec.block_id}  {rec.day} {_week(rec)}  {rec.item_type}  {one_line(rec.body, 80)}"
+        )
+    return "\n".join(lines)
+
+
 def recall_memory(
     query: str,
     k: int = 8,
@@ -75,11 +192,13 @@ def recall_memory(
     scope: str = DEFAULT_SCOPE,
     valid_from: str | None = None,
     index: BlockIndex | None = None,
+    time_from: str | None = None,
+    time_to: str | None = None,
 ) -> str:
     """Channel ladder: id → entity_key → fts5 → (gated embed) → l1 last resort.
 
-    Default channels omit ``status: rejected`` so an outdated contradiction
-    cannot answer a normal lookup; exact mem-id still pages the card in.
+    Optional time_from/time_to OR-union approximate occurrence windows with
+    entity/lexical hits. Exact mem-id still pages a card in and ignores bounds.
     """
     q = str(query or "").strip()
     root = staging_root(staging)
@@ -99,6 +218,16 @@ def recall_memory(
         if rec:
             return format_id_block(rec)
 
+    bounds = _parse_recall_bounds(time_from, time_to)
+    timed: list[BlockRecord] = []
+    widen_days = 0
+    applied_lo: datetime | None = None
+    applied_hi: datetime | None = None
+    if bounds:
+        timed, widen_days, applied_lo, applied_hi = _select_time_window(
+            store, bounds[0], bounds[1]
+        )
+
     idx = load_entity_index(root)
     key = lookup_key(q, idx) or entity_key(q)
     node = idx.get(key) if key else None
@@ -116,55 +245,81 @@ def recall_memory(
         rec = store.get(str(row["id"]))
         if rec is None or rec.block_id in seen:
             continue
-        if str(rec.parsed.get("status") or "").strip() == "rejected":
+        if _is_rejected(rec):
             continue
         if member_ids and rec.block_id in member_ids:
             continue
         fts_only.append(rec)
         seen.add(rec.block_id)
+    semantic: list[BlockRecord] = []
     if node and member_ids:
         recs = [store.get(mid) for mid in node["mem_ids"]]
-        recs = [
-            r
-            for r in recs
-            if r is not None
-            and str(r.parsed.get("status") or "").strip() != "rejected"
-        ]
+        recs = [r for r in recs if r is not None and not _is_rejected(r)]
         recs.sort(key=lambda r: r.day or "", reverse=True)
-        pinned = fts_only + recs
-        lines = [f"## Memory / recall  channel=entity_key  key={key}"]
-        for rec in pinned[:cap]:
-            lines.append(
-                f"- {rec.block_id}  {rec.day} {_week(rec)}  {rec.item_type}  {one_line(rec.body, 80)}"
-            )
-        return "\n".join(lines)
-    if fts:
-        lines = [f"## Memory / recall  channel=fts5  q={q}"]
+        semantic = fts_only + recs
+        if not bounds:
+            lines = [f"## Memory / recall  channel=entity_key  key={key}"]
+            for rec in semantic[:cap]:
+                lines.append(
+                    f"- {rec.block_id}  {rec.day} {_week(rec)}  {rec.item_type}  {one_line(rec.body, 80)}"
+                )
+            return "\n".join(lines)
+    elif fts:
         for row in fts:
             rec = store.get(str(row["id"]))
-            if rec is not None and str(rec.parsed.get("status") or "").strip() == "rejected":
+            if rec is None or _is_rejected(rec):
                 continue
-            snippet = one_line(rec.body, 100) if rec else ""
-            lines.append(
-                f"- rank={row['rank']}  bm25={row['bm25']:.2f}  {row['id']}  {row['day']} {iso_week(str(row['day']))}"
-            )
-            if rec:
-                lines.append(f"  entity: {rec.entity}")
-                lines.append(f"  one-line: {snippet}")
-        return "\n".join(lines)
+            if rec.block_id in {r.block_id for r in semantic}:
+                continue
+            semantic.append(rec)
+        if not bounds:
+            lines = [f"## Memory / recall  channel=fts5  q={q}"]
+            for row in fts:
+                rec = store.get(str(row["id"]))
+                if rec is not None and _is_rejected(rec):
+                    continue
+                snippet = one_line(rec.body, 100) if rec else ""
+                lines.append(
+                    f"- rank={row['rank']}  bm25={row['bm25']:.2f}  {row['id']}  {row['day']} {iso_week(str(row['day']))}"
+                )
+                if rec:
+                    lines.append(f"  entity: {rec.entity}")
+                    lines.append(f"  one-line: {snippet}")
+            return "\n".join(lines)
 
-    if embed_enabled(root):
-        live = [
-            rec
-            for rec in store.records
-            if str(rec.parsed.get("status") or "").strip() != "rejected"
-        ]
+    if not semantic and embed_enabled(root):
+        live = [rec for rec in store.records if not _is_rejected(rec)]
         reranked = rerank_embed(q, live, k=cap)
         if reranked:
-            return str(reranked)
+            if not bounds:
+                return str(reranked)
+            seen_sem = {r.block_id for r in semantic}
+            for mid in _MEM_ID_RE.findall(str(reranked)):
+                rec = store.get(mid)
+                if rec is not None and rec.block_id not in seen_sem:
+                    semantic.append(rec)
+                    seen_sem.add(rec.block_id)
+
+    if bounds and applied_lo is not None and applied_hi is not None:
+        ranked = _rank_or_union(semantic, timed)
+        if ranked:
+            return _format_time_or(
+                q,
+                ranked,
+                lo=applied_lo,
+                hi=applied_hi,
+                widen_days=widen_days,
+                cap=cap,
+            )
 
     if budget.get("L1"):
-        l1 = search_l1(q, valid_from=valid_from, k=min(5, int(budget["L1"])))
+        l1 = search_l1(
+            q,
+            valid_from=valid_from,
+            k=min(5, int(budget["L1"])),
+            time_from=applied_lo.isoformat() if applied_lo is not None else None,
+            time_to=applied_hi.isoformat() if applied_hi is not None else None,
+        )
         if l1:
             lines = [f"## Memory / recall  channel=l1  q={q}"]
             for hit in l1:
@@ -406,15 +561,35 @@ def render_bands(
                 except Exception:
                     payload = {}
                 threads = payload.get("cross-day-thread") or []
+                summary_rows = payload.get("summary") or []
+                if (
+                    summary_rows
+                    and isinstance(summary_rows, list)
+                    and isinstance(summary_rows[0], dict)
+                ):
+                    headline = str(summary_rows[0].get("text") or "").strip() or headline
                 if threads and isinstance(threads, list) and isinstance(threads[0], dict):
-                    headline = str(threads[0].get("label") or "").strip() or headline
+                    if headline in {"(no wrap-up)", "(no brief)", ""}:
+                        headline = str(threads[0].get("label") or "").strip() or headline
                 if headline in {"(no wrap-up)", "(no brief)", ""}:
                     for row in payload.get("intra-day-thread") or []:
                         if isinstance(row, dict) and str(row.get("text") or "").strip():
                             headline = " ".join(str(row.get("text")).split())[:72]
                             break
+                ids: set[str] = set()
                 legend = payload.get("legend") or {}
-                n_evt = len(legend) if isinstance(legend, dict) else 0
+                if isinstance(legend, dict):
+                    ids.update(str(v).strip() for v in legend.values() if str(v).strip())
+                if isinstance(threads, list):
+                    for thread in threads:
+                        if not isinstance(thread, dict):
+                            continue
+                        for step in thread.get("steps") or []:
+                            if isinstance(step, dict):
+                                mid = str(step.get("event_id") or "").strip()
+                                if mid:
+                                    ids.add(mid)
+                n_evt = len(ids)
                 ents = payload.get("entities") or []
                 names = []
                 if isinstance(ents, list):
@@ -440,15 +615,30 @@ TOOL_SCHEMAS = [
     {
         "name": "recall_memory",
         "description": (
-            "Find memory cards by id, entity, or lexical match. The host always "
-            "runs expand_memory on the first seed id after recall (depth 2). "
-            "Do not call search_memory."
+            "Find memory cards by id, entity, or lexical match. When the user "
+            "mentions a time, also pass time_from and time_to as ISO dates. "
+            "The host always runs expand_memory on the first seed id after "
+            "recall (depth 2). Do not call search_memory."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
                 "k": {"type": "integer", "default": 8},
+                "time_from": {
+                    "type": "string",
+                    "description": (
+                        "Optional ISO date or datetime. Set together with time_to "
+                        "only when the user mentioned a time."
+                    ),
+                },
+                "time_to": {
+                    "type": "string",
+                    "description": (
+                        "Optional ISO date or datetime. Set together with time_from "
+                        "only when the user mentioned a time."
+                    ),
+                },
             },
             "required": ["query"],
         },
@@ -514,6 +704,8 @@ def _recall_then_expand(
     k: int = 8,
     staging: Path | None = None,
     min_weight: float = 0.5,
+    time_from: str | None = None,
+    time_to: str | None = None,
 ) -> str:
     """Recall first, then expand listed seeds so hops do not depend on rank-1 or a second LLM tool.
 
@@ -522,7 +714,15 @@ def _recall_then_expand(
     """
     chunks = []
     for q in _script_queries(query):
-        chunks.append(recall_memory(q, k=k, staging=staging))
+        chunks.append(
+            recall_memory(
+                q,
+                k=k,
+                staging=staging,
+                time_from=time_from,
+                time_to=time_to,
+            )
+        )
     found = "\n\n".join(chunks)
     q0 = str(query or "").strip()
     asked = _MEM_ID_RE.findall(q0)
@@ -559,10 +759,14 @@ def handle_tool(
     """
     args = args or {}
     if name == "recall_memory":
+        raw_from = args.get("time_from")
+        raw_to = args.get("time_to")
         return _recall_then_expand(
             str(args.get("query") or ""),
             k=int(args.get("k") or 8),
             staging=staging,
+            time_from=str(raw_from) if raw_from else None,
+            time_to=str(raw_to) if raw_to else None,
         )
     if name == "expand_memory":
         q = str(args.get("id_or_key") or args.get("id") or args.get("query") or "")
