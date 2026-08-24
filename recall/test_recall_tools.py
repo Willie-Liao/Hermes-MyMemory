@@ -399,3 +399,64 @@ def test_recall_channel_embed_when_fts_misses(staging, monkeypatch):
     text = recall_memory("qzxnmprefersdeckstructure", staging=staging)
     assert "channel=embed" in text
     assert "mem-20260616-1607-cognitive-directionality" in text
+
+
+CASEY_ID = "mem-20260616-1607-cognitive-directionality"
+
+
+def _vec_for_cosine(x: float) -> list[float]:
+    """Build a unit vector whose cosine with [1,0] equals x so stubs do not load GTE."""
+    y = (max(0.0, 1.0 - x * x)) ** 0.5
+    return [x, y]
+
+
+def test_embed_flat_pile_keeps_rank1_only(staging, monkeypatch):
+    """Int8 piles of 0.83 vs 0.82 must not dump sibling cards into the LLM context."""
+    def _stub_encode(texts):
+        out = []
+        for i, text in enumerate(texts):
+            if i == 0:
+                out.append([1.0, 0.0])
+                continue
+            if "Casey prefers visual outlines" in text:
+                x = 0.83
+            else:
+                x = 0.82
+            out.append(_vec_for_cosine(x))
+        return out
+
+    monkeypatch.setattr("recall.embed._encode_texts", _stub_encode)
+    live = BlockIndex(staging).records
+    text = rerank_embed("qzxnmprefersdeckstructure", live, k=8)
+    assert isinstance(text, str)
+    assert "channel=embed" in text
+    assert CASEY_ID in text
+    assert text.count("rank=") == 1
+    assert HOP1 not in text
+    assert HOP2 not in text
+
+
+def test_embed_real_peak_keeps_two(staging, monkeypatch):
+    """A real 0.90 vs 0.70 peak must still keep two cards, not collapse to rank 1."""
+    def _stub_encode(texts):
+        out = []
+        for i, text in enumerate(texts):
+            if i == 0:
+                out.append([1.0, 0.0])
+                continue
+            if "Casey prefers visual outlines" in text:
+                x = 0.90
+            elif "merge slots drifted" in text:
+                x = 0.70
+            else:
+                x = 0.20
+            out.append(_vec_for_cosine(x))
+        return out
+
+    monkeypatch.setattr("recall.embed._encode_texts", _stub_encode)
+    live = BlockIndex(staging).records
+    text = rerank_embed("qzxnmprefersdeckstructure", live, k=8)
+    assert isinstance(text, str)
+    assert CASEY_ID in text
+    assert HOP1 in text
+    assert text.count("rank=") == 2
