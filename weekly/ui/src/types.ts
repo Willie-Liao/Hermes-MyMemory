@@ -82,7 +82,7 @@ export interface WeeklyProposal {
   block_ids?: string[];
   label?: string;
   source?: string;
-  /** Staging block type — Approval Hub keeps ``event`` only. */
+  /** Staging block type. */
   type?: MemoryType | string;
   tier?: 'proposed' | 'not_proposed' | 'hypothesis' | 'procedure' | string;
   proposed_text?: string;

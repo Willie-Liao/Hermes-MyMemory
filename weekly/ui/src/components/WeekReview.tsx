@@ -831,44 +831,11 @@ export default function WeekReview({
         if (data.empty_digests) {
           setEmptyDigests(true);
         }
-        const proposalKeys = new Set<string>();
-        const proposals: WeeklyProposal[] = filterApprovalHubProposals(
-          (data.candidates ?? data.decisions ?? [])
-            .filter((proposal: WeeklyProposal) =>
-              proposal.tier !== 'not_proposed'
-              && Boolean(proposal.block_id || proposal.block_ids?.[0])
-              && Boolean(proposalKey(proposal)))
-            .filter((proposal: WeeklyProposal) => {
-              const key = proposalKey(proposal);
-              if (proposalKeys.has(key)) return false;
-              proposalKeys.add(key);
-              return true;
-            }),
-        );
-        const initialBullets: Record<string, string> = {};
-
-        proposals.forEach((proposal) => {
-          const key = proposalKey(proposal);
-          initialBullets[key] = proposal.proposed_text || proposal.label || proposal.block_id || key;
-        });
-
-        setWeeklyProposals(proposals);
-        setStagedActions({});
-        setSavedByRecordId({});
-        setRecallAvailable(false);
-        setCandidateBullets(initialBullets);
-        setPendingEdits({});
-        setEditBaselines({});
-        setApprovalTightenComposerId(null);
-        setApprovalTightenGuidance('');
-        setApprovalTightenDraftId(null);
-        setApprovalTightenDraft(null);
         setReviewPendingOps([]);
         setSavedReviewOps([]);
         fetchHotHealth();
         void refreshFourPartSurfaces(week.week);
         void checkStaleness(week.week);
-        void fetchApprovalRecall(week.week);
         void fetchReviewRecall(week.week);
       })
       .catch((err) => {
@@ -1102,15 +1069,11 @@ export default function WeekReview({
 
   useEffect(() => {
     editingPauseRef.current = Boolean(
-      editingBulletId
-      || approvalTightenComposerId
-      || editingBlockId
+      editingBlockId
       || stagingTightenComposerId
       || hotComposeActive,
     );
   }, [
-    editingBulletId,
-    approvalTightenComposerId,
     editingBlockId,
     stagingTightenComposerId,
     hotComposeActive,
@@ -1156,12 +1119,6 @@ export default function WeekReview({
             fileContent: soft.fileContent,
             decisions: soft.decisions ?? [],
           });
-          setWeeklyProposals([]);
-          setStagedActions({});
-          setSavedByRecordId({});
-          setCandidateBullets({});
-          setPendingEdits({});
-          setEditBaselines({});
           void fetchWeeks({ silent: true });
           if (hotChanged) {
             await fetch('/api/hot/health/refresh', {
@@ -1199,12 +1156,6 @@ export default function WeekReview({
               fileContent: soft.fileContent,
               decisions: soft.decisions ?? [],
             });
-            setWeeklyProposals([]);
-            setStagedActions({});
-            setSavedByRecordId({});
-            setCandidateBullets({});
-            setPendingEdits({});
-            setEditBaselines({});
             void fetchWeeks({ silent: true });
           } else if (!updRes.ok) {
             throw new Error(data.error || 'Failed to re-scan the chosen week.');
@@ -1318,129 +1269,31 @@ export default function WeekReview({
     }
   };
 
-  const fetchApprovalRecall = async (weekKey: string) => {
-    try {
-      const res = await fetch(`/api/weekly/weeks/${weekKey}/approval/recall`);
-      if (!res.ok) {
-        setRecallAvailable(false);
-        return;
-      }
-      const data = await res.json();
-      const batches = Array.isArray(data?.batches) ? data.batches : [];
-      setRecallAvailable(batches.length > 0);
-      const saved: Record<string, ApprovalAction> = {};
-      for (const batch of batches) {
-        for (const op of batch.operations ?? []) {
-          if (op?.recordId && (op.action === 'memory' || op.action === 'user' || op.action === 'delete')) {
-            saved[op.recordId] = op.action;
-          }
-        }
-      }
-      setSavedByRecordId(saved);
-    } catch {
-      setRecallAvailable(false);
-    }
-  };
-
   const refreshStatusOnly = () => {
     (onStatusRefresh ?? onRefresh)();
   };
 
-  const handleApprovalSave = async () => {
+  /** Persist overdue/review pends after Memory Approval hub retired. */
+  const handleReviewSave = async () => {
     if (!selectedWeek) return;
-    const stagedPromote = Object.values(stagedActions)
-      .filter((item) => item.action !== 'edit')
-      .map((item) => ({
-        ...item,
-        bulletText: candidateBullets[item.recordId] ?? item.bulletText,
-      }));
-    const stagedEdits = Object.entries(pendingEdits).map(([recordId, pend]) => ({
-      blockId: pend.blockId,
-      recordId,
-      action: 'edit' as const,
-      bulletText: pend.afterText,
-      beforeBody: pend.beforeText,
-    }));
-    const staged = [...stagedPromote, ...stagedEdits];
     const reviewOps = [...reviewPendingOps];
-    if (!staged.length && !reviewOps.length) {
+    if (!reviewOps.length) {
       setMessage({
         type: 'error',
-        text: 'Pend a Weekly Review action, or stage Add to memory / user / Delete before Save.',
+        text: 'Pend a Weekly Review action before Save.',
       });
       return;
     }
     const scrollSnap = captureViewScroll();
     setLoading(true);
     setMessage(null);
-
     try {
-      let approvalCount = 0;
-      if (staged.length) {
-        // Always open/refresh the 15m instant window before Approval Save.
-        const gateRes = await fetch('/api/weekly/gate/start', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ type: 'instant' }),
-        });
-        if (!gateRes.ok) throw new Error('Gate pre-authorization failed.');
-
-        const res = await fetch(`/api/weekly/weeks/${selectedWeek.week}/approval/save`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ staged }),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          throw new Error(data.error || 'Failed to save approval batch.');
-        }
-
-        const ops = data.batch?.operations ?? staged;
-        approvalCount = ops.length;
-        setSavedByRecordId((prev) => {
-          const next = { ...prev };
-          for (const op of ops) {
-            if (op?.recordId && op?.action) next[op.recordId] = op.action;
-          }
-          return next;
-        });
-        setCandidateBullets((prev) => {
-          const next = { ...prev };
-          for (const edit of stagedEdits) {
-            next[edit.recordId] = edit.bulletText;
-          }
-          return next;
-        });
-        setStagedActions({});
-        setPendingEdits({});
-        setEditBaselines({});
-        const batches = data.store?.batches;
-        setRecallAvailable(Array.isArray(batches) ? batches.length > 0 : true);
-      }
-
-      let reviewCount = 0;
-      if (reviewOps.length) {
-        const saved = await runWeeklyReviewSave(selectedWeek.week, reviewOps);
-        reviewCount = saved.count;
-        await refreshFourPartSurfaces(selectedWeek.week);
-      }
-
-      const parts: string[] = [];
-      if (approvalCount) {
-        parts.push(
-          `${approvalCount} approval action${approvalCount === 1 ? '' : 's'}`,
-        );
-      }
-      if (reviewCount) {
-        parts.push(
-          `${reviewCount} review action${reviewCount === 1 ? '' : 's'}`,
-        );
-      }
+      const saved = await runWeeklyReviewSave(selectedWeek.week, reviewOps);
+      await refreshFourPartSurfaces(selectedWeek.week);
       setMessage({
         type: 'success',
-        text: `Saved ${parts.join(' + ')}. Week stays open.`,
+        text: `Saved ${saved.count} review action${saved.count === 1 ? '' : 's'}. Week stays open.`,
       });
-      fetchCandidates();
       fetchHotHealth();
       refreshStatusOnly();
       restoreViewScroll(scrollSnap);
@@ -1451,12 +1304,12 @@ export default function WeekReview({
     }
   };
 
-  const handleApprovalRecall = async () => {
+  const handleReviewRecall = async () => {
     if (!selectedWeek) return;
-    if (!recallAvailable && !reviewRecallAvailable) {
+    if (!reviewRecallAvailable) {
       setMessage({
         type: 'error',
-        text: 'Nothing to recall yet — Save a staged batch first.',
+        text: 'Nothing to recall yet — Save a review batch first.',
       });
       return;
     }
@@ -1464,54 +1317,12 @@ export default function WeekReview({
     setLoading(true);
     setMessage(null);
     try {
-      const parts: string[] = [];
-      if (recallAvailable) {
-        const res = await fetch(`/api/weekly/weeks/${selectedWeek.week}/approval/recall`, {
-          method: 'POST',
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          const errText = data.error || 'Recall failed.';
-          setMessage({ type: 'error', text: errText });
-          if (errText === RECALL_LIMIT_MESSAGE) {
-            setRecallAvailable(false);
-          }
-          return;
-        }
-        const recalled = data.batch?.operations ?? [];
-        if (recalled.length) {
-          setCandidateBullets((prev) => {
-            const next = { ...prev };
-            for (const op of recalled) {
-              if (op?.action === 'edit' && op.recordId && typeof op.beforeBody === 'string') {
-                next[op.recordId] = op.beforeBody;
-              }
-            }
-            return next;
-          });
-          setSavedByRecordId((prev) => {
-            const next = { ...prev };
-            for (const op of recalled) {
-              if (op?.recordId) delete next[op.recordId];
-            }
-            return next;
-          });
-        }
-        await fetchApprovalRecall(selectedWeek.week);
-        parts.push('approval');
-      }
-
-      if (reviewRecallAvailable) {
-        const { count } = await runWeeklyReviewRecall(selectedWeek.week);
-        parts.push(`review (${count})`);
-        await refreshFourPartSurfaces(selectedWeek.week);
-      }
-
+      const { count } = await runWeeklyReviewRecall(selectedWeek.week);
+      await refreshFourPartSurfaces(selectedWeek.week);
       setMessage({
         type: 'success',
-        text: `Recalled last save batch (${parts.join(' + ')}).`,
+        text: `Recalled last review save (${count} action(s)).`,
       });
-      fetchCandidates();
       fetchHotHealth();
       refreshStatusOnly();
       restoreViewScroll(scrollSnap);
@@ -1522,250 +1333,7 @@ export default function WeekReview({
     }
   };
 
-  const handleApprovalRecallCard = async (recordId: string) => {
-    if (!selectedWeek) return;
-    const scrollSnap = captureViewScroll();
-    setLoading(true);
-    setMessage(null);
-    try {
-      const res = await fetch(`/api/weekly/weeks/${selectedWeek.week}/approval/recall-card`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ recordId }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        const errText = data.error || 'Card recall failed.';
-        setMessage({ type: 'error', text: errText });
-        if (errText === RECALL_LIMIT_MESSAGE) {
-          setRecallAvailable(false);
-        }
-        return;
-      }
-      setSavedByRecordId((prev) => {
-        const next = { ...prev };
-        delete next[recordId];
-        return next;
-      });
-      if (data.operation?.action === 'edit' && typeof data.operation.beforeBody === 'string') {
-        setCandidateBullets((prev) => ({
-          ...prev,
-          [recordId]: data.operation.beforeBody,
-        }));
-      }
-      setMessage({ type: 'success', text: `Recalled card ${recordId}.` });
-      await fetchApprovalRecall(selectedWeek.week);
-      fetchCandidates();
-      fetchHotHealth();
-      refreshStatusOnly();
-      restoreViewScroll(scrollSnap);
-    } catch (err: any) {
-      setMessage({ type: 'error', text: err.message });
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const stageAction = (
-    recordId: string,
-    action: ApprovalAction,
-    blockId: string,
-    linkedBlock?: MemoryBlock,
-  ) => {
-    if (!blockId) return;
-    const bulletText = candidateBullets[recordId] || recordId;
-    setStagedActions((prev) => ({
-      ...prev,
-      [recordId]: {
-        blockId,
-        recordId,
-        action,
-        bulletText,
-        validFrom: linkedBlock?.valid_from?.trim() || 'open',
-        validTo: linkedBlock?.valid_to?.trim() || 'open',
-      },
-    }));
-  };
-
-  const unstageAction = (recordId: string) => {
-    setStagedActions((prev) => {
-      if (!prev[recordId]) return prev;
-      const next = { ...prev };
-      delete next[recordId];
-      return next;
-    });
-  };
-
-  const startApprovalBulletEdit = (recordId: string) => {
-    const current = candidateBullets[recordId] ?? '';
-    const pend = pendingEdits[recordId];
-    const baseline = pend?.beforeText ?? current;
-    // If already pended, reopen with the pended after-text in the box.
-    if (pend) {
-      setCandidateBullets((prev) => ({ ...prev, [recordId]: pend.afterText }));
-    }
-    setEditBaselines((prev) => ({ ...prev, [recordId]: baseline }));
-    setEditingBulletId(recordId);
-  };
-
-  const pendApprovalBulletEdit = (recordId: string, blockId: string) => {
-    const after = (candidateBullets[recordId] ?? '').trim();
-    if (!after) {
-      setMessage({ type: 'error', text: 'Bullet is empty — nothing to pend.' });
-      return;
-    }
-    if (!blockId) {
-      setMessage({ type: 'error', text: 'No linked daily block to edit.' });
-      return;
-    }
-    const before = (
-      pendingEdits[recordId]?.beforeText
-      ?? editBaselines[recordId]
-      ?? after
-    );
-    setEditingBulletId(null);
-    if (approvalTightenComposerId === recordId) {
-      cancelApprovalTightenComposer();
-    }
-    if (after === before.trim()) {
-      setPendingEdits((prev) => {
-        const next = { ...prev };
-        delete next[recordId];
-        return next;
-      });
-      setCandidateBullets((prev) => ({ ...prev, [recordId]: before }));
-      setMessage({ type: 'success', text: 'No text change — nothing pended.' });
-      return;
-    }
-    // Keep the pended text visible; `beforeText` is retained exclusively for
-    // Undo and persisted recall after the footer Save.
-    setPendingEdits((prev) => ({
-      ...prev,
-      [recordId]: { blockId, beforeText: before, afterText: after },
-    }));
-  };
-
-  const undoPendingApprovalEdit = (recordId: string) => {
-    const pend = pendingEdits[recordId];
-    if (!pend) return;
-    setCandidateBullets((prev) => ({ ...prev, [recordId]: pend.beforeText }));
-    setPendingEdits((prev) => {
-      const next = { ...prev };
-      delete next[recordId];
-      return next;
-    });
-    setEditingBulletId(null);
-  };
-
-  const openApprovalTightenComposer = (recordId: string) => {
-    setApprovalTightenComposerId(recordId);
-    setApprovalTightenGuidance('');
-    setApprovalTightenDraftId(null);
-    setApprovalTightenDraft(null);
-    setMessage(null);
-  };
-
-  const cancelApprovalTightenComposer = () => {
-    setApprovalTightenComposerId(null);
-    setApprovalTightenGuidance('');
-  };
-
-  const handleApprovalTighten = async (recordId: string, guidance: string) => {
-    const text = (candidateBullets[recordId] ?? '').trim();
-    if (!text) {
-      setMessage({ type: 'error', text: 'Bullet is empty — nothing to tighten.' });
-      return;
-    }
-    const resolvedGuidance = resolveTightenGuidance(guidance);
-    setApprovalTightening(true);
-    setMessage({
-      type: 'info',
-      text: 'Waiting for LLM worker to polish.',
-    });
-    setApprovalTightenDraftId(recordId);
-    setApprovalTightenDraft(null);
-    try {
-      const res = await fetch('/api/approval/tighten', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, guidance: resolvedGuidance, entryType: 'event' }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        throw new Error(data.error || 'Tighten failed');
-      }
-      const next = String(data.tightened ?? '').replace(/§/g, '');
-      if (!next.trim()) throw new Error('Tighten returned an empty bullet.');
-      setApprovalTightenDraft(next);
-      setApprovalTightenComposerId(null);
-      setApprovalTightenGuidance('');
-      setMessage({ type: 'success', text: 'Tighten draft ready — Accept or Discard.' });
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Tighten failed';
-      setMessage({ type: 'error', text: msg });
-      setApprovalTightenDraftId(null);
-    } finally {
-      setApprovalTightening(false);
-    }
-  };
-
-  const acceptApprovalTighten = (recordId: string) => {
-    if (approvalTightenDraftId !== recordId || approvalTightenDraft === null) return;
-    const text = approvalTightenDraft;
-    setCandidateBullets((prev) => ({ ...prev, [recordId]: text }));
-    setStagedActions((prev) => {
-      const current = prev[recordId];
-      if (!current) return prev;
-      return { ...prev, [recordId]: { ...current, bulletText: text } };
-    });
-    setApprovalTightenDraftId(null);
-    setApprovalTightenDraft(null);
-    setEditingBulletId(recordId);
-  };
-
-  const discardApprovalTighten = () => {
-    setApprovalTightenDraftId(null);
-    setApprovalTightenDraft(null);
-  };
-
-  const updateStagedValidity = (
-    recordId: string,
-    field: 'validFrom' | 'validTo',
-    value: string,
-  ) => {
-    setStagedActions((prev) => {
-      const current = prev[recordId];
-      if (!current) return prev;
-      return { ...prev, [recordId]: { ...current, [field]: value } };
-    });
-  };
-
-  const recallLabelFor = (action: ApprovalAction): string => {
-    if (action === 'memory') return 'Recall from memory';
-    if (action === 'user') return 'Recall from user';
-    if (action === 'edit') return 'Recall edit';
-    return 'Recall from delete';
-  };
-
-  // Helper counters (staged intents)
-  const totalToMemory = Object.values(stagedActions).filter((v) => v.action === 'memory').length;
-  const totalToUser = Object.values(stagedActions).filter((v) => v.action === 'user').length;
-  const totalToDelete = Object.values(stagedActions).filter((v) => v.action === 'delete').length;
-  const stagedCount = Object.keys(stagedActions).length;
-  const pendingEditCount = Object.keys(pendingEdits).length;
   const reviewPendingCount = reviewPendingOps.length;
-  const saveReadyCount = stagedCount + pendingEditCount + reviewPendingCount;
-  const savedCount = Object.keys(savedByRecordId).length;
-  const approvalReminderText =
-    saveReadyCount > 0
-      ? `${saveReadyCount} item${saveReadyCount === 1 ? '' : 's'} ready — click Save to apply${
-          reviewPendingCount
-            ? ` (${reviewPendingCount} from Weekly Review)`
-            : ''
-        }.`
-      : recallAvailable || reviewRecallAvailable
-        ? 'Last save applied. Recall undoes the batch (approval and/or weekly review).'
-        : 'Pend Weekly Review actions or stage card actions, then save.';
 
   return (
     <div className="space-y-6 fade-in">
@@ -1910,7 +1478,7 @@ export default function WeekReview({
                   : 'text-slate-400 hover:text-slate-200'
               }`}
             >
-              ⚡ Approval Hub ({weeklyProposals.length})
+              ⚡ Weekly Chronicle
             </button>
             <button
               onClick={() => changeViewMode('read')}
@@ -2036,12 +1604,7 @@ export default function WeekReview({
                         : 'Loading chronicle…'}
                     </p>
                   ) : weeklyJson ? (
-                    <FourPartWeeklyCard
-                      payload={weeklyJson}
-                      allBlocks={allBlocks}
-                      onJumpApprovalCite={jumpToApprovalCite}
-                      onJumpDailyBlock={jumpToDailyBlock}
-                    >
+                    <FourPartWeeklyCard payload={weeklyJson}>
                     <MemoryApprovalActionQueue
                       weekKey={selectedWeek.week}
                       bridgeSpans={spanBridgeRows}
@@ -2051,16 +1614,31 @@ export default function WeekReview({
                       onPendOp={handleReviewPendOp}
                       onClearPendingOp={handleClearReviewPendingOp}
                       onRecallSavedReview={() => void handleRecallSavedReview()}
-                      onJumpApprovalCite={jumpToApprovalCite}
-                      onJumpDailyBlock={jumpToDailyBlock}
                     />
+                    <div className="flex gap-2 pt-3">
+                      <button
+                        type="button"
+                        onClick={() => void handleReviewSave()}
+                        disabled={loading || !selectedWeek || reviewPendingCount === 0}
+                        className="flex-1 px-4 py-3 bg-indigo-600 hover:bg-indigo-500 text-slate-100 text-xs font-bold rounded-xl font-mono flex items-center justify-center gap-2 shadow-lg shadow-indigo-950/40 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        <CheckSquare className="w-4 h-4" />
+                        <span>Save</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleReviewRecall()}
+                        disabled={loading || !selectedWeek || !reviewRecallAvailable}
+                        className="flex-1 px-4 py-3 bg-slate-800 hover:bg-slate-700 text-slate-100 text-xs font-bold rounded-xl font-mono flex items-center justify-center gap-2 border border-slate-700 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        <RefreshCw className="w-4 h-4" />
+                        <span>Recall</span>
+                      </button>
+                    </div>
                     </FourPartWeeklyCard>
                   ) : chronicleSummary.trim() && isFourPartBrief(chronicleSummary) ? (
                     <FourPartWeeklyCard
                       payload={{ legend: {}, 'cross-day-thread': [], 'intra-day-thread': [] }}
-                      allBlocks={allBlocks}
-                      onJumpApprovalCite={jumpToApprovalCite}
-                      onJumpDailyBlock={jumpToDailyBlock}
                     />
                   ) : chronicleSummary.trim() ? (
                     <p className="text-xs md:text-sm text-slate-300 leading-relaxed font-sans font-medium whitespace-pre-wrap">
@@ -2072,19 +1650,8 @@ export default function WeekReview({
                           >
                             {seg.title}
                           </strong>
-                        ) : seg.kind === 'text' ? (
-                          <span key={i}>{seg.value}</span>
                         ) : (
-                          <button
-                            key={i}
-                            type="button"
-                            id={briefCiteAnchorId(seg.n)}
-                            onClick={() => jumpToApprovalCite(seg.n)}
-                            className="text-indigo-400 hover:text-indigo-300 font-mono text-[11px] px-0.5 rounded"
-                            title={`Open approval card [${seg.n}]`}
-                          >
-                            {seg.value}
-                          </button>
+                          <span key={i}>{seg.kind === 'text' ? seg.value : seg.value}</span>
                         ),
                       )}
                     </p>
@@ -2170,7 +1737,7 @@ export default function WeekReview({
                               <p className="text-xs font-mono text-slate-500 text-center py-6">
                                 No cognitive blocks recorded on this date.
                               </p>
-                              {/* Always show Save/Recall (same as Approval Hub footer). */}
+                              {/* Always show Save/Recall for staging day edits. */}
                               <div className="bg-gradient-to-r from-[#111625] to-slate-900 border border-amber-500/20 p-4 rounded-2xl shadow-xl">
                                 <div className="space-y-3 w-full">
                                   <div className="space-y-1 text-center sm:text-left">
@@ -2239,9 +1806,6 @@ export default function WeekReview({
                                     op.kind === 'edit' &&
                                     (op.after.id === block.id || op.before.id === block.id),
                                 );
-                                const citeRaw = weeklyProposals.find((p) => p.block_id === block.id)?.cite_n;
-                                const citeN = citeRaw != null && citeRaw !== '' ? Number(citeRaw) : undefined;
-                                const hasCite = citeN != null && !Number.isNaN(citeN);
 
                                 return (
                                   <div 
@@ -2289,30 +1853,6 @@ export default function WeekReview({
                                           }`}>
                                             {block.status}
                                           </span>
-                                          {dailyNavReturn?.blockId === block.id ? (
-                                            <button
-                                              type="button"
-                                              onClick={() => jumpBackFromDailyQuote()}
-                                              title={
-                                                dailyNavReturn.mode === 'approval'
-                                                  ? `Back to Approval cite [${dailyNavReturn.n}]`
-                                                  : `Back to Brief cite [${dailyNavReturn.n}]`
-                                              }
-                                              className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-indigo-500/15 text-indigo-200 border border-indigo-500/40 hover:bg-indigo-500/25 cursor-pointer"
-                                            >
-                                              <Quote className="w-3 h-3" />
-                                              [{dailyNavReturn.n}]
-                                            </button>
-                                          ) : hasCite ? (
-                                            <button
-                                              type="button"
-                                              onClick={() => jumpToBriefCite(citeN)}
-                                              title="To brief"
-                                              className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-slate-800 text-indigo-300 border border-indigo-500/30 hover:border-indigo-400 hover:text-indigo-200 transition-colors cursor-pointer"
-                                            >
-                                              [{citeN}]
-                                            </button>
-                                          ) : null}
                                         </div>
 
                                         {isEditingThis && editingBlockData ? (
@@ -2610,7 +2150,7 @@ export default function WeekReview({
               <HotMemoryEditor onComposeActiveChange={setHotComposeActive} />
             </div>
           ) : (
-            /* 2. FAST APPROVAL HUB (Essence of a premium approval platform) */
+            /* 2. WEEKLY CHRONICLE TAB (hot editor + retention; no Memory Approval hub) */
             <div className="space-y-6">
               
               {selectedWeek?.status === 'reviewed' || selectedWeek?.status === 'completed' || selectedWeek?.tidyState === 'tidy: done' ? (

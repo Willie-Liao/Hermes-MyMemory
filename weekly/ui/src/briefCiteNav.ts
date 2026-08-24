@@ -1,13 +1,5 @@
 const CITE_RE = /\[(\d+)\]/g;
 
-export function briefCiteAnchorId(n: number | string): string {
-  return `brief-cite-${n}`;
-}
-
-export function approvalCiteAnchorId(n: number | string): string {
-  return `approval-cite-${n}`;
-}
-
 export function dailyBlockAnchorId(blockId: string): string {
   return `daily-block-${blockId}`;
 }

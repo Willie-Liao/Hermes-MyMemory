@@ -1,14 +1,10 @@
 import assert from 'node:assert/strict';
 import {
-  briefCiteAnchorId,
-  approvalCiteAnchorId,
   dailyBlockAnchorId,
   splitBriefCites,
   splitBriefDisplaySegments,
 } from './briefCiteNav.ts';
 
-assert.equal(briefCiteAnchorId(3), 'brief-cite-3');
-assert.equal(approvalCiteAnchorId(3), 'approval-cite-3');
 assert.equal(
   dailyBlockAnchorId('mem-2026-07-11-example'),
   'daily-block-mem-2026-07-11-example',

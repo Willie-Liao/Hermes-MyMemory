@@ -1,4 +1,4 @@
-/** Shared weekly JSON types so Chronicle and tests paint the same [N] as Approval Hub. */
+/** Shared weekly JSON types for Chronicle thread paint. */
 
 export type ThreadVia = 'evolves' | 'invalidates';
 
@@ -37,26 +37,6 @@ export type WeeklyJsonPayload = {
   'intra-day-thread'?: WeeklyIntraDayThread[];
   entities?: unknown[];
 };
-
-/** Look up week-global [N] from legend so a thread step cannot mint a local index. */
-export function citeNForEventId(
-  legend: Record<string, string> | undefined,
-  eventId: string,
-  denorm?: number | null,
-): number | null {
-  if (denorm != null && legend) {
-    const mapped = legend[String(denorm)];
-    if (mapped === eventId) return denorm;
-  }
-  if (!legend) return denorm ?? null;
-  for (const [n, mem] of Object.entries(legend)) {
-    if (mem === eventId) {
-      const parsed = Number(n);
-      return Number.isFinite(parsed) ? parsed : null;
-    }
-  }
-  return null;
-}
 
 /** Badge the superseded step (to_seq, else former seq) only when via is invalidates. */
 export function invalidatesBadgeSeq(step: WeeklyThreadStep): number | null {
