@@ -186,8 +186,18 @@ def test_render_stamps_session_source_with_message_range():
         today="2026-08-15",
         message_start_id=64989,
         message_end_id=65117,
+        user_message_at="2026-08-22T16:01:12+08:00",
+        assistant_response_at="2026-08-22T17:10:44+08:00",
+        generated_at="2026-08-22T17:16:08+08:00",
     )
     assert "session 20260811_170325_fdef935a#64989-65117" in yaml_text
+    assert "user_message_at:" in yaml_text
+    assert "2026-08-22T16:01:12+08:00" in yaml_text
+    assert "assistant_response_at:" in yaml_text
+    assert "2026-08-22T17:10:44+08:00" in yaml_text
+    assert "generated_at:" in yaml_text
+    assert "2026-08-22T17:16:08+08:00" in yaml_text
+    assert yaml_text.index("sources:") < yaml_text.index("user_message_at:")
     assert "transcript:2026-08-15" not in yaml_text
     assert "conversation" not in yaml_text
     assert "file:/tmp/a.html" in yaml_text
@@ -856,6 +866,17 @@ def test_validate_worker_tool_args_event_participants():
         ],
     }
     assert digest_tools.validate_worker_tool_args("event", good) == []
+    clocked = {
+        **good,
+        "user_message_at": "2026-08-22T16:01:12+08:00",
+        "assistant_response_at": "2026-08-22T17:10:44+08:00",
+        "generated_at": "2026-08-22T17:16:08+08:00",
+    }
+    assert digest_tools.validate_worker_tool_args("event", clocked) == []
+    schema = json.dumps(digest_tools.submit_schema("event"))
+    assert "user_message_at" not in schema
+    assert "assistant_response_at" not in schema
+    assert "generated_at" not in schema
 
 
 def test_render_worker_yaml_quotes_at_session_and_default_sources():

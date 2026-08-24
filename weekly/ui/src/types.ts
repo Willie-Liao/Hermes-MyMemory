@@ -28,6 +28,9 @@ export interface MemoryBlock {
   participants?: Participant[];
   promoted_at?: string;
   discarded_at?: string;
+  user_message_at?: string;
+  assistant_response_at?: string;
+  generated_at?: string;
   body: string;
   filePath: string; // which daily md file it belongs to
 }

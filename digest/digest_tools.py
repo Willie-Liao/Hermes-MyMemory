@@ -16,6 +16,7 @@ import logging
 import re
 import uuid
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 from typing import Any
 
 logger = logging.getLogger("plugins.memory-digest")
@@ -1931,8 +1932,14 @@ def render_worker_yaml_from_args(
     today: str,
     message_start_id: int | None = None,
     message_end_id: int | None = None,
+    user_message_at: str | None = None,
+    assistant_response_at: str | None = None,
+    generated_at: str | None = None,
 ) -> str:
-    """Code-owned YAML frontmatter + one-line body from accepted tool args."""
+    """Code-owned YAML frontmatter + one-line body from accepted tool args.
+
+    Wall clocks are plugin-stamped so the worker never invents send/reply times.
+    """
     wt = worker_type.strip().lower()
     bag = dict(args)
     if is_skip_tool("skip_digest_worker", bag) or bag.get("skip") is True:
@@ -1951,6 +1958,14 @@ def render_worker_yaml_from_args(
         message_end_id=message_end_id,
     )
     parsed["sources"] = [locator, *_extra_file_sources(bag.get("sources"))]
+    if user_message_at:
+        parsed["user_message_at"] = str(user_message_at).strip()
+    if assistant_response_at:
+        parsed["assistant_response_at"] = str(assistant_response_at).strip()
+    parsed["generated_at"] = str(
+        generated_at
+        or datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    ).strip()
 
     for key in (
         "entity",
@@ -1979,6 +1994,9 @@ def render_worker_yaml_from_args(
         "valid_from",
         "valid_to",
         "sources",
+        "user_message_at",
+        "assistant_response_at",
+        "generated_at",
         "related",
         "supersedes",
     ]

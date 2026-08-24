@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from recall.conftest import HOP1, HOP2, OVERLAP, SEED, write_fake_staging
+from recall.embed import DEFAULT_MODEL, rerank_embed
+from recall.ids import BlockIndex
 from recall.lexical import rebuild_lexical
 from recall.tools import expand_memory, handle_tool, recall_memory
 
@@ -144,3 +146,33 @@ def test_recall_omits_rejected_except_exact_id(tmp_path, monkeypatch):
     assert "valid_to: 2026-08-20" in ident
     assert "rejected_reason: rejected by mem-2026-08-20-fact-bbbbbbbbbbbb" in ident
     assert "Canteen zxqvrejectedcanteen is open." in ident
+
+
+def test_default_model_is_gte_multilingual_base():
+    assert DEFAULT_MODEL == "Alibaba-NLP/gte-multilingual-base"
+
+
+def test_rerank_embed_missing_onnx_failopen(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYMEMORY_GTE_ONNX", str(tmp_path / "no-such.onnx"))
+    write_fake_staging(tmp_path)
+    live = BlockIndex(tmp_path).records
+    assert rerank_embed("quantum pineapple recipe", live, k=8) == []
+
+
+def test_recall_channel_embed_when_fts_misses(staging, monkeypatch):
+    monkeypatch.setattr("recall.tools.embed_enabled", lambda *_a, **_k: True)
+
+    def _stub_encode(texts):
+        out = []
+        for i, text in enumerate(texts):
+            if i == 0:
+                out.append([1.0, 0.0])
+                continue
+            hit = "Casey prefers visual outlines" in text
+            out.append([1.0, 0.0] if hit else [0.0, 1.0])
+        return out
+
+    monkeypatch.setattr("recall.embed._encode_texts", _stub_encode)
+    text = recall_memory("qzxnmprefersdeckstructure", staging=staging)
+    assert "channel=embed" in text
+    assert "mem-20260616-1607-cognitive-directionality" in text

@@ -213,6 +213,11 @@ export function parseMDBlock(fileContent: string, filePath: string): MemoryBlock
         participants: meta.participants,
         promoted_at: meta.promoted_at,
         discarded_at: meta.discarded_at ? String(meta.discarded_at) : undefined,
+        user_message_at: meta.user_message_at ? String(meta.user_message_at) : undefined,
+        assistant_response_at: meta.assistant_response_at
+          ? String(meta.assistant_response_at)
+          : undefined,
+        generated_at: meta.generated_at ? String(meta.generated_at) : undefined,
         body: body,
         filePath: path.basename(filePath)
       });

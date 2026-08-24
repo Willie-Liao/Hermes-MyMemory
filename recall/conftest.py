@@ -196,3 +196,15 @@ def write_fake_staging(root: Path) -> Path:
 @pytest.fixture
 def staging(tmp_path: Path) -> Path:
     return write_fake_staging(tmp_path)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_gte_weights(monkeypatch, tmp_path_factory):
+    """Unit tests must not load ~/.cache GTE; Channel 4 is stubbed or fail-open."""
+    missing = tmp_path_factory.mktemp("no-gte") / "missing.onnx"
+    monkeypatch.setenv("MYMEMORY_GTE_ONNX", str(missing))
+    from recall.embed import _drop_session
+
+    _drop_session()
+    yield
+    _drop_session()

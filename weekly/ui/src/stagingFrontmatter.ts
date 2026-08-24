@@ -22,6 +22,9 @@ export const STAGING_FRONTMATTER_KEY_ORDER = [
   'promoted_at',
   'discarded_at',
   'sources',
+  'user_message_at',
+  'assistant_response_at',
+  'generated_at',
 ] as const;
 
 export function yamlQuoteIfNeeded(value: string): string {
@@ -87,6 +90,15 @@ export function formatStagingFrontmatter(block: MemoryBlock): string {
   if (block.discarded_at) lines.push(`discarded_at: ${block.discarded_at}`);
   if (block.sources && block.sources.length > 0) {
     lines.push(`sources: ${formatStagingFlowList(block.sources)}`);
+  }
+  if (block.user_message_at) {
+    lines.push(`user_message_at: ${yamlQuoteIfNeeded(block.user_message_at)}`);
+  }
+  if (block.assistant_response_at) {
+    lines.push(`assistant_response_at: ${yamlQuoteIfNeeded(block.assistant_response_at)}`);
+  }
+  if (block.generated_at) {
+    lines.push(`generated_at: ${yamlQuoteIfNeeded(block.generated_at)}`);
   }
 
   lines.push('---');

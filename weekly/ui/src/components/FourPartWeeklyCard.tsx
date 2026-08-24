@@ -1,38 +1,24 @@
 import React from 'react';
-import { briefCiteAnchorId } from '../briefCiteNav';
 import {
-  citeNForEventId,
   invalidatesBadgeSeq,
   type WeeklyJsonPayload,
 } from '../weeklyJson';
-import type { MemoryBlock } from '../types';
 
 export type FourPartWeeklyCardProps = {
   payload: WeeklyJsonPayload;
-  allBlocks: MemoryBlock[];
-  onJumpApprovalCite: (n: number) => void;
-  onJumpDailyBlock?: (
-    block: MemoryBlock,
-    returnTo?: { mode: 'approval' | 'brief'; n: number },
-  ) => void;
   children?: React.ReactNode;
 };
 
 /**
  * Chronicle lists cross-day-thread then wrap-ups from JSON so Distill/Brief cannot double-render.
+ * No legend [N] hops — Read by Date is a separate manual tab.
  */
 export default function FourPartWeeklyCard({
   payload,
-  onJumpApprovalCite,
   children,
 }: FourPartWeeklyCardProps) {
-  const legend = payload.legend || {};
   const threads = payload['cross-day-thread'] || [];
   const wrapups = (payload['intra-day-thread'] || []).filter((row) => !row.empty);
-
-  const handleCite = (n: number) => {
-    onJumpApprovalCite(n);
-  };
 
   return (
     <div className="space-y-5" data-testid="weekly-chronicle-json">
@@ -50,7 +36,6 @@ export default function FourPartWeeklyCard({
               </p>
               <ul className="space-y-1 pl-1">
                 {thread.steps.map((step) => {
-                  const n = citeNForEventId(legend, step.event_id, step.cite_n);
                   const badge = invalidatesBadgeSeq(step);
                   return (
                     <li
@@ -60,17 +45,6 @@ export default function FourPartWeeklyCard({
                       <span className="font-mono text-[11px] text-slate-500 mr-1">
                         {step.date}
                       </span>
-                      {n != null ? (
-                        <button
-                          type="button"
-                          id={briefCiteAnchorId(n)}
-                          onClick={() => handleCite(n)}
-                          className="text-indigo-400 hover:text-indigo-300 font-mono text-[11px] px-0.5 rounded"
-                          title={`Open approval card [${n}]`}
-                        >
-                          [{n}]
-                        </button>
-                      ) : null}{' '}
                       {step.text}
                       {badge != null ? (
                         <span

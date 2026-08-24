@@ -288,6 +288,9 @@ _FRONTMATTER_KEY_ORDER = (
     "discarded_at",
     "superseded_at",
     "sources",
+    "user_message_at",
+    "assistant_response_at",
+    "generated_at",
     "strength",
     "recall_n",
     "last_recall_at",
@@ -723,6 +726,7 @@ def _seconds_since(ts: datetime | None) -> float:
 
 
 def _fetch_messages(session_id: str, after_id: int = 0) -> list[dict[str, Any]]:
+    """Load active user/assistant rows including timestamp for source-window clocks."""
     db_path = _hermes_home() / "state.db"
     if not db_path.exists():
         return []
@@ -749,8 +753,83 @@ def _fetch_messages(session_id: str, after_id: int = 0) -> list[dict[str, Any]]:
         content = (row["content"] or "").strip()
         if role not in ("user", "assistant") or not content:
             continue
-        out.append({"id": row["id"], "role": role, "content": content[:2000]})
+        out.append(
+            {
+                "id": row["id"],
+                "role": role,
+                "content": content[:2000],
+                "timestamp": row["timestamp"],
+            }
+        )
     return out
+
+
+def _iso_from_message_ts(raw: Any) -> str | None:
+    """Turn SQLite messages.timestamp into offset ISO-8601 seconds."""
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, datetime):
+        dt = raw
+    elif isinstance(raw, (int, float)):
+        dt = datetime.fromtimestamp(float(raw), tz=timezone.utc)
+    else:
+        text = str(raw).strip().replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone().isoformat(timespec="seconds")
+
+
+def _iso_clocks_for_window(
+    session_id: str,
+    start_id: int | None,
+    end_id: int | None,
+) -> tuple[str | None, str | None]:
+    """First user / last assistant clocks in the cited message id range."""
+    if start_id is None or end_id is None:
+        return None, None
+    lo, hi = (start_id, end_id) if start_id <= end_id else (end_id, start_id)
+    user_at: str | None = None
+    assistant_at: str | None = None
+    for row in _fetch_messages(session_id, after_id=max(0, lo - 1)):
+        try:
+            mid = int(row["id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if mid < lo or mid > hi:
+            continue
+        stamp = _iso_from_message_ts(row.get("timestamp"))
+        if not stamp:
+            continue
+        if row.get("role") == "user" and user_at is None:
+            user_at = stamp
+        if row.get("role") == "assistant":
+            assistant_at = stamp
+    return user_at, assistant_at
+
+
+def _parse_frontmatter_clock(value: Any) -> datetime | None:
+    """Parse an optional wall-clock frontmatter value; None if blank."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, (int, float)):
+        dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
+    else:
+        text = str(value).strip().strip("'\"")
+        if not text:
+            return None
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _format_transcript(messages: list[dict[str, Any]]) -> str:
@@ -916,6 +995,17 @@ def _normalize_digest_content(
         )
         extras = digest_tools._extra_file_sources(parsed.get("sources"))
         parsed["sources"] = [locator, *extras]
+        user_at, assistant_at = _iso_clocks_for_window(
+            session_id, message_start_id, message_end_id
+        )
+        if user_at:
+            parsed["user_message_at"] = user_at
+        if assistant_at:
+            parsed["assistant_response_at"] = assistant_at
+        parsed.setdefault(
+            "generated_at",
+            datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+        )
 
         body = _truncate_body(body.strip())
         item_type = str(parsed.get("type", "")).strip()
@@ -1105,6 +1195,11 @@ def _validate_block(
     body: str,
     seen_ids: set[str],
 ) -> list[str]:
+    """Reject malformed cards so bad YAML cannot enter daily staging.
+
+    Optional wall clocks are format-checked here; missing clocks stay valid so
+    older cards and pre-stamp worker YAML do not fail.
+    """
     errors: list[str] = []
     try:
         parsed = yaml.safe_load(raw_frontmatter)
@@ -1161,6 +1256,28 @@ def _validate_block(
         if not _DATE_RE.match(stamp):
             errors.append(
                 f"line {line_no}: superseded_at must be YYYY-MM-DD, got {stamp!r}"
+            )
+
+    clock_values: dict[str, datetime] = {}
+    for key in ("user_message_at", "assistant_response_at", "generated_at"):
+        if key not in parsed:
+            continue
+        raw = parsed.get(key)
+        if raw in (None, ""):
+            continue
+        parsed_clock = _parse_frontmatter_clock(raw)
+        if parsed_clock is None:
+            errors.append(
+                f"line {line_no}: {key} must be ISO-8601, got {raw!r}"
+            )
+        else:
+            clock_values[key] = parsed_clock
+    user_clock = clock_values.get("user_message_at")
+    assistant_clock = clock_values.get("assistant_response_at")
+    if user_clock is not None and assistant_clock is not None:
+        if user_clock > assistant_clock:
+            errors.append(
+                f"line {line_no}: user_message_at must be <= assistant_response_at"
             )
 
     sources = parsed.get("sources")
@@ -3518,6 +3635,8 @@ def _run_validated_worker(
     reason: str = "digest",
     user_count: int = 0,
     assistant_count: int = 0,
+    message_start_id: int | None = None,
+    message_end_id: int | None = None,
 ) -> ValidatedWorkerResult | WorkerFailure:
     """Validate worker output via forced submit/patch tool calls + code render."""
     last_content = ""
@@ -3525,6 +3644,9 @@ def _run_validated_worker(
     previous_args: dict[str, Any] = {}
     active_type = worker_type
     use_rebuild = transcript is not None
+    user_at, assistant_at = _iso_clocks_for_window(
+        session_id, message_start_id, message_end_id
+    )
 
     for attempt in range(1, MAX_WORKER_VALIDATION_ATTEMPTS + 1):
         mode = "submit" if attempt == 1 or not previous_args else "patch"
@@ -3618,6 +3740,10 @@ def _run_validated_worker(
                         previous_args,
                         session_id=session_id,
                         today=hermes_local_today_str(),
+                        message_start_id=message_start_id,
+                        message_end_id=message_end_id,
+                        user_message_at=user_at,
+                        assistant_response_at=assistant_at,
                     )
                 except Exception as render_exc:
                     content = ""
@@ -3628,7 +3754,10 @@ def _run_validated_worker(
                     errors = [f"renderer defect: {render_exc}"]
                 else:
                     content = _normalize_digest_content(
-                        content, session_id=session_id
+                        content,
+                        session_id=session_id,
+                        message_start_id=message_start_id,
+                        message_end_id=message_end_id,
                     )
                     smoke = _smoke_rendered_worker_yaml(active_type, content)
                     if smoke:
@@ -3646,14 +3775,26 @@ def _run_validated_worker(
                         previous_args,
                         session_id=session_id,
                         today=hermes_local_today_str(),
+                        message_start_id=message_start_id,
+                        message_end_id=message_end_id,
+                        user_message_at=user_at,
+                        assistant_response_at=assistant_at,
                     )
                     content = _normalize_digest_content(
-                        content, session_id=session_id
+                        content,
+                        session_id=session_id,
+                        message_start_id=message_start_id,
+                        message_end_id=message_end_id,
                     )
                 except Exception:
                     content = content or ""
         elif content:
-            content = _normalize_digest_content(content, session_id=session_id)
+            content = _normalize_digest_content(
+                content,
+                session_id=session_id,
+                message_start_id=message_start_id,
+                message_end_id=message_end_id,
+            )
             errors = list(_validate_worker_output(content, active_type))
             for err in errors:
                 m = re.search(r"returned type (\S+)", err)
@@ -3717,12 +3858,19 @@ def _run_validated_worker(
                 previous_args,
                 session_id=session_id,
                 today=hermes_local_today_str(),
+                message_start_id=message_start_id,
+                message_end_id=message_end_id,
+                user_message_at=user_at,
+                assistant_response_at=assistant_at,
             )
         except Exception:
             dirty_content = ""
     if dirty_content.strip():
         dirty_content = _normalize_digest_content(
-            dirty_content, session_id=session_id
+            dirty_content,
+            session_id=session_id,
+            message_start_id=message_start_id,
+            message_end_id=message_end_id,
         )
         blocks = _worker_result_blocks(dirty_content)
         usable = bool(blocks) or _is_skip_only_content(dirty_content)
@@ -4007,6 +4155,9 @@ def _blocks_from_digest_args(
     occupied: set[str] = set()
     temp_map: dict[str, str] = {}
     rendered: list[dict[str, Any]] = []
+    user_at, assistant_at = _iso_clocks_for_window(
+        session_id, message_start_id, message_end_id
+    )
 
     for item in raw_blocks:
         if not isinstance(item, Mapping):
@@ -4026,6 +4177,8 @@ def _blocks_from_digest_args(
             today=today,
             message_start_id=message_start_id,
             message_end_id=message_end_id,
+            user_message_at=user_at,
+            assistant_response_at=assistant_at,
         )
         blocks = list(_worker_result_blocks(yaml_text))
         if not blocks:

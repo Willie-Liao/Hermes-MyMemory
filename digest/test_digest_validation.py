@@ -1567,3 +1567,28 @@ def test_append_rejects_event_related_to_existing_daily_event(tmp_path, monkeypa
     assert any(
         "related must not point at event mem-20260726-resume-v3" in e for e in errors
     )
+
+
+def test_message_clocks_optional_and_iso_when_present():
+    """Wall clocks are plugin-stamped; missing keys must not fail old cards."""
+    digest = _load_digest()
+    assert digest._validate_digest_content(_block()) == []
+    ok = _block(
+        extra=(
+            "user_message_at: '2026-08-22T16:01:12+08:00'\n"
+            "assistant_response_at: '2026-08-22T17:10:44+08:00'\n"
+            "generated_at: '2026-08-22T17:16:08+08:00'"
+        )
+    )
+    assert digest._validate_digest_content(ok) == []
+    garbage = _block(extra="user_message_at: not-a-timestamp")
+    garbage_errs = digest._validate_digest_content(garbage)
+    assert any("user_message_at" in e for e in garbage_errs)
+    inverted = _block(
+        extra=(
+            "user_message_at: '2026-08-22T17:10:44+08:00'\n"
+            "assistant_response_at: '2026-08-22T16:01:12+08:00'"
+        )
+    )
+    inverted_errs = digest._validate_digest_content(inverted)
+    assert any("user_message_at" in e and "assistant_response_at" in e for e in inverted_errs)
