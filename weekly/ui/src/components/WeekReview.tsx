@@ -680,7 +680,10 @@ export default function WeekReview({
   const handleReorganizeWeek = async () => {
     if (!activeDate || !selectedWeek) return;
     setReorganizeLoading(true);
-    setMessage(null);
+    setMessage({
+      type: 'info',
+      text: `Reorganise ${activeDate}: starting Phase-2…`,
+    });
     try {
       const result = await runReorganiseSequence(fetch, {
         date: activeDate,
@@ -931,17 +934,17 @@ export default function WeekReview({
               const staleRes = await fetch(`/api/weekly/weeks/${week.week}/staleness`);
               const staleData = await staleRes.json().catch(() => ({}));
               if (!staleRes.ok) {
-                return { week, kind: 'skip' as const };
+                return { week, kind: 'stale' as const };
               }
               if (staleData.empty_digests) {
                 return { week, kind: 'empty' as const };
               }
-              if (staleData.stale) {
+              if (!staleData.has_weekly_file || staleData.stale) {
                 return { week, kind: 'stale' as const };
               }
               return { week, kind: 'skip' as const };
             } catch {
-              return { week, kind: 'skip' as const };
+              return { week, kind: 'stale' as const };
             }
           }),
         );
@@ -1081,36 +1084,38 @@ export default function WeekReview({
 
   const handleRescanWeek = () => {
     if (!selectedWeek) return;
+    const week = selectedWeek.week;
     setRescanLoading(true);
-    setMessage(null);
+    setMessage({
+      type: 'info',
+      text: `Re-scan ${week}: checking daily cards…`,
+    });
 
     void (async () => {
       try {
-        // Step 1: parallel digest_stale + hot source_hash.
         const [staleRes, hotChangedRes] = await Promise.all([
-          fetch(`/api/weekly/weeks/${selectedWeek.week}/staleness`),
+          fetch(`/api/weekly/weeks/${week}/staleness`),
           fetch('/api/hot/health/changed'),
         ]);
         const staleData = await staleRes.json().catch(() => ({}));
         const hotData = await hotChangedRes.json().catch(() => ({}));
-        const digestsStale = Boolean(
-          staleRes.ok && staleData.stale && !staleData.empty_digests,
-        );
         const hotChanged = Boolean(hotChangedRes.ok && hotData.changed);
-        const emptyDigests = Boolean(staleRes.ok && staleData.empty_digests);
 
-        // Empty digests: POST update purges orphan draft (no Worker 1/2), then soft empty.
-        if (emptyDigests) {
-          await fetch('/api/weekly/update', {
+        const refreshHotKeepBanner = async () => {
+          if (!hotChanged) return;
+          await fetch('/api/hot/health/refresh', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ week: selectedWeek.week, reason: 'rescan' }),
+            body: JSON.stringify({ reason: 'ui_rescan' }),
           });
+          fetchHotHealth();
+        };
+
+        const applySoftEmpty = () => {
           setEmptyDigests(true);
           setChronicleSummary('');
           setSpanBridgeRows([]);
-          setMessage(null);
-          const soft = emptyWeekSoftLoadPayload(selectedWeek.week);
+          const soft = emptyWeekSoftLoadPayload(week);
           setSelectedWeek({
             week: soft.week,
             status: normalizeWeekStatus(soft.status),
@@ -1120,75 +1125,100 @@ export default function WeekReview({
             decisions: soft.decisions ?? [],
           });
           void fetchWeeks({ silent: true });
+        };
+
+        if (!staleRes.ok) {
+          const reason = typeof staleData.error === 'string' && staleData.error
+            ? staleData.error
+            : `HTTP ${staleRes.status}`;
+          throw new Error(`Could not check daily cards for ${week}. ${reason}`);
+        }
+
+        const emptyDigests = Boolean(staleData.empty_digests);
+        const hasWeeklyFile = Boolean(staleData.has_weekly_file);
+        const stale = Boolean(staleData.stale);
+
+        if (emptyDigests) {
+          setMessage({
+            type: 'info',
+            text: `Re-scan ${week}: no usable dailies — clearing empty week…`,
+          });
+          await fetch('/api/weekly/update', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ week, reason: 'rescan' }),
+          });
+          applySoftEmpty();
           if (hotChanged) {
-            await fetch('/api/hot/health/refresh', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ reason: 'ui_rescan' }),
+            setMessage({
+              type: 'info',
+              text: `Re-scan ${week}: refreshing hot memory…`,
             });
-            fetchHotHealth();
+            await refreshHotKeepBanner();
+            setMessage({
+              type: 'info',
+              text: `Re-scan ${week}: no usable dailies — clearing empty week…`,
+            });
           }
           return;
         }
 
-        // Step 2: generate first when stale; then health if hot changed.
-        if (digestsStale) {
-          const updRes = await fetch('/api/weekly/update', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ week: selectedWeek.week, reason: 'rescan' }),
-          });
-          const data = await updRes.json().catch(() => ({}));
-          if (
-            data.empty_digests
-            || isEmptyDigestGenerateOutcome(data.outcome)
-          ) {
-            setEmptyDigests(true);
-            setChronicleSummary('');
-            setSpanBridgeRows([]);
-            setMessage(null);
-            const soft = emptyWeekSoftLoadPayload(selectedWeek.week);
-            setSelectedWeek({
-              week: soft.week,
-              status: normalizeWeekStatus(soft.status),
-              tidyState: soft.tidyState,
-              filePath: soft.filePath,
-              fileContent: soft.fileContent,
-              decisions: soft.decisions ?? [],
-            });
-            void fetchWeeks({ silent: true });
-          } else if (!updRes.ok) {
-            throw new Error(data.error || 'Failed to re-scan the chosen week.');
-          } else {
-            setMessage({
-              type: 'success',
-              text: `Successfully re-scanned and regenerated summary for ${selectedWeek.week}!`,
-            });
-            handleSelectWeek(selectedWeek);
-            void fetchWeeks({ silent: true });
-            if (onRefresh) onRefresh();
-          }
-        } else if (!hotChanged) {
+        if (hasWeeklyFile && !stale) {
           setMessage({
             type: 'success',
-            text: `${selectedWeek.week} digests and hot memory are unchanged.`,
+            text: `nothing needs to be regenerated for ${week}`,
           });
+          await refreshHotKeepBanner();
+          return;
         }
 
-        if (hotChanged) {
-          await fetch('/api/hot/health/refresh', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ reason: 'ui_rescan' }),
-          });
-          fetchHotHealth();
-          if (!digestsStale) {
-            setMessage({
-              type: 'success',
-              text: 'Hot memory health refreshed (digests unchanged).',
-            });
-          }
+        setMessage({
+          type: 'info',
+          text: hasWeeklyFile
+            ? `Re-scan ${week}: regenerating weekly schema…`
+            : `Re-scan ${week}: generating weekly schema…`,
+        });
+        const updRes = await fetch('/api/weekly/update', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ week, reason: 'rescan' }),
+        });
+        const data = await updRes.json().catch(() => ({}));
+        if (updRes.status === 409 || data.outcome === 'already_closed') {
+          throw new Error(`${week} is reviewed. Reopen it first, then Re-scan.`);
         }
+        if (
+          data.empty_digests
+          || isEmptyDigestGenerateOutcome(data.outcome)
+        ) {
+          applySoftEmpty();
+          return;
+        }
+        if (!updRes.ok) {
+          const details = data.details !== undefined
+            ? ` ${JSON.stringify(data.details)}`
+            : '';
+          const reason = typeof data.error === 'string' && data.error
+            ? data.error
+            : typeof data.outcome === 'string' && data.outcome
+              ? data.outcome
+              : 'Failed to re-scan the chosen week.';
+          throw new Error(`Failed to re-scan ${week}. ${reason}${details}`.trim());
+        }
+        if (hotChanged) {
+          setMessage({
+            type: 'info',
+            text: `Re-scan ${week}: refreshing hot memory…`,
+          });
+          await refreshHotKeepBanner();
+        }
+        setMessage({
+          type: 'success',
+          text: `Regenerated weekly schema for ${week}`,
+        });
+        handleSelectWeek(selectedWeek);
+        void fetchWeeks({ silent: true });
+        if (onRefresh) onRefresh();
       } catch (err: any) {
         setMessage({ type: 'error', text: err.message || String(err) });
       } finally {

@@ -277,9 +277,20 @@ async function callBridge(
     return bridged;
   }
   if (child.status !== 0) {
+    const stderr = child.stderr.trim();
+    let error = stderr;
+    if (!error) {
+      error = child.status === 137
+        ? `${label} bridge exit 137 SIGKILL`
+        : child.status === -1
+          ? `${label} bridge timed out after ${BRIDGE_CHILD_TIMEOUT_MS}ms`
+          : `${label} bridge exited with status ${child.status}`;
+    } else if (child.status === 137 && !/137/.test(error)) {
+      error = `${error}; bridge exit 137 SIGKILL`;
+    }
     const bridged = {
       ok: false as const,
-      error: child.stderr.trim() || `${label} bridge exited with status ${child.status}`,
+      error,
     };
     if (logMutation) logWeeklyBridgeMutation(op, args, bridged);
     return bridged;

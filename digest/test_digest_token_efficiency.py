@@ -655,6 +655,14 @@ def test_proposer_tool_loop_submit_then_patch(tmp_path, monkeypatch):
     assert "mem-2026-08-11-fact-x" in prompts[-1]
     assert "Compare only these same-type pairs" not in prompts[-1]
 
+    monkeypatch.setattr(digest, "_PHASE2_MINILM", None)
+    monkeypatch.setattr(digest, "_PHASE2_EMBED_CACHE", {})
+    monkeypatch.setenv("HERMES_PHASE2_SKIP_MINILM", "1")
+    skip_ram = digest.make_llm_proposer("cli", session_id="s1", run_id="r-ram")
+    skip_ram([], [singleton, {**singleton, "id": "mem-2026-08-11-fact-y", "body": "Other."}], errors=(), attempt=1)
+    assert calls[-1] == "submit_operations"
+    monkeypatch.delenv("HERMES_PHASE2_SKIP_MINILM", raising=False)
+
     monkeypatch.setattr(digest, "_PHASE2_MINILM", _StubMiniLM())
     monkeypatch.setattr(digest, "_PHASE2_EMBED_CACHE", {})
     proposer = digest.make_llm_proposer("cli", session_id="s1", run_id="r1")

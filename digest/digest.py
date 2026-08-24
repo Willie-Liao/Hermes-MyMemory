@@ -3345,6 +3345,34 @@ def _phase2_prompt_and_tool(
             ]
             if missing_i:
                 if _PHASE2_MINILM is None:
+                    skip_flag = os.environ.get(
+                        "HERMES_PHASE2_SKIP_MINILM", ""
+                    ).strip().lower()
+                    mem_total = 0
+                    mem_avail = 0
+                    try:
+                        with open("/proc/meminfo", encoding="utf-8") as fh:
+                            for line in fh:
+                                parts = line.split()
+                                if len(parts) < 2:
+                                    continue
+                                kib = int(parts[1]) * 1024
+                                if line.startswith("MemTotal:"):
+                                    mem_total = kib
+                                elif line.startswith("MemAvailable:"):
+                                    mem_avail = kib
+                    except (OSError, ValueError):
+                        pass
+                    skip_ram = (
+                        skip_flag in {"1", "true", "yes"}
+                        or (0 < mem_total <= 2560 * 1024 * 1024)
+                        or (0 < mem_avail < 768 * 1024 * 1024)
+                    )
+                    if skip_ram:
+                        _log("phase2 Pearson/MI gate skipped MiniLM (ram)")
+                        raise RuntimeError(
+                            "phase2 Pearson/MI gate skipped MiniLM (ram)"
+                        )
                     from sentence_transformers import SentenceTransformer
 
                     _PHASE2_MINILM = SentenceTransformer(PHASE2_MINILM_MODEL)

@@ -111,6 +111,7 @@ def test_digest_staleness_false_right_after_generate_then_true_after_daily_touch
     assert fresh["week"] == "2026-W29"
     assert fresh["empty_digests"] is False
     assert fresh["stale"] is False
+    assert fresh["has_weekly_file"] is True
     assert fresh["fingerprint"]
     assert fresh["last_fingerprint"] == fresh["fingerprint"]
 
@@ -136,6 +137,45 @@ def test_digest_staleness_empty_digests(tmp_path, monkeypatch):
     assert result["week"] == "2026-W29"
     assert result["empty_digests"] is True
     assert result["stale"] is False
+    assert result["has_weekly_file"] is False
+
+
+def test_digest_staleness_has_weekly_file_false_with_only_dailies(tmp_path, monkeypatch):
+    """Dailies without a weekly md: has_weekly_file false, still stale (no fingerprint)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    actions = _load_weekly_actions()
+    monkeypatch.setattr(actions.weekly, "hermes_local_today", lambda: date(2026, 7, 13))
+    _write_daily(tmp_path, "2026-07-13", "mid-week source")
+
+    result = actions.digest_staleness("2026-W29")
+
+    assert result["outcome"] == "ok"
+    assert result["has_weekly_file"] is False
+    assert result["empty_digests"] is False
+    assert result["stale"] is True
+
+
+def test_digest_staleness_has_weekly_file_true_fingerprint_still_drives_stale(
+    tmp_path, monkeypatch
+):
+    """Stub weekly md sets has_weekly_file; stale follows fingerprint, not the file alone."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    actions = _load_weekly_actions()
+    monkeypatch.setattr(actions.weekly, "hermes_local_today", lambda: date(2026, 7, 13))
+    _write_daily(tmp_path, "2026-07-13", "mid-week source")
+    weekly_dir = tmp_path / "memories" / "staging" / "weekly"
+    weekly_dir.mkdir(parents=True, exist_ok=True)
+    (weekly_dir / "2026-W29.md").write_text(
+        "---\nweek: 2026-W29\nweek_status: pending\n---\nschema_version: 2\n",
+        encoding="utf-8",
+    )
+
+    result = actions.digest_staleness("2026-W29")
+
+    assert result["has_weekly_file"] is True
+    assert result["empty_digests"] is False
+    assert result["stale"] is True
+    assert result["last_fingerprint"] is None
 
 
 def test_digest_fingerprint_unchanged_when_bytes_rewritten_same(
