@@ -73,7 +73,7 @@ def test_reduce_drops_invented_ids_and_keeps_verbatim():
         clause = clause[len("Preference:") :].strip()
     assert kept.text == clause
     gitnexus = next(row for row in payload.entities if row.key == "gitnexus")
-    assert gitnexus.weeks == ("2026-W32", "2026-W33")
+    assert gitnexus.weeks == ("2026-W32",)
 
 
 def test_cognition_change_requires_supersedes_pair():
@@ -146,3 +146,38 @@ def test_synthesize_month_forced_tool(monkeypatch):
     assert payload.summary == "June start"
     assert payload.key_decisions[0].id == real.id
     assert usage["input_tokens"] == 50
+
+
+def test_payload_from_synthesis_passes_bilingual_aliases():
+    facts = mechanical_facts("2026-08")
+    patched = [
+        {**row, "aliases": ("记忆摘要",)} if row["key"] == "memorydigest" else dict(row)
+        for row in facts.cross_month_entities
+    ]
+    if not any(row["key"] == "memorydigest" for row in patched):
+        patched.append(
+            {
+                "key": "memorydigest",
+                "canonical": "Memory Digest",
+                "months": ("2026-07", "2026-08"),
+                "weeks": ("2026-W35",),
+                "month_count": 1,
+                "first_seen": "2026-07-27",
+                "last_seen": "2026-08-24",
+                "aliases": ("记忆摘要",),
+            }
+        )
+    facts.cross_month_entities = tuple(patched)
+    payload = payload_from_synthesis(
+        "2026-08",
+        {"summary": "alias check"},
+        facts,
+        carry="",
+        model="mimo-v2.5",
+        map_calls=1,
+        reduce_tokens=1,
+        generated_at="2026-09-01T08:00:00+08:00",
+    )
+    digest = next(row for row in payload.entities if row.key == "memorydigest")
+    assert digest.canonical
+    assert "记忆摘要" in digest.aliases

@@ -53,6 +53,7 @@ describe('staging frontmatter display', () => {
     assert.ok(relatedIdx > 0 && relatedIdx < validFromIdx);
     assert.ok(sourcesIdx > validFromIdx);
     assert.ok(STAGING_FRONTMATTER_KEY_ORDER.includes('supersedes'));
+    assert.ok(STAGING_FRONTMATTER_KEY_ORDER.includes('entity_aliases'));
   });
 
   it('emits optional message clocks after sources and omits them when unset', () => {
@@ -114,5 +115,28 @@ Spent helper.
     assert.match(out, /discarded_at: 2026-07-26/);
     // sources last
     assert.ok(out.indexOf('discarded_at:') < out.indexOf('sources:'));
+  });
+
+  it('parse + stringify preserves Unicode entity_aliases after entity', () => {
+    const raw = `---
+id: mem-2026-08-24-event-bbbbbbbbbbbb
+type: event
+entity: Memory Digest
+entity_aliases: [记忆摘要]
+predicate: user_requested_memory_recall
+confidence: high
+importance: 3
+status: candidate
+sources: [session s-example]
+---
+Beginning: asked; Course: traced; Outcome: recalled.
+`;
+    const parsed = parseMDBlock(raw, '2026-08-24.md');
+    assert.deepEqual(parsed[0]?.entity_aliases, ['记忆摘要']);
+    const out = stringifyMDBlock(parsed[0]!);
+    assert.match(out, /entity: Memory Digest\nentity_aliases: \[记忆摘要\]/);
+    const again = parseMDBlock(out, '2026-08-24.md');
+    assert.deepEqual(again[0]?.entity_aliases, ['记忆摘要']);
+    assert.equal(again[0]?.entity, 'Memory Digest');
   });
 });

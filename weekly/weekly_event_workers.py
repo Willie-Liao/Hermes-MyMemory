@@ -1475,11 +1475,31 @@ def _intra_day_from_dailies(
 def _entities_from_event_blocks(
     blocks: Sequence[dict[str, Any]],
 ) -> tuple[WeeklyEntity, ...]:
-    """Collapse entity: surfaces onto one key so weekly JSON matches the recall roster."""
+    """Fold original-language entity_aliases onto the English weekly key so a Chinese surface cannot mint a second roster row."""
     try:
         from .weekly_json import normalize_entity_key
     except ImportError:  # pragma: no cover
         from weekly_json import normalize_entity_key  # type: ignore
+
+    claims: dict[str, set[str]] = {}
+    english_canonical: dict[str, str] = {}
+    for block in blocks:
+        fm = block.get("frontmatter") or {}
+        surface = str(fm.get("entity") or "").strip()
+        key = normalize_entity_key(surface)
+        if not key:
+            continue
+        english_canonical.setdefault(key, surface)
+        raw_aliases = fm.get("entity_aliases")
+        if not isinstance(raw_aliases, list):
+            continue
+        for alias in raw_aliases:
+            ak = normalize_entity_key(str(alias or "").strip())
+            if ak and ak != key:
+                claims.setdefault(ak, set()).add(key)
+    unique_redirect = {
+        ak: next(iter(eks)) for ak, eks in claims.items() if len(eks) == 1
+    }
 
     buckets: dict[str, dict[str, Any]] = {}
     for block in blocks:
@@ -1487,9 +1507,10 @@ def _entities_from_event_blocks(
         surface = str(fm.get("entity") or "").strip()
         if not surface:
             continue
-        key = normalize_entity_key(surface)
-        if not key:
+        raw_key = normalize_entity_key(surface)
+        if not raw_key:
             continue
+        key = unique_redirect.get(raw_key, raw_key)
         vf = str(fm.get("valid_from") or "").strip()[:10]
         bid = str(fm.get("id") or "").strip()
         related = fm.get("related") or []
@@ -1504,13 +1525,22 @@ def _entities_from_event_blocks(
         bucket = buckets.setdefault(
             key,
             {
-                "canonical": surface,
-                "aliases": {surface},
+                "canonical": english_canonical.get(key) or surface,
+                "aliases": set(),
                 "dates": [],
                 "blocks": [],
             },
         )
+        preferred = english_canonical.get(key)
+        if preferred:
+            bucket["canonical"] = preferred
         bucket["aliases"].add(surface)
+        raw_aliases = fm.get("entity_aliases")
+        if isinstance(raw_aliases, list):
+            for alias in raw_aliases:
+                text = str(alias or "").strip()
+                if text:
+                    bucket["aliases"].add(text)
         if vf:
             bucket["dates"].append(vf)
         bucket["blocks"].extend(mems)

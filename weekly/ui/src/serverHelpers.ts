@@ -113,7 +113,7 @@ export function ensureDirs() {
   if (!fs.existsSync(WEEKLY_DIR)) fs.mkdirSync(WEEKLY_DIR, { recursive: true });
 }
 
-// Simple frontmatter parser & stringifier
+/** Parse daily YAML so original-language entity_aliases survive a later stringify instead of being dropped. */
 export function parseMDBlock(fileContent: string, filePath: string): MemoryBlock[] {
   const { fences } = splitDailyWrapup(fileContent);
   const blocks: MemoryBlock[] = [];
@@ -204,6 +204,7 @@ export function parseMDBlock(fileContent: string, filePath: string): MemoryBlock
         status: (meta.status || 'candidate') as MemoryStatus,
         sources: Array.isArray(meta.sources) ? meta.sources : [String(meta.sources || '')],
         entity: meta.entity,
+        entity_aliases: Array.isArray(meta.entity_aliases) ? meta.entity_aliases : undefined,
         valid_from: meta.valid_from,
         valid_to: meta.valid_to,
         involves: Array.isArray(meta.involves) ? meta.involves : undefined,
@@ -256,7 +257,7 @@ export function parseYamlFlowStringList(bracketed: string): string[] {
   return out;
 }
 
-/** Serialize a block to daily-staging markdown (digest key order + all fields). */
+/** Serialize a block to daily-staging markdown (digest key order + all fields, including entity_aliases). */
 export function stringifyMDBlock(block: MemoryBlock): string {
   return formatStagingBlock(block);
 }

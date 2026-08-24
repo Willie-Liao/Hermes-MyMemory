@@ -125,6 +125,46 @@ def test_recall_channels(staging):
     assert "Beginning:" in ident or "event body" in ident.lower()
 
 
+def test_recall_bilingual_entity_queries(tmp_path):
+    from recall.normalize import write_entity_index
+
+    daily = tmp_path / "daily"
+    daily.mkdir(parents=True)
+    (tmp_path / "weekly").mkdir()
+    (tmp_path / "monthly").mkdir()
+    old_id = "mem-2026-08-01-fact-aaaaaaaaaaaa"
+    new_id = "mem-2026-08-24-event-bbbbbbbbbbbb"
+    (daily / "2026-08-01.md").write_text(
+        _block(
+            mem_id=old_id,
+            type_="fact",
+            entity="记忆摘要",
+            body="Factual: legacy Chinese-only Memory Digest card.",
+        ),
+        encoding="utf-8",
+    )
+    (daily / "2026-08-24.md").write_text(
+        _block(
+            mem_id=new_id,
+            type_="event",
+            entity="Memory Digest",
+            body="Beginning: asked; Course: traced; Outcome: recalled.",
+            extra="entity_aliases: [记忆摘要]\npredicate: user_requested_memory_recall\n",
+        ),
+        encoding="utf-8",
+    )
+    rebuild_lexical(tmp_path)
+    write_entity_index(tmp_path)
+    english = recall_memory("what did we do about memory digest?", staging=tmp_path)
+    chinese = recall_memory("记忆摘要相关的记忆有哪些？", staging=tmp_path)
+    assert "channel=entity_key" in english
+    assert "key=memorydigest" in english
+    assert "channel=entity_key" in chinese
+    assert "key=memorydigest" in chinese
+    assert old_id in english and new_id in english
+    assert old_id in chinese and new_id in chinese
+
+
 def test_expand_ppr_order_and_depth_clamp(staging):
     text = expand_memory(SEED, depth=5, staging=staging)
     assert "depth=2" in text

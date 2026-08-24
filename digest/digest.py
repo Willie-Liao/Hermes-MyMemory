@@ -247,7 +247,7 @@ WORKER_FAILURE_FILENAMES = {
     "decision": "decision-failures.jsonl",
     "phase1": "phase1-failures.jsonl",
 }
-LIST_FRONTMATTER_KEYS = frozenset({"sources", "related", "supersedes"})
+LIST_FRONTMATTER_KEYS = frozenset({"sources", "related", "supersedes", "entity_aliases"})
 CLOCK_FRONTMATTER_KEYS = frozenset(
     {"user_message_at", "assistant_response_at", "generated_at"}
 )
@@ -276,6 +276,7 @@ _FRONTMATTER_KEY_ORDER = (
     "id",
     "type",
     "entity",
+    "entity_aliases",
     "predicate",
     "participants",
     "involves",
@@ -340,7 +341,7 @@ Types: fact | procedure | decision | event. Never type: entity or hypothesis (en
 - decision: user-only rulings and preferences for agent behavior (must/must-not), including decision_constraint: user feedback on that procedure, corrections, and standing prefs. Scan the transcript for the user's must / must-not / standing prefs and emit them as subject=user plus a predicate ruling so Preference:/Decision: {{subject}} {{ruling}} is one clause. First subject after Preference:/Decision: must be user/User (plus USER.md aliases). Third-party traits/living/likes → fact (`Narration:` / kind=Narration), even when the user reported them. Do not duplicate the full procedure or event summary. Corrections use supersedes: + confidence: explicit. `decision_constraint` is accepted only as a legacy input alias and is normalized to canonical `decision`.
 - Legacy input alias detail: decision_constraint: user feedback on that procedure; it is never emitted as the canonical output type.
 - Episode-first: one outcome event per completed user request (not one per tool step). Grade/scrape snapshot → fact; multi-file deliverable arc → one event.
-- entity: required on fact and event. involves: optional on non-event only (max {MAX_INVOLVES}; omit primary; entity collection with optional role). Do NOT use involves on event — use participants instead.
+- entity: required on fact and event (English canonical). entity_aliases: optional original-language surfaces; omit when identical to entity. involves: optional on non-event only (max {MAX_INVOLVES}; omit primary; entity collection with optional role). Do NOT use involves on event — use participants instead.
 - related: optional mem-ids (max {MAX_RELATED}); associative only — event→fact/procedure/decision only. NEVER put another event id in an event's related:. related: is associative only and NEVER deletes or supersedes a block.
 - supersedes: correction only (max {MAX_SUPERSEDES}); requires confidence: explicit. User correction: MUST set confidence: explicit and supersedes: [mem-…] from EXISTING BLOCK IDS (today's daily file / earlier batches on today). Prefer decision or corrected fact; never guess ids.
 - Filename ≠ entity (paths in sources:). Roster >5: collective entity + ≤5 participants + related roster fact. Unconfirmed roles are not participants.
@@ -1031,6 +1032,7 @@ def _format_entity_collection_lines(key: str, items: Any) -> list[str]:
 
 
 def _render_digest_block(parsed: dict[str, Any], body: str) -> str:
+    """Keep entity_aliases in list form after entity so a rewrite cannot drop the original-language surface."""
     lines = ["---"]
     seen: set[str] = set()
     for key in _FRONTMATTER_KEY_ORDER:
@@ -2109,6 +2111,7 @@ def _staging_output_example() -> str:
 
 
 def _staging_output_contract(daily_path: Path) -> str:
+    """Teach the worker the bilingual entity field so original-language names are not lost on English canonicalization."""
     return (
         "OUTPUT CONTRACT (reference / legacy text path):\n"
         "- Prefer forced tool calls (submit_*/patch_*/skip_digest_worker) for workers.\n"
@@ -2117,7 +2120,8 @@ def _staging_output_contract(daily_path: Path) -> str:
         "  ---\n"
         "  id: mem-<YYYY-MM-DD>-<slug>\n"
         "  type: fact | procedure | decision | event\n"
-        "  entity: <Person|Class|Project>  # required on fact and event\n"
+        "  entity: <Person|Class|Project>  # required on fact and event; English canonical\n"
+        "  entity_aliases: [<original-language surface>]  # optional; omit when identical to entity\n"
         "  predicate: <snake_case>  # required on event only (e.g. grade_dispute)\n"
         "  participants:\n"
         "    - {entity: <Name>, role: <optional>}  # event only; max 5; role optional\n"
@@ -4549,12 +4553,21 @@ def _persist_phase1_candidates(
     daily_path: Path,
     blocks: Sequence[Mapping[str, Any]],
 ) -> None:
-    """Append validated Phase-1 candidate blocks to the daily staging file."""
+    """Append Phase-1 cards then refresh the entity index so original-language aliases are searchable the same day.
+
+    Index rebuild is fail-open: a digest write must not roll back if recall indexing fails.
+    """
     if not blocks:
         return
     content = _content_from_blocks(blocks)
     if content.strip():
         _append_daily_digest(daily_path, content)
+        try:
+            from recall.normalize import write_entity_index
+
+            write_entity_index(_hermes_home() / "memories" / "staging")
+        except Exception as exc:
+            _log(f"entity index refresh fail-open: {exc}")
 
 
 def _filter_redundant_phase1_creates(

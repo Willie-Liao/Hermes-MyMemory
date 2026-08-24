@@ -112,6 +112,45 @@ def test_entity_key_collapses_digest_aliases():
     assert keys == {"memorydigest"}
 
 
+def test_entities_from_event_blocks_keep_bilingual_aliases():
+    workers_path = Path(__file__).with_name("weekly_event_workers.py")
+    spec = importlib.util.spec_from_file_location(
+        "memory_weekly_workers_bilingual", workers_path
+    )
+    assert spec is not None and spec.loader is not None
+    workers = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = workers
+    spec.loader.exec_module(workers)
+    entities = workers._entities_from_event_blocks(
+        [
+            {
+                "frontmatter": {
+                    "id": "mem-2026-08-01-fact-aaaaaaaaaaaa",
+                    "type": "fact",
+                    "entity": "记忆摘要",
+                    "valid_from": "2026-08-01",
+                }
+            },
+            {
+                "frontmatter": {
+                    "id": "mem-2026-08-24-event-bbbbbbbbbbbb",
+                    "type": "event",
+                    "entity": "Memory Digest",
+                    "entity_aliases": ["记忆摘要"],
+                    "valid_from": "2026-08-24",
+                }
+            },
+        ]
+    )
+    assert [row.key for row in entities] == ["memorydigest"]
+    assert entities[0].canonical == "Memory Digest"
+    assert entities[0].aliases == ("记忆摘要",)
+    assert entities[0].week_blocks == (
+        "mem-2026-08-01-fact-aaaaaaaaaaaa",
+        "mem-2026-08-24-event-bbbbbbbbbbbb",
+    )
+
+
 def test_write_sidecars_deletes_json_and_yaml_leaves_md(tmp_path):
     schema = _load()
     wj = _load_weekly_json()

@@ -11,6 +11,7 @@ export interface Participant {
 export type ImportanceLevel = 0 | 1 | 2 | 3 | 4 | 5;
 
 export interface MemoryBlock {
+  /** Daily YAML card. entity_aliases keeps original-language surfaces so a UI rewrite cannot drop them. */
   id: string;
   type: MemoryType;
   confidence: ConfidenceType;
@@ -19,6 +20,7 @@ export interface MemoryBlock {
   status: MemoryStatus;
   sources: string[];
   entity?: string;
+  entity_aliases?: string[];
   valid_from?: string;
   valid_to?: string;
   involves?: string[];

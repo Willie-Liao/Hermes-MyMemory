@@ -388,7 +388,7 @@ def _kind_from_clause(clause: str) -> str:
 
 
 def mechanical_facts(month_key: str) -> MechanicalFacts:
-    """Build counts, state rows, and the carry-card inputs with zero LLM calls."""
+    """Build counts, state rows, and bilingual entity aliases with zero LLM calls so monthly roster keys cannot split on original-language surfaces."""
     month_blocks = blocks_for_month(month_key)
     dpe = tuple(b for b in month_blocks if b.type in SYNTHESIS_TYPES)
     counts = Counter(b.type for b in month_blocks)
@@ -454,19 +454,56 @@ def mechanical_facts(month_key: str) -> MechanicalFacts:
     entity_months: dict[str, set[str]] = defaultdict(set)
     entity_weeks: dict[str, set[str]] = defaultdict(set)
     entity_meta: dict[str, dict[str, Any]] = {}
+    claims: dict[str, set[str]] = defaultdict(set)
+    english_canonical: dict[str, str] = {}
+    for _day, fm, _body in all_rows:
+        entity = str(fm.get("entity") or "").strip()
+        ek = normalize_entity_key(entity)
+        if not ek:
+            continue
+        english_canonical.setdefault(ek, entity)
+        raw_aliases = fm.get("entity_aliases")
+        if not isinstance(raw_aliases, list):
+            continue
+        for alias in raw_aliases:
+            ak = normalize_entity_key(str(alias or "").strip())
+            if ak and ak != ek:
+                claims[ak].add(ek)
+    unique_redirect = {
+        ak: next(iter(eks)) for ak, eks in claims.items() if len(eks) == 1
+    }
     for day, fm, body in all_rows:
         entity = str(fm.get("entity") or "").strip()
         if not entity:
             continue
-        key = normalize_entity_key(entity)
-        if not key:
+        raw_key = normalize_entity_key(entity)
+        if not raw_key:
             continue
+        key = unique_redirect.get(raw_key, raw_key)
         entity_months[key].add(day.strftime("%Y-%m"))
         if day.strftime("%Y-%m") == month_key:
             entity_weeks[key].add(week_key_for(day))
         meta = entity_meta.setdefault(
-            key, {"canonical": entity, "first": day.isoformat(), "last": day.isoformat(), "count": 0}
+            key,
+            {
+                "canonical": english_canonical.get(key) or entity,
+                "aliases": set(),
+                "first": day.isoformat(),
+                "last": day.isoformat(),
+                "count": 0,
+            },
         )
+        preferred = english_canonical.get(key)
+        if preferred:
+            meta["canonical"] = preferred
+        if entity != meta["canonical"]:
+            meta["aliases"].add(entity)
+        raw_aliases = fm.get("entity_aliases")
+        if isinstance(raw_aliases, list):
+            for alias in raw_aliases:
+                text = str(alias or "").strip()
+                if text and text != meta["canonical"]:
+                    meta["aliases"].add(text)
         meta["last"] = day.isoformat()
         if day.isoformat() < meta["first"]:
             meta["first"] = day.isoformat()
@@ -483,6 +520,7 @@ def mechanical_facts(month_key: str) -> MechanicalFacts:
             {
                 "key": key,
                 "canonical": meta["canonical"],
+                "aliases": tuple(sorted(meta.get("aliases") or ())),
                 "months": tuple(sorted(months)),
                 "weeks": weeks_this_month,
                 "month_count": int(meta["count"]),
