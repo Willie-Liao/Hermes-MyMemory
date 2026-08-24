@@ -248,6 +248,9 @@ WORKER_FAILURE_FILENAMES = {
     "phase1": "phase1-failures.jsonl",
 }
 LIST_FRONTMATTER_KEYS = frozenset({"sources", "related", "supersedes"})
+CLOCK_FRONTMATTER_KEYS = frozenset(
+    {"user_message_at", "assistant_response_at", "generated_at"}
+)
 # Body keywords implying a time-bound fact — both span keys then required.
 # Narrow hints — avoid broad Chinese substrings (e.g. 之前) that fire on venting.
 TEMPORAL_REQUIRED_HINTS = (
@@ -787,6 +790,8 @@ def _iso_clocks_for_window(
     session_id: str,
     start_id: int | None,
     end_id: int | None,
+    *,
+    on_day: date | None = None,
 ) -> tuple[str | None, str | None]:
     """First user / last assistant clocks in the cited message id range."""
     if start_id is None or end_id is None:
@@ -803,6 +808,11 @@ def _iso_clocks_for_window(
             continue
         stamp = _iso_from_message_ts(row.get("timestamp"))
         if not stamp:
+            continue
+        parsed_stamp = _parse_frontmatter_clock(stamp)
+        if on_day is not None and (
+            parsed_stamp is None or parsed_stamp.astimezone().date() != on_day
+        ):
             continue
         if row.get("role") == "user" and user_at is None:
             user_at = stamp
@@ -830,6 +840,125 @@ def _parse_frontmatter_clock(value: Any) -> datetime | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def _civil_noon_iso(day: date) -> str:
+    """Fallback wall clock when state.db has no row for the cited window."""
+    tz = datetime.now().astimezone().tzinfo or timezone.utc
+    return datetime(day.year, day.month, day.day, 12, 0, 0, tzinfo=tz).isoformat(
+        timespec="seconds"
+    )
+
+
+def _clocks_from_source_tags(
+    sources: Any, day: date
+) -> tuple[str | None, str | None]:
+    """Earliest user / latest assistant ISO from session source tags via state.db."""
+    if isinstance(sources, list):
+        tags = [str(item).strip() for item in sources if str(item).strip()]
+    elif sources in (None, ""):
+        tags = []
+    else:
+        tags = [str(sources).strip()]
+    user_dt: datetime | None = None
+    asst_dt: datetime | None = None
+    for tag in tags:
+        session_id = digest_tools.session_id_from_source_tag(tag)
+        if not session_id:
+            continue
+        rng = digest_tools.message_range_from_source_tag(tag)
+        if rng:
+            user_iso, asst_iso = _iso_clocks_for_window(
+                session_id, rng[0], rng[1]
+            )
+        else:
+            user_iso, asst_iso = None, None
+        if not user_iso and not asst_iso:
+            user_iso, asst_iso = _iso_clocks_for_window(
+                session_id, 1, 2_147_483_647, on_day=day
+            )
+        user_parsed = _parse_frontmatter_clock(user_iso)
+        asst_parsed = _parse_frontmatter_clock(asst_iso)
+        if user_parsed is not None and (user_dt is None or user_parsed < user_dt):
+            user_dt = user_parsed
+        if asst_parsed is not None and (asst_dt is None or asst_parsed > asst_dt):
+            asst_dt = asst_parsed
+    user_out = user_dt.isoformat(timespec="seconds") if user_dt else None
+    asst_out = asst_dt.isoformat(timespec="seconds") if asst_dt else None
+    return user_out, asst_out
+
+
+def _stamp_block_clocks(parsed: dict[str, Any], day: date) -> bool:
+    """Fill missing message clocks from state.db; civil noon when lookup misses."""
+    changed = False
+    user_iso, asst_iso = _clocks_from_source_tags(parsed.get("sources"), day)
+    noon = _civil_noon_iso(day)
+    wanted = {
+        "user_message_at": user_iso or noon,
+        "assistant_response_at": asst_iso or noon,
+        "generated_at": asst_iso or noon,
+    }
+    for key, stamp in wanted.items():
+        current = parsed.get(key)
+        if _parse_frontmatter_clock(current) == _parse_frontmatter_clock(stamp):
+            continue
+        parsed[key] = stamp
+        changed = True
+    return changed
+
+
+def backfill_daily_file_clocks(path: Path | str) -> int:
+    """Rewrite one daily staging file with plugin-stamped clocks. Returns cards changed."""
+    file_path = Path(path)
+    try:
+        day = date.fromisoformat(file_path.stem)
+    except ValueError:
+        return 0
+    try:
+        original = file_path.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    _fences, wrapup = split_daily_wrapup(original)
+    blocks = _frontmatter_blocks(original)
+    if not blocks:
+        return 0
+    stamped: list[str] = []
+    changed_n = 0
+    for _line_no, raw_frontmatter, body in blocks:
+        try:
+            parsed = yaml.safe_load(raw_frontmatter)
+        except yaml.YAMLError:
+            stamped.append(
+                _render_digest_block({"id": f"mem-{day.isoformat()}-digest"}, body)
+            )
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        if _stamp_block_clocks(parsed, day):
+            changed_n += 1
+        stamped.append(_render_digest_block(parsed, body))
+    if changed_n == 0:
+        return 0
+    new_fences = "\n\n".join(stamped).rstrip() + "\n"
+    updated = join_daily_wrapup(new_fences, wrapup) if wrapup else new_fences
+    if updated != original:
+        file_path.write_text(updated, encoding="utf-8")
+    return changed_n
+
+
+def backfill_daily_dir_clocks(daily_dir: Path | str) -> dict[str, int]:
+    """Walk YYYY-MM-DD.md files and stamp clocks. No LLM."""
+    root = Path(daily_dir)
+    files = 0
+    cards = 0
+    if not root.is_dir():
+        return {"files": 0, "cards": 0}
+    for path in sorted(root.glob("*.md")):
+        n = backfill_daily_file_clocks(path)
+        if n:
+            files += 1
+            cards += n
+    return {"files": files, "cards": cards}
 
 
 def _format_transcript(messages: list[dict[str, Any]]) -> str:
@@ -912,6 +1041,8 @@ def _render_digest_block(parsed: dict[str, Any], body: str) -> str:
             lines.append(f"{key}: {_format_sources(parsed[key])}")
         elif key in {"participants", "involves"}:
             lines.extend(_format_entity_collection_lines(key, parsed[key]))
+        elif key in CLOCK_FRONTMATTER_KEYS:
+            lines.append(f"{key}: {digest_tools._yaml_scalar(parsed[key])}")
         else:
             lines.append(f"{key}: {parsed[key]}")
     for key, value in parsed.items():
@@ -921,6 +1052,8 @@ def _render_digest_block(parsed: dict[str, Any], body: str) -> str:
             lines.append(f"{key}: {_format_sources(value)}")
         elif key in {"participants", "involves"}:
             lines.extend(_format_entity_collection_lines(key, value))
+        elif key in CLOCK_FRONTMATTER_KEYS:
+            lines.append(f"{key}: {digest_tools._yaml_scalar(value)}")
         else:
             lines.append(f"{key}: {value}")
     lines.extend(["---", body])

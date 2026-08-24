@@ -1885,6 +1885,18 @@ def session_id_from_source_tag(tag: str) -> str:
     return rest.split("#", 1)[0].strip()
 
 
+_SOURCE_RANGE_RE = re.compile(r"#(\d+)-(\d+)\s*$")
+
+
+def message_range_from_source_tag(tag: str) -> tuple[int, int] | None:
+    """Read ``#start-end`` from a session source tag; None when the tag has no range."""
+    text = str(tag or "").strip()
+    match = _SOURCE_RANGE_RE.search(text)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
 _STAGING_PATH_RE = re.compile(r"memories[/\\]staging", re.IGNORECASE)
 _STAGING_BASENAME_RE = re.compile(
     r"^(?:file:)?(?:\./)?(?:\d{4}-\d{2}-\d{2}|\d{4}-W\d{2})\.md$",
