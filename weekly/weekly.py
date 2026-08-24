@@ -566,6 +566,8 @@ def digest_staleness(
 
     Blank ``week_key`` resolves to the current ISO week. No dailies → empty-digest
     state (not stale). Missing prior fingerprint with digests present → stale.
+    ``has_weekly_file`` is the canonical ``YYYY-Www.md`` on disk so Re-scan can
+    generate a missing schema without treating that as a fingerprint skip.
     """
     if week_key:
         parsed = _parse_week_key(week_key)
@@ -575,6 +577,7 @@ def digest_staleness(
                 "week": week_key,
                 "stale": False,
                 "empty_digests": False,
+                "has_weekly_file": False,
                 "fingerprint": "",
                 "last_fingerprint": None,
             }
@@ -584,6 +587,7 @@ def digest_staleness(
         year, week = _current_iso_week(today)
         key = _week_key(year, week)
 
+    has_weekly_file = _weekly_path(year, week).exists()
     files = _usable_daily_files(_daily_files_for_week(year, week))
     if not files:
         state = _load_state()
@@ -594,6 +598,7 @@ def digest_staleness(
             "week": key,
             "stale": False,
             "empty_digests": True,
+            "has_weekly_file": has_weekly_file,
             "fingerprint": "",
             "last_fingerprint": last,
         }
@@ -607,6 +612,7 @@ def digest_staleness(
         "week": key,
         "stale": last != fingerprint,
         "empty_digests": False,
+        "has_weekly_file": has_weekly_file,
         "fingerprint": fingerprint,
         "last_fingerprint": last,
     }

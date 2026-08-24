@@ -123,6 +123,14 @@ const nonZero = await callWeeklyBridge(
 );
 assert.deepEqual(nonZero, { ok: false, error: 'bridge exploded' });
 
+const oomKill = await callDigestBridge(
+  'request_weekly_reorganise',
+  { date_str: '2026-08-24' },
+  runner({ status: 137, stdout: '', stderr: '' }),
+);
+assert.equal(oomKill.ok, false);
+assert.match(oomKill.error ?? '', /bridge exit 137 SIGKILL/);
+
 const digestOk = await callDigestBridge(
   'request_resummarise',
   { date_str: '2026-07-20', force: true },
