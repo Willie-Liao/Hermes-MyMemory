@@ -11,7 +11,8 @@ export type FourPartWeeklyCardProps = {
 
 /**
  * Chronicle paints schema summary so Distill/Brief and thread dumps cannot double-render.
- * Threads stay on disk for recall; hops stay retired.
+ * Threads stay on disk for recall; hops stay retired. Empty list means Worker 1 skipped
+ * summary (no wrap-up and no cross-day thread), not an overdue-style placeholder.
  */
 export default function FourPartWeeklyCard({
   payload,
@@ -23,7 +24,7 @@ export default function FourPartWeeklyCard({
     <div className="space-y-5" data-testid="weekly-chronicle-json">
       <ul className="space-y-1.5" data-testid="weekly-chronicle-summary">
         {rows.length === 0 ? (
-          <li className="text-xs text-slate-500 font-mono">- None.</li>
+          <li className="text-xs text-slate-500 font-mono">No weekly summary yet</li>
         ) : (
           rows.map((row, index) => (
             <li

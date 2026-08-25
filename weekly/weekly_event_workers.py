@@ -1649,7 +1649,11 @@ def run_parallel_worker1(
     log: LogFn | None = None,
     reason: str = "",
 ) -> Worker1Result:
-    """Coordinate one event worker then analysts; return Distill blocks + payload."""
+    """Build one week's payload so generate can dump YAML without a Distill document.
+
+    Empty weekday wrap-up slots must not skip summary; skip only when every
+    intra-day row is empty and there is no cross-day thread.
+    """
     _log: LogFn = log or (lambda _msg: None)
     reason_bit = f" reason={reason}" if reason else ""
     week_dates = iso_week_dates(week_key)
@@ -1791,8 +1795,9 @@ def run_parallel_worker1(
     )
 
     summary_items: tuple[WeeklySummaryItem, ...] = ()
-    has_intra = any(not row.empty and str(row.text).strip() for row in intra)
-    if has_intra or cross_day:
+    # Skip only when every wrap-up is empty AND there is no cross-day thread.
+    all_intra_empty = all(row.empty or not str(row.text).strip() for row in intra)
+    if not all_intra_empty or cross_day:
         purposes_called.append("worker1_summary")
         try:
             summary_items = _run_summary_worker(

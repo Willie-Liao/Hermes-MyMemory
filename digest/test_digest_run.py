@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 
 _mymemory = Path(__file__).resolve().parent.parent
@@ -327,6 +329,34 @@ def test_request_weekly_reorganise_propagates_oneshot_failure(tmp_path, monkeypa
 
     result = dr.request_weekly_reorganise(date_str="2026-07-27")
     assert result["outcome"] == "failed"
+
+
+def test_request_weekly_reorganise_wait_false_returns_in_flight(tmp_path, monkeypatch):
+    dr = _load_digest_run()
+    digest = dr.digest
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    daily = tmp_path / "memories" / "staging" / "daily"
+    daily.mkdir(parents=True, exist_ok=True)
+    (daily / "2026-07-27.md").write_text(_DAILY_TWO_FACTS, encoding="utf-8")
+    started = threading.Event()
+
+    def fake_phase2(*_a, **_k):
+        started.wait(timeout=2)
+        return {"outcome": "rewritten", "path": str(daily / "2026-07-27.md"), "date": "2026-07-27"}
+
+    monkeypatch.setattr(digest, "run_manual_phase2", fake_phase2)
+    result = dr.request_weekly_reorganise(date_str="2026-07-27", wait=False)
+    assert result["outcome"] == "in_flight"
+    status = dr.request_weekly_reorganise(date_str="2026-07-27", status_only=True)
+    assert status["outcome"] == "in_flight"
+    started.set()
+    for _ in range(50):
+        done = dr.request_weekly_reorganise(date_str="2026-07-27", status_only=True)
+        if done["outcome"] != "in_flight":
+            assert done["outcome"] == "rewritten"
+            return
+        time.sleep(0.05)
+    raise AssertionError("background reorganise did not finish")
 
 
 def test_digest_oneshot_raises_completion_budget_for_four_type_ops(monkeypatch):
