@@ -35,6 +35,8 @@ from typing import Any
 _ENV_WORKER_LLM_DEPTH = "HERMES_WORKER_LLM_DEPTH"
 _worker_llm_depth = 0
 _worker_llm_depth_lock = threading.Lock()
+# Gateway progressive disclosure — never the weekly/digest submit/patch payload.
+_PROGRESSIVE_DISCLOSURE_TOOLS = frozenset({"tool_search", "tool_describe", "tool_call"})
 
 
 @contextmanager
@@ -260,7 +262,8 @@ def extract_tool_calls_from_result(
 
     Accepts OpenAI nested ``function`` calls, flat ``name``/``arguments``,
     trailing-comma JSON, and JSON dumped into assistant content / final_response
-    (MiMo v2.5).
+    (MiMo v2.5). Drops ``tool_search`` / ``tool_describe`` / ``tool_call`` so a
+    disclosure hop cannot replace submit/patch as the worker payload.
     """
     found: list[tuple[str, dict[str, Any]]] = []
     default = str(default_tool_name or "").strip() or None
@@ -275,15 +278,15 @@ def extract_tool_calls_from_result(
                 if not isinstance(tc, Mapping):
                     continue
                 pair = _pair_from_tool_call(tc, default)
-                if pair:
+                if pair and pair[0] not in _PROGRESSIVE_DISCLOSURE_TOOLS:
                     found.append(pair)
             if not any(args for _name, args in found):
                 pair = _pair_from_json_blob(msg.get("content"), default)
-                if pair:
+                if pair and pair[0] not in _PROGRESSIVE_DISCLOSURE_TOOLS:
                     found.append(pair)
     if not any(args for _name, args in found):
         pair = _pair_from_json_blob(result.get("final_response"), default)
-        if pair:
+        if pair and pair[0] not in _PROGRESSIVE_DISCLOSURE_TOOLS:
             found.append(pair)
     return found
 
@@ -505,7 +508,13 @@ def run_worker_llm_tools(
     )
     from_messages = extract_tool_calls_from_result(result, default_tool_name=force)
     def _usable(calls: list[tuple[str, dict[str, Any]]]) -> list[tuple[str, dict[str, Any]]]:
-        return [(n, a) for n, a in calls if n and _tool_args_have_values(a)]
+        return [
+            (n, a)
+            for n, a in calls
+            if n
+            and n not in _PROGRESSIVE_DISCLOSURE_TOOLS
+            and _tool_args_have_values(a)
+        ]
     tool_calls = _usable(captured) or _usable(from_messages) or from_messages or captured
     tool_name: str | None = None
     tool_args: dict[str, Any] | None = None

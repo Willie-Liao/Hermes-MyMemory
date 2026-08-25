@@ -80,6 +80,7 @@ const NEWSROOM_EMPTY_COPY = {
 };
 
 const WEEKS_POLL_MS = 180_000; // 3 minutes — avoid flashy frequent re-renders
+const JOB_POLL_MS = 2_000;
 
 /** YAML above body; viewport sized to body so first glance is the narrative (scroll up for schema). */
 function BodyFirstYamlScroll({ yaml, body }: { yaml: string; body: string }) {
@@ -163,6 +164,8 @@ export default function WeekReview({
   const [spansLoading, setSpansLoading] = useState(false);
   const [emptyDigests, setEmptyDigests] = useState(false);
   const [showReopenConfirm, setShowReopenConfirm] = useState(false);
+  /** Validate-mode span rows stay in this session so tab switches do not re-run the LLM. */
+  const spanRowsByWeekRef = useRef<Record<string, WeeklySpanBridgeRow[]>>({});
 
   const selectedWeekRef = useRef<WeekOverview | null>(null);
   selectedWeekRef.current = selectedWeek;
@@ -462,7 +465,7 @@ export default function WeekReview({
         type: 'success',
         text: `Recalled last review save (${count} action(s)).`,
       });
-      await refreshFourPartSurfaces(selectedWeek.week);
+      await refreshFourPartSurfaces(selectedWeek.week, { reload: true });
     } catch (err: unknown) {
       setMessage({
         type: 'error',
@@ -689,19 +692,26 @@ export default function WeekReview({
         date: activeDate,
         week: selectedWeek.week,
       });
+      if (result.digestOutcome === 'in_flight') {
+        setMessage({
+          type: 'info',
+          text: `Reorganise ${activeDate}: running in background…`,
+        });
+        return;
+      }
       setMessage({
         type: 'success',
         text: `Reorganised ${result.pathLabel}.`,
       });
       fetchCandidates();
-      handleSelectWeek(selectedWeek);
+      handleSelectWeek(selectedWeek, { reload: true });
       if (onRefresh) onRefresh();
+      setReorganizeLoading(false);
     } catch (err: unknown) {
       setMessage({
         type: 'error',
         text: err instanceof Error ? err.message : 'Reorganise failed.',
       });
-    } finally {
       setReorganizeLoading(false);
     }
   };
@@ -718,7 +728,14 @@ export default function WeekReview({
       .catch((err) => console.warn('Fetch hot health notice:', err.message || err));
   };
 
-  const fetchWeeklySpans = async (weekKey: string) => {
+  const fetchWeeklySpans = async (weekKey: string, opts?: { reload?: boolean }) => {
+    if (!opts?.reload) {
+      const cached = spanRowsByWeekRef.current[weekKey];
+      if (cached) {
+        setSpanBridgeRows(cached);
+        return;
+      }
+    }
     setSpansLoading(true);
     try {
       // Validate mode: memory-digest explicit|high mem-* candidates only.
@@ -726,16 +743,17 @@ export default function WeekReview({
       const validated = await fetch(`/api/weekly/weeks/${weekKey}/spans?mode=validate`);
       const data = await validated.json().catch(() => ({}));
       if (validated.ok && Array.isArray(data.results)) {
-        setSpanBridgeRows(
-          (data.results as WeeklySpanBridgeRow[]).map((c) => ({
-            ...c,
-            block_id: String((c as { id?: string; block_id?: string }).block_id
-              || (c as { id?: string }).id
-              || '').trim(),
-          })).filter((c) => c.block_id),
-        );
+        const rows = (data.results as WeeklySpanBridgeRow[]).map((c) => ({
+          ...c,
+          block_id: String((c as { id?: string; block_id?: string }).block_id
+            || (c as { id?: string }).id
+            || '').trim(),
+        })).filter((c) => c.block_id);
+        spanRowsByWeekRef.current[weekKey] = rows;
+        setSpanBridgeRows(rows);
         return;
       }
+      spanRowsByWeekRef.current[weekKey] = [];
       setSpanBridgeRows([]);
     } catch {
       setSpanBridgeRows([]);
@@ -780,10 +798,10 @@ export default function WeekReview({
     }
   };
 
-  const refreshFourPartSurfaces = async (weekKey: string) => {
+  const refreshFourPartSurfaces = async (weekKey: string, opts?: { reload?: boolean }) => {
     await Promise.all([
       fetchChronicle(weekKey),
-      fetchWeeklySpans(weekKey),
+      fetchWeeklySpans(weekKey, opts),
       fetchWeeklyJson(weekKey),
     ]);
   };
@@ -803,7 +821,19 @@ export default function WeekReview({
     }
   };
 
-  const handleSelectWeek = (week: WeekOverview) => {
+  const handleSelectWeek = (week: WeekOverview, opts?: { reload?: boolean }) => {
+    if (!opts?.reload && selectedWeekRef.current?.week === week.week) {
+      setSelectedWeek((prev) => ({
+        ...week,
+        status: normalizeWeekStatus(week.status ?? prev?.status),
+        fileContent: prev?.fileContent || week.fileContent,
+        decisions: prev?.decisions?.length ? prev.decisions : week.decisions,
+      }));
+      return;
+    }
+    if (opts?.reload) {
+      delete spanRowsByWeekRef.current[week.week];
+    }
     setLoading(true);
     setMessage(null);
     setEmptyDigests(false);
@@ -837,7 +867,7 @@ export default function WeekReview({
         setReviewPendingOps([]);
         setSavedReviewOps([]);
         fetchHotHealth();
-        void refreshFourPartSurfaces(week.week);
+        void refreshFourPartSurfaces(week.week, { reload: Boolean(opts?.reload) });
         void checkStaleness(week.week);
         void fetchReviewRecall(week.week);
       })
@@ -860,7 +890,7 @@ export default function WeekReview({
     // Only full reselect on open↔closed (slash Close/Reopen). Ignore current↔pending
     // / completed↔reviewed aliases and tidy-only diffs so refresh does not reset UI.
     if (!weekStatusesEquivalent(fresh.status, current.status)) {
-      handleSelectWeek(fresh);
+      handleSelectWeek(fresh, { reload: true });
       return;
     }
     if (fresh.tidyState !== current.tidyState) {
@@ -902,6 +932,70 @@ export default function WeekReview({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- stable poll; uses refs + fetchWeeks
   }, [fetchWeeks]);
+
+  useEffect(() => {
+    if (!rescanLoading && !reorganizeLoading) return;
+    const tick = async () => {
+      const current = selectedWeekRef.current;
+      if (rescanLoading && current) {
+        try {
+          const res = await fetch('/api/weekly/weeks');
+          const rows = await res.json().catch(() => []);
+          const row = Array.isArray(rows)
+            ? rows.find((w: { week?: string }) => w.week === current.week)
+            : null;
+          if (row && !row.generateInFlight) {
+            setRescanLoading(false);
+            setMessage({
+              type: 'success',
+              text: `Regenerated weekly schema for ${current.week}`,
+            });
+            handleSelectWeek(current, { reload: true });
+            void fetchWeeks({ silent: true });
+            void refreshFourPartSurfaces(current.week, { reload: true });
+            if (onRefresh) onRefresh();
+          }
+        } catch {
+          /* keep listening */
+        }
+      }
+      if (reorganizeLoading && activeDate) {
+        try {
+          const res = await fetch('/api/digest/run', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ date: activeDate, status_only: true }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (data.outcome === 'in_flight') return;
+          setReorganizeLoading(false);
+          if (data.outcome === 'failed') {
+            setMessage({
+              type: 'error',
+              text: `Reorganise failed for ${activeDate}.`,
+            });
+            return;
+          }
+          if (data.outcome === 'idle') {
+            return;
+          }
+          setMessage({
+            type: 'success',
+            text: `Reorganised ${typeof data.path === 'string' ? data.path : activeDate}.`,
+          });
+          fetchCandidates();
+          if (current) handleSelectWeek(current, { reload: true });
+          if (onRefresh) onRefresh();
+        } catch {
+          /* keep listening */
+        }
+      }
+    };
+    const id = window.setInterval(() => { void tick(); }, JOB_POLL_MS);
+    void tick();
+    return () => window.clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- job listen uses refs
+  }, [rescanLoading, reorganizeLoading, activeDate]);
 
   // Idle-aware background rescan: every 3 min while active; 30s no mousemove pauses
   // auto-rescan only (WEEKS_POLL_MS list sync continues). Wake resets the 3-min origin.
@@ -962,7 +1056,7 @@ export default function WeekReview({
             const updRes = await fetch('/api/weekly/update', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ week: week.week, reason: 'rescan' }),
+              body: JSON.stringify({ week: week.week, reason: 'rescan', background: true }),
             });
             if (!updRes.ok) continue;
             anyGenerated = true;
@@ -980,7 +1074,7 @@ export default function WeekReview({
             const updRes = await fetch('/api/weekly/update', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ week: week.week, reason: 'rescan' }),
+              body: JSON.stringify({ week: week.week, reason: 'rescan', background: true }),
             });
             if (!updRes.ok) continue;
             anyGenerated = true;
@@ -1009,7 +1103,7 @@ export default function WeekReview({
           if (anyGenerated || selectedNeedsRefresh) {
             await fetchWeeks({ silent: true });
             if (selectedNeedsRefresh && selectedWeekRef.current) {
-              handleSelectWeek(selectedWeekRef.current);
+              handleSelectWeek(selectedWeekRef.current, { reload: true });
             }
           }
         }
@@ -1160,6 +1254,7 @@ export default function WeekReview({
               text: `Re-scan ${week}: no usable dailies — clearing empty week…`,
             });
           }
+          setRescanLoading(false);
           return;
         }
 
@@ -1169,6 +1264,7 @@ export default function WeekReview({
             text: `nothing needs to be regenerated for ${week}`,
           });
           await refreshHotKeepBanner();
+          setRescanLoading(false);
           return;
         }
 
@@ -1181,7 +1277,7 @@ export default function WeekReview({
         const updRes = await fetch('/api/weekly/update', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ week, reason: 'rescan' }),
+          body: JSON.stringify({ week, reason: 'rescan', background: true }),
         });
         const data = await updRes.json().catch(() => ({}));
         if (updRes.status === 409 || data.outcome === 'already_closed') {
@@ -1192,6 +1288,7 @@ export default function WeekReview({
           || isEmptyDigestGenerateOutcome(data.outcome)
         ) {
           applySoftEmpty();
+          setRescanLoading(false);
           return;
         }
         if (!updRes.ok) {
@@ -1205,6 +1302,13 @@ export default function WeekReview({
               : 'Failed to re-scan the chosen week.';
           throw new Error(`Failed to re-scan ${week}. ${reason}${details}`.trim());
         }
+        if (data.outcome === 'started' || data.generate_in_flight) {
+          setMessage({
+            type: 'info',
+            text: `Re-scan ${week}: running in background…`,
+          });
+          return;
+        }
         if (hotChanged) {
           setMessage({
             type: 'info',
@@ -1216,12 +1320,12 @@ export default function WeekReview({
           type: 'success',
           text: `Regenerated weekly schema for ${week}`,
         });
-        handleSelectWeek(selectedWeek);
+        handleSelectWeek(selectedWeek, { reload: true });
         void fetchWeeks({ silent: true });
         if (onRefresh) onRefresh();
+        setRescanLoading(false);
       } catch (err: any) {
         setMessage({ type: 'error', text: err.message || String(err) });
-      } finally {
         setRescanLoading(false);
       }
     })();
@@ -1264,7 +1368,7 @@ export default function WeekReview({
       }
       setMessage({ type: 'success', text: successText });
       await fetchWeeks({ silent: true });
-      handleSelectWeek({ ...selectedWeek, status: 'reviewed', tidyState: 'tidy: done' });
+      handleSelectWeek({ ...selectedWeek, status: 'reviewed', tidyState: 'tidy: done' }, { reload: true });
       if (onRefresh) onRefresh();
     } catch (err: any) {
       setMessage({ type: 'error', text: err.message });
@@ -1290,7 +1394,7 @@ export default function WeekReview({
       }
       setMessage({ type: 'success', text: `Week ${selectedWeek.week} reopened.` });
       await fetchWeeks({ silent: true });
-      handleSelectWeek({ ...selectedWeek, status: 'pending', tidyState: 'tidy: pending' });
+      handleSelectWeek({ ...selectedWeek, status: 'pending', tidyState: 'tidy: pending' }, { reload: true });
       if (onRefresh) onRefresh();
     } catch (err: any) {
       setMessage({ type: 'error', text: err.message });
@@ -1319,7 +1423,7 @@ export default function WeekReview({
     setMessage(null);
     try {
       const saved = await runWeeklyReviewSave(selectedWeek.week, reviewOps);
-      await refreshFourPartSurfaces(selectedWeek.week);
+      await refreshFourPartSurfaces(selectedWeek.week, { reload: true });
       setMessage({
         type: 'success',
         text: `Saved ${saved.count} review action${saved.count === 1 ? '' : 's'}. Week stays open.`,
@@ -1348,7 +1452,7 @@ export default function WeekReview({
     setMessage(null);
     try {
       const { count } = await runWeeklyReviewRecall(selectedWeek.week);
-      await refreshFourPartSurfaces(selectedWeek.week);
+      await refreshFourPartSurfaces(selectedWeek.week, { reload: true });
       setMessage({
         type: 'success',
         text: `Recalled last review save (${count} action(s)).`,
@@ -1695,8 +1799,8 @@ export default function WeekReview({
               </div>
           )}
 
-          {viewMode === 'read' ? (
-            /* 1. READ BY DATE DAY-BY-DAY EXPLORER */
+          <div className={viewMode === 'read' ? '' : 'hidden'}>
+            {/* 1. READ BY DATE DAY-BY-DAY EXPLORER */}
             <div id="read-by-date-container" className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-sm space-y-4">
               <div className="p-4 bg-slate-950 border-b border-slate-850 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div>
@@ -2174,14 +2278,10 @@ export default function WeekReview({
                 })()}
               </div>
             </div>
-          ) : viewMode === 'hot' ? (
-            /* 3. MEMORY AND USER — HotMemoryEditor only (no Retention) */
-            <div className="space-y-6">
-              <HotMemoryEditor onComposeActiveChange={setHotComposeActive} />
-            </div>
-          ) : (
-            /* 2. WEEKLY CHRONICLE TAB (hot editor + retention; no Memory Approval hub) */
-            <div className="space-y-6">
+          </div>
+          <div className={viewMode === 'read' ? 'hidden' : 'space-y-6'}>
+            <HotMemoryEditor onComposeActiveChange={setHotComposeActive} />
+            <div className={viewMode === 'approve' ? 'space-y-6' : 'hidden'}>
               
               {selectedWeek?.status === 'reviewed' || selectedWeek?.status === 'completed' || selectedWeek?.tidyState === 'tidy: done' ? (
                 /* CLOSED SNAPSHOT SCREEN */
@@ -2215,9 +2315,6 @@ export default function WeekReview({
               ) : (
                 /* INTERACTIVE REVIEW PLATFORM */
                 <div className="space-y-6">
-                  
-                  {/* Hot memory editor — Chronicle tab */}
-                  <HotMemoryEditor onComposeActiveChange={setHotComposeActive} />
 
                   {/* Dynamic Staging Retention & Compliance Policy (NEW RETENTION SECTION) */}
                   <div id="retention-policy-section" className="bg-slate-900 border border-slate-800 rounded-2xl p-5 md:p-6 space-y-4">
@@ -2324,7 +2421,7 @@ export default function WeekReview({
               )}
 
             </div>
-          )}
+          </div>
 
         </div>
 

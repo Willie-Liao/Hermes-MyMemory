@@ -60,6 +60,8 @@ interface PluginWeekRow {
   filename?: string;
   path?: string;
   tidy?: string;
+  generate_in_flight?: string;
+  reorganise_in_flight?: string;
 }
 
 interface PluginWeeksResult {
@@ -137,6 +139,8 @@ export function mapListWeeks(payload: PluginWeeksResult): WeekOverview[] {
         : 'none',
     filePath: row.path ?? row.filename ?? `${row.week}.md`,
     fileContent: '',
+    generateInFlight: row.generate_in_flight === 'true',
+    reorganiseInFlight: row.reorganise_in_flight === 'true',
   }));
 }
 

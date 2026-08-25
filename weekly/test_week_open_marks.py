@@ -293,3 +293,24 @@ def test_sunday_close_is_plugin_clock_not_cron():
     assert "_previous_week_key" in text
     script = Path(__file__).resolve().parents[3] / "scripts" / "weekly-sunday-close.sh"
     assert not script.exists()
+
+
+def test_generate_week_background_kicks_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    actions = _load_actions()
+    _write_usable_daily(tmp_path, "2026-07-06", "W28 source")
+    kicked: list[str] = []
+    monkeypatch.setattr(actions, "_kick_background_generate_week", kicked.append)
+    first = actions.generate_week("2026-W28", reason="rescan", background=True)
+    assert first["outcome"] == "started"
+    assert first["generate_in_flight"] is True
+    assert kicked == ["2026-W28"]
+    mark = actions.weekly._load_state()["week_open_marks"]["2026-W28"]
+    assert mark["generate_in_flight"] is True
+    second = actions.generate_week("2026-W28", reason="rescan", background=True)
+    assert second["outcome"] == "started"
+    assert kicked == ["2026-W28"]
+    _write_draft(tmp_path, "2026-W28")
+    rows = actions.weekly._weeks_status_rows()
+    row = next(r for r in rows if r["week"] == "2026-W28")
+    assert row["generate_in_flight"] == "true"

@@ -82,6 +82,8 @@ def main() -> int:
                     date_str=a.get("date_str"),
                     session_key=a.get("session_key"),
                     force=bool(a.get("force", True)),
+                    wait=a.get("wait", True),
+                    status_only=a.get("status_only", False),
                 ),
                 "request_resummarise": lambda **a: digest_run.request_weekly_reorganise(
                     date_str=a.get("date_str"),
@@ -91,6 +93,8 @@ def main() -> int:
                         else str(a.get("session_key"))
                     ),
                     force=bool(a.get("force", True)),
+                    wait=a.get("wait", True),
+                    status_only=a.get("status_only", False),
                 ),
                 "list_weekly_span_candidates": lambda **a: digest_run.list_weekly_span_candidates(
                     str(a.get("week_key") or "")

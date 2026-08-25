@@ -55,7 +55,7 @@ def test_bridge_dispatches_request_weekly_reorganise(monkeypatch, capsys):
 
     class FakeRun:
         @staticmethod
-        def request_weekly_reorganise(*, date_str=None, session_key=None, force=True):
+        def request_weekly_reorganise(*, date_str=None, session_key=None, force=True, **_k):
             captured.update(
                 {
                     "date_str": date_str,
@@ -100,7 +100,7 @@ def test_bridge_dispatches_request_resummarise(monkeypatch, capsys):
 
     class FakeRun:
         @staticmethod
-        def request_weekly_reorganise(*, date_str=None, session_key=None, force=True):
+        def request_weekly_reorganise(*, date_str=None, session_key=None, force=True, **_k):
             captured.update(
                 {
                     "date_str": date_str,

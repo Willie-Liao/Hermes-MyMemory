@@ -99,6 +99,8 @@ export interface WeekOverview {
   tidyState: 'tidy: pending' | 'tidy: done' | 'none';
   filePath: string;
   fileContent: string;
+  generateInFlight?: boolean;
+  reorganiseInFlight?: boolean;
   completedDate?: string;
   decisions?: WeeklyProposal[];
   candidates?: WeeklyProposal[];

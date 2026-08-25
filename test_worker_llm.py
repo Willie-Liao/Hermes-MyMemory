@@ -459,6 +459,39 @@ def test_extract_tool_calls_flat_shape_and_broken_arguments_string():
     assert found == [("submit_tighten_fact", {"kind": "Factual", "content": "x"})]
 
 
+def test_extract_tool_calls_drops_tool_describe_keeps_submit():
+    """Gateway disclosure hops must not become worker1_summary's recorded tool."""
+    wl = _load_worker_llm()
+    result = {
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "tool_describe",
+                            "arguments": '{"name": "submit_weekly_summary"}',
+                        }
+                    },
+                    {
+                        "function": {
+                            "name": "submit_weekly_summary",
+                            "arguments": '{"summary": [{"text": "Shipped wrap-up", "weekdays": ["Monday"]}]}',
+                        }
+                    },
+                ],
+            }
+        ]
+    }
+    found = wl.extract_tool_calls_from_result(result)
+    assert found == [
+        (
+            "submit_weekly_summary",
+            {"summary": [{"text": "Shipped wrap-up", "weekdays": ["Monday"]}]},
+        )
+    ]
+
+
 def test_run_worker_llm_tools_falls_back_when_callback_args_empty(tmp_path, monkeypatch):
     wl = _load_worker_llm()
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

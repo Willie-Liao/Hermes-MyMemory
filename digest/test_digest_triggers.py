@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
+import sqlite3
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 _mymemory = Path(__file__).resolve().parent.parent
@@ -128,6 +130,9 @@ def test_batch_trigger_skips_before_twelve_user_messages(tmp_path, monkeypatch):
 def test_batch_trigger_ready_at_twelve_user_without_assistant_floor(tmp_path, monkeypatch):
     digest = _load_digest()
     messages = _messages(12, assistant_count=0)
+    aged = (datetime.now(timezone.utc) - timedelta(seconds=700)).isoformat()
+    for row in messages:
+        row["timestamp"] = aged
     calls = _configure_digest(digest, monkeypatch, tmp_path, messages)
 
     digest.on_agent_end({"session_id": "s1", "platform": "wecom"})
@@ -783,3 +788,227 @@ def test_span_validator_purpose(monkeypatch):
         [{"id": "mem-1", "entity": "X", "body": "y", "file": "2026-07-16.md"}],
     )
     assert purposes == ["span_validator"]
+
+
+def test_stale_inflight_skips_when_source_window_already_on_daily(tmp_path, monkeypatch):
+    digest = _load_digest()
+    messages = _messages(12)
+    today = hermes_local_today_str()
+    daily = tmp_path / "memories" / "staging" / "daily" / f"{today}.md"
+    daily.parent.mkdir(parents=True, exist_ok=True)
+    daily.write_text(
+        "\n".join(
+            [
+                "---",
+                "id: mem-already-extracted",
+                "type: fact",
+                "entity: Replay",
+                "confidence: high",
+                "status: candidate",
+                "sources: [session s1#1-24]",
+                "---",
+                "Already extracted window.",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _inflight_state(tmp_path)
+    calls = _configure_digest(digest, monkeypatch, tmp_path, messages)
+
+    result = digest._maybe_run_digest("s1", reason=digest.BOOKMARK_TRIGGER_REASON)
+
+    assert calls == []
+    assert result["outcome"] == "already_extracted"
+    state = _read_state(tmp_path)
+    assert state["sessions"]["s1"]["last_digest_message_id"] == 24
+    assert state["sessions"]["s1"]["digest_in_flight"] is False
+
+
+def test_replayed_new_sqlite_ids_skip_when_user_hashes_known(tmp_path, monkeypatch):
+    digest = _load_digest()
+    texts = [f"cloned user {idx}" for idx in range(1, 13)]
+    hashes = [hashlib.sha256(text.strip().encode()).hexdigest() for text in texts]
+    messages: list[dict] = []
+    next_id = 70000
+    for text in texts:
+        messages.append({"id": next_id, "role": "user", "content": text})
+        next_id += 1
+        messages.append({"id": next_id, "role": "assistant", "content": "ok"})
+        next_id += 1
+    path = _state_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "digested_user_hashes": hashes,
+                "sessions": {
+                    "s1": {
+                        "session_id": "s1",
+                        "platform": "wecom",
+                        "last_digest_message_id": 69999,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = _configure_digest(digest, monkeypatch, tmp_path, messages)
+
+    result = digest._maybe_run_digest("s1", reason=digest.BOOKMARK_TRIGGER_REASON)
+
+    assert calls == []
+    assert result["outcome"] == "already_extracted"
+    state = _read_state(tmp_path)
+    assert state["sessions"]["s1"]["last_digest_message_id"] == next_id - 1
+
+
+def test_fresh_user_text_after_hashes_still_runs_worker(tmp_path, monkeypatch):
+    digest = _load_digest()
+    old_hashes = [
+        hashlib.sha256(f"old text {idx}".encode()).hexdigest() for idx in range(12)
+    ]
+    messages = _messages(12)
+    path = _state_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "digested_user_hashes": old_hashes,
+                "sessions": {
+                    "s1": {"session_id": "s1", "platform": "wecom"}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = _configure_digest(digest, monkeypatch, tmp_path, messages)
+
+    digest._maybe_run_digest("s1", reason=digest.BOOKMARK_TRIGGER_REASON)
+
+    assert len(calls) == 1
+
+
+def test_fetch_messages_skips_compaction_user_rows(tmp_path, monkeypatch):
+    digest = _load_digest()
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    db = tmp_path / "state.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY,
+            session_id TEXT,
+            role TEXT,
+            content TEXT,
+            timestamp TEXT,
+            active INTEGER
+        )
+        """
+    )
+    aged = (datetime.now(timezone.utc) - timedelta(seconds=700)).isoformat()
+    rows = []
+    for idx in range(1, 12):
+        rows.append((idx, "s1", "user", f"user {idx}", aged, 1))
+    rows.append(
+        (
+            12,
+            "s1",
+            "user",
+            "[CONTEXT COMPACTION — REFERENCE ONLY]\nsummary of prior turns",
+            aged,
+            1,
+        )
+    )
+    conn.executemany(
+        "INSERT INTO messages (id, session_id, role, content, timestamp, active) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    conn.commit()
+    conn.close()
+
+    fetched = digest._fetch_messages("s1")
+    assert len(fetched) == 11
+    assert all(not m["content"].startswith("[CONTEXT COMPACTION") for m in fetched)
+
+    path = _state_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"sessions": {"s1": {"session_id": "s1", "platform": "wecom"}}}),
+        encoding="utf-8",
+    )
+    calls: list[dict] = []
+
+    def fake_run(*_args, **_kwargs):
+        calls.append({"ran": True})
+
+    monkeypatch.setattr(digest, "_run_digest_worker", fake_run)
+
+    class ImmediateThread:
+        def __init__(self, *, target, args, kwargs=None, name, daemon):
+            self._target = target
+            self._args = args
+            self._kwargs = kwargs or {}
+
+        def start(self):
+            self._target(*self._args, **self._kwargs)
+
+    monkeypatch.setattr(digest.threading, "Thread", ImmediateThread)
+
+    digest._maybe_run_digest("s1", reason=digest.BOOKMARK_TRIGGER_REASON)
+    assert calls == []
+
+
+def test_batch_ready_holds_ten_minutes_without_trailing_assistant(tmp_path, monkeypatch):
+    digest = _load_digest()
+    messages = _messages(12, assistant_count=0)
+    now = datetime.now(timezone.utc).isoformat()
+    for row in messages:
+        row["timestamp"] = now
+    _write_state(tmp_path)
+    calls = _configure_digest(digest, monkeypatch, tmp_path, messages)
+
+    result = digest._maybe_run_digest("s1", reason=digest.BOOKMARK_TRIGGER_REASON)
+
+    assert calls == []
+    assert result["outcome"] == "waiting_assistant"
+    state = _read_state(tmp_path)
+    assert "batch_hold_until" in state["sessions"]["s1"]
+
+    aged = (datetime.now(timezone.utc) - timedelta(seconds=700)).isoformat()
+    for row in messages:
+        row["timestamp"] = aged
+    digest._maybe_run_digest("s1", reason=digest.BOOKMARK_TRIGGER_REASON)
+    assert len(calls) == 1
+    assert "batch_hold_until" not in _read_state(tmp_path)["sessions"]["s1"]
+
+
+def test_batch_ready_starts_immediately_when_trailing_assistant_present(
+    tmp_path, monkeypatch
+):
+    digest = _load_digest()
+    messages = _messages(12)
+    _write_state(tmp_path)
+    calls = _configure_digest(digest, monkeypatch, tmp_path, messages)
+
+    digest._maybe_run_digest("s1", reason=digest.BOOKMARK_TRIGGER_REASON)
+
+    assert len(calls) == 1
+    assert "batch_hold_until" not in _read_state(tmp_path)["sessions"]["s1"]
+
+
+def test_thirteenth_user_breaks_assistant_hold(tmp_path, monkeypatch):
+    digest = _load_digest()
+    messages = _messages(13, assistant_count=0)
+    now = datetime.now(timezone.utc).isoformat()
+    for row in messages:
+        row["timestamp"] = now
+    _write_state(tmp_path)
+    calls = _configure_digest(digest, monkeypatch, tmp_path, messages)
+
+    digest._maybe_run_digest("s1", reason=digest.BOOKMARK_TRIGGER_REASON)
+
+    assert len(calls) == 1
+    assert calls[0]["user_count"] == 12
+    assert "batch_hold_until" not in _read_state(tmp_path)["sessions"]["s1"]

@@ -97,6 +97,11 @@ def _hermes_home() -> Path:
 
 
 BATCH_USER_MESSAGES = 12
+DIGEST_HASH_RING_MAX = 500
+DIGEST_REPLAY_HIT_NUMERATOR = 4
+DIGEST_REPLAY_HIT_DENOMINATOR = 5
+DIGEST_WINDOW_LOOKBACK_DAYS = 7
+BATCH_ASSISTANT_WAIT_SECONDS = 600
 RETRIEVAL_ID_CAP = 8
 RETRIEVAL_TTL_SECONDS = 30 * 60
 USER_CORRECTION_REASON = "rejected by user's correction"
@@ -356,6 +361,7 @@ _digest_lock = threading.RLock()
 # (AIAgent.run_conversation fires on_agent_end) does not pollute .digest-state.json.
 _digest_worker_active = threading.local()
 _clock_stop = threading.Event()
+_clock_wake = threading.Event()
 _clock_thread: threading.Thread | None = None
 _clock_action_lock = threading.Lock()
 
@@ -639,6 +645,7 @@ def start_digest_clock_thread() -> None:
     if _clock_thread is not None and _clock_thread.is_alive():
         return
     _clock_stop.clear()
+    _clock_wake.clear()
     _clock_thread = threading.Thread(
         target=_digest_clock_loop,
         name="memory-digest-clock",
@@ -658,13 +665,16 @@ def start_digest_clock_thread() -> None:
 def stop_digest_clock_thread() -> None:
     """Tests / plugin unload: wake the sleep loop so the thread can exit."""
     _clock_stop.set()
+    _clock_wake.set()
 
 
 def _digest_clock_loop() -> None:
-    """Sleep until next_clock_at; a 60s poll hid a sleeping thread from state.
+    """Sleep until next_clock_at or the earliest batch_hold_until.
 
-    Fire the slept-for tick as ``now`` so a wake a few minutes past midnight
-    still leftover-extracts that 23:55 civil day instead of skipping until 08:00.
+    A civil-only wait would miss the 10-minute assistant hold after the 12th
+    user turn. Fire the slept-for civil tick as ``now`` so a wake a few minutes
+    past midnight still leftover-extracts that 23:55 civil day instead of
+    skipping until 08:00.
     """
     global _clock_thread
     while not _clock_stop.is_set():
@@ -682,20 +692,51 @@ def _digest_clock_loop() -> None:
                     state["next_clock_at"] = stored.isoformat()
                     _save_state(state)
             delay = max(0.0, (stored - local).total_seconds())
+            now_utc = datetime.now(timezone.utc)
             with _digest_lock:
                 state = _load_state()
                 state["clock_alive"] = True
-                state["clock_heartbeat_at"] = datetime.now(timezone.utc).isoformat()
+                state["clock_heartbeat_at"] = now_utc.isoformat()
                 _save_state(state)
+                for entry in state.get("sessions", {}).values():
+                    raw_hold = entry.get("batch_hold_until")
+                    until = _parse_ts(
+                        str(raw_hold).replace("Z", "+00:00") if raw_hold else None
+                    )
+                    if until is None:
+                        continue
+                    if until.tzinfo is None:
+                        until = until.replace(tzinfo=timezone.utc)
+                    delay = min(delay, max(0.0, (until - now_utc).total_seconds()))
             _log(f"digest clock waiting until {stored.isoformat()}")
-            if _clock_stop.wait(delay):
+            _clock_wake.clear()
+            _clock_wake.wait(delay)
+            if _clock_stop.is_set():
                 with _digest_lock:
                     state = _load_state()
                     state["clock_alive"] = False
                     state["clock_stopped_at"] = datetime.now(timezone.utc).isoformat()
                     _save_state(state)
                 break
-            maybe_run_digest_clock(now=stored, sync=True)
+            due_keys: list[str] = []
+            now_utc = datetime.now(timezone.utc)
+            with _digest_lock:
+                for session_key, entry in _load_state().get("sessions", {}).items():
+                    raw_hold = entry.get("batch_hold_until")
+                    until = _parse_ts(
+                        str(raw_hold).replace("Z", "+00:00") if raw_hold else None
+                    )
+                    if until is None:
+                        continue
+                    if until.tzinfo is None:
+                        until = until.replace(tzinfo=timezone.utc)
+                    if until <= now_utc:
+                        due_keys.append(session_key)
+            for session_key in due_keys:
+                _maybe_run_digest(session_key, reason=BOOKMARK_TRIGGER_REASON)
+            local = datetime.now(zone)
+            if local >= stored:
+                maybe_run_digest_clock(now=stored, sync=True)
         except Exception as exc:
             _log(f"digest clock died: {exc}")
             with _digest_lock:
@@ -730,7 +771,12 @@ def _seconds_since(ts: datetime | None) -> float:
 
 
 def _fetch_messages(session_id: str, after_id: int = 0) -> list[dict[str, Any]]:
-    """Load active user/assistant rows including timestamp for source-window clocks."""
+    """Load chat rows for digest without treating compaction summaries as user turns.
+
+    Hermes compaction writes a ``[CONTEXT COMPACTION`` blob as ``role=user``;
+    counting that toward the batch floor would extract a recap as if the user
+    sent it.
+    """
     db_path = _hermes_home() / "state.db"
     if not db_path.exists():
         return []
@@ -756,6 +802,8 @@ def _fetch_messages(session_id: str, after_id: int = 0) -> list[dict[str, Any]]:
         role = row["role"] or ""
         content = (row["content"] or "").strip()
         if role not in ("user", "assistant") or not content:
+            continue
+        if role == "user" and content.startswith("[CONTEXT COMPACTION"):
             continue
         out.append(
             {
@@ -2577,11 +2625,14 @@ def _finalize_digest_success(
     batch_end_id: int | None,
     *,
     session_id: str | None = None,
+    user_hashes: list[str] | None = None,
 ) -> None:
-    """Advance the session bookmark after a committed digest (or durable skip).
+    """Advance the bookmark and remember user-text hashes so compaction clones skip.
 
-    Always upserts state: a successful daily write must move the bookmark even
-    if the session entry was missing/cleared mid-run.
+    New sqlite ids after session compaction look undigested; without a content
+    hash ring the same turns would extract again. Always upserts state: a
+    successful daily write must move the bookmark even if the session entry
+    was missing/cleared mid-run.
     """
     with _digest_lock:
         state = _load_state()
@@ -2601,8 +2652,21 @@ def _finalize_digest_success(
         entry["digest_in_flight"] = False
         entry["in_flight_batch_end_id"] = None
         entry.pop("last_digest_failure_at", None)
+        entry.pop("batch_hold_until", None)
         entry["last_digest_attempts"] = 0
         sessions[session_key] = entry
+        if user_hashes:
+            ring = list(state.get("digested_user_hashes") or [])
+            seen = set(ring)
+            for digest_hash in user_hashes:
+                if not digest_hash or digest_hash in seen:
+                    continue
+                ring.append(digest_hash)
+                seen.add(digest_hash)
+            overflow = len(ring) - DIGEST_HASH_RING_MAX
+            if overflow > 0:
+                ring = ring[overflow:]
+            state["digested_user_hashes"] = ring
         _save_state(state)
 
 
@@ -4916,8 +4980,9 @@ def _run_digest_pipeline(
     user_count: int = 0,
     assistant_count: int = 0,
     batch_start_id: int | None = None,
+    user_hashes: list[str] | None = None,
 ) -> str:
-    """Phase-1 extract → persist → same-day supersede commit → bookmark.
+    """Phase-1 extract → persist → bookmark, recording user hashes so clones skip.
 
     Merge stays on the 08/12/16/20 clock. Apply overwrite here so a later
     batch in the same civil day does not wait for that tick. Fail-open keeps
@@ -4954,7 +5019,7 @@ def _run_digest_pipeline(
             f"reason={reason}"
         )
         _finalize_digest_success(
-            session_key, batch_end_id, session_id=session_id
+            session_key, batch_end_id, session_id=session_id, user_hashes=user_hashes
         )
         return "skip"
 
@@ -5004,7 +5069,9 @@ def _run_digest_pipeline(
             f"run={run_id} error={exc}"
         )
 
-    _finalize_digest_success(session_key, batch_end_id, session_id=session_id)
+    _finalize_digest_success(
+        session_key, batch_end_id, session_id=session_id, user_hashes=user_hashes
+    )
     _log(
         f"digest pipeline appended session={session_id} "
         f"run={run_id} reason={reason} prior_cards={prior_count}"
@@ -5054,6 +5121,7 @@ def _run_digest_pipeline_entry(
     user_count: int = 0,
     assistant_count: int = 0,
     batch_start_id: int | None = None,
+    user_hashes: list[str] | None = None,
 ) -> str:
     """Run the digest pipeline. Returns appended/skip/failed."""
     _digest_worker_active.active = True
@@ -5070,6 +5138,7 @@ def _run_digest_pipeline_entry(
             user_count=user_count,
             assistant_count=assistant_count,
             batch_start_id=batch_start_id,
+            user_hashes=user_hashes,
         )
     finally:
         _digest_worker_active.active = False
@@ -5087,16 +5156,17 @@ def _maybe_run_digest(
     sync: bool = False,
     date_str: str | None = None,
 ) -> dict[str, Any]:
-    """Decide and launch a digest run for ``session_key``.
+    """Decide digest: skip already-extracted windows, hold for the 12th reply, then launch.
 
-    Auto runs wait for ``BATCH_USER_MESSAGES`` user turns, then take only
-    those turns plus assistant replies between them so leftover user 13+
-    cannot inflate one extract. ``force`` skips the floor and that clip
-    (still requires undigested messages). ``sync`` runs the worker inline
-    and returns its terminal outcome ('appended' / 'skip' / 'failed')
-    instead of 'started'. Hook callers ignore the outcome dict; slash inspects it.
-    Nightly leftover passes ``date_str`` so a missed 23:55 still writes
-    yesterday's file instead of the morning's civil date.
+    Crash/compaction must not extract the same turns twice. Auto runs wait for
+    ``BATCH_USER_MESSAGES`` user turns, then take only those turns plus assistant
+    replies between them so leftover user 13+ cannot inflate one extract.
+    ``force`` skips the floor, the clip, and the assistant hold (still requires
+    undigested messages). ``sync`` runs the worker inline and returns its
+    terminal outcome ('appended' / 'skip' / 'failed') instead of 'started'.
+    Hook callers ignore the outcome dict; slash inspects it. Nightly leftover
+    passes ``date_str`` so a missed 23:55 still writes yesterday's file instead
+    of the morning's civil date.
     """
     with _digest_lock:
         state = _load_state()
@@ -5120,6 +5190,7 @@ def _maybe_run_digest(
         after_id = int(entry.get("last_digest_message_id") or 0)
         messages = _fetch_messages(session_id, after_id=after_id)
         user_count, assistant_count = _role_counts(messages)
+        pending_users = user_count
         if not messages:
             _log(f"skip digest ({reason}): no undigested messages session={session_id}")
             return {
@@ -5154,6 +5225,54 @@ def _maybe_run_digest(
             messages = sliced
             user_count, assistant_count = _role_counts(messages)
 
+            if pending_users >= BATCH_USER_MESSAGES + 1:
+                entry.pop("batch_hold_until", None)
+            else:
+                last_user_idx = None
+                for idx, msg in enumerate(messages):
+                    if msg.get("role") == "user":
+                        last_user_idx = idx
+                trailing_assistant = False
+                if last_user_idx is not None:
+                    for msg in messages[last_user_idx + 1 :]:
+                        if (
+                            msg.get("role") == "assistant"
+                            and str(msg.get("content") or "").strip()
+                        ):
+                            trailing_assistant = True
+                            break
+                if trailing_assistant:
+                    entry.pop("batch_hold_until", None)
+                elif last_user_idx is not None:
+                    iso = _iso_from_message_ts(messages[last_user_idx].get("timestamp"))
+                    if iso:
+                        hold_start = datetime.fromisoformat(iso)
+                    else:
+                        hold_start = datetime.now(timezone.utc)
+                    if hold_start.tzinfo is None:
+                        hold_start = hold_start.replace(tzinfo=timezone.utc)
+                    hold_until = hold_start + timedelta(
+                        seconds=BATCH_ASSISTANT_WAIT_SECONDS
+                    )
+                    if datetime.now(timezone.utc) < hold_until:
+                        entry["batch_hold_until"] = hold_until.isoformat()
+                        state["sessions"][session_key] = entry
+                        _save_state(state)
+                        _log(
+                            f"skip digest (waiting_assistant) session={session_id} "
+                            f"until={hold_until.isoformat()}"
+                        )
+                        _clock_wake.set()
+                        return {
+                            "outcome": "waiting_assistant",
+                            "session_id": session_id,
+                            "user": user_count,
+                            "assistant": assistant_count,
+                        }
+                    entry.pop("batch_hold_until", None)
+            state["sessions"][session_key] = entry
+            _save_state(state)
+
         platform = entry.get("platform", "")
         transcript = _format_transcript(messages)
         daily_dir = _staging_daily()
@@ -5162,6 +5281,72 @@ def _maybe_run_digest(
         daily_path = daily_staging_path(_hermes_home(), today)
         batch_start_id = messages[0]["id"] if messages else None
         batch_end_id = messages[-1]["id"] if messages else None
+        user_hashes = [
+            hashlib.sha256(str(msg.get("content") or "").strip().encode()).hexdigest()
+            for msg in messages
+            if msg.get("role") == "user"
+        ]
+        window_hit = False
+        if batch_start_id is not None and batch_end_id is not None:
+            cutoff = hermes_local_today() - timedelta(days=DIGEST_WINDOW_LOOKBACK_DAYS)
+            for path in iter_daily_staging_files(daily_dir):
+                try:
+                    file_day = date.fromisoformat(path.stem)
+                except ValueError:
+                    continue
+                if file_day < cutoff:
+                    continue
+                try:
+                    content = path.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                for block in _daily_blocks(content):
+                    sources = block.get("sources") or []
+                    if not isinstance(sources, list):
+                        continue
+                    for tag in sources:
+                        tag_text = str(tag)
+                        if digest_tools.session_id_from_source_tag(tag_text) != session_id:
+                            continue
+                        rng = digest_tools.message_range_from_source_tag(tag_text)
+                        if rng is None:
+                            continue
+                        range_start, range_end = rng
+                        if range_end < batch_start_id or range_start > batch_end_id:
+                            continue
+                        window_hit = True
+                        break
+                    if window_hit:
+                        break
+                if window_hit:
+                    break
+        known_set = set(state.get("digested_user_hashes") or [])
+        known_count = sum(1 for digest_hash in user_hashes if digest_hash in known_set)
+        hash_hit = bool(user_hashes) and (
+            known_count * DIGEST_REPLAY_HIT_DENOMINATOR
+            >= len(user_hashes) * DIGEST_REPLAY_HIT_NUMERATOR
+        )
+        if window_hit or hash_hit:
+            _log(
+                f"skip digest (already_extracted) session={session_id} "
+                f"range={batch_start_id}-{batch_end_id} "
+                f"window_hit={window_hit} hash_hit={hash_hit}"
+            )
+            _finalize_digest_success(
+                session_key,
+                batch_end_id,
+                session_id=session_id,
+                user_hashes=user_hashes,
+            )
+            return {
+                "outcome": "already_extracted",
+                "session_id": session_id,
+                "path": str(daily_path),
+                "batch_end_id": batch_end_id,
+                "batch_start_id": batch_start_id,
+                "user": user_count,
+                "assistant": assistant_count,
+            }
         _log(
             f"start digest ({reason}{' force' if force else ''}"
             f"{' sync' if sync else ''}) session={session_id} messages={len(messages)} "
@@ -5195,6 +5380,7 @@ def _maybe_run_digest(
             user_count=user_count,
             assistant_count=assistant_count,
             batch_start_id=batch_start_id,
+            user_hashes=user_hashes,
         )
         return {"outcome": outcome, **base}
 
@@ -5213,6 +5399,7 @@ def _maybe_run_digest(
             "user_count": user_count,
             "assistant_count": assistant_count,
             "batch_start_id": batch_start_id,
+            "user_hashes": user_hashes,
         },
         name=f"memory-digest-{session_id[:8]}",
         daemon=True,
@@ -5872,6 +6059,11 @@ def on_pre_llm_call(
     platform: str = "",
     **_: Any,
 ) -> dict[str, str] | None:
+    """Re-enter digest before the next model call so user 13 can cancel the 12th-turn hold.
+
+    Waiting only on ``on_agent_end`` would keep holding until assistant 12 exists;
+    inbound user 13 is already in sqlite at pre-LLM time.
+    """
     del is_first_turn, turn_id
     if in_worker_llm():
         return None
@@ -5882,6 +6074,8 @@ def on_pre_llm_call(
         or str(platform or "").casefold() == "cron"
     ):
         return None
+    if session_id:
+        _maybe_run_digest(str(session_id), reason=BOOKMARK_TRIGGER_REASON)
     decision = _recall_inject_decision(session_id, user_message)
     if decision == "skip":
         return None

@@ -120,7 +120,11 @@ def main() -> int:
             dispatch: dict[str, Callable[..., dict[str, Any]]] = {
                 "weekly_status": lambda **_: weekly_actions.weekly_status(),
                 "list_weekly_review_status": lambda **_: weekly_actions.list_weekly_review_status(),
-                "generate_week": lambda **a: weekly_actions.generate_week(a.get("week_key"), reason=a.get("reason") or "bridge"),
+                "generate_week": lambda **a: weekly_actions.generate_week(
+                    a.get("week_key"),
+                    reason=a.get("reason") or "bridge",
+                    background=a.get("background", False),
+                ),
                 "review_week": lambda **a: weekly_actions.review_week(a.get("week_key")),
                 "snooze_week": lambda **a: weekly_actions.snooze_week(seconds=a.get("seconds"), session_id=a.get("session_id") or ""),
                 "skip_week": lambda **_: weekly_actions.skip_week(),

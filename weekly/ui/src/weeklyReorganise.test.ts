@@ -30,7 +30,7 @@ describe('runReorganiseSequence', () => {
     });
 
     expect(calls.map((c) => c.url)).toEqual(['/api/digest/run']);
-    expect(calls[0]?.body).toEqual({ date: '2026-07-27' });
+    expect(calls[0]?.body).toEqual({ date: '2026-07-27', wait: false });
     expect(result).toEqual({
       pathLabel: '/tmp/staging/daily/2026-07-27.md',
       week: '2026-W31',
@@ -55,6 +55,22 @@ describe('runReorganiseSequence', () => {
       stage: 'digest',
     });
     expect(calls).toEqual(['/api/digest/run']);
+  });
+
+  it('treats in_flight as a started background job', async () => {
+    const fetchImpl = vi.fn(async (url: string) => {
+      expect(url).toBe('/api/digest/run');
+      return jsonResponse(202, {
+        outcome: 'in_flight',
+        path: '/tmp/staging/daily/2026-07-27.md',
+        date: '2026-07-27',
+      });
+    });
+    const result = await runReorganiseSequence(fetchImpl, {
+      date: '2026-07-27',
+      week: '2026-W31',
+    });
+    expect(result.digestOutcome).toBe('in_flight');
   });
 
   it('never calls the obsolete resummarise endpoint', async () => {

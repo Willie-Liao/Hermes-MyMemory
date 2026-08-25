@@ -36,9 +36,20 @@ export async function runReorganiseSequence(
   const digestRes = await fetchImpl('/api/digest/run', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: jsonBody({ date: opts.date }),
+    body: jsonBody({ date: opts.date, wait: false }),
   });
   const digestData = await readJson(digestRes);
+  if (digestData.outcome === 'in_flight' || digestRes.status === 202) {
+    const pathLabel =
+      typeof digestData.path === 'string' && digestData.path
+        ? digestData.path
+        : `${opts.date}.md`;
+    return {
+      pathLabel,
+      week: opts.week,
+      digestOutcome: 'in_flight',
+    };
+  }
   if (!digestRes.ok) {
     const err: ReorganiseSequenceError = {
       stage: 'digest',

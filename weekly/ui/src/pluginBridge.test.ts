@@ -67,6 +67,7 @@ const mapped = mapListWeeks({
 });
 
 assert.equal(mapped[0].week, '2026-W26');
+assert.equal(mapped[0].generateInFlight, false);
 
 const runner = (
   result: BridgeRunResult,
