@@ -1,3 +1,4 @@
+export const AUTO_RESCAN_MS = 180_000;
 export const IDLE_MS = 30_000;
 /** Shared Weekly UI server inactivity timeout (desktop + phone). */
 export const UI_IDLE_TIMEOUT_MS = 3_600_000;
@@ -39,6 +40,20 @@ export function shouldSendActivityHeartbeat(args: {
   return args.now - args.lastSentAt >= minIntervalMs;
 }
 
+/** Fire idle auto-rescan only when the 3-min origin elapsed and the user is not idle or composing. */
+export function shouldFireAutoRescan(args: {
+  now: number;
+  idle: boolean;
+  timerStartedAt: number;
+  intervalMs?: number;
+  /** True while an edit/tighten composer is open — freezes the auto-rescan countdown. */
+  editing?: boolean;
+}): boolean {
+  const intervalMs = args.intervalMs ?? AUTO_RESCAN_MS;
+  if (args.idle || args.editing) return false;
+  return args.now - args.timerStartedAt >= intervalMs;
+}
+
 /** Hot Memory Editor entry edit, tighten guidance, or tighten draft review. */
 export function isHotMemoryComposeActive(args: {
   editingIndex: number | null;
@@ -57,7 +72,18 @@ export function shouldApplyPostRescanRefresh(editing: boolean): boolean {
   return !editing;
 }
 
-/** Clears idle and resets the last-move clock to `now`. */
+/**
+ * While editing, hold remaining auto-rescan time by shifting the origin forward
+ * each tick by `elapsedMs` (typically the interval tick size).
+ */
+export function freezeAutoRescanOrigin(
+  timerStartedAt: number,
+  elapsedMs: number,
+): number {
+  return timerStartedAt + Math.max(0, elapsedMs);
+}
+
+/** Clears idle and resets the auto-rescan timer origin to `now`. */
 export function onMouseMove(state: IdleRescanState, now: number): IdleRescanState {
   return {
     lastMoveAt: now,
