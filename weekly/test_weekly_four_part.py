@@ -220,6 +220,7 @@ def test_assign_typed_citations_does_not_renumber_events():
     payload = _golden_payload(schema)
     before = dict(payload.legend)
     assigned = schema.assign_typed_citations(payload)
+    assert assigned.summary == payload.summary
     assert assigned.legend == before
     assert citations.next_cite_after_legend(before) == 6
     assert set(assigned.typed_legend) == {6, 7}
@@ -229,6 +230,24 @@ def test_assign_typed_citations_does_not_renumber_events():
     overdue_text = schema.render_overdue_section(assigned.span_candidates)
     assert overdue_text == "Possible overdue report\n- None."
     assert all(s.cite is None for s in assigned.span_candidates)
+
+
+def test_assign_typed_citations_keeps_summary():
+    """Cite rebuild must not drop Worker-1 summary or Chronicle dumps []."""
+    schema = _load_schema()
+    payload = schema.WeeklyReviewPayload(
+        days=(),
+        week_key="2026-W35",
+        summary=(
+            schema.WeeklySummaryItem(
+                text="Monday wrap-up only",
+                weekdays=("Monday",),
+            ),
+        ),
+    )
+    assigned = schema.assign_typed_citations(payload)
+    assert assigned.summary == payload.summary
+    assert assigned.summary[0].text == "Monday wrap-up only"
 
 
 def test_empty_day_constant_exact():

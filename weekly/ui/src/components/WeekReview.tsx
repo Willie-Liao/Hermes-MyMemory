@@ -1035,7 +1035,6 @@ export default function WeekReview({
 
         const emptyDigests = Boolean(staleData.empty_digests);
         const hasWeeklyFile = Boolean(staleData.has_weekly_file);
-        const stale = Boolean(staleData.stale);
 
         if (emptyDigests) {
           setMessage({
@@ -1063,16 +1062,6 @@ export default function WeekReview({
           return;
         }
 
-        if (hasWeeklyFile && !stale) {
-          setMessage({
-            type: 'success',
-            text: `nothing needs to be regenerated for ${week}`,
-          });
-          await refreshHotKeepBanner();
-          setRescanLoading(false);
-          return;
-        }
-
         setMessage({
           type: 'info',
           text: hasWeeklyFile
@@ -1082,7 +1071,7 @@ export default function WeekReview({
         const updRes = await fetch('/api/weekly/update', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ week, reason: 'rescan', background: true }),
+          body: JSON.stringify({ week, reason: 'rescan' }),
         });
         const data = await updRes.json().catch(() => ({}));
         if (updRes.status === 409 || data.outcome === 'already_closed') {
@@ -1108,11 +1097,9 @@ export default function WeekReview({
           throw new Error(`Failed to re-scan ${week}. ${reason}${details}`.trim());
         }
         if (data.outcome === 'started' || data.generate_in_flight) {
-          setMessage({
-            type: 'info',
-            text: `Re-scan ${week}: running in background…`,
-          });
-          return;
+          throw new Error(
+            `Re-scan ${week} returned background start; generate must finish in this request.`,
+          );
         }
         if (hotChanged) {
           setMessage({
