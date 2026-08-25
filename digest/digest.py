@@ -5805,7 +5805,7 @@ def _entity_filter_match(parsed: dict[str, Any], entities: list[str] | None) -> 
 
 
 def _expiring_blocks(files: list[Path], *, open_only: bool = False) -> list[dict[str, str]]:
-    """Return blocks whose valid_to is past today or is 'open' (actionable).
+    """Include YAML confidence so Weekly UI overdue can filter without the span-validator LLM.
 
     When open_only=True, keep only valid_to == open (v1 ladder candidates).
     """
@@ -5867,6 +5867,7 @@ def _expiring_blocks(files: list[Path], *, open_only: bool = False) -> list[dict
                     "valid_from": str(parsed.get("valid_from", "")).strip(),
                     "valid_to": valid_to,
                     "state": "open" if is_open else "past",
+                    "confidence": str(parsed.get("confidence", "")).strip().lower(),
                     "body": body,
                 }
             )

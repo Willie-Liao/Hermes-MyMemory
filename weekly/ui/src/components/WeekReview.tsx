@@ -48,15 +48,6 @@ import MemoryApprovalActionQueue from './MemoryApprovalActionQueue';
 import type { WeeklyReviewPendingOp } from '../weeklyReviewRecall';
 import { clearReviewPendingTarget } from '../weeklyReviewOps';
 import {
-  AUTO_RESCAN_MS,
-  freezeAutoRescanOrigin,
-  isIdle,
-  onMouseMove,
-  shouldApplyPostRescanRefresh,
-  shouldFireAutoRescan,
-  type IdleRescanState,
-} from '../idleRescan';
-import {
   filterWeeksByYearMonth,
   formatISOWeekDateRange,
   getISOWeekCode,
@@ -73,6 +64,15 @@ import {
 } from '../viewScroll';
 import { canRunTightenGuidance, DEFAULT_TIGHTEN_GUIDANCE, resolveTightenGuidance } from '../hotHealthUi';
 import { runReorganiseSequence } from '../weeklyReorganise';
+import {
+  AUTO_RESCAN_MS,
+  freezeAutoRescanOrigin,
+  isIdle,
+  onMouseMove,
+  shouldApplyPostRescanRefresh,
+  shouldFireAutoRescan,
+  type IdleRescanState,
+} from '../idleRescan';
 
 const NEWSROOM_EMPTY_COPY = {
   title: 'No current news for this week',
@@ -164,7 +164,7 @@ export default function WeekReview({
   const [spansLoading, setSpansLoading] = useState(false);
   const [emptyDigests, setEmptyDigests] = useState(false);
   const [showReopenConfirm, setShowReopenConfirm] = useState(false);
-  /** Validate-mode span rows stay in this session so tab switches do not re-run the LLM. */
+  /** Listed daily span rows stay in this session so tab switches do not re-fetch. */
   const spanRowsByWeekRef = useRef<Record<string, WeeklySpanBridgeRow[]>>({});
 
   const selectedWeekRef = useRef<WeekOverview | null>(null);
@@ -177,6 +177,9 @@ export default function WeekReview({
     idle: false,
   });
   const autoRescanInFlightRef = useRef(false);
+  /** Skip idle auto-rescan while a manual Re-scan is awaiting sync generate. */
+  const rescanLoadingRef = useRef(false);
+  rescanLoadingRef.current = rescanLoading;
   /** Freeze auto-rescan countdown while any edit/tighten composer is open. */
   const editingPauseRef = useRef(false);
   const [hotComposeActive, setHotComposeActive] = useState(false);
@@ -728,6 +731,9 @@ export default function WeekReview({
       .catch((err) => console.warn('Fetch hot health notice:', err.message || err));
   };
 
+  /**
+   * Load open/past-due daily spans from list JSON so Chronicle does not wait on the span-validator LLM.
+   */
   const fetchWeeklySpans = async (weekKey: string, opts?: { reload?: boolean }) => {
     if (!opts?.reload) {
       const cached = spanRowsByWeekRef.current[weekKey];
@@ -738,12 +744,12 @@ export default function WeekReview({
     }
     setSpansLoading(true);
     try {
-      // Validate mode: memory-digest explicit|high mem-* candidates only.
-      // Brief Possible overdue is not a UI source.
-      const validated = await fetch(`/api/weekly/weeks/${weekKey}/spans?mode=validate`);
-      const data = await validated.json().catch(() => ({}));
-      if (validated.ok && Array.isArray(data.results)) {
-        const rows = (data.results as WeeklySpanBridgeRow[]).map((c) => ({
+      // List mode: daily YAML parse only. Queue keeps confidence high (not LLM validate).
+      const listed = await fetch(`/api/weekly/weeks/${weekKey}/spans?mode=list`);
+      const data = await listed.json().catch(() => ({}));
+      const raw = Array.isArray(data.candidates) ? data.candidates : [];
+      if (listed.ok && raw.length) {
+        const rows = (raw as WeeklySpanBridgeRow[]).map((c) => ({
           ...c,
           block_id: String((c as { id?: string; block_id?: string }).block_id
             || (c as { id?: string }).id
@@ -1005,7 +1011,7 @@ export default function WeekReview({
     const TICK_MS = 1_000;
 
     const runBackgroundStaleRescan = async () => {
-      if (autoRescanInFlightRef.current) return;
+      if (autoRescanInFlightRef.current || rescanLoadingRef.current) return;
       autoRescanInFlightRef.current = true;
       try {
         const pending = weeksRef.current.filter(
@@ -1056,7 +1062,7 @@ export default function WeekReview({
             const updRes = await fetch('/api/weekly/update', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ week: week.week, reason: 'rescan', background: true }),
+              body: JSON.stringify({ week: week.week, reason: 'rescan' }),
             });
             if (!updRes.ok) continue;
             anyGenerated = true;
@@ -1074,7 +1080,7 @@ export default function WeekReview({
             const updRes = await fetch('/api/weekly/update', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ week: week.week, reason: 'rescan', background: true }),
+              body: JSON.stringify({ week: week.week, reason: 'rescan' }),
             });
             if (!updRes.ok) continue;
             anyGenerated = true;
@@ -1128,6 +1134,9 @@ export default function WeekReview({
       const idle = isIdle(now, prev.lastMoveAt);
       const next = { ...prev, idle };
       idleStateRef.current = next;
+      if (rescanLoadingRef.current) {
+        return;
+      }
       if (
         !shouldFireAutoRescan({
           now,
@@ -1230,7 +1239,6 @@ export default function WeekReview({
 
         const emptyDigests = Boolean(staleData.empty_digests);
         const hasWeeklyFile = Boolean(staleData.has_weekly_file);
-        const stale = Boolean(staleData.stale);
 
         if (emptyDigests) {
           setMessage({
@@ -1258,16 +1266,6 @@ export default function WeekReview({
           return;
         }
 
-        if (hasWeeklyFile && !stale) {
-          setMessage({
-            type: 'success',
-            text: `nothing needs to be regenerated for ${week}`,
-          });
-          await refreshHotKeepBanner();
-          setRescanLoading(false);
-          return;
-        }
-
         setMessage({
           type: 'info',
           text: hasWeeklyFile
@@ -1277,7 +1275,7 @@ export default function WeekReview({
         const updRes = await fetch('/api/weekly/update', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ week, reason: 'rescan', background: true }),
+          body: JSON.stringify({ week, reason: 'rescan' }),
         });
         const data = await updRes.json().catch(() => ({}));
         if (updRes.status === 409 || data.outcome === 'already_closed') {
@@ -1303,11 +1301,9 @@ export default function WeekReview({
           throw new Error(`Failed to re-scan ${week}. ${reason}${details}`.trim());
         }
         if (data.outcome === 'started' || data.generate_in_flight) {
-          setMessage({
-            type: 'info',
-            text: `Re-scan ${week}: running in background…`,
-          });
-          return;
+          throw new Error(
+            `Re-scan ${week} returned background start; generate must finish in this request.`,
+          );
         }
         if (hotChanged) {
           setMessage({
