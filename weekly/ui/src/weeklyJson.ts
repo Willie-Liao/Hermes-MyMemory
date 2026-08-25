@@ -44,6 +44,87 @@ export type WeeklyJsonPayload = {
   entities?: unknown[];
 };
 
+/** Drop YAML frontmatter so Chronicle can read the dumped `summary:` list from the week file. */
+function stripWeekFrontmatter(md: string): string {
+  const match = /^---\r?\n[\s\S]*?\r?\n---\r?\n?/.exec(md);
+  return match ? md.slice(match[0].length) : md;
+}
+
+function parseSummaryBlock(block: string): WeeklySummaryItem[] {
+  const lines = block.split(/\r?\n/);
+  const items: WeeklySummaryItem[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const start = lines[i].match(/^- text:\s*(.*)$/);
+    if (!start) {
+      i += 1;
+      continue;
+    }
+    let text = start[1];
+    i += 1;
+    const weekdays: string[] = [];
+    let inWeekdays = false;
+    while (i < lines.length) {
+      const line = lines[i];
+      if (/^- text:/.test(line)) break;
+      if (/^\s+weekdays:\s*$/.test(line)) {
+        inWeekdays = true;
+        i += 1;
+        continue;
+      }
+      if (inWeekdays) {
+        const day = line.match(/^\s+-\s+(.+)$/);
+        if (day) {
+          weekdays.push(day[1].trim());
+          i += 1;
+          continue;
+        }
+        inWeekdays = false;
+      }
+      const cont = line.match(/^\s{2,}(\S.*)$/);
+      if (cont) {
+        text = text ? `${text} ${cont[1]}` : cont[1];
+        i += 1;
+        continue;
+      }
+      i += 1;
+    }
+    items.push({ text: text.trim(), weekdays });
+  }
+  return items;
+}
+
+/**
+ * Read Worker-1 `summary` from YYYY-Www.md so Chronicle does not wait on
+ * chronicle LLM or span-validate just to list what the week file already stored.
+ */
+export function summaryItemsFromWeeklyMd(md: string): WeeklySummaryItem[] | null {
+  const body = stripWeekFrontmatter(md);
+  const header = /^summary:\s*(.*)\s*$/gm;
+  let found: RegExpExecArray | null = null;
+  let match: RegExpExecArray | null = header.exec(body);
+  while (match) {
+    found = match;
+    match = header.exec(body);
+  }
+  if (!found) return null;
+  const inline = (found[1] || '').trim();
+  if (inline === '[]' || inline === 'null' || inline === '~') return [];
+  if (inline) return null;
+  const after = body.slice(found.index + found[0].length);
+  const nextKey = after.search(/\n[A-Za-z_][\w-]*:/);
+  const block = (nextKey >= 0 ? after.slice(0, nextKey) : after).replace(/^\n/, '');
+  if (!block.trim()) return [];
+  return parseSummaryBlock(block);
+}
+
+/** Schema payload for FourPartWeeklyCard from the week markdown already on disk. */
+export function payloadFromWeeklyMd(md: string): WeeklyJsonPayload | null {
+  const summary = summaryItemsFromWeeklyMd(md);
+  if (summary === null) return null;
+  return { summary };
+}
+
 /** Paint `- text (Monday, Tuesday)` so Chronicle does not parse hops. */
 export function formatSummaryLine(row: WeeklySummaryItem): string {
   const text = (row.text || '').trim();

@@ -48,15 +48,6 @@ import MemoryApprovalActionQueue from './MemoryApprovalActionQueue';
 import type { WeeklyReviewPendingOp } from '../weeklyReviewRecall';
 import { clearReviewPendingTarget } from '../weeklyReviewOps';
 import {
-  AUTO_RESCAN_MS,
-  freezeAutoRescanOrigin,
-  isIdle,
-  onMouseMove,
-  shouldApplyPostRescanRefresh,
-  shouldFireAutoRescan,
-  type IdleRescanState,
-} from '../idleRescan';
-import {
   filterWeeksByYearMonth,
   formatISOWeekDateRange,
   getISOWeekCode,
@@ -164,20 +155,12 @@ export default function WeekReview({
   const [spansLoading, setSpansLoading] = useState(false);
   const [emptyDigests, setEmptyDigests] = useState(false);
   const [showReopenConfirm, setShowReopenConfirm] = useState(false);
+  /** Listed daily span rows stay in this session so tab switches do not re-fetch. */
+  const spanRowsByWeekRef = useRef<Record<string, WeeklySpanBridgeRow[]>>({});
 
   const selectedWeekRef = useRef<WeekOverview | null>(null);
   selectedWeekRef.current = selectedWeek;
-  const weeksRef = useRef(weeks);
-  weeksRef.current = weeks;
-  const idleStateRef = useRef<IdleRescanState>({
-    lastMoveAt: Date.now(),
-    timerStartedAt: Date.now(),
-    idle: false,
-  });
-  const autoRescanInFlightRef = useRef(false);
-  /** Freeze auto-rescan countdown while any edit/tighten composer is open. */
-  const editingPauseRef = useRef(false);
-  const [hotComposeActive, setHotComposeActive] = useState(false);
+  const [, setHotComposeActive] = useState(false);
   /** Nested list scrollers — window.scrollY alone misses halfway scroll inside these. */
   const stagingListScrollRef = useRef<HTMLDivElement>(null);
 
@@ -463,7 +446,7 @@ export default function WeekReview({
         type: 'success',
         text: `Recalled last review save (${count} action(s)).`,
       });
-      await refreshFourPartSurfaces(selectedWeek.week);
+      await refreshFourPartSurfaces(selectedWeek.week, { reload: true });
     } catch (err: unknown) {
       setMessage({
         type: 'error',
@@ -702,7 +685,7 @@ export default function WeekReview({
         text: `Reorganised ${result.pathLabel}.`,
       });
       fetchCandidates();
-      handleSelectWeek(selectedWeek);
+      handleSelectWeek(selectedWeek, { reload: true });
       if (onRefresh) onRefresh();
       setReorganizeLoading(false);
     } catch (err: unknown) {
@@ -726,24 +709,35 @@ export default function WeekReview({
       .catch((err) => console.warn('Fetch hot health notice:', err.message || err));
   };
 
-  const fetchWeeklySpans = async (weekKey: string) => {
-    setSpansLoading(true);
-    try {
-      // Validate mode: memory-digest explicit|high mem-* candidates only.
-      // Brief Possible overdue is not a UI source.
-      const validated = await fetch(`/api/weekly/weeks/${weekKey}/spans?mode=validate`);
-      const data = await validated.json().catch(() => ({}));
-      if (validated.ok && Array.isArray(data.results)) {
-        setSpanBridgeRows(
-          (data.results as WeeklySpanBridgeRow[]).map((c) => ({
-            ...c,
-            block_id: String((c as { id?: string; block_id?: string }).block_id
-              || (c as { id?: string }).id
-              || '').trim(),
-          })).filter((c) => c.block_id),
-        );
+  /**
+   * Load open/past-due daily spans from list JSON so Chronicle does not wait on the span-validator LLM.
+   */
+  const fetchWeeklySpans = async (weekKey: string, opts?: { reload?: boolean }) => {
+    if (!opts?.reload) {
+      const cached = spanRowsByWeekRef.current[weekKey];
+      if (cached) {
+        setSpanBridgeRows(cached);
         return;
       }
+    }
+    setSpansLoading(true);
+    try {
+      // List mode: daily YAML parse only. Queue keeps confidence high (not LLM validate).
+      const listed = await fetch(`/api/weekly/weeks/${weekKey}/spans?mode=list`);
+      const data = await listed.json().catch(() => ({}));
+      const raw = Array.isArray(data.candidates) ? data.candidates : [];
+      if (listed.ok && raw.length) {
+        const rows = (raw as WeeklySpanBridgeRow[]).map((c) => ({
+          ...c,
+          block_id: String((c as { id?: string; block_id?: string }).block_id
+            || (c as { id?: string }).id
+            || '').trim(),
+        })).filter((c) => c.block_id);
+        spanRowsByWeekRef.current[weekKey] = rows;
+        setSpanBridgeRows(rows);
+        return;
+      }
+      spanRowsByWeekRef.current[weekKey] = [];
       setSpanBridgeRows([]);
     } catch {
       setSpanBridgeRows([]);
@@ -788,10 +782,10 @@ export default function WeekReview({
     }
   };
 
-  const refreshFourPartSurfaces = async (weekKey: string) => {
+  const refreshFourPartSurfaces = async (weekKey: string, opts?: { reload?: boolean }) => {
     await Promise.all([
       fetchChronicle(weekKey),
-      fetchWeeklySpans(weekKey),
+      fetchWeeklySpans(weekKey, opts),
       fetchWeeklyJson(weekKey),
     ]);
   };
@@ -811,7 +805,19 @@ export default function WeekReview({
     }
   };
 
-  const handleSelectWeek = (week: WeekOverview) => {
+  const handleSelectWeek = (week: WeekOverview, opts?: { reload?: boolean }) => {
+    if (!opts?.reload && selectedWeekRef.current?.week === week.week) {
+      setSelectedWeek((prev) => ({
+        ...week,
+        status: normalizeWeekStatus(week.status ?? prev?.status),
+        fileContent: prev?.fileContent || week.fileContent,
+        decisions: prev?.decisions?.length ? prev.decisions : week.decisions,
+      }));
+      return;
+    }
+    if (opts?.reload) {
+      delete spanRowsByWeekRef.current[week.week];
+    }
     setLoading(true);
     setMessage(null);
     setEmptyDigests(false);
@@ -845,7 +851,7 @@ export default function WeekReview({
         setReviewPendingOps([]);
         setSavedReviewOps([]);
         fetchHotHealth();
-        void refreshFourPartSurfaces(week.week);
+        void refreshFourPartSurfaces(week.week, { reload: Boolean(opts?.reload) });
         void checkStaleness(week.week);
         void fetchReviewRecall(week.week);
       })
@@ -868,7 +874,7 @@ export default function WeekReview({
     // Only full reselect on open↔closed (slash Close/Reopen). Ignore current↔pending
     // / completed↔reviewed aliases and tidy-only diffs so refresh does not reset UI.
     if (!weekStatusesEquivalent(fresh.status, current.status)) {
-      handleSelectWeek(fresh);
+      handleSelectWeek(fresh, { reload: true });
       return;
     }
     if (fresh.tidyState !== current.tidyState) {
@@ -928,9 +934,9 @@ export default function WeekReview({
               type: 'success',
               text: `Regenerated weekly schema for ${current.week}`,
             });
-            handleSelectWeek(current);
+            handleSelectWeek(current, { reload: true });
             void fetchWeeks({ silent: true });
-            void refreshFourPartSurfaces(current.week);
+            void refreshFourPartSurfaces(current.week, { reload: true });
             if (onRefresh) onRefresh();
           }
         } catch {
@@ -962,7 +968,7 @@ export default function WeekReview({
             text: `Reorganised ${typeof data.path === 'string' ? data.path : activeDate}.`,
           });
           fetchCandidates();
-          if (current) handleSelectWeek(current);
+          if (current) handleSelectWeek(current, { reload: true });
           if (onRefresh) onRefresh();
         } catch {
           /* keep listening */
@@ -974,185 +980,6 @@ export default function WeekReview({
     return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- job listen uses refs
   }, [rescanLoading, reorganizeLoading, activeDate]);
-
-  // Idle-aware background rescan: every 3 min while active; 30s no mousemove pauses
-  // auto-rescan only (WEEKS_POLL_MS list sync continues). Wake resets the 3-min origin.
-  // Edit/tighten composers freeze the auto-rescan countdown; weeks refresh runs when
-  // a rescan finishes (manual or background).
-  useEffect(() => {
-    const TICK_MS = 1_000;
-
-    const runBackgroundStaleRescan = async () => {
-      if (autoRescanInFlightRef.current) return;
-      autoRescanInFlightRef.current = true;
-      try {
-        const pending = weeksRef.current.filter(
-          (w) => w.status === 'pending',
-        );
-        let selectedNeedsRefresh = false;
-        let anyGenerated = false;
-
-        // Step 1: parallel digest_stale (per pending week) + hot source_hash.
-        const hotChangedPromise = fetch('/api/hot/health/changed')
-          .then(async (res) => {
-            const data = await res.json().catch(() => ({}));
-            return Boolean(res.ok && data.changed);
-          })
-          .catch(() => true);
-
-        const staleChecks = await Promise.all(
-          pending.map(async (week) => {
-            try {
-              const staleRes = await fetch(`/api/weekly/weeks/${week.week}/staleness`);
-              const staleData = await staleRes.json().catch(() => ({}));
-              if (!staleRes.ok) {
-                return { week, kind: 'stale' as const };
-              }
-              if (staleData.empty_digests) {
-                return { week, kind: 'empty' as const };
-              }
-              if (!staleData.has_weekly_file || staleData.stale) {
-                return { week, kind: 'stale' as const };
-              }
-              return { week, kind: 'skip' as const };
-            } catch {
-              return { week, kind: 'stale' as const };
-            }
-          }),
-        );
-        const hotChanged = await hotChangedPromise;
-        const staleWeeks = staleChecks
-          .filter((row) => row.kind === 'stale')
-          .map((row) => row.week);
-        const emptyWeeks = staleChecks
-          .filter((row) => row.kind === 'empty')
-          .map((row) => row.week);
-
-        // Empty digests: cheap update purges orphan pending draft (no Worker 1/2).
-        for (const week of emptyWeeks) {
-          try {
-            const updRes = await fetch('/api/weekly/update', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ week: week.week, reason: 'rescan', background: true }),
-            });
-            if (!updRes.ok) continue;
-            anyGenerated = true;
-            if (selectedWeekRef.current?.week === week.week) {
-              selectedNeedsRefresh = true;
-            }
-          } catch {
-            // Silent background path — skip week on failure
-          }
-        }
-
-        // Step 2: generate first when digests stale (before health if both).
-        for (const week of staleWeeks) {
-          try {
-            const updRes = await fetch('/api/weekly/update', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ week: week.week, reason: 'rescan', background: true }),
-            });
-            if (!updRes.ok) continue;
-            anyGenerated = true;
-            if (selectedWeekRef.current?.week === week.week) {
-              selectedNeedsRefresh = true;
-            }
-          } catch {
-            // Silent background path — skip week on failure
-          }
-        }
-
-        if (hotChanged) {
-          try {
-            await fetch('/api/hot/health/refresh', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ reason: 'ui_auto_rescan' }),
-            });
-            fetchHotHealth();
-          } catch {
-            // Silent — health refresh is best-effort on auto path
-          }
-        }
-
-        if (shouldApplyPostRescanRefresh(editingPauseRef.current)) {
-          if (anyGenerated || selectedNeedsRefresh) {
-            await fetchWeeks({ silent: true });
-            if (selectedNeedsRefresh && selectedWeekRef.current) {
-              handleSelectWeek(selectedWeekRef.current);
-            }
-          }
-        }
-      } finally {
-        autoRescanInFlightRef.current = false;
-      }
-    };
-
-    const id = window.setInterval(() => {
-      const now = Date.now();
-      const prev = idleStateRef.current;
-      const editing = editingPauseRef.current;
-      if (editing) {
-        // Hold remaining auto-rescan time while an edit box is open.
-        idleStateRef.current = {
-          ...prev,
-          timerStartedAt: freezeAutoRescanOrigin(prev.timerStartedAt, TICK_MS),
-          idle: isIdle(now, prev.lastMoveAt),
-        };
-        return;
-      }
-      const idle = isIdle(now, prev.lastMoveAt);
-      const next = { ...prev, idle };
-      idleStateRef.current = next;
-      if (
-        !shouldFireAutoRescan({
-          now,
-          idle,
-          timerStartedAt: next.timerStartedAt,
-          intervalMs: AUTO_RESCAN_MS,
-          editing: false,
-        })
-      ) {
-        return;
-      }
-      idleStateRef.current = { ...next, timerStartedAt: now };
-      void runBackgroundStaleRescan();
-    }, TICK_MS);
-
-    const onMove = () => {
-      const now = Date.now();
-      const prev = idleStateRef.current;
-      const wasIdle = prev.idle || isIdle(now, prev.lastMoveAt);
-      if (wasIdle) {
-        // Wake from idle: clear idle + restart 3-min origin
-        idleStateRef.current = onMouseMove(prev, now);
-      } else {
-        // Stay active: refresh idle clock only (do not reset auto-rescan origin)
-        idleStateRef.current = { ...prev, lastMoveAt: now, idle: false };
-      }
-    };
-
-    window.addEventListener('mousemove', onMove);
-    return () => {
-      window.clearInterval(id);
-      window.removeEventListener('mousemove', onMove);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- uses refs; fetchWeeks stable
-  }, [fetchWeeks]);
-
-  useEffect(() => {
-    editingPauseRef.current = Boolean(
-      editingBlockId
-      || stagingTightenComposerId
-      || hotComposeActive,
-    );
-  }, [
-    editingBlockId,
-    stagingTightenComposerId,
-    hotComposeActive,
-  ]);
 
   const handleRescanWeek = () => {
     if (!selectedWeek) return;
@@ -1298,7 +1125,7 @@ export default function WeekReview({
           type: 'success',
           text: `Regenerated weekly schema for ${week}`,
         });
-        handleSelectWeek(selectedWeek);
+        handleSelectWeek(selectedWeek, { reload: true });
         void fetchWeeks({ silent: true });
         if (onRefresh) onRefresh();
         setRescanLoading(false);
@@ -1346,7 +1173,7 @@ export default function WeekReview({
       }
       setMessage({ type: 'success', text: successText });
       await fetchWeeks({ silent: true });
-      handleSelectWeek({ ...selectedWeek, status: 'reviewed', tidyState: 'tidy: done' });
+      handleSelectWeek({ ...selectedWeek, status: 'reviewed', tidyState: 'tidy: done' }, { reload: true });
       if (onRefresh) onRefresh();
     } catch (err: any) {
       setMessage({ type: 'error', text: err.message });
@@ -1372,7 +1199,7 @@ export default function WeekReview({
       }
       setMessage({ type: 'success', text: `Week ${selectedWeek.week} reopened.` });
       await fetchWeeks({ silent: true });
-      handleSelectWeek({ ...selectedWeek, status: 'pending', tidyState: 'tidy: pending' });
+      handleSelectWeek({ ...selectedWeek, status: 'pending', tidyState: 'tidy: pending' }, { reload: true });
       if (onRefresh) onRefresh();
     } catch (err: any) {
       setMessage({ type: 'error', text: err.message });
@@ -1401,7 +1228,7 @@ export default function WeekReview({
     setMessage(null);
     try {
       const saved = await runWeeklyReviewSave(selectedWeek.week, reviewOps);
-      await refreshFourPartSurfaces(selectedWeek.week);
+      await refreshFourPartSurfaces(selectedWeek.week, { reload: true });
       setMessage({
         type: 'success',
         text: `Saved ${saved.count} review action${saved.count === 1 ? '' : 's'}. Week stays open.`,
@@ -1430,7 +1257,7 @@ export default function WeekReview({
     setMessage(null);
     try {
       const { count } = await runWeeklyReviewRecall(selectedWeek.week);
-      await refreshFourPartSurfaces(selectedWeek.week);
+      await refreshFourPartSurfaces(selectedWeek.week, { reload: true });
       setMessage({
         type: 'success',
         text: `Recalled last review save (${count} action(s)).`,
@@ -1777,8 +1604,8 @@ export default function WeekReview({
               </div>
           )}
 
-          {viewMode === 'read' ? (
-            /* 1. READ BY DATE DAY-BY-DAY EXPLORER */
+          <div className={viewMode === 'read' ? '' : 'hidden'}>
+            {/* 1. READ BY DATE DAY-BY-DAY EXPLORER */}
             <div id="read-by-date-container" className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-sm space-y-4">
               <div className="p-4 bg-slate-950 border-b border-slate-850 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div>
@@ -2256,14 +2083,10 @@ export default function WeekReview({
                 })()}
               </div>
             </div>
-          ) : viewMode === 'hot' ? (
-            /* 3. MEMORY AND USER — HotMemoryEditor only (no Retention) */
-            <div className="space-y-6">
-              <HotMemoryEditor onComposeActiveChange={setHotComposeActive} />
-            </div>
-          ) : (
-            /* 2. WEEKLY CHRONICLE TAB (hot editor + retention; no Memory Approval hub) */
-            <div className="space-y-6">
+          </div>
+          <div className={viewMode === 'read' ? 'hidden' : 'space-y-6'}>
+            <HotMemoryEditor onComposeActiveChange={setHotComposeActive} />
+            <div className={viewMode === 'approve' ? 'space-y-6' : 'hidden'}>
               
               {selectedWeek?.status === 'reviewed' || selectedWeek?.status === 'completed' || selectedWeek?.tidyState === 'tidy: done' ? (
                 /* CLOSED SNAPSHOT SCREEN */
@@ -2297,9 +2120,6 @@ export default function WeekReview({
               ) : (
                 /* INTERACTIVE REVIEW PLATFORM */
                 <div className="space-y-6">
-                  
-                  {/* Hot memory editor — Chronicle tab */}
-                  <HotMemoryEditor onComposeActiveChange={setHotComposeActive} />
 
                   {/* Dynamic Staging Retention & Compliance Policy (NEW RETENTION SECTION) */}
                   <div id="retention-policy-section" className="bg-slate-900 border border-slate-800 rounded-2xl p-5 md:p-6 space-y-4">
@@ -2406,7 +2226,7 @@ export default function WeekReview({
               )}
 
             </div>
-          )}
+          </div>
 
         </div>
 

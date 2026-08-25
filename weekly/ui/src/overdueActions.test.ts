@@ -19,7 +19,7 @@ import {
 const bridgeRows = [
   {
     block_id: 'mem-2026-08-02-project-deadline',
-    confidence: 'explicit',
+    confidence: 'high',
     entity: 'Project deadline',
     proposed_valid_to: '2026-08-02',
   },
@@ -41,18 +41,19 @@ describe('overdueActions', () => {
     expect(putOffIntervalForLabel('1 month')).toBe('1mo');
   });
 
-  it('filters bridge rows to explicit/high only', () => {
+  it('filters bridge rows to YAML high only', () => {
     expect(
       filterBridgeSpansExplicitHigh([
         { block_id: 'a', confidence: 'explicit' },
         { block_id: 'b', confidence: 'high' },
         { block_id: 'c', confidence: 'medium' },
         { block_id: 'd', confidence: 'low' },
+        { block_id: 'e' },
       ]).map((r) => r.block_id),
-    ).toEqual(['a', 'b']);
+    ).toEqual(['b']);
   });
 
-  it('builds actionable rows from digest validate bridge only', () => {
+  it('builds actionable rows from digest list high only', () => {
     const rows = mergeActionableOverdueRows({ bridgeRows });
     expect(rows).toHaveLength(1);
     expect(rows[0].blockId).toBe('mem-2026-08-02-project-deadline');
@@ -152,7 +153,7 @@ describe('overdueActions', () => {
           block_id: 'mem-20260730-superprof-cn-monitor-built',
           valid_to: '2026-07-31',
           entity: 'superprof-cn-monitor',
-          confidence: 'explicit',
+          confidence: 'high',
         },
         {
           block_id: 'mem-unknown-elsewhere',
@@ -165,6 +166,17 @@ describe('overdueActions', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].blockId).toBe('mem-20260730-superprof-cn-monitor-built');
     expect(rows[0].confirmDisabled).toBe(false);
+  });
+
+  it('omits explicit and missing confidence', () => {
+    const rows = mergeActionableOverdueRows({
+      bridgeRows: [
+        { block_id: 'mem-explicit', valid_to: '2026-08-01', confidence: 'explicit' },
+        { block_id: 'mem-blank', valid_to: '2026-08-01' },
+        { block_id: 'mem-high', valid_to: '2026-08-01', confidence: 'high' },
+      ],
+    });
+    expect(rows.map((r) => r.blockId)).toEqual(['mem-high']);
   });
 });
 
