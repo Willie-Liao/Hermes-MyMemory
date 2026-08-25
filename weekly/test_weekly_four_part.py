@@ -189,7 +189,7 @@ def test_render_parse_round_trip_matches_golden():
     assert rendered.strip() == golden.strip()
 
     parsed = schema.parse_four_part_brief(rendered)
-    # Brief Possible overdue is always empty (digest validate owns UI overdue).
+    # Brief Possible overdue is always empty (Weekly UI does not render it).
     errors = schema.payloads_structurally_equal(
         schema.WeeklyReviewPayload(
             days=payload.days,

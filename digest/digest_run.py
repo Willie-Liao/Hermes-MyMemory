@@ -230,13 +230,6 @@ def list_weekly_span_candidates(week_key: str) -> dict[str, Any]:
     return span_weekly.list_weekly_span_candidates(week_key)
 
 
-def validate_weekly_spans(
-    week_key: str, candidates: list[dict[str, Any]] | None = None
-) -> dict[str, Any]:
-    """Validator-scored candidates for one ISO week, filtered to explicit/high."""
-    return span_weekly.validate_weekly_spans(week_key, candidates)
-
-
 def resolve_weekly_span(
     week_key: str,
     block_id: str,

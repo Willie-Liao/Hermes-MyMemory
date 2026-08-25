@@ -3,7 +3,7 @@
 #   1) Weekly Brief by date (Mon–Sun, Events markers, "No record for this day.")
 #   2) Conflict
 #   3) Hypothesis
-#   4) Possible overdue report (`- None.` in Brief; UI from digest validate)
+#   4) Possible overdue report (`- None.` in Brief; Weekly UI does not render it)
 # Golden layout: ../fixtures/weekly_four_part_w31.md
 # See also: docs/langfuse-weekly-ui-evaluators.md
 week_key: "2026-W31"

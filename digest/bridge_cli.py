@@ -99,10 +99,6 @@ def main() -> int:
                 "list_weekly_span_candidates": lambda **a: digest_run.list_weekly_span_candidates(
                     str(a.get("week_key") or "")
                 ),
-                "validate_weekly_spans": lambda **a: digest_run.validate_weekly_spans(
-                    str(a.get("week_key") or ""),
-                    a.get("candidates") if isinstance(a.get("candidates"), list) else None,
-                ),
                 "resolve_weekly_span": lambda **a: digest_run.resolve_weekly_span(
                     str(a.get("week_key") or ""),
                     str(a.get("block_id") or ""),

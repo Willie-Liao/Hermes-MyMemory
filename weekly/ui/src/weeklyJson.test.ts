@@ -72,14 +72,13 @@ describe('Chronicle source wiring', () => {
     expect(card).not.toContain('onJumpApprovalCite');
   });
 
-  it('queue is overdue-only with no Hypothesis Confirm/Delete', () => {
-    const queue = readFileSync(
-      join(root, 'components/MemoryApprovalActionQueue.tsx'),
-      'utf8',
-    );
-    expect(queue).toContain('Possible overdue report');
-    expect(queue).toContain('chronicle-overdue-queue');
-    expect(queue).not.toContain('Hypothesis');
-    expect(queue).not.toContain('onHypConfirm');
+  it('does not mount Possible overdue queue on Chronicle', () => {
+    const weekReview = readFileSync(join(root, 'components/WeekReview.tsx'), 'utf8');
+    expect(weekReview).not.toContain('MemoryApprovalActionQueue');
+    expect(weekReview).not.toContain('chronicle-overdue-queue');
+    expect(weekReview).not.toContain('fetchWeeklySpans');
+    expect(weekReview).not.toContain('spans?mode=list');
+    expect(weekReview).not.toContain('mode=validate');
   });
 });
+

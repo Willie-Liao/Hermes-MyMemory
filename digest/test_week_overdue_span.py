@@ -76,7 +76,6 @@ def test_build_recall_does_not_inject_weekly_close_note(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(actions.weekly, "hermes_local_today", lambda: date(2026, 7, 13))
-    monkeypatch.setattr(digest, "_run_span_validator_llm", lambda *a, **k: [])
     _write_daily(tmp_path, "2026-07-13")
     _seed_overdue_open(tmp_path, actions, "2026-W27", "2026-W28")
 
@@ -99,7 +98,6 @@ def test_build_recall_empty_without_tier1_dailies(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(actions.weekly, "hermes_local_today", lambda: date(2026, 7, 13))
-    monkeypatch.setattr(digest, "_run_span_validator_llm", lambda *a, **k: [])
     _seed_overdue_open(tmp_path, actions, "2026-W28")
 
     ctx = digest.build_recall_injection_context(
@@ -118,7 +116,6 @@ def test_on_pre_llm_skip_does_not_force_weekly_ask(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(actions.weekly, "hermes_local_today", lambda: date(2026, 7, 13))
-    monkeypatch.setattr(digest, "_run_span_validator_llm", lambda *a, **k: [])
     _seed_overdue_open(tmp_path, actions, "2026-W28")
     actions.process_overdue_week_marks(today=date(2026, 7, 13), kick_generate=False)
     marks = actions.weekly._load_state()["week_open_marks"]["2026-W28"]

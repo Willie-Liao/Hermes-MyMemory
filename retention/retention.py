@@ -60,6 +60,14 @@ except Exception:  # pragma: no cover
 
 RETENTION_DAYS = 7
 
+# Leftover chat-ladder maps — snapshot then drop; not session-id age-trim.
+SPAN_WATCH_STATE_KEYS: tuple[str, ...] = (
+    "span_watches",
+    "span_pending_writes",
+    "span_ask_sessions",
+    "span_validator_budget",
+)
+
 _SESSION_ID_DATE_RE = re.compile(r"^(\d{8})_")
 
 _sweep_lock = threading.Lock()
@@ -412,6 +420,49 @@ def _session_id_date(sid: str):
         return None
 
 
+def _archive_and_strip_span_watch_state(raw: dict[str, Any]) -> bool:
+    """Snapshot retired span-watch maps under memories/.archive before deleting them.
+
+    Mixing those keys with session bookmarks made Weekly UI treat YAML confidence
+    as a span ladder. Archive first so retirement stays auditable.
+    """
+    had_keys = any(key in raw for key in SPAN_WATCH_STATE_KEYS)
+    archive_dir = _archive_dir()
+    try:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        if not had_keys and any(archive_dir.glob("span-watch-*.json")):
+            return False
+        dest = archive_dir / f"span-watch-{hermes_local_today().isoformat()}.json"
+        dest.write_text(
+            json.dumps(
+                {
+                    "archived_at": datetime.now(timezone.utc).isoformat(),
+                    "source": "memories/staging/.digest-state.json",
+                    "symbols": [
+                        "_run_span_validator_llm",
+                        "validate_weekly_spans",
+                        "span_watches",
+                    ],
+                    "maps": {
+                        key: raw[key] if key in raw else {}
+                        for key in SPAN_WATCH_STATE_KEYS
+                    },
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        _log(f"span-watch archive failed: {exc}")
+        return False
+    for key in SPAN_WATCH_STATE_KEYS:
+        raw.pop(key, None)
+    _log(f"span-watch archived to {dest.name} and stripped from digest-state")
+    return had_keys
+
+
 def _sweep_digest_state() -> int:
     """Drop idle dated digest-state keys; never the bookmark of a still-open session.
 
@@ -432,6 +483,7 @@ def _sweep_digest_state() -> int:
     if not isinstance(raw, dict):
         return 0
 
+    stripped_span = _archive_and_strip_span_watch_state(raw)
     today = hermes_local_today()
     cutoff = today - timedelta(days=RETENTION_DAYS)
     live_ids = list_live_session_ids(_hermes_home())
@@ -456,14 +508,15 @@ def _sweep_digest_state() -> int:
             mapping.pop(sid, None)
             removed += 1
 
-    if removed:
+    if removed or stripped_span:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(
                 json.dumps(raw, indent=2, ensure_ascii=False) + "\n",
                 encoding="utf-8",
             )
-            _log(f"digest-state trim removed {removed} session key(s)")
+            if removed:
+                _log(f"digest-state trim removed {removed} session key(s)")
         except OSError as exc:
             _log(f"digest-state trim save failed: {exc}")
             return 0

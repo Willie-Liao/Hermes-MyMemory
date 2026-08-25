@@ -1,4 +1,4 @@
-"""Weekly/digest-bridge span ops: overdue reporting + resolution (Task 4).
+"""Weekly/digest-bridge span ops: list + resolve (no validate ladder).
 
 Covers list/validate scoping + confidence filtering and the three resolve
 actions (confirm / put_off / set_due_date), independent of chat recall.
@@ -97,61 +97,6 @@ def test_list_weekly_span_candidates_includes_overdue_and_open(tmp_path, monkeyp
     ids = {c["id"] for c in result["candidates"]}
     assert ids == {"mem-open", "mem-overdue"}
     assert all(c.get("confidence") == "high" for c in result["candidates"])
-
-
-def test_validate_weekly_spans_filters_to_explicit_and_high(tmp_path, monkeypatch):
-    sw = _load_span_weekly()
-    monkeypatch.setattr(sw.digest, "get_hermes_home", lambda: tmp_path)
-    _write_daily(
-        tmp_path,
-        "2026-07-13",
-        [
-            _block("mem-explicit", entity="A", valid_to="open"),
-            _block("mem-high", entity="B", valid_to="open"),
-            _block("mem-medium", entity="C", valid_to="open"),
-            _block("mem-low", entity="D", valid_to="open"),
-        ],
-    )
-
-    def fake_validator(user_message, candidates, conversation_excerpt=""):
-        return [
-            {"block_key": "mem-explicit", "confidence": "explicit", "proposed_valid_to": "2026-08-01"},
-            {"block_key": "mem-high", "confidence": "high"},
-            {"block_key": "mem-medium", "confidence": "medium"},
-            {"block_key": "mem-low", "confidence": "low"},
-        ]
-
-    monkeypatch.setattr(sw.digest, "_run_span_validator_llm", fake_validator)
-
-    result = sw.validate_weekly_spans(WEEK)
-
-    assert result["outcome"] == "validated"
-    ids = {r["block_id"] for r in result["results"]}
-    assert ids == {"mem-explicit", "mem-high"}
-    explicit_row = next(r for r in result["results"] if r["block_id"] == "mem-explicit")
-    assert explicit_row["proposed_valid_to"] == "2026-08-01"
-    high_row = next(r for r in result["results"] if r["block_id"] == "mem-high")
-    assert "proposed_valid_to" not in high_row
-
-
-def test_validate_weekly_spans_empty_candidates(tmp_path, monkeypatch):
-    sw = _load_span_weekly()
-    monkeypatch.setattr(sw.digest, "get_hermes_home", lambda: tmp_path)
-
-    result = sw.validate_weekly_spans(WEEK, candidates=[])
-
-    assert result["outcome"] == "empty"
-    assert result["results"] == []
-
-
-def test_validate_weekly_spans_invalid_week_key(tmp_path, monkeypatch):
-    sw = _load_span_weekly()
-    monkeypatch.setattr(sw.digest, "get_hermes_home", lambda: tmp_path)
-
-    result = sw.validate_weekly_spans("bogus")
-
-    assert result["outcome"] == "invalid_week"
-    assert result["results"] == []
 
 
 def test_resolve_confirm_applies_proposed_valid_to(tmp_path, monkeypatch):

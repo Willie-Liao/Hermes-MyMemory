@@ -174,7 +174,6 @@ RECENT_CONTEXT_TYPES = {
     "decision_constraint",
     "event",
 }
-SPAN_CONFIDENCES = frozenset({"explicit", "high", "medium", "low"})
 # fact / event must carry an entity anchor so weekly review can group them.
 # Hypothesis is owned by the weekly worker, not by digest.
 ENTITY_REQUIRED_TYPES = {"fact", "event"}
@@ -5683,98 +5682,6 @@ def _recall_inject_decision(
     return "bootstrap"
 
 
-def _run_span_validator_llm(
-    user_message: str,
-    candidates: list[dict],
-    conversation_excerpt: str = "",
-) -> list[dict]:
-    """Compare conversation to open-span candidates; return confidence ladder rows.
-
-    Each row: {block_key, confidence, proposed_valid_to?}. On failure, all low.
-    explicit without proposed_valid_to is coerced to high (spec).
-    """
-    if not candidates:
-        return []
-
-    def _fallback_low() -> list[dict]:
-        return [
-            {
-                "block_key": str(c.get("id") or c.get("block_key") or "").strip(),
-                "confidence": "low",
-            }
-            for c in candidates
-            if str(c.get("id") or c.get("block_key") or "").strip()
-        ]
-
-    cand_lines: list[str] = []
-    for c in candidates:
-        key = str(c.get("id") or c.get("block_key") or "").strip()
-        if not key:
-            continue
-        entity = str(c.get("entity") or "").strip()
-        body = str(c.get("body") or "").strip()[:120]
-        cand_lines.append(f"{key} | {entity}: {body}")
-
-    if not cand_lines:
-        return []
-
-    prompt = (
-        "You are the memory span validator. Return ONLY JSON.\n"
-        f"User message: {user_message}\n"
-        f"Conversation excerpt: {conversation_excerpt or '(none)'}\n"
-        f"Open-span candidates:\n" + "\n".join(cand_lines) + "\n"
-        "Output schema (JSON array):\n"
-        '[{"block_key":"<id>","confidence":"explicit|high|medium|low",'
-        '"proposed_valid_to":"YYYY-MM-DD"?}]\n'
-        "Rules: confidence=explicit only when a concrete finish date is clear "
-        "enough to propose as proposed_valid_to; otherwise use high/medium/low. "
-        "Include one object per candidate block_key listed above."
-    )
-    try:
-        raw = _invoke_digest_llm(prompt, "cli", purpose="span_validator")
-        start = raw.find("[")
-        end = raw.rfind("]")
-        if start < 0 or end <= start:
-            start = raw.find("{")
-            end = raw.rfind("}")
-            if start < 0 or end <= start:
-                return _fallback_low()
-            data = json.loads(raw[start : end + 1])
-            if isinstance(data, dict):
-                rows = data.get("results") or data.get("candidates") or [data]
-            else:
-                rows = data
-        else:
-            rows = json.loads(raw[start : end + 1])
-        if not isinstance(rows, list):
-            return _fallback_low()
-
-        out: list[dict] = []
-        seen: set[str] = set()
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            key = str(row.get("block_key") or "").strip()
-            if not key or key in seen:
-                continue
-            confidence = str(row.get("confidence") or "low").strip().lower()
-            if confidence not in SPAN_CONFIDENCES:
-                confidence = "low"
-            proposed = str(row.get("proposed_valid_to") or "").strip()
-            if confidence == "explicit" and not (_DATE_RE.match(proposed) if proposed else False):
-                confidence = "high"
-                proposed = ""
-            item: dict[str, Any] = {"block_key": key, "confidence": confidence}
-            if proposed and _DATE_RE.match(proposed):
-                item["proposed_valid_to"] = proposed
-            out.append(item)
-            seen.add(key)
-        return out or _fallback_low()
-    except Exception as exc:
-        _log(f"span validator LLM failed, treating candidates as low: {exc}")
-        return _fallback_low()
-
-
 def _hot_memory_text() -> str:
     mem_dir = _hermes_home() / "memories"
     parts: list[str] = []
@@ -5805,9 +5712,9 @@ def _entity_filter_match(parsed: dict[str, Any], entities: list[str] | None) -> 
 
 
 def _expiring_blocks(files: list[Path], *, open_only: bool = False) -> list[dict[str, str]]:
-    """Include YAML confidence so Weekly UI overdue can filter without the span-validator LLM.
+    """List open or past-due daily blocks for week-scoped span listing.
 
-    When open_only=True, keep only valid_to == open (v1 ladder candidates).
+    When open_only=True, keep only valid_to == open.
     """
     today = hermes_local_today_str()
     out: list[dict[str, str]] = []

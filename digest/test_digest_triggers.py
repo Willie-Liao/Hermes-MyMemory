@@ -772,24 +772,6 @@ def test_invoke_digest_llm_delegates(monkeypatch):
     assert seen["kwargs"]["max_iterations"] == 15
 
 
-def test_span_validator_purpose(monkeypatch):
-    digest = _load_digest()
-    purposes: list[str] = []
-
-    def fake_invoke(prompt, platform, *, purpose="digest"):
-        purposes.append(purpose)
-        if purpose == "span_validator":
-            return '[{"block_key":"mem-1","confidence":"low"}]'
-        return ""
-
-    monkeypatch.setattr(digest, "_invoke_digest_llm", fake_invoke)
-    digest._run_span_validator_llm(
-        "hello",
-        [{"id": "mem-1", "entity": "X", "body": "y", "file": "2026-07-16.md"}],
-    )
-    assert purposes == ["span_validator"]
-
-
 def test_stale_inflight_skips_when_source_window_already_on_daily(tmp_path, monkeypatch):
     digest = _load_digest()
     messages = _messages(12)

@@ -133,7 +133,7 @@ describe('memoryApprovalActionQueue helpers', () => {
 });
 
 describe('Memory Approval action queue placement (source fixture)', () => {
-  it('renders overdue queue inside Chronicle, not Memory Approval', () => {
+  it('does not render Possible overdue in Chronicle', () => {
     const weekReview = fs.readFileSync(
       path.join(root, 'components/WeekReview.tsx'),
       'utf8',
@@ -142,36 +142,27 @@ describe('Memory Approval action queue placement (source fixture)', () => {
       path.join(root, 'components/FourPartWeeklyCard.tsx'),
       'utf8',
     );
-    const queue = fs.readFileSync(
-      path.join(root, 'components/MemoryApprovalActionQueue.tsx'),
-      'utf8',
-    );
-
-    expect(queue).not.toContain('Hypothesis');
-    expect(queue).toContain('Possible overdue report');
-    expect(queue).toContain('id="chronicle-overdue-queue"');
-    expect(queue).not.toContain('onJumpApprovalCite');
-    expect(queue).not.toContain('Open this block in Read by Date');
 
     expect(chronicle).toContain('payload.summary');
     expect(chronicle).toContain('weekly-chronicle-summary');
     expect(chronicle).not.toContain('Cross-day-thread');
     expect(chronicle).not.toContain('Weekly Brief');
     expect(chronicle).not.toContain('Conflict');
+    expect(chronicle).not.toContain('MemoryApprovalActionQueue');
 
-    const chronicleCall = weekReview.match(
-      /<FourPartWeeklyCard[\s\S]*?<\/FourPartWeeklyCard>/,
-    )?.[0] ?? '';
-    expect(chronicleCall).toContain('payload={weeklyJson}');
-    expect(chronicleCall).toContain('<MemoryApprovalActionQueue');
-    expect(chronicleCall).toContain('handleReviewSave');
+    expect(weekReview).toContain('payload={weeklyJson}');
+    expect(weekReview).toContain('<FourPartWeeklyCard');
+    expect(weekReview).not.toContain('MemoryApprovalActionQueue');
+    expect(weekReview).not.toContain('handleReviewSave');
 
     expect(weekReview).not.toContain('id="memory-approval-section"');
     expect(weekReview).toContain('id="read-by-date-container"');
     expect(weekReview).toContain('Weekly Chronicle');
     expect(weekReview).not.toContain('Approval Hub');
-    expect(weekReview).toContain('spans?mode=list');
+    expect(weekReview).not.toContain('spans?mode=list');
     expect(weekReview).not.toContain('mode=validate');
+    expect(weekReview).not.toContain('fetchWeeklySpans');
+    expect(weekReview).not.toContain('chronicle-overdue-queue');
     expect(weekReview).not.toContain('shouldFireAutoRescan');
     expect(weekReview).not.toContain('runBackgroundStaleRescan');
   });

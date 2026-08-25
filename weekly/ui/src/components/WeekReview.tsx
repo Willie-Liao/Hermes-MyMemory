@@ -6,7 +6,6 @@ import {
   Sliders, 
   Edit2,
   Sparkles,
-  CheckSquare,
   RefreshCw,
   Trash2,
   Unlock,
@@ -42,11 +41,7 @@ import {
 } from '../chronicleFold';
 import { isFourPartBrief } from '../fourPartBrief';
 import type { WeeklyJsonPayload } from '../weeklyJson';
-import type { WeeklySpanBridgeRow } from '../overdueActions';
 import FourPartWeeklyCard from './FourPartWeeklyCard';
-import MemoryApprovalActionQueue from './MemoryApprovalActionQueue';
-import type { WeeklyReviewPendingOp } from '../weeklyReviewRecall';
-import { clearReviewPendingTarget } from '../weeklyReviewOps';
 import {
   filterWeeksByYearMonth,
   formatISOWeekDateRange,
@@ -151,12 +146,8 @@ export default function WeekReview({
   const [chronicleSummary, setChronicleSummary] = useState('');
   const [weeklyJson, setWeeklyJson] = useState<WeeklyJsonPayload | null>(null);
   const [chronicleLoading, setChronicleLoading] = useState(false);
-  const [spanBridgeRows, setSpanBridgeRows] = useState<WeeklySpanBridgeRow[]>([]);
-  const [spansLoading, setSpansLoading] = useState(false);
   const [emptyDigests, setEmptyDigests] = useState(false);
   const [showReopenConfirm, setShowReopenConfirm] = useState(false);
-  /** Listed daily span rows stay in this session so tab switches do not re-fetch. */
-  const spanRowsByWeekRef = useRef<Record<string, WeeklySpanBridgeRow[]>>({});
 
   const selectedWeekRef = useRef<WeekOverview | null>(null);
   selectedWeekRef.current = selectedWeek;
@@ -205,10 +196,6 @@ export default function WeekReview({
   const [stagingRecallAvailable, setStagingRecallAvailable] = useState(false);
   const [stagingSaving, setStagingSaving] = useState(false);
   const [stagingRecalling, setStagingRecalling] = useState(false);
-  /** Weekly Review hyp + overdue pend → finalized via Memory Approval Save / Recall. */
-  const [reviewPendingOps, setReviewPendingOps] = useState<WeeklyReviewPendingOp[]>([]);
-  const [savedReviewOps, setSavedReviewOps] = useState<WeeklyReviewPendingOp[]>([]);
-  const [reviewRecallAvailable, setReviewRecallAvailable] = useState(false);
   const [stagingTightenComposerId, setStagingTightenComposerId] = useState<string | null>(null);
   const [stagingTightenGuidance, setStagingTightenGuidance] = useState('');
   const [stagingTightenDraftId, setStagingTightenDraftId] = useState<string | null>(null);
@@ -363,98 +350,6 @@ export default function WeekReview({
       setStagingRecallAvailable(Boolean(data.available));
     } catch {
       setStagingRecallAvailable(false);
-    }
-  };
-
-  const fetchReviewRecall = async (weekKey: string) => {
-    try {
-      const res = await fetch(
-        `/api/weekly/weeks/${encodeURIComponent(weekKey)}/review/recall`,
-      );
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        setReviewRecallAvailable(false);
-        return;
-      }
-      setReviewRecallAvailable(Boolean(data.available));
-    } catch {
-      setReviewRecallAvailable(false);
-    }
-  };
-
-  const handleReviewPendOp = (op: WeeklyReviewPendingOp) => {
-    setReviewPendingOps((prev) => [...prev, op]);
-    setMessage({
-      type: 'success',
-      text: 'Review action pended — Save in Memory Approval.',
-    });
-  };
-
-  const handleClearReviewPendingOp = (op: WeeklyReviewPendingOp) => {
-    setReviewPendingOps((prev) => clearReviewPendingTarget(prev, op));
-    setMessage({
-      type: 'success',
-      text: 'Pending review action cleared.',
-    });
-  };
-
-  const runWeeklyReviewSave = async (weekKey: string, ops: WeeklyReviewPendingOp[]) => {
-    if (!ops.length) return { count: 0 };
-    const res = await fetch(
-      `/api/weekly/weeks/${encodeURIComponent(weekKey)}/review/save`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ops }),
-      },
-    );
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      throw new Error(
-        typeof data.error === 'string' ? data.error : 'Weekly review save failed.',
-      );
-    }
-    setReviewPendingOps([]);
-    setSavedReviewOps(ops);
-    setReviewRecallAvailable(Boolean(data.recallAvailable ?? true));
-    return { count: Number(data.count ?? ops.length) };
-  };
-
-  const runWeeklyReviewRecall = async (weekKey: string) => {
-    const res = await fetch(
-      `/api/weekly/weeks/${encodeURIComponent(weekKey)}/review/recall`,
-      { method: 'POST' },
-    );
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      throw new Error(
-        typeof data.error === 'string' ? data.error : 'Weekly review recall failed.',
-      );
-    }
-    setSavedReviewOps([]);
-    setReviewRecallAvailable(Boolean(data.recallAvailable));
-    return { count: Number(data.count ?? 0) };
-  };
-
-  const handleRecallSavedReview = async () => {
-    if (!selectedWeek) return;
-    setLoading(true);
-    setMessage(null);
-    try {
-      const { count } = await runWeeklyReviewRecall(selectedWeek.week);
-      setMessage({
-        type: 'success',
-        text: `Recalled last review save (${count} action(s)).`,
-      });
-      await refreshFourPartSurfaces(selectedWeek.week, { reload: true });
-    } catch (err: unknown) {
-      setMessage({
-        type: 'error',
-        text: err instanceof Error ? err.message : 'Weekly review recall failed.',
-      });
-      setReviewRecallAvailable(false);
-    } finally {
-      setLoading(false);
     }
   };
 
@@ -709,43 +604,6 @@ export default function WeekReview({
       .catch((err) => console.warn('Fetch hot health notice:', err.message || err));
   };
 
-  /**
-   * Load open/past-due daily spans from list JSON so Chronicle does not wait on the span-validator LLM.
-   */
-  const fetchWeeklySpans = async (weekKey: string, opts?: { reload?: boolean }) => {
-    if (!opts?.reload) {
-      const cached = spanRowsByWeekRef.current[weekKey];
-      if (cached) {
-        setSpanBridgeRows(cached);
-        return;
-      }
-    }
-    setSpansLoading(true);
-    try {
-      // List mode: daily YAML parse only. Queue keeps confidence high (not LLM validate).
-      const listed = await fetch(`/api/weekly/weeks/${weekKey}/spans?mode=list`);
-      const data = await listed.json().catch(() => ({}));
-      const raw = Array.isArray(data.candidates) ? data.candidates : [];
-      if (listed.ok && raw.length) {
-        const rows = (raw as WeeklySpanBridgeRow[]).map((c) => ({
-          ...c,
-          block_id: String((c as { id?: string; block_id?: string }).block_id
-            || (c as { id?: string }).id
-            || '').trim(),
-        })).filter((c) => c.block_id);
-        spanRowsByWeekRef.current[weekKey] = rows;
-        setSpanBridgeRows(rows);
-        return;
-      }
-      spanRowsByWeekRef.current[weekKey] = [];
-      setSpanBridgeRows([]);
-    } catch {
-      setSpanBridgeRows([]);
-    } finally {
-      setSpansLoading(false);
-    }
-  };
-
   const fetchChronicle = async (weekKey: string) => {
     setChronicleLoading(true);
     try {
@@ -782,10 +640,9 @@ export default function WeekReview({
     }
   };
 
-  const refreshFourPartSurfaces = async (weekKey: string, opts?: { reload?: boolean }) => {
+  const refreshFourPartSurfaces = async (weekKey: string) => {
     await Promise.all([
       fetchChronicle(weekKey),
-      fetchWeeklySpans(weekKey, opts),
       fetchWeeklyJson(weekKey),
     ]);
   };
@@ -815,14 +672,10 @@ export default function WeekReview({
       }));
       return;
     }
-    if (opts?.reload) {
-      delete spanRowsByWeekRef.current[week.week];
-    }
     setLoading(true);
     setMessage(null);
     setEmptyDigests(false);
     setChronicleSummary('');
-    setSpanBridgeRows([]);
     fetch(`/api/weekly/weeks/${week.week}`)
       .then(async (res) => {
         if (res.status === 404) {
@@ -848,12 +701,9 @@ export default function WeekReview({
         if (data.empty_digests) {
           setEmptyDigests(true);
         }
-        setReviewPendingOps([]);
-        setSavedReviewOps([]);
         fetchHotHealth();
-        void refreshFourPartSurfaces(week.week, { reload: Boolean(opts?.reload) });
+        void refreshFourPartSurfaces(week.week);
         void checkStaleness(week.week);
-        void fetchReviewRecall(week.week);
       })
       .catch((err) => {
         setMessage({ type: 'error', text: err.message });
@@ -936,7 +786,7 @@ export default function WeekReview({
             });
             handleSelectWeek(current, { reload: true });
             void fetchWeeks({ silent: true });
-            void refreshFourPartSurfaces(current.week, { reload: true });
+            void refreshFourPartSurfaces(current.week);
             if (onRefresh) onRefresh();
           }
         } catch {
@@ -1013,7 +863,6 @@ export default function WeekReview({
         const applySoftEmpty = () => {
           setEmptyDigests(true);
           setChronicleSummary('');
-          setSpanBridgeRows([]);
           const soft = emptyWeekSoftLoadPayload(week);
           setSelectedWeek({
             week: soft.week,
@@ -1194,72 +1043,6 @@ export default function WeekReview({
       setReopenLoading(false);
     }
   };
-
-  const refreshStatusOnly = () => {
-    (onStatusRefresh ?? onRefresh)();
-  };
-
-  /** Persist overdue/review pends after Memory Approval hub retired. */
-  const handleReviewSave = async () => {
-    if (!selectedWeek) return;
-    const reviewOps = [...reviewPendingOps];
-    if (!reviewOps.length) {
-      setMessage({
-        type: 'error',
-        text: 'Pend a Weekly Review action before Save.',
-      });
-      return;
-    }
-    const scrollSnap = captureViewScroll();
-    setLoading(true);
-    setMessage(null);
-    try {
-      const saved = await runWeeklyReviewSave(selectedWeek.week, reviewOps);
-      await refreshFourPartSurfaces(selectedWeek.week, { reload: true });
-      setMessage({
-        type: 'success',
-        text: `Saved ${saved.count} review action${saved.count === 1 ? '' : 's'}. Week stays open.`,
-      });
-      fetchHotHealth();
-      refreshStatusOnly();
-      restoreViewScroll(scrollSnap);
-    } catch (err: any) {
-      setMessage({ type: 'error', text: err.message });
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleReviewRecall = async () => {
-    if (!selectedWeek) return;
-    if (!reviewRecallAvailable) {
-      setMessage({
-        type: 'error',
-        text: 'Nothing to recall yet — Save a review batch first.',
-      });
-      return;
-    }
-    const scrollSnap = captureViewScroll();
-    setLoading(true);
-    setMessage(null);
-    try {
-      const { count } = await runWeeklyReviewRecall(selectedWeek.week);
-      await refreshFourPartSurfaces(selectedWeek.week, { reload: true });
-      setMessage({
-        type: 'success',
-        text: `Recalled last review save (${count} action(s)).`,
-      });
-      fetchHotHealth();
-      refreshStatusOnly();
-      restoreViewScroll(scrollSnap);
-    } catch (err: any) {
-      setMessage({ type: 'error', text: err.message });
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const reviewPendingCount = reviewPendingOps.length;
 
   return (
     <div className="space-y-6 fade-in">
@@ -1499,7 +1282,7 @@ export default function WeekReview({
                       </h3>
                       <p className="text-[10px] text-slate-500 font-mono mt-0.5">
                         {weeklyJson
-                          ? `summary · overdue · ${selectedWeek.week}`
+                          ? `summary · ${selectedWeek.week}`
                           : isFourPartBrief(chronicleSummary)
                           ? `Brief · Conflict · ${selectedWeek.week}`
                           : `What you did · ${selectedWeek.week}`}
@@ -1515,38 +1298,7 @@ export default function WeekReview({
                 {!isHighlightsFolded && (
                 <div className="space-y-3 pt-4 border-t border-slate-850 fade-in">
                   {weeklyJson ? (
-                    <FourPartWeeklyCard payload={weeklyJson}>
-                    <MemoryApprovalActionQueue
-                      weekKey={selectedWeek.week}
-                      bridgeSpans={spanBridgeRows}
-                      allBlocks={allBlocks}
-                      pendingOps={reviewPendingOps}
-                      savedReviewOps={savedReviewOps}
-                      onPendOp={handleReviewPendOp}
-                      onClearPendingOp={handleClearReviewPendingOp}
-                      onRecallSavedReview={() => void handleRecallSavedReview()}
-                    />
-                    <div className="flex gap-2 pt-3">
-                      <button
-                        type="button"
-                        onClick={() => void handleReviewSave()}
-                        disabled={loading || !selectedWeek || reviewPendingCount === 0}
-                        className="flex-1 px-4 py-3 bg-indigo-600 hover:bg-indigo-500 text-slate-100 text-xs font-bold rounded-xl font-mono flex items-center justify-center gap-2 shadow-lg shadow-indigo-950/40 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-                      >
-                        <CheckSquare className="w-4 h-4" />
-                        <span>Save</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => void handleReviewRecall()}
-                        disabled={loading || !selectedWeek || !reviewRecallAvailable}
-                        className="flex-1 px-4 py-3 bg-slate-800 hover:bg-slate-700 text-slate-100 text-xs font-bold rounded-xl font-mono flex items-center justify-center gap-2 border border-slate-700 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-                      >
-                        <RefreshCw className="w-4 h-4" />
-                        <span>Recall</span>
-                      </button>
-                    </div>
-                    </FourPartWeeklyCard>
+                    <FourPartWeeklyCard payload={weeklyJson} />
                   ) : emptyDigests ? (
                     <div className="space-y-1.5">
                       <p className="text-sm font-sans font-semibold text-slate-200">
@@ -1556,7 +1308,7 @@ export default function WeekReview({
                         {NEWSROOM_EMPTY_COPY.body}
                       </p>
                     </div>
-                  ) : chronicleLoading || spansLoading ? (
+                  ) : chronicleLoading ? (
                     <p className="text-xs font-mono text-slate-500">
                       {isFourPartBrief(chronicleSummary) || chronicleLoading
                         ? 'Loading weekly review…'

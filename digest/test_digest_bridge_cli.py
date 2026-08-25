@@ -168,17 +168,10 @@ def test_bridge_dispatches_list_weekly_span_candidates(monkeypatch, capsys):
     assert captured["week_key"] == "2026-W29"
 
 
-def test_bridge_dispatches_validate_weekly_spans(monkeypatch, capsys):
+def test_bridge_rejects_validate_weekly_spans(monkeypatch, capsys):
+    """Span-watch ladder retired; Weekly UI must not dispatch validate_weekly_spans."""
     bridge = _load_bridge_module()
-    captured: dict = {}
-
-    class FakeRun:
-        @staticmethod
-        def validate_weekly_spans(week_key, candidates):
-            captured.update({"week_key": week_key, "candidates": candidates})
-            return {"week_key": week_key, "outcome": "validated", "results": []}
-
-    monkeypatch.setattr(bridge, "_load_digest_run", lambda: FakeRun)
+    monkeypatch.setattr(bridge, "_load_digest_run", lambda: object())
     monkeypatch.setattr(
         sys,
         "stdin",
@@ -186,7 +179,7 @@ def test_bridge_dispatches_validate_weekly_spans(monkeypatch, capsys):
             json.dumps(
                 {
                     "op": "validate_weekly_spans",
-                    "args": {"week_key": "2026-W29", "candidates": [{"id": "mem-1"}]},
+                    "args": {"week_key": "2026-W29"},
                 }
             )
         ),
@@ -194,9 +187,8 @@ def test_bridge_dispatches_validate_weekly_spans(monkeypatch, capsys):
 
     assert bridge.main() == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["ok"] is True
-    assert payload["result"]["outcome"] == "validated"
-    assert captured == {"week_key": "2026-W29", "candidates": [{"id": "mem-1"}]}
+    assert payload["ok"] is False
+    assert "unknown op" in payload["error"]
 
 
 def test_bridge_dispatches_resolve_weekly_span(monkeypatch, capsys):

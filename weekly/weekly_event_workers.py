@@ -1748,8 +1748,7 @@ def run_parallel_worker1(
     event_id_set = set(event_ids)
     merged_events_md = "\n\n".join(_render_block(b) for b in event_blocks) or "(no events)"
 
-    # Possible overdue UI comes from memory-digest validate_weekly_spans only.
-    # Do not invent Worker 1 span candidates into the Brief.
+    # Worker 1 still dumps Possible overdue as ``- None.``; Weekly UI does not render it.
     span_candidates: list[SpanCandidate] = []
     cross_day: list[SpanCandidate] = []
 

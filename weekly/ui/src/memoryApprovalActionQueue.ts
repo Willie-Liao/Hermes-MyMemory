@@ -1,6 +1,6 @@
 /**
- * Pure helpers for Memory Approval Weekly Review action queue
- * (Hypothesis + Possible overdue). Browser-safe — no Node imports.
+ * Pure helpers for Weekly Review pending marks.
+ * Browser-safe — no Node imports.
  */
 import {
   citeTargetId,
