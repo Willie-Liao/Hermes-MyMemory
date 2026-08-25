@@ -172,7 +172,7 @@ describe('Memory Approval action queue placement (source fixture)', () => {
     expect(weekReview).not.toContain('Approval Hub');
     expect(weekReview).toContain('spans?mode=list');
     expect(weekReview).not.toContain('mode=validate');
-    expect(weekReview).toContain('shouldFireAutoRescan');
-    expect(weekReview).toContain('runBackgroundStaleRescan');
+    expect(weekReview).not.toContain('shouldFireAutoRescan');
+    expect(weekReview).not.toContain('runBackgroundStaleRescan');
   });
 });
