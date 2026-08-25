@@ -77,9 +77,26 @@ def dumps(payload: WeeklyReviewPayload, *, generated_at: str | None = None) -> s
 
 
 def dump_yaml(payload: WeeklyReviewPayload, *, generated_at: str | None = None) -> str:
-    """YAML body of YYYY-Www.md so recall can parse threads without a second file."""
-    return yaml.safe_dump(
+    """YAML body of YYYY-Www.md so recall can parse threads without a second file.
+
+    Wrap-up text often starts with ``- `` bullets; a quoted folded scalar can
+    look like a nested list to strict parsers. Literal blocks stay one string.
+    """
+
+    class _Dumper(yaml.SafeDumper):
+        """Private dumper so wrap-up literal style cannot leak onto global SafeDumper."""
+
+        pass
+
+    def _str_representer(dumper: yaml.SafeDumper, data: str) -> yaml.Node:
+        if "\n" in data or data.lstrip().startswith("- "):
+            return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data)
+
+    _Dumper.add_representer(str, _str_representer)
+    return yaml.dump(
         _to_dict(payload, generated_at=generated_at),
+        Dumper=_Dumper,
         sort_keys=False,
         allow_unicode=True,
     )
