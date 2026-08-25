@@ -62,6 +62,8 @@ describe('Chronicle source wiring', () => {
     expect(card).toContain('payload.summary');
     expect(card).toContain('weekly-chronicle-summary');
     expect(card).toContain('formatSummaryLine');
+    expect(card).toContain('No weekly summary yet');
+    expect(card).not.toContain('- None.');
     expect(card).not.toContain('Cross-day-thread');
     expect(card).not.toContain('Intra-day-thread');
     expect(card).not.toContain('parseFourPartBrief');

@@ -376,10 +376,14 @@ async function startServer() {
       }
       const sessionKey =
         typeof req.body?.session_key === 'string' ? req.body.session_key.trim() : '';
+      const wait = req.body?.wait !== false && req.body?.wait !== 'false';
+      const statusOnly = Boolean(req.body?.status_only);
       const bridged = await callDigestBridge('request_weekly_reorganise', {
         date_str: date,
         ...(sessionKey ? { session_key: sessionKey } : {}),
         force: true,
+        wait,
+        status_only: statusOnly,
       });
       if (!bridged.ok) {
         appendWeeklyUiLog(
@@ -399,12 +403,12 @@ async function startServer() {
           ...result,
         });
       }
-      if (outcome === 'failed' || outcome === 'in_flight') {
+      if (outcome === 'in_flight' || outcome === 'idle') {
+        return res.status(outcome === 'in_flight' ? 202 : 200).json(result);
+      }
+      if (outcome === 'failed') {
         return res.status(502).json({
-          error:
-            outcome === 'in_flight'
-              ? `Digest already in flight for ${result.path || date}.`
-              : `Reorganise failed for ${result.path || date}.`,
+          error: `Reorganise failed for ${result.path || date}.`,
           outcome,
           ...result,
         });
@@ -767,7 +771,7 @@ async function startServer() {
   // 9b. Mid-week draft update / Rescan (generate_week reason=update|rescan)
   app.post('/api/weekly/update', async (req, res) => {
     try {
-      const { week, week_key, reason } = req.body ?? {};
+      const { week, week_key, reason, background } = req.body ?? {};
       const requestedWeek = week_key || week;
       if (requestedWeek !== undefined && !isValidWeekKey(requestedWeek)) {
         return res.status(400).json({ error: 'A valid week code (YYYY-Www) is required.' });
@@ -776,6 +780,7 @@ async function startServer() {
       const bridged = await callWeeklyBridge('generate_week', {
         ...(requestedWeek === undefined ? {} : { week_key: requestedWeek }),
         reason: updateReason,
+        background: Boolean(background),
       });
       if (!bridged.ok) {
         return res.status(502).json({ error: bridged.error });
@@ -802,7 +807,7 @@ async function startServer() {
           });
         }
       }
-      const outcomeError = pluginOutcomeError(bridged.result, ['generated']);
+      const outcomeError = pluginOutcomeError(bridged.result, ['generated', 'started']);
       if (outcomeError) {
         return res.status(outcomeError.status).json(outcomeError);
       }

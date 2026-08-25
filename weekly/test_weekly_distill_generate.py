@@ -172,16 +172,19 @@ def _write_daily(
     *,
     mem_id: str | None = None,
     block_type: str = "fact",
+    wrapup: str | None = None,
 ) -> Path:
     mem_id = mem_id or f"mem-{day}-a"
     daily = tmp_path / "memories" / "staging" / "daily" / f"{day}.md"
     daily.parent.mkdir(parents=True, exist_ok=True)
-    daily.write_text(
+    text = (
         f"---\nid: {mem_id}\ntype: {block_type}\nentity: X\nconfidence: high\n"
         "status: candidate\nsources: [session s1]\n---\n"
-        f"{block_type.capitalize()} recorded on {day}.\n",
-        encoding="utf-8",
+        f"{block_type.capitalize()} recorded on {day}.\n"
     )
+    if wrapup:
+        text += f"\n## Day wrap-up\n{wrapup}\n"
+    daily.write_text(text, encoding="utf-8")
     return daily
 
 
@@ -702,4 +705,154 @@ def test_generate_weekly_content_renders_four_part_without_worker2_llm(
     assert "## Distill" not in result
     assert not any(c["purpose"] == "worker2_brief" for c in calls)
     assert not any(c["purpose"] == "worker1_span" for c in calls)
+
+
+def _w1_tools(handler):
+    def tools(prompt, *, purpose="weekly_llm", force_tool_name=""):
+        out = handler(prompt, purpose, force_tool_name=force_tool_name)
+        assert isinstance(out, dict)
+        return {
+            "final_response": "",
+            "tool_name": out["tool_name"],
+            "tool_args": out["tool_args"],
+            "tool_calls": [(out["tool_name"], out["tool_args"])],
+            "messages": [],
+            "failed": False,
+        }
+
+    return tools
+
+
+def test_summary_runs_when_monday_wrapup_and_other_days_empty(tmp_path, monkeypatch):
+    weekly = _load_weekly(tmp_path, monkeypatch)
+    files = [
+        _write_daily(tmp_path, "2026-06-29", wrapup="- Monday wrap-up only."),
+        _write_daily(tmp_path, "2026-06-30"),
+    ]
+    days = ("2026-06-29", "2026-06-30")
+
+    def handler(prompt: str, purpose: str, force_tool_name: str = "") -> object:
+        if purpose.startswith("worker1_event"):
+            return _ok_event_tools(days, force_tool_name=force_tool_name)
+        if purpose == "worker1_thread":
+            return _empty_analyst(purpose, force_tool_name)
+        if purpose == "worker1_summary":
+            return {
+                "tool_name": force_tool_name or "submit_weekly_summary",
+                "tool_args": {
+                    "summary": [
+                        {"text": "Monday wrap-up only", "weekdays": ["Monday"]}
+                    ]
+                },
+            }
+        return ""
+
+    _purpose_keyed_llm(weekly, monkeypatch, handler)
+    from weekly_event_workers import run_parallel_worker1
+
+    w1 = run_parallel_worker1(
+        "2026-W27",
+        files,
+        call_llm_tools=_w1_tools(handler),
+        log=lambda _m: None,
+    )
+    assert "worker1_summary" in w1.purposes_called
+    assert w1.payload.summary
+    assert w1.payload.summary[0].text == "Monday wrap-up only"
+
+
+def test_summary_runs_when_wrapups_empty_but_cross_day_exists(tmp_path, monkeypatch):
+    weekly = _load_weekly(tmp_path, monkeypatch)
+    files = [
+        _write_daily(tmp_path, "2026-06-29"),
+        _write_daily(tmp_path, "2026-06-30"),
+    ]
+    days = ("2026-06-29", "2026-06-30")
+
+    def handler(prompt: str, purpose: str, force_tool_name: str = "") -> object:
+        if purpose.startswith("worker1_event"):
+            return _ok_event_tools(days, force_tool_name=force_tool_name)
+        if purpose == "worker1_thread":
+            return {
+                "tool_name": force_tool_name or "submit_weekly_thread",
+                "tool_args": {
+                    "cross-day-thread": [
+                        {
+                            "id": "t1",
+                            "label": "cross",
+                            "start_date": "2026-06-29",
+                            "end_date": "2026-06-30",
+                            "steps": [
+                                {
+                                    "seq": 1,
+                                    "date": "2026-06-29",
+                                    "event_id": "evt-2026-06-29",
+                                    "text": "first",
+                                },
+                                {
+                                    "seq": 2,
+                                    "date": "2026-06-30",
+                                    "event_id": "evt-2026-06-30",
+                                    "text": "second",
+                                    "via": "evolves",
+                                },
+                            ],
+                        }
+                    ]
+                },
+            }
+        if purpose == "worker1_summary":
+            return {
+                "tool_name": force_tool_name or "submit_weekly_summary",
+                "tool_args": {
+                    "summary": [
+                        {
+                            "text": "cross day thread",
+                            "weekdays": ["Monday", "Tuesday"],
+                        }
+                    ]
+                },
+            }
+        return ""
+
+    _purpose_keyed_llm(weekly, monkeypatch, handler)
+    from weekly_event_workers import run_parallel_worker1
+
+    w1 = run_parallel_worker1(
+        "2026-W27",
+        files,
+        call_llm_tools=_w1_tools(handler),
+        log=lambda _m: None,
+    )
+    assert "worker1_summary" in w1.purposes_called
+    assert w1.payload.summary
+    assert w1.cross_day_thread
+
+
+def test_summary_skipped_when_all_intra_and_cross_empty(tmp_path, monkeypatch):
+    weekly = _load_weekly(tmp_path, monkeypatch)
+    files = [_write_daily(tmp_path, "2026-06-29")]
+    days = ("2026-06-29",)
+
+    def handler(prompt: str, purpose: str, force_tool_name: str = "") -> object:
+        if purpose.startswith("worker1_event"):
+            return _ok_event_tools(days, force_tool_name=force_tool_name)
+        if purpose == "worker1_thread":
+            return _empty_analyst(purpose, force_tool_name)
+        if purpose == "worker1_summary":
+            raise AssertionError("worker1_summary must not run when all empty")
+        return ""
+
+    _purpose_keyed_llm(weekly, monkeypatch, handler)
+    from weekly_event_workers import run_parallel_worker1
+
+    w1 = run_parallel_worker1(
+        "2026-W27",
+        files,
+        call_llm_tools=_w1_tools(handler),
+        log=lambda _m: None,
+    )
+    assert "worker1_summary" not in w1.purposes_called
+    assert w1.payload.summary == ()
+    assert w1.summary == ()
 

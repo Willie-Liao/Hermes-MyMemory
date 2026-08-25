@@ -419,15 +419,22 @@ def list_weekly_pending_approval() -> dict[str, Any]:
 _CURRENT_WEEK_GENERATE_REASONS = frozenset({"update", "rescan"})
 
 
-def generate_week(week_key: str | None = None, *, reason: str = "slash") -> dict[str, Any]:
-    """Generate a weekly review file synchronously.
+def generate_week(
+    week_key: str | None = None,
+    *,
+    reason: str = "slash",
+    background: bool = False,
+) -> dict[str, Any]:
+    """Generate a weekly review file, or kick the existing background thread.
 
-    With ``week_key`` (``YYYY-Www``) generates that specific week (overwriting an
-    existing file), including the in-progress current ISO week. Without it:
-    ``reason`` in ``update``/``rescan`` resolves to the current ISO week; otherwise
-    runs the normal backlog sweep.
+    UI Re-scan passes background so the HTTP handler does not wait on Worker 1.
+    The daemon still calls this function without background to do the write.
     """
     _purge_orphan_daily_blocks_before_generate()
+    if isinstance(background, str):
+        background = background.strip().lower() in {"1", "true", "yes"}
+    else:
+        background = bool(background)
 
     if not week_key and reason in _CURRENT_WEEK_GENERATE_REASONS:
         year, week = weekly._current_iso_week()
@@ -502,6 +509,20 @@ def generate_week(week_key: str | None = None, *, reason: str = "slash") -> dict
                 "week": week_key,
                 "empty_digests": True,
                 "draft_cleared": draft_cleared,
+            }
+
+        if background:
+            state = weekly._load_state()
+            mark = weekly.ensure_week_open_mark(state, week_key)
+            already = bool(mark.get("generate_in_flight"))
+            mark["generate_in_flight"] = True
+            weekly._save_state(state)
+            if not already:
+                _kick_background_generate_week(week_key)
+            return {
+                "outcome": "started",
+                "week": week_key,
+                "generate_in_flight": True,
             }
 
         target = weekly._weekly_path(year, week)

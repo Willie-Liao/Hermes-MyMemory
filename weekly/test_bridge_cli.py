@@ -240,9 +240,10 @@ def test_bridge_dispatches_generate_week_with_update_reason(monkeypatch, capsys)
 
     class FakeActions:
         @staticmethod
-        def generate_week(week_key=None, *, reason="bridge"):
+        def generate_week(week_key=None, *, reason="bridge", background=False):
             captured["week_key"] = week_key
             captured["reason"] = reason
+            captured["background"] = background
             return {"outcome": "generated", "week": week_key or "2026-W29"}
 
     monkeypatch.setattr(bridge, "_load_weekly_actions", lambda: FakeActions)
@@ -263,7 +264,7 @@ def test_bridge_dispatches_generate_week_with_update_reason(monkeypatch, capsys)
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is True
     assert payload["result"]["outcome"] == "generated"
-    assert captured == {"week_key": "2026-W28", "reason": "update"}
+    assert captured == {"week_key": "2026-W28", "reason": "update", "background": False}
 
 
 def test_bridge_dispatches_tighten_hot_entry(monkeypatch, capsys):

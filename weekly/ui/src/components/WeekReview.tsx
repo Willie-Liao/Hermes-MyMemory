@@ -80,6 +80,7 @@ const NEWSROOM_EMPTY_COPY = {
 };
 
 const WEEKS_POLL_MS = 180_000; // 3 minutes — avoid flashy frequent re-renders
+const JOB_POLL_MS = 2_000;
 
 /** YAML above body; viewport sized to body so first glance is the narrative (scroll up for schema). */
 function BodyFirstYamlScroll({ yaml, body }: { yaml: string; body: string }) {
@@ -689,6 +690,13 @@ export default function WeekReview({
         date: activeDate,
         week: selectedWeek.week,
       });
+      if (result.digestOutcome === 'in_flight') {
+        setMessage({
+          type: 'info',
+          text: `Reorganise ${activeDate}: running in background…`,
+        });
+        return;
+      }
       setMessage({
         type: 'success',
         text: `Reorganised ${result.pathLabel}.`,
@@ -696,12 +704,12 @@ export default function WeekReview({
       fetchCandidates();
       handleSelectWeek(selectedWeek);
       if (onRefresh) onRefresh();
+      setReorganizeLoading(false);
     } catch (err: unknown) {
       setMessage({
         type: 'error',
         text: err instanceof Error ? err.message : 'Reorganise failed.',
       });
-    } finally {
       setReorganizeLoading(false);
     }
   };
@@ -903,6 +911,70 @@ export default function WeekReview({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- stable poll; uses refs + fetchWeeks
   }, [fetchWeeks]);
 
+  useEffect(() => {
+    if (!rescanLoading && !reorganizeLoading) return;
+    const tick = async () => {
+      const current = selectedWeekRef.current;
+      if (rescanLoading && current) {
+        try {
+          const res = await fetch('/api/weekly/weeks');
+          const rows = await res.json().catch(() => []);
+          const row = Array.isArray(rows)
+            ? rows.find((w: { week?: string }) => w.week === current.week)
+            : null;
+          if (row && !row.generateInFlight) {
+            setRescanLoading(false);
+            setMessage({
+              type: 'success',
+              text: `Regenerated weekly schema for ${current.week}`,
+            });
+            handleSelectWeek(current);
+            void fetchWeeks({ silent: true });
+            void refreshFourPartSurfaces(current.week);
+            if (onRefresh) onRefresh();
+          }
+        } catch {
+          /* keep listening */
+        }
+      }
+      if (reorganizeLoading && activeDate) {
+        try {
+          const res = await fetch('/api/digest/run', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ date: activeDate, status_only: true }),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (data.outcome === 'in_flight') return;
+          setReorganizeLoading(false);
+          if (data.outcome === 'failed') {
+            setMessage({
+              type: 'error',
+              text: `Reorganise failed for ${activeDate}.`,
+            });
+            return;
+          }
+          if (data.outcome === 'idle') {
+            return;
+          }
+          setMessage({
+            type: 'success',
+            text: `Reorganised ${typeof data.path === 'string' ? data.path : activeDate}.`,
+          });
+          fetchCandidates();
+          if (current) handleSelectWeek(current);
+          if (onRefresh) onRefresh();
+        } catch {
+          /* keep listening */
+        }
+      }
+    };
+    const id = window.setInterval(() => { void tick(); }, JOB_POLL_MS);
+    void tick();
+    return () => window.clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- job listen uses refs
+  }, [rescanLoading, reorganizeLoading, activeDate]);
+
   // Idle-aware background rescan: every 3 min while active; 30s no mousemove pauses
   // auto-rescan only (WEEKS_POLL_MS list sync continues). Wake resets the 3-min origin.
   // Edit/tighten composers freeze the auto-rescan countdown; weeks refresh runs when
@@ -962,7 +1034,7 @@ export default function WeekReview({
             const updRes = await fetch('/api/weekly/update', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ week: week.week, reason: 'rescan' }),
+              body: JSON.stringify({ week: week.week, reason: 'rescan', background: true }),
             });
             if (!updRes.ok) continue;
             anyGenerated = true;
@@ -980,7 +1052,7 @@ export default function WeekReview({
             const updRes = await fetch('/api/weekly/update', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ week: week.week, reason: 'rescan' }),
+              body: JSON.stringify({ week: week.week, reason: 'rescan', background: true }),
             });
             if (!updRes.ok) continue;
             anyGenerated = true;
@@ -1160,6 +1232,7 @@ export default function WeekReview({
               text: `Re-scan ${week}: no usable dailies — clearing empty week…`,
             });
           }
+          setRescanLoading(false);
           return;
         }
 
@@ -1169,6 +1242,7 @@ export default function WeekReview({
             text: `nothing needs to be regenerated for ${week}`,
           });
           await refreshHotKeepBanner();
+          setRescanLoading(false);
           return;
         }
 
@@ -1181,7 +1255,7 @@ export default function WeekReview({
         const updRes = await fetch('/api/weekly/update', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ week, reason: 'rescan' }),
+          body: JSON.stringify({ week, reason: 'rescan', background: true }),
         });
         const data = await updRes.json().catch(() => ({}));
         if (updRes.status === 409 || data.outcome === 'already_closed') {
@@ -1192,6 +1266,7 @@ export default function WeekReview({
           || isEmptyDigestGenerateOutcome(data.outcome)
         ) {
           applySoftEmpty();
+          setRescanLoading(false);
           return;
         }
         if (!updRes.ok) {
@@ -1204,6 +1279,13 @@ export default function WeekReview({
               ? data.outcome
               : 'Failed to re-scan the chosen week.';
           throw new Error(`Failed to re-scan ${week}. ${reason}${details}`.trim());
+        }
+        if (data.outcome === 'started' || data.generate_in_flight) {
+          setMessage({
+            type: 'info',
+            text: `Re-scan ${week}: running in background…`,
+          });
+          return;
         }
         if (hotChanged) {
           setMessage({
@@ -1219,9 +1301,9 @@ export default function WeekReview({
         handleSelectWeek(selectedWeek);
         void fetchWeeks({ silent: true });
         if (onRefresh) onRefresh();
+        setRescanLoading(false);
       } catch (err: any) {
         setMessage({ type: 'error', text: err.message || String(err) });
-      } finally {
         setRescanLoading(false);
       }
     })();

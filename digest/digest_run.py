@@ -130,20 +130,99 @@ def request_weekly_reorganise(
     date_str: str | None = None,
     session_key: str | None = None,
     force: bool = True,
+    wait: bool = True,
+    status_only: bool = False,
 ) -> dict[str, Any]:
     """Weekly UI Reorganise: oneshot Phase-2 on the daily file.
 
     No Phase-1 extract, no Hermes ``AIAgent``, no weekly generate.
     ``session_key`` / ``force`` are kept for bridge compatibility and ignored.
+    UI passes wait=False so the HTTP request returns while Phase-2 runs;
+    status_only reads the in-flight flag without starting another job.
     """
     _ = (session_key, force)
     from memory_staging import daily_staging_path, hermes_local_today_str
 
     target_date = date_str or hermes_local_today_str()
     daily_path = daily_staging_path(digest._hermes_home(), target_date)
+    job_key = "weekly_reorganise_job"
+    if isinstance(wait, str):
+        wait = wait.strip().lower() not in {"0", "false", "no"}
+    else:
+        wait = bool(wait)
+    if isinstance(status_only, str):
+        status_only = status_only.strip().lower() in {"1", "true", "yes"}
+    else:
+        status_only = bool(status_only)
+
+    with digest._digest_lock:
+        state = digest._load_state()
+        job = state.get(job_key) if isinstance(state.get(job_key), dict) else {}
+        in_flight = bool(job.get("in_flight"))
+        last_outcome = str(job.get("last_outcome") or "").strip()
+        job_date = str(job.get("date") or "").strip()
+        if status_only:
+            if in_flight:
+                return {
+                    "outcome": "in_flight",
+                    "path": str(daily_path),
+                    "date": job_date or target_date,
+                }
+            return {
+                "outcome": last_outcome or "idle",
+                "path": str(daily_path),
+                "date": job_date or target_date,
+            }
+
     if not daily_path.exists():
         return {"outcome": "missing", "path": str(daily_path), "date": target_date}
-    return digest.run_manual_phase2(daily_path, date_str=target_date)
+
+    if wait:
+        return digest.run_manual_phase2(daily_path, date_str=target_date)
+
+    with digest._digest_lock:
+        state = digest._load_state()
+        job = state.get(job_key) if isinstance(state.get(job_key), dict) else {}
+        if bool(job.get("in_flight")):
+            return {
+                "outcome": "in_flight",
+                "path": str(daily_path),
+                "date": str(job.get("date") or target_date),
+            }
+        state[job_key] = {
+            "in_flight": True,
+            "date": target_date,
+            "last_outcome": "",
+        }
+        digest._save_state(state)
+
+    def _target() -> None:
+        outcome = "failed"
+        try:
+            result = digest.run_manual_phase2(daily_path, date_str=target_date)
+            outcome = str(result.get("outcome") or "failed")
+        except Exception:  # noqa: BLE001
+            outcome = "failed"
+        finally:
+            with digest._digest_lock:
+                state = digest._load_state()
+                state[job_key] = {
+                    "in_flight": False,
+                    "date": target_date,
+                    "last_outcome": outcome,
+                }
+                digest._save_state(state)
+
+    threading.Thread(
+        target=_target,
+        name=f"weekly-reorganise-{target_date}",
+        daemon=True,
+    ).start()
+    return {
+        "outcome": "in_flight",
+        "path": str(daily_path),
+        "date": target_date,
+    }
 
 
 def list_weekly_span_candidates(week_key: str) -> dict[str, Any]:
