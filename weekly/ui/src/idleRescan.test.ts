@@ -2,11 +2,14 @@ import assert from 'node:assert/strict';
 import {
   isIdle,
   onMouseMove,
+  shouldFireAutoRescan,
+  freezeAutoRescanOrigin,
   isHotMemoryComposeActive,
   shouldApplyPostRescanRefresh,
   shouldIdleShutdown,
   shouldSendActivityHeartbeat,
   IDLE_MS,
+  AUTO_RESCAN_MS,
   UI_IDLE_TIMEOUT_MS,
   ACTIVITY_HEARTBEAT_MIN_MS,
 } from './idleRescan.ts';
@@ -19,6 +22,42 @@ const s1 = onMouseMove(s0, 50_000);
 assert.equal(s1.idle, false);
 assert.equal(s1.timerStartedAt, 50_000);
 assert.equal(s1.lastMoveAt, 50_000);
+
+assert.equal(
+  shouldFireAutoRescan({
+    now: 50_000 + AUTO_RESCAN_MS,
+    idle: false,
+    timerStartedAt: 50_000,
+  }),
+  true,
+);
+assert.equal(
+  shouldFireAutoRescan({
+    now: 50_000 + AUTO_RESCAN_MS,
+    idle: true,
+    timerStartedAt: 50_000,
+  }),
+  false,
+);
+assert.equal(
+  shouldFireAutoRescan({
+    now: 50_000 + AUTO_RESCAN_MS - 1,
+    idle: false,
+    timerStartedAt: 50_000,
+  }),
+  false,
+);
+assert.equal(
+  shouldFireAutoRescan({
+    now: 50_000 + AUTO_RESCAN_MS,
+    idle: false,
+    timerStartedAt: 50_000,
+    editing: true,
+  }),
+  false,
+);
+assert.equal(freezeAutoRescanOrigin(50_000, 1_000), 51_000);
+assert.equal(freezeAutoRescanOrigin(50_000, -5), 50_000);
 
 assert.equal(
   isHotMemoryComposeActive({
