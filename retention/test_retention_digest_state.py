@@ -56,15 +56,73 @@ def test_sweep_digest_state_drops_old_keeps_young_and_undated(tmp_path, monkeypa
     )
 
     removed = ret._sweep_digest_state()
-    assert removed >= 2
+    assert removed >= 1
 
     data = json.loads(state_path.read_text(encoding="utf-8"))
     assert young in data["sessions"]
     assert undated in data["sessions"]
     assert old not in data["sessions"]
-    assert young in data["span_watches"]
-    assert old not in data["span_watches"]
+    assert "span_watches" not in data
     assert data["not_a_map"] == "skip-me"
+    archive = tmp_path / "memories" / ".archive" / f"span-watch-{today.isoformat()}.json"
+    snap = json.loads(archive.read_text(encoding="utf-8"))
+    assert young in snap["maps"]["span_watches"]
+    assert old in snap["maps"]["span_watches"]
+
+
+def test_sweep_archives_then_strips_span_watch_keys(tmp_path, monkeypatch):
+    """Span-watch maps leave digest-state only after a dated .archive snapshot."""
+    ret = _load_retention()
+    monkeypatch.setattr(ret, "get_hermes_home", lambda: tmp_path)
+    today = date(2026, 8, 26)
+    monkeypatch.setattr(ret, "hermes_local_today", lambda: today)
+
+    state_path = tmp_path / "memories" / "staging" / ".digest-state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "sessions": {"keep": {"session_id": "keep"}},
+                "span_watches": {"s1": {"mem-a": {"confidence": "high"}}},
+                "span_pending_writes": {},
+                "span_ask_sessions": {},
+                "span_validator_budget": {"s1": {"date": "2026-07-24", "count": 1}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert ret._sweep_digest_state() >= 0
+    data = json.loads(state_path.read_text(encoding="utf-8"))
+    assert data["sessions"]["keep"]["session_id"] == "keep"
+    for key in ret.SPAN_WATCH_STATE_KEYS:
+        assert key not in data
+    archive = tmp_path / "memories" / ".archive" / "span-watch-2026-08-26.json"
+    snap = json.loads(archive.read_text(encoding="utf-8"))
+    assert snap["source"] == "memories/staging/.digest-state.json"
+    assert "validate_weekly_spans" in snap["symbols"]
+    assert snap["maps"]["span_watches"]["s1"]["mem-a"]["confidence"] == "high"
+    assert ret._sweep_digest_state() == 0
+    assert archive.is_file()
+
+
+def test_sweep_archives_empty_span_maps_when_no_prior_snapshot(tmp_path, monkeypatch):
+    """Retirement must still leave an auditable snapshot when span keys are already gone."""
+    ret = _load_retention()
+    monkeypatch.setattr(ret, "get_hermes_home", lambda: tmp_path)
+    today = date(2026, 8, 26)
+    monkeypatch.setattr(ret, "hermes_local_today", lambda: today)
+
+    state_path = tmp_path / "memories" / "staging" / ".digest-state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({"sessions": {"keep": {}}}), encoding="utf-8")
+
+    assert ret._sweep_digest_state() == 0
+    archive = tmp_path / "memories" / ".archive" / "span-watch-2026-08-26.json"
+    snap = json.loads(archive.read_text(encoding="utf-8"))
+    assert snap["maps"]["span_watches"] == {}
+    data = json.loads(state_path.read_text(encoding="utf-8"))
+    assert "span_watches" not in data
 
 
 def test_sweep_digest_state_keeps_old_key_still_in_state_db(tmp_path, monkeypatch):

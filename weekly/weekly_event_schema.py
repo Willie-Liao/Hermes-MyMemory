@@ -36,7 +36,7 @@ ClaimKind = Literal["fact", "procedure", "decision"]
 TypedCiteKind = Literal["conflict", "hypothesis", "span"]
 
 _ALLOWED_CLAIM_KINDS: frozenset[str] = frozenset({"fact", "procedure", "decision"})
-# Align with memory-digest SPAN_CONFIDENCES; UI later filters to explicit|high.
+# Align with Worker-1 overdue section parser; UI no longer queues these rows.
 _ALLOWED_SPAN_CONFIDENCE: frozenset[str] = frozenset(
     {"explicit", "high", "medium", "low"}
 )
@@ -535,7 +535,7 @@ def assign_typed_citations(payload: WeeklyReviewPayload) -> WeeklyReviewPayload:
     """Keep Worker-1 summary on the rebuilt payload so dump cannot empty Chronicle.
 
     Conflict → hypothesis receive the next contiguous numbers. Span candidates
-    are not Brief-cited (Possible overdue UI uses digest validate only).
+    are not Brief-cited (Weekly UI does not render Possible overdue).
     """
     next_n = max_event_cite_number(payload.legend) + 1
     typed: dict[int, TypedCite] = {}
@@ -607,7 +607,7 @@ def render_hypothesis_section(hypotheses: Sequence[HypothesisItem]) -> str:
 
 
 def render_overdue_section(spans: Sequence[SpanCandidate]) -> str:
-    """Brief Possible overdue is always empty; UI uses digest validate only."""
+    """Brief Possible overdue is always empty; Weekly UI does not render it."""
     del spans  # retained for call-site compatibility
     return "\n".join([OVERDUE_SECTION_TITLE, "- None."])
 

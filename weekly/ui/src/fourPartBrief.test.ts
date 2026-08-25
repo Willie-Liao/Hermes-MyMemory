@@ -105,7 +105,7 @@ describe('fourPartBrief', () => {
     expect(stripped).toContain('Possible overdue report');
   });
 
-  it('Brief Possible overdue is empty; UI uses digest validate', () => {
+  it('Brief Possible overdue is empty; Weekly UI does not render it', () => {
     const parsed = parseFourPartBrief(golden);
     expect(parsed.overdue).toHaveLength(0);
     expect(golden).toContain('Possible overdue report\n- None.');

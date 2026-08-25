@@ -3,7 +3,7 @@ digest_date: "2026-07-21"
 # Defaults match the two slow Weekly UI buttons.
 # After rescan/reorganise, inspect generated weekly markdown for Event-First
 # four sections: Weekly Brief (Mon–Sun + Events markers / No record for this day.),
-# Conflict, Hypothesis, Possible overdue report (`- None.` in Brief; UI uses digest validate).
+# Conflict, Hypothesis, Possible overdue report (`- None.` in Brief; Weekly UI does not render it).
 # Golden layout: fixtures/weekly_four_part_w31.md
 # Prefer week_key 2026-W31 when digests exist under HERMES_HOME.
 ops:

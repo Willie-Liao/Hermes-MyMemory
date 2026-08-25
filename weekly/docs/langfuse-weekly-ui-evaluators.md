@@ -102,9 +102,8 @@ Before creating evaluators, confirm the project default judge model is **minimax
       Beginning/Course/Outcome labels), or exactly "No record for this day." when empty.
    2. Conflict
    3. Hypothesis
-   4. Possible overdue report — always `- None.` in Brief. Weekly UI Possible
-      overdue comes only from memory-digest ``validate_weekly_spans``
-      (explicit|high ``mem-*``); Worker 1 must not invent Brief overdue rows.
+   4. Possible overdue report — always `- None.` in Brief. Weekly UI does not
+      render that section (span-watch / validate ladder retired).
 
    Criteria (score 1 only if all relevant checks pass for this op; else 0):
 

@@ -1,10 +1,9 @@
-"""Weekly/digest-bridge span ops: overdue reporting + resolution for the Weekly UI.
+"""Weekly/digest-bridge span ops: list and resolve daily-block valid_to.
 
 These are non-chat entry points. They must never call
 ``build_recall_injection_context`` or ``on_pre_llm_call``.
 They reuse on-disk primitives
-(``_expiring_blocks``, ``_run_span_validator_llm``,
-``patch_daily_block_valid_to``) so daily-block writes stay consistent.
+(``_expiring_blocks``, ``patch_daily_block_valid_to``) so daily-block writes stay consistent.
 """
 
 from __future__ import annotations
@@ -125,58 +124,6 @@ def list_weekly_span_candidates(week_key: str) -> dict[str, Any]:
     return {"week_key": week_key, "outcome": "listed", "candidates": candidates}
 
 
-def validate_weekly_spans(
-    week_key: str, candidates: list[dict[str, Any]] | None = None
-) -> dict[str, Any]:
-    """Run the span validator LLM and keep only explicit/high confidence rows.
-
-    Does not touch chat span-watch state or session budgets — this is a
-    stateless batch validation for the Weekly UI, separate from
-    ``build_recall_injection_context``.
-    """
-    if candidates is None:
-        listed = list_weekly_span_candidates(week_key)
-        if listed.get("outcome") == "invalid_week":
-            return {"week_key": week_key, "outcome": "invalid_week", "results": []}
-        candidates = listed["candidates"]
-
-    if not candidates:
-        return {"week_key": week_key, "outcome": "empty", "results": []}
-
-    rows = digest._run_span_validator_llm("", list(candidates), "")
-    cand_by_id = {
-        str(c.get("id") or "").strip(): c for c in candidates if str(c.get("id") or "").strip()
-    }
-
-    results: list[dict[str, Any]] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        confidence = str(row.get("confidence") or "low").strip().lower()
-        if confidence not in ("explicit", "high"):
-            continue
-        block_id = str(row.get("block_key") or "").strip()
-        if not block_id:
-            continue
-        cand = cand_by_id.get(block_id, {})
-        item: dict[str, Any] = {
-            "block_id": block_id,
-            "confidence": confidence,
-            "entity": cand.get("entity", ""),
-            "involves": cand.get("involves", ""),
-            "body": cand.get("body", ""),
-            "valid_from": cand.get("valid_from", ""),
-            "valid_to": cand.get("valid_to", ""),
-            "state": cand.get("state", ""),
-            "file": cand.get("file", ""),
-        }
-        proposed = str(row.get("proposed_valid_to") or "").strip()
-        if proposed:
-            item["proposed_valid_to"] = proposed
-        results.append(item)
-    return {"week_key": week_key, "outcome": "validated", "results": results}
-
-
 def resolve_weekly_span(
     week_key: str,
     block_id: str,
@@ -189,7 +136,7 @@ def resolve_weekly_span(
 ) -> dict[str, Any]:
     """Apply one of the three UI resolution choices to a daily block's valid_to.
 
-    - confirm: apply ``proposed_valid_to`` (from a prior ``validate_weekly_spans`` call).
+    - confirm: apply ``proposed_valid_to``.
     - put_off: add ``interval`` (1d|7d|2w|1mo) to the current/proposed due date
       (or today when the block is still ``open``).
     - set_due_date: apply a user-selected ISO ``due_date`` verbatim.
