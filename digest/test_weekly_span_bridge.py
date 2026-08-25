@@ -96,6 +96,7 @@ def test_list_weekly_span_candidates_includes_overdue_and_open(tmp_path, monkeyp
     result = sw.list_weekly_span_candidates(WEEK)
     ids = {c["id"] for c in result["candidates"]}
     assert ids == {"mem-open", "mem-overdue"}
+    assert all(c.get("confidence") == "high" for c in result["candidates"])
 
 
 def test_validate_weekly_spans_filters_to_explicit_and_high(tmp_path, monkeypatch):

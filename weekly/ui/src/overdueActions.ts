@@ -75,13 +75,13 @@ export function newIdempotencyKey(): string {
   return `idem-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-/** Keep only explicit/high bridge rows (defense in depth). */
+/** Keep YAML `high` only — explicit already has a decided span; do not default missing to high. */
 export function filterBridgeSpansExplicitHigh(
   rows: WeeklySpanBridgeRow[],
 ): WeeklySpanBridgeRow[] {
   return rows.filter((r) => {
     const c = String(r.confidence || '').toLowerCase();
-    return c === 'explicit' || c === 'high';
+    return c === 'high';
   });
 }
 
@@ -173,7 +173,7 @@ export function resolveSpanBlockId(opts: {
 }
 
 /**
- * Build actionable overdue rows from digest validate bridge only.
+ * Build actionable overdue rows from digest list JSON (YAML confidence high).
  * Worker 1 Brief Possible overdue / invented span-* cites are ignored.
  */
 export function mergeActionableOverdueRows(opts: {
@@ -198,8 +198,8 @@ export function mergeActionableOverdueRows(opts: {
     }
     const proposed =
       (row.proposed_valid_to || '').trim() || (row.valid_to || '').trim();
-    const confidence = (String(row.confidence || 'high').toLowerCase() as SpanConfidence);
-    if (confidence !== 'explicit' && confidence !== 'high') continue;
+    const confidence = String(row.confidence || '').toLowerCase() as SpanConfidence;
+    if (confidence !== 'high') continue;
     const confirmDisabled = !isValidIsoDate(proposed);
     out.push({
       key: row.block_id,

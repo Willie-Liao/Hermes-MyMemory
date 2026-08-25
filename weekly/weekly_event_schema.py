@@ -532,7 +532,7 @@ def overdue_span_candidates(
 
 
 def assign_typed_citations(payload: WeeklyReviewPayload) -> WeeklyReviewPayload:
-    """Attach typed cite numbers after the event legend max; never renumber events.
+    """Keep Worker-1 summary on the rebuilt payload so dump cannot empty Chronicle.
 
     Conflict → hypothesis receive the next contiguous numbers. Span candidates
     are not Brief-cited (Possible overdue UI uses digest validate only).
@@ -568,6 +568,7 @@ def assign_typed_citations(payload: WeeklyReviewPayload) -> WeeklyReviewPayload:
         cross_day_thread=payload.cross_day_thread,
         intra_day_thread=payload.intra_day_thread,
         entities=payload.entities,
+        summary=payload.summary,
     )
 
 

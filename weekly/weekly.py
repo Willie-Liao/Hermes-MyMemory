@@ -1412,6 +1412,7 @@ def _generate_weekly_content(
         intra_day_thread=payload.intra_day_thread,
         entities=payload.entities,
         week_key=week_key,
+        summary=payload.summary,
     )
     _last_weekly_payload = assigned
     return weekly_json.dump_yaml(assigned)

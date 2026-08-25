@@ -596,7 +596,7 @@ def test_event_workers_never_emit_non_event_types(tmp_path, monkeypatch):
 
 def test_generate_weekly_content_fills_brief_after_w1(tmp_path, monkeypatch):
     weekly = _load_weekly(tmp_path, monkeypatch)
-    files = [_write_daily(tmp_path, "2026-06-30")]
+    files = [_write_daily(tmp_path, "2026-06-30", wrapup="- Monday wrap-up only.")]
 
     def handler(prompt: str, purpose: str, force_tool_name: str = "") -> object:
         if purpose.startswith("worker1_event"):
@@ -617,6 +617,15 @@ def test_generate_weekly_content_fills_brief_after_w1(tmp_path, monkeypatch):
                 "tool_name": force_tool_name or "submit_weekly_thread",
                 "tool_args": {"cross-day-thread": []},
             }
+        if purpose == "worker1_summary":
+            return {
+                "tool_name": force_tool_name or "submit_weekly_summary",
+                "tool_args": {
+                    "summary": [
+                        {"text": "Monday wrap-up only", "weekdays": ["Monday"]}
+                    ]
+                },
+            }
         return ""
 
     calls = _purpose_keyed_llm(weekly, monkeypatch, handler)
@@ -625,6 +634,8 @@ def test_generate_weekly_content_fills_brief_after_w1(tmp_path, monkeypatch):
     assert "cross-day-thread" in result
     assert "intra-day-thread" in result
     assert "summary:" in result
+    assert "Monday wrap-up only" in result
+    assert "summary: []" not in result
     assert "legend:" not in result
     assert "Conflict" not in result
     assert "Hypothesis" not in result
