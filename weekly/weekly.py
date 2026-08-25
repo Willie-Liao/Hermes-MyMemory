@@ -453,6 +453,7 @@ def ensure_week_open_mark(
         "ask_pending": False,
         "ask_resolved": None,
         "generate_in_flight": False,
+        "reorganise_in_flight": False,
     }
     marks[week_key] = mark
     return mark
@@ -476,6 +477,7 @@ def mark_week_closed_in_state(
     # Chat overdue A/B ask is retired; never leave ask_pending sticky on close.
     mark["ask_pending"] = False
     mark["generate_in_flight"] = False
+    mark["reorganise_in_flight"] = False
     marks[week_key] = mark
     return mark
 
@@ -792,6 +794,17 @@ def _weeks_status_rows(
             "status": status,
             "filename": filename,
         }
+        mark = _week_open_marks(state).get(key)
+        if isinstance(mark, dict):
+            row["generate_in_flight"] = (
+                "true" if mark.get("generate_in_flight") else "false"
+            )
+            row["reorganise_in_flight"] = (
+                "true" if mark.get("reorganise_in_flight") else "false"
+            )
+        else:
+            row["generate_in_flight"] = "false"
+            row["reorganise_in_flight"] = "false"
         if status == "reviewed":
             tidy = _tidy_tag(key, presentation)
             if tidy:
