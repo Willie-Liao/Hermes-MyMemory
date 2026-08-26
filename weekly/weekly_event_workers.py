@@ -87,7 +87,6 @@ MAX_DAY_FILE_CHARS = 8000
 EVENT_WORKER_PURPOSES: tuple[str, ...] = ("worker1_event",)
 ANALYST_PURPOSES: tuple[str, ...] = (
     "worker1_thread",
-    "worker1_summary",
 )
 
 _EVENT_ONLY_FORBIDDEN: frozenset[str] = frozenset(
@@ -1254,168 +1253,64 @@ def _order_weekdays(names: Sequence[Any]) -> tuple[str, ...]:
     return tuple(ordered)
 
 
-def summary_from_tool_args(
-    args: Mapping[str, Any],
-) -> tuple[list[WeeklySummaryItem], list[str]]:
-    """Keep only non-empty bullets so Chronicle cannot paint blank hops as summary."""
-    items = args.get("summary")
-    if not isinstance(items, list):
-        return [], ["summary must be an array"]
-    out: list[WeeklySummaryItem] = []
-    errors: list[str] = []
-    for i, item in enumerate(items):
-        if not isinstance(item, Mapping):
-            errors.append(f"summary[{i}] must be an object")
-            continue
-        text = str(item.get("text") or "").strip().lstrip("- ").strip()
-        weekdays = _order_weekdays(item.get("weekdays") or ())
-        if not text:
-            errors.append(f"summary[{i}] text must be non-empty")
-            continue
-        if not weekdays:
-            errors.append(f"summary[{i}] weekdays must list Monday–Sunday names")
-            continue
-        try:
-            out.append(WeeklySummaryItem(text=text, weekdays=weekdays))
-        except ValueError as exc:
-            errors.append(str(exc))
-    return out, errors
-
-
-def _build_summary_prompt(
-    *,
-    week_key: str,
-    intra: Sequence[IntraDayThread],
-    cross: Sequence[SpanCandidate],
-    attempt: int = 1,
-    errors: Sequence[str] = (),
-    previous_args: Mapping[str, Any] | None = None,
-) -> str:
-    """Stable prefix then thread YAML only — daily bundle would recache the thread prompt."""
-    intra_lines: list[str] = []
-    for row in intra:
-        if row.empty or not str(row.text).strip():
-            continue
-        intra_lines.append(
-            f"- date={row.date.isoformat()} weekday={row.weekday}\n  {row.text.strip()}"
-        )
-    cross_lines: list[str] = []
-    for thread in cross:
-        step_bits = ", ".join(
-            f"{step.date.isoformat()} {step.text.strip()}" for step in thread.steps
-        )
-        cross_lines.append(
-            f"- id={thread.id} label={thread.label} {thread.start_date}..{thread.end_date}\n"
-            f"  steps: {step_bits}"
-        )
-    rules = (
-        "You are weekly Worker 1 summary analyst (worker1_summary).\n\n"
-        f"Week: {week_key}\n\n"
-        "Call submit_weekly_summary with summary. Each item needs text "
-        "(one sentence, no leading dash) and weekdays (Monday..Sunday).\n"
-        "One row per non-empty intra-day wrap-up and per cross-day-thread.\n"
-        "Sort by earliest date. Same earliest day: intra before cross.\n"
-        "weekdays: unique names in Monday-Sunday order for dates that item covers.\n"
-        "Do not emit legend, cite_n, wrap-up copies, or new events.\n"
-    )
-    if attempt <= 1:
-        return (
-            rules
-            + "\nINTRA-DAY-THREAD:\n"
-            + ("\n".join(intra_lines) or "(none)")
-            + "\n\nCROSS-DAY-THREAD:\n"
-            + ("\n".join(cross_lines) or "(none)")
-            + "\n"
-        )
-    return rules + "\n" + weekly_tools.failed_fields_teach(
-        errors,
-        previous_args or {},
-        role="summary",
-        patch_tool="patch_weekly_summary",
-        attempt=attempt,
-        max_attempts=MAX_WORKER_ATTEMPTS,
-    )
-
-
 def _run_summary_worker(
     *,
     week_key: str,
     intra: Sequence[IntraDayThread],
     cross: Sequence[SpanCandidate],
-    call_llm_tools: CallLlmToolsFn | None,
-    log: LogFn,
+    call_llm_tools: CallLlmToolsFn | None = None,
+    log: LogFn | None = None,
 ) -> tuple[WeeklySummaryItem, ...]:
-    """Force submit then patch for summary; empty tuple on exhaustion so generate still dumps."""
-    last_errors: list[str] = []
-    previous_args: dict[str, Any] = {}
-    submit_name = "submit_weekly_summary"
-    patch_name = "patch_weekly_summary"
-    for attempt in range(1, MAX_WORKER_ATTEMPTS + 1):
-        force_name = submit_name if attempt == 1 else patch_name
-        prompt = _build_summary_prompt(
-            week_key=week_key,
-            intra=intra,
-            cross=cross,
-            attempt=attempt,
-            errors=last_errors,
-            previous_args=previous_args,
-        )
-        try:
-            log(
-                f"weekly worker1_summary LLM tool call start {week_key} "
-                f"attempt={attempt}/{MAX_WORKER_ATTEMPTS} tool={force_name}"
-            )
-            result = _invoke_weekly_tools(
-                prompt,
-                purpose="worker1_summary",
-                force_tool_name=force_name,
-                call_llm_tools=call_llm_tools,
-            )
-        except Exception as exc:  # noqa: BLE001
-            last_errors = [f"agent error: {exc}"]
-            log(f"weekly worker1_summary agent failed {week_key}: {exc}")
+    """Copy wrap-up dashes and thread labels into Chronicle rows so generate cannot wait on a last LLM hop.
+
+    ``call_llm_tools`` is ignored: summary used to be a forced tool call that the 300s
+    bridge killed, then dumped ``summary: []`` over a populated week file.
+    """
+    del call_llm_tools
+    _log: LogFn = log or (lambda _msg: None)
+    keyed: list[tuple[date, int, WeeklySummaryItem]] = []
+    for row in intra:
+        if row.empty or not str(row.text).strip():
             continue
-        tool_name = str(result.get("tool_name") or "").strip()
-        tool_args = result.get("tool_args")
-        if not isinstance(tool_args, dict):
-            tool_args = {}
-        if attempt >= 2 and tool_name == submit_name:
-            last_errors = [
-                f"attempt 2+ must call {patch_name} only "
-                "(no from-scratch submit)"
-            ]
-            continue
-        if attempt == 1:
-            if tool_name != submit_name:
-                last_errors = [
-                    f"expected {submit_name}, got {tool_name or 'none'}"
-                ]
+        weekday = row.weekday or weekday_label(row.date)
+        for line in str(row.text).splitlines():
+            stripped = line.strip().lstrip("- ").strip()
+            if not stripped:
                 continue
-            previous_args = dict(tool_args)
+            keyed.append(
+                (
+                    row.date,
+                    0,
+                    WeeklySummaryItem(
+                        text=stripped,
+                        weekdays=_order_weekdays((weekday,)),
+                    ),
+                )
+            )
+    for thread in cross:
+        days = [step.date for step in thread.steps] or [thread.start_date]
+        weekdays = _order_weekdays(weekday_label(d) for d in days)
+        outcome_text = ""
+        if isinstance(thread.outcome, Mapping):
+            outcome_text = str(thread.outcome.get("text") or "").strip()
+        label = str(thread.label or "").strip()
+        if label and outcome_text:
+            text = f"{label.rstrip('.')}. {outcome_text}"
         else:
-            if tool_name != patch_name:
-                last_errors = [
-                    f"expected {patch_name}, got {tool_name or 'none'}"
-                ]
-                continue
-            previous_args = weekly_tools.merge_field_patch(previous_args, tool_args)
-        enum_errors = weekly_tools.validate_closed_choice_args(
-            previous_args, role="summary"
-        )
-        if enum_errors:
-            last_errors = enum_errors
+            text = label or outcome_text
+        if not text:
             continue
-        items, errors = summary_from_tool_args(previous_args)
-        if not errors:
-            log(f"weekly worker1_summary ok {week_key} rows={len(items)}")
-            return tuple(items)
-        last_errors = errors
-        log(
-            f"weekly worker1_summary validation failed {week_key} "
-            f"attempt={attempt}: {'; '.join(last_errors[:3])}"
+        keyed.append(
+            (
+                min(days),
+                1,
+                WeeklySummaryItem(text=text, weekdays=weekdays),
+            )
         )
-    log(f"weekly worker1_summary soft-empty after failures {week_key}: {last_errors[:3]}")
-    return ()
+    keyed.sort(key=lambda item: (item[0], item[1]))
+    items = tuple(item[2] for item in keyed)
+    _log(f"weekly summary assembled {week_key} rows={len(items)}")
+    return items
 
 
 def _daily_supersedes_map(by_day: Mapping[date, Path]) -> dict[str, list[str]]:
@@ -1695,8 +1590,8 @@ def run_parallel_worker1(
 ) -> Worker1Result:
     """Build one week's payload so generate can dump YAML without a Distill document.
 
-    Empty weekday wrap-up slots must not skip summary; skip only when every
-    intra-day row is empty and there is no cross-day thread.
+    Summary is copied from wrap-up bullets and cross-day threads so a killed
+    LLM hop cannot dump an empty Chronicle over a populated week file.
     """
     _log: LogFn = log or (lambda _msg: None)
     reason_bit = f" reason={reason}" if reason else ""
@@ -1813,23 +1708,13 @@ def run_parallel_worker1(
         entities=entities,
     )
 
-    summary_items: tuple[WeeklySummaryItem, ...] = ()
-    # Skip only when every wrap-up is empty AND there is no cross-day thread.
-    all_intra_empty = all(row.empty or not str(row.text).strip() for row in intra)
-    if not all_intra_empty or cross_day:
-        purposes_called.append("worker1_summary")
-        try:
-            summary_items = _run_summary_worker(
-                week_key=week_key,
-                intra=intra,
-                cross=tuple(cross_day),
-                call_llm_tools=call_llm_tools,
-                log=_log,
-            )
-        except Exception as exc:  # noqa: BLE001
-            _log(f"weekly worker1_summary future error {week_key}: {exc}")
-            summary_items = ()
-        payload = replace(payload, summary=summary_items)
+    summary_items = _run_summary_worker(
+        week_key=week_key,
+        intra=intra,
+        cross=tuple(cross_day),
+        log=_log,
+    )
+    payload = replace(payload, summary=summary_items)
 
     errors: list[str] = list(worker_errs)
     if not event_blocks:

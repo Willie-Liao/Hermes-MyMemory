@@ -617,15 +617,6 @@ def test_generate_weekly_content_fills_brief_after_w1(tmp_path, monkeypatch):
                 "tool_name": force_tool_name or "submit_weekly_thread",
                 "tool_args": {"cross-day-thread": []},
             }
-        if purpose == "worker1_summary":
-            return {
-                "tool_name": force_tool_name or "submit_weekly_summary",
-                "tool_args": {
-                    "summary": [
-                        {"text": "Monday wrap-up only", "weekdays": ["Monday"]}
-                    ]
-                },
-            }
         return ""
 
     calls = _purpose_keyed_llm(weekly, monkeypatch, handler)
@@ -747,15 +738,6 @@ def test_summary_runs_when_monday_wrapup_and_other_days_empty(tmp_path, monkeypa
             return _ok_event_tools(days, force_tool_name=force_tool_name)
         if purpose == "worker1_thread":
             return _empty_analyst(purpose, force_tool_name)
-        if purpose == "worker1_summary":
-            return {
-                "tool_name": force_tool_name or "submit_weekly_summary",
-                "tool_args": {
-                    "summary": [
-                        {"text": "Monday wrap-up only", "weekdays": ["Monday"]}
-                    ]
-                },
-            }
         return ""
 
     _purpose_keyed_llm(weekly, monkeypatch, handler)
@@ -767,9 +749,9 @@ def test_summary_runs_when_monday_wrapup_and_other_days_empty(tmp_path, monkeypa
         call_llm_tools=_w1_tools(handler),
         log=lambda _m: None,
     )
-    assert "worker1_summary" in w1.purposes_called
+    assert "worker1_summary" not in w1.purposes_called
     assert w1.payload.summary
-    assert w1.payload.summary[0].text == "Monday wrap-up only"
+    assert w1.payload.summary[0].text == "Monday wrap-up only."
 
 
 def test_summary_runs_when_wrapups_empty_but_cross_day_exists(tmp_path, monkeypatch):
@@ -812,18 +794,6 @@ def test_summary_runs_when_wrapups_empty_but_cross_day_exists(tmp_path, monkeypa
                     ]
                 },
             }
-        if purpose == "worker1_summary":
-            return {
-                "tool_name": force_tool_name or "submit_weekly_summary",
-                "tool_args": {
-                    "summary": [
-                        {
-                            "text": "cross day thread",
-                            "weekdays": ["Monday", "Tuesday"],
-                        }
-                    ]
-                },
-            }
         return ""
 
     _purpose_keyed_llm(weekly, monkeypatch, handler)
@@ -835,8 +805,9 @@ def test_summary_runs_when_wrapups_empty_but_cross_day_exists(tmp_path, monkeypa
         call_llm_tools=_w1_tools(handler),
         log=lambda _m: None,
     )
-    assert "worker1_summary" in w1.purposes_called
+    assert "worker1_summary" not in w1.purposes_called
     assert w1.payload.summary
+    assert w1.payload.summary[0].text == "cross"
     assert w1.cross_day_thread
 
 
@@ -851,7 +822,7 @@ def test_summary_skipped_when_all_intra_and_cross_empty(tmp_path, monkeypatch):
         if purpose == "worker1_thread":
             return _empty_analyst(purpose, force_tool_name)
         if purpose == "worker1_summary":
-            raise AssertionError("worker1_summary must not run when all empty")
+            raise AssertionError("worker1_summary must not run as an LLM purpose")
         return ""
 
     _purpose_keyed_llm(weekly, monkeypatch, handler)
@@ -964,14 +935,7 @@ def test_agreement_exhaustion_fallback_still_runs_summary(tmp_path, monkeypatch)
         if purpose == "worker1_thread":
             return _empty_analyst(purpose, force_tool_name)
         if purpose == "worker1_summary":
-            return {
-                "tool_name": force_tool_name or "submit_weekly_summary",
-                "tool_args": {
-                    "summary": [
-                        {"text": "Monday wrap-up only", "weekdays": ["Monday"]}
-                    ]
-                },
-            }
+            raise AssertionError("worker1_summary must not run as an LLM purpose")
         return ""
 
     from weekly_event_workers import run_parallel_worker1
@@ -983,10 +947,36 @@ def test_agreement_exhaustion_fallback_still_runs_summary(tmp_path, monkeypatch)
         call_llm_tools=_w1_tools(handler),
         log=logs.append,
     )
-    assert "worker1_summary" in w1.purposes_called
+    assert "worker1_summary" not in w1.purposes_called
     assert w1.payload.summary
     assert any("fallback after failures" in line for line in logs)
     assert not any("skip analysts" in line for line in logs)
-    assert w1.payload.summary[0].text == "Monday wrap-up only"
+    assert w1.payload.summary[0].text == "Monday wrap-up only."
+
+
+def test_commit_carries_forward_empty_summary(tmp_path, monkeypatch):
+    weekly = _load_weekly(tmp_path, monkeypatch)
+    from weekly_event_schema import WeeklyReviewPayload, WeeklySummaryItem
+
+    target = tmp_path / "memories" / "staging" / "weekly" / "2026-W35.md"
+    prior = WeeklyReviewPayload(
+        days=(),
+        week_key="2026-W35",
+        summary=(WeeklySummaryItem(text="kept wrap-up", weekdays=("Monday",)),),
+    )
+    weekly._commit_weekly_outputs(target, "ignored", prior, "2026-W35")
+    empty = WeeklyReviewPayload(days=(), week_key="2026-W35")
+    out = weekly._commit_weekly_outputs(target, "ignored", empty, "2026-W35")
+    assert out.summary[0].text == "kept wrap-up"
+    reloaded = weekly.weekly_json.loads(target.read_text(encoding="utf-8"))
+    assert reloaded.summary[0].text == "kept wrap-up"
+
+    fresh = WeeklyReviewPayload(
+        days=(),
+        week_key="2026-W35",
+        summary=(WeeklySummaryItem(text="new wrap-up", weekdays=("Tuesday",)),),
+    )
+    replaced = weekly._commit_weekly_outputs(target, "ignored", fresh, "2026-W35")
+    assert replaced.summary[0].text == "new wrap-up"
 
 

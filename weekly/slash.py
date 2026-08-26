@@ -34,8 +34,6 @@ if _section_dir not in sys.path:
 try:  # package import (normal plugin load)
     from . import weekly as weekly_mod
     from . import weekly_actions
-    from .weekly_brief_validate import format_brief_for_chat
-    from .weekly_cite import extract_brief
 except ImportError:  # pragma: no cover - direct pytest collection path
     _weekly_path = Path(__file__).with_name("weekly.py")
     _weekly_spec = importlib.util.spec_from_file_location(
@@ -52,26 +50,6 @@ except ImportError:  # pragma: no cover - direct pytest collection path
         raise
     weekly_actions = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(weekly_actions)
-
-    _cite_path = Path(__file__).with_name("weekly_cite.py")
-    _cite_spec = importlib.util.spec_from_file_location(
-        "memory_weekly_cite_slash", _cite_path
-    )
-    if _cite_spec is None or _cite_spec.loader is None:
-        raise
-    _weekly_cite = importlib.util.module_from_spec(_cite_spec)
-    _cite_spec.loader.exec_module(_weekly_cite)
-    extract_brief = _weekly_cite.extract_brief
-
-    _brief_path = Path(__file__).with_name("weekly_brief_validate.py")
-    _brief_spec = importlib.util.spec_from_file_location(
-        "memory_weekly_brief_validate_slash", _brief_path
-    )
-    if _brief_spec is None or _brief_spec.loader is None:
-        raise
-    _weekly_brief = importlib.util.module_from_spec(_brief_spec)
-    _brief_spec.loader.exec_module(_weekly_brief)
-    format_brief_for_chat = _weekly_brief.format_brief_for_chat
 
 _DEFAULT_UI_URL = "http://127.0.0.1:3000"
 _UI_PROBE_TIMEOUT = 1.0
@@ -113,7 +91,7 @@ def _week_arg(args: list[str]) -> str | None:
 
 
 def _brief_from_update_result(result: dict) -> str:
-    """Prefer ``brief`` from generate_week; else extract from the written week file."""
+    """Prefer generate_week brief; else Chronicle rows from the written week YAML."""
     brief = result.get("brief")
     if isinstance(brief, str) and brief.strip():
         return brief.strip()
@@ -122,9 +100,14 @@ def _brief_from_update_result(result: dict) -> str:
         return ""
     try:
         md = Path(path).read_text(encoding="utf-8")
-    except OSError:
+        payload = weekly_mod.weekly_json.loads(md)
+    except Exception:
         return ""
-    return extract_brief(md).strip()
+    lines: list[str] = []
+    for row in payload.summary:
+        days = ", ".join(row.weekdays)
+        lines.append(f"- {row.text} ({days})" if days else f"- {row.text}")
+    return "\n".join(lines)
 
 
 def _update(args: list[str]) -> str:
@@ -157,8 +140,7 @@ def _update(args: list[str]) -> str:
             f"{result.get('sources')} daily file(s) -> {result.get('path')}"
         )
         if brief:
-            processed = format_brief_for_chat(brief)
-            return f"{processed}\n\n{footer}"
+            return f"{brief}\n\n{footer}"
         return footer
     return f"/weekly update: unexpected outcome {outcome!r}."
 

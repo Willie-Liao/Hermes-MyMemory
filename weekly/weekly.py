@@ -1087,8 +1087,22 @@ def _weekly_path(year: int, week: int) -> Path:
 
 def _commit_weekly_outputs(
     target: Path, content: str, payload: WeeklyReviewPayload, week_key: str
-) -> None:
-    """Dump YAML before replacing the md so a serializer crash cannot clobber last week's file."""
+) -> WeeklyReviewPayload:
+    """Dump YAML before replacing the md so a serializer crash cannot clobber last week's file.
+
+    Keep the previous Chronicle bullets when this run produced none — a timed-out
+    or fail-open generate must not wipe a populated summary.
+    """
+    if not payload.summary and target.is_file():
+        try:
+            prior = weekly_json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, ValueError, yaml.YAMLError):
+            prior = None
+        if prior is not None and prior.summary:
+            payload = replace(payload, summary=prior.summary)
+            _log(
+                f"weekly summary carry-forward {week_key} rows={len(prior.summary)}"
+            )
     yaml_text = weekly_json.dump_yaml(payload)
     del content
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1099,6 +1113,7 @@ def _commit_weekly_outputs(
         content=yaml_text.rstrip() + "\n",
     )
     weekly_json.write_sidecars(target, payload)
+    return payload
 
 
 def _build_prompt(
@@ -1490,7 +1505,7 @@ def _run_weekly(reason: str) -> None:
                 payload = _last_weekly_payload
                 if payload is None:
                     payload = WeeklyReviewPayload(days=(), week_key=key)
-                _commit_weekly_outputs(target, content, payload, key)
+                payload = _commit_weekly_outputs(target, content, payload, key)
 
                 state["last_generated_week"] = key
                 state["last_generated_at"] = datetime.now(timezone.utc).isoformat()

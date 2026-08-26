@@ -91,6 +91,7 @@ def test_dumps_uses_hyphenated_keys_and_omits_distill_fields():
     for banned in ("days", "conflicts", "hypotheses", "blocks", "overdue", "typed_legend"):
         assert banned not in obj
     assert obj["summary"][0]["weekdays"] == ["Monday", "Tuesday"]
+    assert obj["generator"]["authored"] == ["cross-day-thread"]
     assert "cite_n" not in obj["cross-day-thread"][0]["steps"][0]
     round_trip = wj.loads(raw)
     assert round_trip.cross_day_thread[0].steps[1].via == "evolves"
@@ -408,7 +409,8 @@ def test_run_analyst_attempt2_calls_patch_not_second_submit():
     }
 
 
-def test_summary_worker_fills_rows_and_fail_open_on_bad_tool():
+def test_summary_worker_copies_wrapup_and_thread():
+    """Deterministic Chronicle rows: wrap-up dashes then thread label+outcome."""
     workers_path = Path(__file__).with_name("weekly_event_workers.py")
     spec = importlib.util.spec_from_file_location(
         "memory_weekly_workers_summary", workers_path
@@ -449,56 +451,50 @@ def test_summary_worker_fills_rows_and_fail_open_on_bad_tool():
                     via="evolves",
                 ),
             ),
+            outcome={"state": "resolved", "text": "legend retired"},
         ),
     )
-
-    def call_ok(prompt, *, purpose, force_tool_name):
-        _ = prompt, purpose
-        assert force_tool_name == "submit_weekly_summary"
-        return {
-            "tool_name": "submit_weekly_summary",
-            "tool_args": {
-                "summary": [
-                    {
-                        "text": "parent photo notifications",
-                        "weekdays": ["Monday"],
-                    },
-                    {
-                        "text": (
-                            "the weekly ui has been updated to second version "
-                            "discarding legend and jump to"
-                        ),
-                        "weekdays": ["Tuesday", "Monday"],
-                    },
-                ]
-            },
-        }
 
     rows = workers._run_summary_worker(
         week_key="2026-W34",
         intra=intra,
         cross=cross,
-        call_llm_tools=call_ok,
         log=lambda _m: None,
     )
     assert [r.text for r in rows] == [
-        "parent photo notifications",
-        "the weekly ui has been updated to second version discarding legend and jump to",
+        "parent photos",
+        "ui hops. legend retired",
     ]
+    assert rows[0].weekdays == ("Monday",)
     assert rows[1].weekdays == ("Monday", "Tuesday")
 
-    def call_bad(prompt, *, purpose, force_tool_name):
-        _ = prompt, purpose, force_tool_name
-        return {"tool_name": "submit_weekly_thread", "tool_args": {}}
 
-    empty = workers._run_summary_worker(
+def test_summary_worker_empty_when_no_wrapup_or_thread():
+    workers_path = Path(__file__).with_name("weekly_event_workers.py")
+    spec = importlib.util.spec_from_file_location(
+        "memory_weekly_workers_summary_empty", workers_path
+    )
+    assert spec is not None and spec.loader is not None
+    workers = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = workers
+    spec.loader.exec_module(workers)
+    schema = _load()
+    intra = (
+        schema.IntraDayThread(
+            date=date(2026, 8, 17),
+            weekday="Monday",
+            source_field="day_wrapup",
+            text="",
+            empty=True,
+        ),
+    )
+    rows = workers._run_summary_worker(
         week_key="2026-W34",
         intra=intra,
-        cross=cross,
-        call_llm_tools=call_bad,
+        cross=(),
         log=lambda _m: None,
     )
-    assert empty == ()
+    assert rows == ()
 
 
 def test_run_analyst_rejects_second_submit_on_attempt2():
@@ -578,5 +574,89 @@ def test_run_analyst_rejects_second_submit_on_attempt2():
     )
     assert threads == []
     assert calls["n"] >= 2
+
+
+def test_w35_wrapup_and_thread_make_four_summary_rows():
+    """Monday's three wrap-up dashes plus one cross-day thread become four Chronicle rows."""
+    workers_path = Path(__file__).with_name("weekly_event_workers.py")
+    spec = importlib.util.spec_from_file_location(
+        "memory_weekly_workers_w35_summary", workers_path
+    )
+    assert spec is not None and spec.loader is not None
+    workers = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = workers
+    spec.loader.exec_module(workers)
+    schema = _load()
+    wrap = (
+        "- The user iterated on a handwritten Qixi greeting card, transcribing, polishing, "
+        "and finalizing the message with structural parallelism.\n"
+        "- The user investigated MyMemory system issues including schema gaps, WeChat "
+        "integration, memory isolation, migration, chronicle performance, and message delivery "
+        "problems.\n"
+        "- The user requested to see the full day wrap-up prompt text to understand how "
+        "daily summaries are generated."
+    )
+    intra = (
+        schema.IntraDayThread(
+            date=date(2026, 8, 24),
+            weekday="Monday",
+            source_field="day_wrapup",
+            text=wrap,
+            empty=False,
+        ),
+        schema.IntraDayThread(
+            date=date(2026, 8, 25),
+            weekday="Tuesday",
+            source_field="day_wrapup",
+            text="",
+            empty=True,
+        ),
+    )
+    cross = (
+        schema.SpanCandidate(
+            id="thread-1",
+            label="Codebase understanding and context gathering",
+            start_date=date(2026, 8, 24),
+            end_date=date(2026, 8, 25),
+            confidence="high",
+            steps=(
+                schema.ThreadStep(
+                    seq=1,
+                    date=date(2026, 8, 24),
+                    event_id="mem-2026-08-24-fact-9605EB855DAA",
+                    text="Identified repository structure",
+                ),
+                schema.ThreadStep(
+                    seq=2,
+                    date=date(2026, 8, 25),
+                    event_id="mem-2026-08-25-fact-62BCB7010463",
+                    text="Expanded understanding",
+                    via="evolves",
+                ),
+            ),
+            outcome={
+                "state": "resolved",
+                "text": (
+                    "Gained sufficient understanding of codebase structure to proceed "
+                    "with tasks"
+                ),
+            },
+        ),
+    )
+    rows = workers._run_summary_worker(
+        week_key="2026-W35",
+        intra=intra,
+        cross=cross,
+        log=lambda _m: None,
+    )
+    assert len(rows) == 4
+    assert rows[0].weekdays == ("Monday",)
+    assert rows[1].weekdays == ("Monday",)
+    assert rows[2].weekdays == ("Monday",)
+    assert rows[3].weekdays == ("Monday", "Tuesday")
+    assert rows[0].text.startswith("The user iterated")
+    assert rows[1].text.startswith("The user investigated")
+    assert rows[2].text.startswith("The user requested")
+    assert rows[3].text.startswith("Codebase understanding")
 
 

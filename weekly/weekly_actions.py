@@ -15,7 +15,6 @@ from typing import Any
 
 try:  # package import (normal plugin load)
     from . import weekly
-    from .weekly_cite import extract_brief
 except ImportError:  # pragma: no cover - direct pytest collection path
     _module_path = Path(__file__).with_name("weekly.py")
     _spec = importlib.util.spec_from_file_location("memory_weekly_core", _module_path)
@@ -23,16 +22,6 @@ except ImportError:  # pragma: no cover - direct pytest collection path
         raise
     weekly = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(weekly)
-
-    _cite_path = Path(__file__).with_name("weekly_cite.py")
-    _cite_spec = importlib.util.spec_from_file_location(
-        "memory_weekly_cite_actions", _cite_path
-    )
-    if _cite_spec is None or _cite_spec.loader is None:
-        raise
-    _weekly_cite = importlib.util.module_from_spec(_cite_spec)
-    _cite_spec.loader.exec_module(_weekly_cite)
-    extract_brief = _weekly_cite.extract_brief
 
 
 def _purge_orphan_daily_blocks_before_generate() -> None:
@@ -427,8 +416,8 @@ def generate_week(
 ) -> dict[str, Any]:
     """Generate a weekly review file, or kick the existing background thread.
 
-    UI Re-scan passes background so the HTTP handler does not wait on Worker 1.
-    The daemon still calls this function without background to do the write.
+    Slash and UI Re-scan wait in-process (background=False). Overdue catch-up
+    still kicks a daemon via process_overdue_week_marks.
     """
     _purge_orphan_daily_blocks_before_generate()
     if isinstance(background, str):
@@ -538,7 +527,7 @@ def generate_week(
         payload = weekly._last_weekly_payload
         if payload is None:
             payload = weekly.WeeklyReviewPayload(days=(), week_key=week_key)
-        weekly._commit_weekly_outputs(target, content, payload, week_key)
+        payload = weekly._commit_weekly_outputs(target, content, payload, week_key)
 
         fingerprint = weekly._digest_fingerprint_for_files(files)
         state = weekly._load_state()
@@ -559,7 +548,14 @@ def generate_week(
         "path": str(target),
         "sources": len(files),
         "fingerprint": fingerprint,
-        "brief": extract_brief(content),
+        "brief": "\n".join(
+            (
+                f"- {row.text} ({', '.join(row.weekdays)})"
+                if row.weekdays
+                else f"- {row.text}"
+            )
+            for row in payload.summary
+        ),
     }
     if weekly._last_brief_error:
         result["brief_error"] = weekly._last_brief_error
