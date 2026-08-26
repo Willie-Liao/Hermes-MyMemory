@@ -47,7 +47,10 @@ try:
         WeeklySummaryItem,
         weekday_label,
     )
-    from .weekly_event_validate import validate_event_blocks_against_dailies
+    from .weekly_event_validate import (
+        index_daily_claim_blocks,
+        validate_event_blocks_against_dailies,
+    )
     from . import weekly_tools
 except ImportError:  # pragma: no cover - flat pytest load
     from weekly_citations import normalize_event_citations  # type: ignore[no-redef]
@@ -68,6 +71,7 @@ except ImportError:  # pragma: no cover - flat pytest load
         weekday_label,
     )
     from weekly_event_validate import (  # type: ignore[no-redef]
+        index_daily_claim_blocks,
         validate_event_blocks_against_dailies,
     )
     import weekly_tools  # type: ignore[no-redef]
@@ -252,10 +256,31 @@ def _build_event_worker_prompt(
     attempt: int = 1,
     errors: Sequence[str] = (),
     previous_args: Mapping[str, Any] | None = None,
+    claim_index: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> str:
+    """Show claim-card ids with bodies so related cannot be copied from event YAML lists.
+
+    Daily sources still include events for context; CITE_ONLY is the only allow-list.
+    """
     day_list = ", ".join(
         f"{weekday_label(d)} {d.isoformat()}" for d in days
     ) or "(no days assigned)"
+    cite_lines = [
+        "related = ids from CITE_ONLY only. Do not copy ids that appear "
+        "only under another block's related:.",
+        "CITE_ONLY:",
+    ]
+    if claim_index:
+        for mem_id, rec in sorted(claim_index.items()):
+            body = " ".join(str(rec.get("body") or "").split())
+            if len(body) > 160:
+                body = body[:159].rstrip() + "…"
+            kind = str(rec.get("type") or "").strip()
+            cite_lines.append(f"- id: {mem_id}  type: {kind}")
+            cite_lines.append(f"  body: {body or '(empty)'}")
+    else:
+        cite_lines.append("(no fact/procedure/decision cards)")
+    cite_block = "\n".join(cite_lines)
     base = (
         f"You are weekly Worker 1 event extractor ({purpose}).\n\n"
         f"Week: {week_key}\n"
@@ -264,7 +289,8 @@ def _build_event_worker_prompt(
         "Each event needs entity, predicate, participants "
         "(User/requester + Assistant/executor), valid_from/valid_to, "
         "confidence (explicit|high|medium|low), sources, related "
-        "(must include a mem-… id), beginning, course, outcome.\n"
+        "(CITE_ONLY card id: only), beginning, course, outcome.\n"
+        f"{cite_block}\n"
         "Do NOT emit fact/procedure/decision/conflict/hypothesis.\n"
         "Do NOT write ## Brief. Do NOT write hot memory.\n"
         "Do NOT emit free-form YAML — use the tool call only.\n"
@@ -521,11 +547,12 @@ def _run_event_worker(
 ) -> tuple[list[dict[str, Any]], bool, list[str]]:
     """Returns (blocks, used_fallback, error notes). Uses forced submit/patch tools.
 
-    Schema failures may fall back to daily events. Agreement-validator exhaustion
-    returns no blocks and ``used_fallback=False`` (hard fail — skip analysts).
+    Schema failures and agreement-validator exhaustion both fall back to daily
+    events so wrap-up/summary still dump. Skip-analysts hard abort is retired.
     """
     day_bundle = _day_bundle(by_day, days)
     daily_files = [by_day[d] for d in days if d in by_day]
+    claim_index = index_daily_claim_blocks(daily_files)
     last_errors: list[str] = []
     previous_args: dict[str, Any] = {}
     agreement_failed = False
@@ -542,6 +569,7 @@ def _run_event_worker(
             attempt=attempt,
             errors=last_errors,
             previous_args=previous_args,
+            claim_index=claim_index,
         )
         try:
             log(
@@ -604,6 +632,19 @@ def _run_event_worker(
             continue
 
         blocks = weekly_tools.render_events_from_tool_args(previous_args)
+        for block in blocks:
+            fm = block.get("frontmatter")
+            if not isinstance(fm, dict):
+                continue
+            related = fm.get("related")
+            if not isinstance(related, list):
+                continue
+            kept: list[Any] = []
+            for entry in related:
+                match = _MEM_ID_RE.search(str(entry))
+                if match and match.group(1) in claim_index:
+                    kept.append(entry)
+            fm["related"] = kept
         errors = _validate_event_only_blocks(blocks)
         if errors:
             last_errors = errors
@@ -627,9 +668,12 @@ def _run_event_worker(
 
     if agreement_failed:
         log(
-            f"weekly {purpose} agreement exhausted {week_key} — no write / skip analysts"
+            f"weekly {purpose} agreement exhausted {week_key} — "
+            f"fallback after failures"
         )
-        return [], False, list(last_errors)
+        return _fallback_events_from_dailies(by_day, days, purpose=purpose), True, list(
+            last_errors
+        )
 
     if not days:
         log(f"weekly {purpose} empty partition exhausted {week_key} — no fallback days")
@@ -1668,6 +1712,7 @@ def run_parallel_worker1(
     fallback_days: list[date] = []
     purpose = EVENT_WORKER_PURPOSES[0]
     purposes_called.append(purpose)
+    worker_errs: list[str] = []
     try:
         event_worker_blocks, used_fallback, worker_errs = _run_event_worker(
             week_key=week_key,
@@ -1685,31 +1730,6 @@ def run_parallel_worker1(
         )
         used_fallback = True
         worker_errs = [str(exc)]
-
-    # Agreement validator exhausted: no write / skip analysts.
-    if (
-        not event_worker_blocks
-        and worker_errs
-        and not used_fallback
-        and active_days
-    ):
-        empty_days = [
-            DayBrief(day=d, events=(), sentences=()) for d in week_dates
-        ]
-        return Worker1Result(
-            blocks=[],
-            legend={},
-            payload=WeeklyReviewPayload(
-                days=tuple(empty_days),
-                conflicts=(),
-                hypotheses=(),
-                span_candidates=(),
-                legend={},
-            ),
-            errors=list(worker_errs),
-            fallback_days=(),
-            purposes_called=tuple(purposes_called),
-        )
 
     if used_fallback:
         fallback_days.extend(active_days)
@@ -1811,7 +1831,7 @@ def run_parallel_worker1(
             summary_items = ()
         payload = replace(payload, summary=summary_items)
 
-    errors: list[str] = []
+    errors: list[str] = list(worker_errs)
     if not event_blocks:
         errors.append("no event blocks after parallel Worker 1")
     if fallback_days:

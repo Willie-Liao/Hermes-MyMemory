@@ -25,7 +25,7 @@ from monthly_slice import (  # noqa: E402
 )
 from monthly_state import month_file_path  # noqa: E402
 from monthly_synth import synthesize_month  # noqa: E402
-from monthly_writer import load_month, write_month  # noqa: E402
+from monthly_writer import load_month, write_month, loads  # noqa: E402
 
 _MONTH_KEY_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 
@@ -88,15 +88,18 @@ def load_monthly_yaml(month_key: str | None = None) -> dict[str, Any]:
     return {"outcome": "ok", "month": key, "payload": payload.to_dict()}
 
 
-def month_band(limit: int = 8) -> str:
-    """One summary line per recent month for prompt injection; nothing else enters the prompt."""
-    folder = month_file_path("x").parent
+def month_band(limit: int = 8, staging: Path | None = None) -> str:
+    """Index last months as one-liners so prefetch Band D is not another daily dump.
+
+    Optional staging points at a sandbox root so tests do not read live HERMES_HOME.
+    """
+    folder = Path(staging) / "monthly" if staging is not None else month_file_path("x").parent
     if not folder.is_dir():
         return ""
     lines: list[str] = []
     for path in sorted(folder.glob("????-??.md"), reverse=True)[:limit]:
         try:
-            payload = load_month(path.stem)
+            payload = loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError, FileNotFoundError):
             continue
         summary = (payload.summary or "").strip()

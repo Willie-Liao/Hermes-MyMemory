@@ -867,3 +867,126 @@ def test_summary_skipped_when_all_intra_and_cross_empty(tmp_path, monkeypatch):
     assert w1.payload.summary == ()
     assert w1.summary == ()
 
+
+def test_strips_related_only_id_keeps_claim_card(tmp_path, monkeypatch):
+    weekly = _load_weekly(tmp_path, monkeypatch)
+    day = "2026-08-24"
+    legal = "mem-2026-08-24-fact-9605EB855DAA"
+    dangling = "mem-2026-08-24-fact-CAC0A038911B"
+    daily = tmp_path / "memories" / "staging" / "daily" / f"{day}.md"
+    daily.parent.mkdir(parents=True, exist_ok=True)
+    daily.write_text(
+        "---\n"
+        f"id: mem-2026-08-24-event-04689ED86657\n"
+        "type: event\n"
+        "entity: X\n"
+        "predicate: cited\n"
+        "participants: [{entity: X}]\n"
+        f"valid_from: {day}\n"
+        f"valid_to: {day}\n"
+        "confidence: high\n"
+        "status: candidate\n"
+        "sources: [s]\n"
+        "related:\n"
+        f"  - {dangling}\n"
+        "---\n"
+        "Event lists a dangling fact id.\n"
+        "---\n"
+        f"id: {legal}\n"
+        "type: fact\n"
+        "entity: X\n"
+        "confidence: high\n"
+        "status: candidate\n"
+        "sources: [s]\n"
+        "---\n"
+        "WeeklyReviewPayload schema has no summary or brief field.\n",
+        encoding="utf-8",
+    )
+    args = _event_tool_args(evt_id="evt-mon", day=day, mem_id=legal)
+    args["related"] = [dangling, legal]
+    args["beginning"] = "WeeklyReviewPayload schema has no summary"
+    args["course"] = "WeeklyReviewPayload schema progress"
+    args["outcome"] = "WeeklyReviewPayload schema has no summary or brief field"
+
+    def handler(prompt: str, purpose: str, force_tool_name: str = "") -> object:
+        if purpose.startswith("worker1_event"):
+            assert "CITE_ONLY" in prompt
+            assert legal in prompt.split("DAILY SOURCES")[0]
+            assert dangling not in prompt.split("DAILY SOURCES")[0]
+            return {
+                "tool_name": force_tool_name or "submit_weekly_event",
+                "tool_args": {"events": [args]},
+            }
+        if purpose == "worker1_thread":
+            return _empty_analyst(purpose, force_tool_name)
+        return ""
+
+    from weekly_event_workers import run_parallel_worker1
+
+    result = run_parallel_worker1(
+        "2026-W35",
+        [daily],
+        call_llm_tools=_w1_tools(handler),
+        log=lambda _m: None,
+    )
+    related = []
+    for block in result.blocks:
+        fm = block.get("frontmatter") or {}
+        if str(fm.get("type") or "").casefold() == "event":
+            related.extend(fm.get("related") or [])
+    joined = " ".join(str(x) for x in related)
+    assert legal in joined
+    assert dangling not in joined
+    assert not result.fallback_days
+
+
+def test_agreement_exhaustion_fallback_still_runs_summary(tmp_path, monkeypatch):
+    weekly = _load_weekly(tmp_path, monkeypatch)
+    files = [
+        _write_daily(tmp_path, "2026-06-29", wrapup="- Monday wrap-up only."),
+    ]
+    days = ("2026-06-29",)
+
+    def handler(prompt: str, purpose: str, force_tool_name: str = "") -> object:
+        if purpose.startswith("worker1_event"):
+            args = _event_tool_args(
+                evt_id="evt-bad",
+                day="2026-06-29",
+                mem_id="mem-2026-06-29-a",
+            )
+            args["beginning"] = "Quantum bananas launched orbital tea ceremony."
+            args["course"] = "Quantum bananas launched orbital tea ceremony."
+            args["outcome"] = "Quantum bananas launched orbital tea ceremony."
+            return {
+                "tool_name": force_tool_name or "submit_weekly_event",
+                "tool_args": {"events": [args]},
+            }
+        if purpose == "worker1_thread":
+            return _empty_analyst(purpose, force_tool_name)
+        if purpose == "worker1_summary":
+            return {
+                "tool_name": force_tool_name or "submit_weekly_summary",
+                "tool_args": {
+                    "summary": [
+                        {"text": "Monday wrap-up only", "weekdays": ["Monday"]}
+                    ]
+                },
+            }
+        return ""
+
+    from weekly_event_workers import run_parallel_worker1
+
+    logs: list[str] = []
+    w1 = run_parallel_worker1(
+        "2026-W27",
+        files,
+        call_llm_tools=_w1_tools(handler),
+        log=logs.append,
+    )
+    assert "worker1_summary" in w1.purposes_called
+    assert w1.payload.summary
+    assert any("fallback after failures" in line for line in logs)
+    assert not any("skip analysts" in line for line in logs)
+    assert w1.payload.summary[0].text == "Monday wrap-up only"
+
+

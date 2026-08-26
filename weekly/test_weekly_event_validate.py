@@ -119,3 +119,88 @@ def test_missing_related_mem_fails(tmp_path: Path):
     ]
     errs = v.validate_event_blocks_against_dailies(blocks, [path])
     assert any("missing mem id" in e for e in errs)
+
+
+def test_index_excludes_ids_only_listed_on_event_related(tmp_path: Path):
+    path = _write_daily(
+        tmp_path,
+        "2026-08-24.md",
+        "---\n"
+        "id: mem-2026-08-24-event-04689ED86657\n"
+        "type: event\n"
+        "entity: X\n"
+        "predicate: cited\n"
+        "participants: [{entity: X}]\n"
+        "valid_from: 2026-08-24\n"
+        "valid_to: 2026-08-24\n"
+        "confidence: high\n"
+        "status: candidate\n"
+        "sources: [s]\n"
+        "related:\n"
+        "  - mem-2026-08-24-fact-CAC0A038911B\n"
+        "---\n"
+        "Pointer-only related id lives on this event.\n"
+        "---\n"
+        "id: mem-2026-08-24-fact-9605EB855DAA\n"
+        "type: fact\n"
+        "entity: X\n"
+        "confidence: high\n"
+        "status: candidate\n"
+        "sources: [s]\n"
+        "---\n"
+        "WeeklyReviewPayload schema has no summary or brief field.\n",
+    )
+    idx = v.index_daily_claim_blocks([path])
+    assert "mem-2026-08-24-fact-9605EB855DAA" in idx
+    assert idx["mem-2026-08-24-fact-9605EB855DAA"]["type"] == "fact"
+    assert "mem-2026-08-24-fact-CAC0A038911B" not in idx
+    assert "mem-2026-08-24-event-04689ED86657" not in idx
+
+
+def test_event_prompt_cite_only_lists_card_ids_not_related_pointers(tmp_path: Path):
+    from datetime import date
+
+    from weekly_event_workers import _build_event_worker_prompt
+
+    path = _write_daily(
+        tmp_path,
+        "2026-08-24.md",
+        "---\n"
+        "id: mem-2026-08-24-event-04689ED86657\n"
+        "type: event\n"
+        "entity: X\n"
+        "predicate: cited\n"
+        "participants: [{entity: X}]\n"
+        "valid_from: 2026-08-24\n"
+        "valid_to: 2026-08-24\n"
+        "confidence: high\n"
+        "status: candidate\n"
+        "sources: [s]\n"
+        "related:\n"
+        "  - mem-2026-08-24-fact-CAC0A038911B\n"
+        "---\n"
+        "Event lists a dangling fact id.\n"
+        "---\n"
+        "id: mem-2026-08-24-fact-9605EB855DAA\n"
+        "type: fact\n"
+        "entity: X\n"
+        "confidence: high\n"
+        "status: candidate\n"
+        "sources: [s]\n"
+        "---\n"
+        "WeeklyReviewPayload schema has no summary or brief field.\n",
+    )
+    idx = v.index_daily_claim_blocks([path])
+    daily_yaml = path.read_text(encoding="utf-8")
+    prompt = _build_event_worker_prompt(
+        "2026-W35",
+        "worker1_event",
+        [date(2026, 8, 24)],
+        daily_yaml,
+        claim_index=idx,
+    )
+    cite_section, _sources = prompt.split("DAILY SOURCES", 1)
+    assert "CITE_ONLY" in cite_section
+    assert "mem-2026-08-24-fact-9605EB855DAA" in cite_section
+    assert "mem-2026-08-24-fact-CAC0A038911B" not in cite_section
+    assert "WeeklyReviewPayload schema" in cite_section

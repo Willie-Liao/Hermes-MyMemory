@@ -474,7 +474,7 @@ def render_bands(
     today: date | None = None,
     hot_text: str = "",
 ) -> str:
-    """Byte-stable Bands A–C for the civil-day system prefix. Band D is empty."""
+    """Byte-stable Bands A–C plus Band D month one-liners for the civil-day prefix."""
     root = staging_root(staging)
     store = BlockIndex(root)
     day0 = today or date.today()
@@ -604,7 +604,22 @@ def render_bands(
                 f"- {week_key} {n_evt}evt · {top_ent or '—'} · {headline} · f={path.name}"
             )
 
+    d_text = ""
+    try:
+        import sys
+
+        mdir = Path(__file__).resolve().parent.parent / "monthly"
+        if str(mdir) not in sys.path:
+            sys.path.insert(0, str(mdir))
+        from monthly_actions import month_band
+
+        d_text = month_band(staging=root)
+    except Exception:
+        d_text = ""
+
     parts = ["\n".join(a_lines), "\n".join(b_lines), "\n".join(c_lines)]
+    if d_text.strip():
+        parts.append(d_text.strip())
     text = "\n\n".join(parts).rstrip() + "\n"
     if "blk ::" not in text:
         return ""
