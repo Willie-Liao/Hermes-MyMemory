@@ -229,6 +229,7 @@ def test_threads_from_tool_args_drops_one_day_and_stamps_cite():
         },
         event_ids=allowed,
         legend=legend,
+        week_dates=workers.iso_week_dates("2026-W31"),
     )
     assert errors == []
     assert [t.id for t in threads] == ["t-ok"]
@@ -305,12 +306,98 @@ def test_skip_invalidates_stamps_to_seq():
         },
         event_ids=set(legend.values()),
         legend=legend,
+        week_dates=workers.iso_week_dates("2026-W33"),
     )
     assert errors == []
     assert threads[0].steps[3].via == "invalidates"
     assert threads[0].steps[3].to_seq == 1
     assert threads[0].steps[1].via == "evolves"
     _ = schema
+
+
+def test_threads_from_tool_args_drops_out_of_iso_week_steps():
+    """W35 cannot keep a W34 Saturday step; one leftover in-week date is not a thread."""
+    workers = _load_workers("memory_weekly_workers_iso_clip")
+    legend = {
+        1: "mem-2026-08-22-event-aaaa",
+        2: "mem-2026-08-26-event-bbbb",
+        3: "mem-2026-08-27-event-cccc",
+    }
+    week_dates = workers.iso_week_dates("2026-W35")
+    dropped, errors = workers.threads_from_tool_args(
+        {
+            "cross-day-thread": [
+                {
+                    "id": "t-w34-leak",
+                    "label": "leak",
+                    "steps": [
+                        {
+                            "seq": 1,
+                            "date": "2026-08-22",
+                            "event_id": legend[1],
+                            "text": "saturday",
+                        },
+                        {
+                            "seq": 2,
+                            "date": "2026-08-26",
+                            "event_id": legend[2],
+                            "text": "wednesday",
+                            "via": "evolves",
+                        },
+                    ],
+                }
+            ]
+        },
+        event_ids=set(legend.values()),
+        legend=legend,
+        week_dates=week_dates,
+    )
+    assert errors == []
+    assert dropped == []
+
+    kept, errors = workers.threads_from_tool_args(
+        {
+            "cross-day-thread": [
+                {
+                    "id": "t-ok",
+                    "label": "in week",
+                    "steps": [
+                        {
+                            "seq": 1,
+                            "date": "2026-08-22",
+                            "event_id": legend[1],
+                            "text": "saturday",
+                        },
+                        {
+                            "seq": 2,
+                            "date": "2026-08-26",
+                            "event_id": legend[2],
+                            "text": "wednesday",
+                            "via": "evolves",
+                        },
+                        {
+                            "seq": 3,
+                            "date": "2026-08-27",
+                            "event_id": legend[3],
+                            "text": "thursday",
+                            "via": "evolves",
+                        },
+                    ],
+                }
+            ]
+        },
+        event_ids=set(legend.values()),
+        legend=legend,
+        week_dates=week_dates,
+    )
+    assert errors == []
+    assert [t.id for t in kept] == ["t-ok"]
+    assert [s.date.isoformat() for s in kept[0].steps] == [
+        "2026-08-26",
+        "2026-08-27",
+    ]
+    assert kept[0].start_date == date(2026, 8, 26)
+    assert kept[0].end_date == date(2026, 8, 27)
 
 
 def test_run_analyst_attempt2_calls_patch_not_second_submit():
@@ -520,6 +607,69 @@ def test_summary_worker_empty_when_no_wrapup_or_thread():
         log=lambda _m: None,
     )
     assert rows == ()
+
+
+def test_summary_worker_clips_weekdays_to_iso_week():
+    """W35 Chronicle must not paint Saturday from 2026-08-22."""
+    workers = _load_workers("memory_weekly_workers_summary_iso")
+    schema = _load()
+    intra = (
+        schema.IntraDayThread(
+            date=date(2026, 8, 26),
+            weekday="Wednesday",
+            source_field="events",
+            text="- in week",
+            empty=False,
+        ),
+    )
+    cross = (
+        schema.SpanCandidate(
+            id="t1",
+            label="qixi card",
+            start_date=date(2026, 8, 22),
+            end_date=date(2026, 8, 26),
+            confidence="high",
+            related_event_ids=("mem-2026-08-22-a", "mem-2026-08-26-b"),
+            steps=(
+                schema.ThreadStep(
+                    seq=1,
+                    date=date(2026, 8, 22),
+                    event_id="mem-2026-08-22-a",
+                    text="saturday leak",
+                ),
+                schema.ThreadStep(
+                    seq=2,
+                    date=date(2026, 8, 26),
+                    event_id="mem-2026-08-26-b",
+                    text="wednesday",
+                    via="evolves",
+                ),
+            ),
+            outcome={"state": "open", "text": "still open"},
+        ),
+    )
+    event_blocks = [
+        {
+            "frontmatter": {
+                "id": "mem-2026-08-22-leak",
+                "type": "event",
+                "entity": "photos",
+                "predicate": "shared",
+                "valid_from": "2026-08-22",
+            },
+            "body": "Beginning: last week photos.\n",
+        },
+    ]
+    rows = workers._run_summary_worker(
+        week_key="2026-W35",
+        intra=intra,
+        cross=cross,
+        event_blocks=event_blocks,
+        log=lambda _m: None,
+    )
+    assert [r.text for r in rows] == ["qixi card. still open"]
+    assert rows[0].weekdays == ("Wednesday",)
+    assert "Saturday" not in rows[0].weekdays
 
 
 def test_run_analyst_rejects_second_submit_on_attempt2():
@@ -760,6 +910,27 @@ def test_collect_daily_event_cards_skips_fact_and_wrapup(tmp_path):
     ids = {c["event_id"] for c in cards}
     assert ids == {event_id}
     assert fact_id not in ids
+
+
+def test_collect_daily_event_cards_uses_file_day_when_valid_from_outside_week(
+    tmp_path,
+):
+    workers = _load_workers("memory_weekly_collect_vf_clip")
+    daily = tmp_path / "memories" / "staging" / "daily" / "2026-08-24.md"
+    daily.parent.mkdir(parents=True, exist_ok=True)
+    daily.write_text(
+        (
+            "---\nid: mem-2026-08-24-event-AAAA\ntype: event\nentity: Qixi\n"
+            "predicate: recorded\nvalid_from: 2026-08-22\nstatus: candidate\n---\n"
+            "Card lived on Monday but valid_from is last Saturday.\n"
+        ),
+        encoding="utf-8",
+    )
+    week_dates = workers.iso_week_dates("2026-W35")
+    by_day = {date(2026, 8, 24): daily}
+    cards = workers._collect_daily_event_cards(by_day, week_dates)
+    assert len(cards) == 1
+    assert cards[0]["date"] == date(2026, 8, 24)
 
 
 def test_score_event_clusters_two_days_same_theme(monkeypatch):

@@ -185,7 +185,10 @@ def _event_snippet(body: str) -> str:
 def _collect_daily_event_cards(
     by_day: Mapping[date, Path], days: Sequence[date]
 ) -> list[dict[str, Any]]:
-    """Index only daily type:event mem-ids so threads cannot paste wrap-ups, facts, or w-evt-* cards."""
+    """Index only daily type:event mem-ids so threads cannot paste wrap-ups, facts, or w-evt-* cards.
+
+    If valid_from sits outside this ISO week, use the daily file day so Allaway cannot chain last week's Saturday.
+    """
     cards: list[dict[str, Any]] = []
     for day in days:
         path = by_day.get(day)
@@ -213,6 +216,8 @@ def _collect_daily_event_cards(
             try:
                 card_day = date.fromisoformat(vf) if vf else day
             except ValueError:
+                card_day = day
+            if card_day not in days:
                 card_day = day
             entity = str(fm.get("entity") or "").strip()
             predicate = str(fm.get("predicate") or "").strip()
@@ -1353,7 +1358,10 @@ def _run_analyst(
             continue
 
         spans, errors = threads_from_tool_args(
-            previous_args, event_ids=event_ids, legend=legend
+            previous_args,
+            event_ids=event_ids,
+            legend=legend,
+            week_dates=iso_week_dates(week_key),
         )
         if not errors:
             log(f"weekly {purpose} ok {week_key} threads={len(spans)}")
@@ -1373,13 +1381,18 @@ def threads_from_tool_args(
     *,
     event_ids: set[str],
     legend: dict[int, str],
+    week_dates: Sequence[date],
 ) -> tuple[list[SpanCandidate], list[str]]:
-    """Keep only multi-day chains whose event_ids exist this week, so one-day LLM noise cannot become Chronicle rows."""
+    """Keep only multi-day chains whose event_ids and dates belong to this ISO week.
+
+    Out-of-week step dates would paint Saturday from last week on this week's Chronicle.
+    """
     items = args.get("cross-day-thread")
     if not isinstance(items, list):
         return [], []
     cite_by_id = {mem: n for n, mem in legend.items()}
     allowed = set(event_ids) | set(legend.values())
+    in_week = set(week_dates)
     threads: list[SpanCandidate] = []
     errors: list[str] = []
     for i, item in enumerate(items):
@@ -1410,6 +1423,8 @@ def threads_from_tool_args(
                 errors.append(f"cross-day-thread[{i}] bad step date")
                 skip = True
                 break
+            if step_day not in in_week:
+                continue
             seq = int(raw.get("seq") or len(steps) + 1)
             via = str(raw.get("via") or "").strip() or None
             if seq == 1:
@@ -1498,11 +1513,13 @@ def _run_summary_worker(
 ) -> tuple[WeeklySummaryItem, ...]:
     """Build Chronicle rows from leftover event titles plus cross-day threads.
 
+    Weekdays must be ISO-week days only; an Aug 22 Saturday must not paint on W35.
     Wrap-up dashes must not become summary: a killed last LLM hop used to dump
     those trailers over a week that already had event cards.
     """
     del call_llm_tools, intra
     _log: LogFn = log or (lambda _msg: None)
+    in_week = set(iso_week_dates(week_key))
     in_cross: set[str] = set()
     for thread in cross:
         in_cross.update(str(eid).strip() for eid in thread.related_event_ids if str(eid).strip())
@@ -1511,7 +1528,11 @@ def _run_summary_worker(
         )
     keyed: list[tuple[date, int, WeeklySummaryItem]] = []
     for thread in cross:
-        days = [step.date for step in thread.steps] or [thread.start_date]
+        days = [step.date for step in thread.steps if step.date in in_week]
+        if not days and thread.start_date in in_week:
+            days = [thread.start_date]
+        if not days:
+            continue
         weekdays = _order_weekdays(weekday_label(d) for d in days)
         outcome_text = ""
         if isinstance(thread.outcome, Mapping):
@@ -1541,6 +1562,8 @@ def _run_summary_worker(
         try:
             day = date.fromisoformat(vf)
         except ValueError:
+            continue
+        if day not in in_week:
             continue
         title = _event_title_summary(
             str(block.get("body") or ""),
@@ -1954,6 +1977,7 @@ def run_parallel_worker1(
         except ImportError:  # pragma: no cover
             from weekly_json import normalize_entity_key  # type: ignore
         grouped: dict[str, list[tuple[date, str, str, str]]] = {}
+        in_week = set(iso_week_dates(week_key))
         for block in event_blocks:
             fm = block.get("frontmatter") or {}
             if str(fm.get("type") or "").strip().casefold() != "event":
@@ -1966,6 +1990,8 @@ def run_parallel_worker1(
             try:
                 day = date.fromisoformat(vf)
             except ValueError:
+                continue
+            if day not in in_week:
                 continue
             eid = _daily_event_id_from_block(fm)
             if not eid:
