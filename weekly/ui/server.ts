@@ -785,7 +785,7 @@ async function startServer() {
           });
         }
       }
-      const outcomeError = pluginOutcomeError(bridged.result, ['generated', 'started']);
+      const outcomeError = pluginOutcomeError(bridged.result, ['generated']);
       if (outcomeError) {
         return res.status(outcomeError.status).json(outcomeError);
       }

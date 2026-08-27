@@ -167,6 +167,7 @@ assert.equal(isValidMonthKey('2026-13'), false);
 assert.equal(isValidMonthKey('2026-W33'), false);
 
 assert.equal(pluginOutcomeError({ outcome: 'generated' }, ['generated']), undefined);
+assert.equal(pluginOutcomeError({ outcome: 'started' }, ['generated'])?.status, 502);
 assert.deepEqual(pluginOutcomeError({ outcome: 'bad_week' }, ['generated']), {
   status: 400,
   error: 'Weekly plugin returned bad_week.',
