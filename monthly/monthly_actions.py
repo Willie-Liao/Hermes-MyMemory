@@ -89,9 +89,10 @@ def load_monthly_yaml(month_key: str | None = None) -> dict[str, Any]:
 
 
 def month_band(limit: int = 8, staging: Path | None = None) -> str:
-    """Index last months as one-liners so prefetch Band D is not another daily dump.
+    """Index last months as summary plus ISO range so Band D can pick a month window.
 
     Optional staging points at a sandbox root so tests do not read live HERMES_HOME.
+    Prefetch passes limit=4; other callers keep the default eight.
     """
     folder = Path(staging) / "monthly" if staging is not None else month_file_path("x").parent
     if not folder.is_dir():
@@ -105,7 +106,12 @@ def month_band(limit: int = 8, staging: Path | None = None) -> str:
         summary = (payload.summary or "").strip()
         if not summary:
             continue
-        lines.append(f"{payload.key}: {summary}")
+        start = str(payload.range.start or "").strip()[:10]
+        end = str(payload.range.end or "").strip()[:10]
+        if start or end:
+            lines.append(f"{payload.key} {start}..{end}: {summary}")
+        else:
+            lines.append(f"{payload.key}: {summary}")
     if not lines:
         return ""
     return "## Month summaries\n" + "\n".join(lines)

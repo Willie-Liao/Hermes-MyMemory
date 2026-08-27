@@ -159,21 +159,45 @@ def write_fake_staging(root: Path) -> Path:
         encoding="utf-8",
     )
 
-    weekly_md = (
+    weekly_w32 = (
+        "---\n"
+        "week: 2026-W32\n"
+        "week_status: pending\n"
+        "---\n"
+        "schema_version: 2\n"
+        "week_key: 2026-W32\n"
+        "range:\n"
+        "  start: '2026-08-03'\n"
+        "  end: '2026-08-09'\n"
+        "entities:\n"
+        "  - {key: gitnexus, canonical: gitnexus}\n"
+        "  - {key: memorydigest, canonical: Memory Digest}\n"
+        "summary:\n"
+        "  - text: First W32 bullet for injection.\n"
+        "    weekdays: [Monday]\n"
+        "  - text: Second W32 bullet also injected.\n"
+        "    weekdays: [Tuesday]\n"
+    )
+    (weekly / "2026-W32.md").write_text(weekly_w32, encoding="utf-8")
+    weekly_w33 = (
         "---\n"
         "week: 2026-W33\n"
-        "legend:\n"
-        f"  1: {SEED}\n"
-        f"  2: {HOP1}\n"
+        "week_status: pending\n"
+        "---\n"
+        "schema_version: 2\n"
+        "week_key: 2026-W33\n"
+        "range:\n"
+        "  start: '2026-08-10'\n"
+        "  end: '2026-08-16'\n"
         "entities:\n"
         "  - {key: memorydigest, canonical: Memory Digest}\n"
-        "cross-day-thread: []\n"
-        "intra-day-thread:\n"
-        "  - {date: 2026-08-12, text: semicolon digest bug returned}\n"
-        "---\n"
-        "Week 33 brief: Memory Digest semicolon fix.\n"
+        "summary:\n"
+        "  - text: Memory Digest semicolon fix.\n"
+        "    weekdays: [Wednesday]\n"
+        "  - text: Second W33 summary stays in prefetch.\n"
+        "    weekdays: [Thursday]\n"
     )
-    (weekly / "2026-W33.md").write_text(weekly_md, encoding="utf-8")
+    (weekly / "2026-W33.md").write_text(weekly_w33, encoding="utf-8")
 
     monthly_md = (
         "---\n"
@@ -183,6 +207,9 @@ def write_fake_staging(root: Path) -> Path:
         "schema_version: 1\n"
         "cycle: monthly\n"
         "month_key: 2026-08\n"
+        "range:\n"
+        "  start: '2026-08-01'\n"
+        "  end: '2026-08-31'\n"
         "evidence:\n"
         f"  - {SEED}\n"
         "  - st-kimi\n"
