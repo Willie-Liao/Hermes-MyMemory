@@ -747,31 +747,10 @@ async function startServer() {
     }
   });
 
-  // 9. Generate a brand new weekly review markdown summary
-  app.post('/api/weekly/generate', async (req, res) => {
-    try {
-      const { week } = req.body;
-      if (!isValidWeekKey(week)) {
-        return res.status(400).json({ error: 'A valid week code (YYYY-Www) is required.' });
-      }
-      const bridged = await callWeeklyBridge('generate_week', { week_key: week });
-      if (!bridged.ok) {
-        return res.status(502).json({ error: bridged.error });
-      }
-      const outcomeError = pluginOutcomeError(bridged.result, ['generated']);
-      if (outcomeError) {
-        return res.status(outcomeError.status).json(outcomeError);
-      }
-      res.json(bridged.result);
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
   // 9b. Mid-week draft update / Rescan (generate_week reason=update|rescan)
   app.post('/api/weekly/update', async (req, res) => {
     try {
-      const { week, week_key, reason, background } = req.body ?? {};
+      const { week, week_key, reason } = req.body ?? {};
       const requestedWeek = week_key || week;
       if (requestedWeek !== undefined && !isValidWeekKey(requestedWeek)) {
         return res.status(400).json({ error: 'A valid week code (YYYY-Www) is required.' });
@@ -780,7 +759,6 @@ async function startServer() {
       const bridged = await callWeeklyBridge('generate_week', {
         ...(requestedWeek === undefined ? {} : { week_key: requestedWeek }),
         reason: updateReason,
-        background: Boolean(background),
       });
       if (!bridged.ok) {
         return res.status(502).json({ error: bridged.error });
@@ -807,7 +785,7 @@ async function startServer() {
           });
         }
       }
-      const outcomeError = pluginOutcomeError(bridged.result, ['generated', 'started']);
+      const outcomeError = pluginOutcomeError(bridged.result, ['generated']);
       if (outcomeError) {
         return res.status(outcomeError.status).json(outcomeError);
       }

@@ -78,8 +78,8 @@ def test_thread_tools_are_registered_conflict_hypothesis_are_not():
     names = {s["name"] for s in weekly_tools.all_tool_schemas()}
     assert "submit_weekly_thread" in names
     assert "patch_weekly_thread" in names
-    assert "submit_weekly_summary" in names
-    assert "patch_weekly_summary" in names
+    assert "submit_weekly_summary" not in names
+    assert "patch_weekly_summary" not in names
     assert "submit_weekly_conflict" not in names
     assert "submit_weekly_hypothesis" not in names
     submit = weekly_tools.submit_weekly_thread_schema()

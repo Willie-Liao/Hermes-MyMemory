@@ -6,12 +6,12 @@ Callers wrap helper LLM turns in ``worker_llm_scope()``; hooks bail via
 
 Forced tool-call workers (daily digest + weekly distill)
 --------------------------------------------------------
-``run_worker_llm_tools`` equips the nested ``AIAgent`` with **only** the
-forced tool (plus ``skip_*`` companions from the same toolset), after
-``skip_tool_search_assembly=True`` so Hermes progressive disclosure cannot
-replace schemas with ``tool_search`` / ``tool_describe`` / ``tool_call``.
+``run_worker_llm_tools`` with ``force_tool_name`` uses ``run_worker_llm_oneshot``
+so the HTTP ``tools`` array is only that function. Nested ``AIAgent`` still
+runs Hermes ``tool_describe``. Digest Phase-1 ``allowed_tool_names`` keeps the
+nested agent.
 
-Also sets ``tool_choice`` to that function name. Main chat agents never call
+Also sets ``tool_choice`` to that function name on oneshot. Main chat agents never call
 this module — no effect on interactive tool catalogs.
 
 Default ``run_worker_llm`` remains text-only (``enabled_toolsets=[]``).
@@ -465,9 +465,9 @@ def run_worker_llm_tools(
 ) -> dict[str, Any]:
     """Run a worker turn that must emit a tool call; return structured capture.
 
-    When ``force_tool_name`` is set, the nested agent is equipped with only that
-    tool (+ ``skip_*`` companions) and ``tool_choice`` is forced — daily digest
-    Phase-2 and weekly distill share this path.
+    When ``force_tool_name`` is set, this is one OpenAI-compatible completion
+    with only that function schema — nested ``AIAgent`` would still run Hermes
+    ``tool_describe``. Digest Phase-1 ``allowed_tool_names`` keeps the nested agent.
 
     When ``allowed_tool_names`` is set (Phase-1 type A), the agent is equipped
     with exactly those tools and may choose among them within one turn.
@@ -479,12 +479,31 @@ def run_worker_llm_tools(
         if allowed_tool_names
         else None
     )
-    if force and not allowed and "tool_choice" not in overrides:
-        overrides["tool_choice"] = {
-            "type": "function",
-            "function": {"name": force},
-        }
-    elif allowed and "tool_choice" not in overrides:
+    if force and not allowed:
+        bound = bind_forced_worker_tools(list(enabled_toolsets), force)
+        schema = next((td for td in bound if _tool_def_name(td) == force), None)
+        if schema is None and bound:
+            schema = bound[0]
+        try:
+            return run_worker_llm_oneshot(
+                prompt,
+                plugin=plugin,
+                purpose=purpose,
+                force_tool_name=force,
+                tool_schema=schema or {"name": force},
+                max_tokens=8192,
+            )
+        except Exception as exc:
+            return {
+                "final_response": str(exc),
+                "tool_name": None,
+                "tool_args": None,
+                "tool_calls": [],
+                "messages": [],
+                "failed": True,
+                "error": str(exc),
+            }
+    if allowed and "tool_choice" not in overrides:
         # Require a tool call but do not force a single name (same-turn repair).
         overrides["tool_choice"] = "required"
     captured: list[tuple[str, dict[str, Any]]] = []

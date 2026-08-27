@@ -474,7 +474,11 @@ def render_bands(
     today: date | None = None,
     hot_text: str = "",
 ) -> str:
-    """Byte-stable Bands A–C plus Band D month one-liners for the civil-day prefix."""
+    """Byte-stable A–D prefix so the model can pick a week/month ISO window without a daily dump.
+
+    Band C is four weeks of summary bullets plus ranges; entity names only on the older three
+    so the newest week does not duplicate Band B. Band D is four month summaries with ranges.
+    """
     root = staging_root(staging)
     store = BlockIndex(root)
     day0 = today or date.today()
@@ -539,7 +543,7 @@ def render_bands(
         if edge_n >= 8:
             break
 
-    c_lines = ["## Memory / weeks (one line per week)"]
+    c_lines = ["## Memory / weeks"]
     weekly = root / "weekly"
     if weekly.is_dir():
         import sys
@@ -551,58 +555,57 @@ def render_bands(
             from weekly_json import load_sidecar
         except Exception:
             load_sidecar = None
-        for path in sorted(weekly.glob("*.md"))[-8:]:
-            headline = "(no wrap-up)"
-            n_evt = 0
-            top_ent = ""
+        week_paths = sorted(weekly.glob("*.md"))[-4:]
+        newest_stem = week_paths[-1].stem if week_paths else ""
+        for path in week_paths:
+            payload: dict[str, Any] = {}
             if load_sidecar:
                 try:
                     payload = load_sidecar(path)
                 except Exception:
                     payload = {}
-                threads = payload.get("cross-day-thread") or []
-                summary_rows = payload.get("summary") or []
-                if (
-                    summary_rows
-                    and isinstance(summary_rows, list)
-                    and isinstance(summary_rows[0], dict)
-                ):
-                    headline = str(summary_rows[0].get("text") or "").strip() or headline
-                if threads and isinstance(threads, list) and isinstance(threads[0], dict):
-                    if headline in {"(no wrap-up)", "(no brief)", ""}:
-                        headline = str(threads[0].get("label") or "").strip() or headline
-                if headline in {"(no wrap-up)", "(no brief)", ""}:
-                    for row in payload.get("intra-day-thread") or []:
-                        if isinstance(row, dict) and str(row.get("text") or "").strip():
-                            headline = " ".join(str(row.get("text")).split())[:72]
-                            break
-                ids: set[str] = set()
-                legend = payload.get("legend") or {}
-                if isinstance(legend, dict):
-                    ids.update(str(v).strip() for v in legend.values() if str(v).strip())
-                if isinstance(threads, list):
-                    for thread in threads:
-                        if not isinstance(thread, dict):
-                            continue
-                        for step in thread.get("steps") or []:
-                            if isinstance(step, dict):
-                                mid = str(step.get("event_id") or "").strip()
-                                if mid:
-                                    ids.add(mid)
-                n_evt = len(ids)
-                ents = payload.get("entities") or []
-                names = []
-                if isinstance(ents, list):
-                    for e in ents[:3]:
-                        if isinstance(e, dict):
-                            names.append(str(e.get("canonical") or e.get("key") or ""))
-                top_ent = ", ".join(n for n in names if n)
-            if headline in {"(no brief)", ""}:
-                headline = "(no wrap-up)"
+            bullets: list[str] = []
+            for row in payload.get("summary") or []:
+                if not isinstance(row, dict):
+                    continue
+                text = str(row.get("text") or "").strip()
+                if not text:
+                    continue
+                days = [
+                    str(name).strip()
+                    for name in (row.get("weekdays") or [])
+                    if str(name).strip()
+                ]
+                suffix = f" ({', '.join(days)})" if days else ""
+                bullets.append(f"- {text}{suffix}")
+            if not bullets:
+                continue
             week_key = path.stem
-            c_lines.append(
-                f"- {week_key} {n_evt}evt · {top_ent or '—'} · {headline} · f={path.name}"
-            )
+            start = ""
+            end = ""
+            rng = payload.get("range") or {}
+            if isinstance(rng, dict):
+                start = str(rng.get("start") or "")[:10]
+                end = str(rng.get("end") or "")[:10]
+            if not start or not end:
+                year_s, _, week_s = week_key.partition("-W")
+                try:
+                    lo = date.fromisocalendar(int(year_s), int(week_s), 1)
+                    start, end = lo.isoformat(), (lo + timedelta(days=6)).isoformat()
+                except ValueError:
+                    start, end = start, end
+            c_lines.append(f"### {week_key}  {start}..{end}  f={path.name}")
+            c_lines.extend(bullets)
+            if week_key != newest_stem:
+                names: list[str] = []
+                for ent in payload.get("entities") or []:
+                    if not isinstance(ent, dict):
+                        continue
+                    name = str(ent.get("canonical") or ent.get("key") or "").strip()
+                    if name:
+                        names.append(name)
+                if names:
+                    c_lines.append("entities: " + ", ".join(names))
 
     d_text = ""
     try:
@@ -613,7 +616,7 @@ def render_bands(
             sys.path.insert(0, str(mdir))
         from monthly_actions import month_band
 
-        d_text = month_band(staging=root)
+        d_text = month_band(limit=4, staging=root)
     except Exception:
         d_text = ""
 
@@ -631,9 +634,11 @@ TOOL_SCHEMAS = [
         "name": "recall_memory",
         "description": (
             "Find memory cards by id, entity, or lexical match. When the user "
-            "mentions a time, also pass time_from and time_to as ISO dates. "
+            "mentions a time, or a week/month block in the memory bands matches, "
+            "pass time_from and time_to as that block's ISO start and end. "
             "The host always runs expand_memory on the first seed id after "
-            "recall (depth 2). Do not call search_memory."
+            "recall (depth 2). Do not call search_memory. Cards live in daily "
+            "YAML, not weekly/*.md or monthly/*.md."
         ),
         "parameters": {
             "type": "object",
@@ -644,14 +649,14 @@ TOOL_SCHEMAS = [
                     "type": "string",
                     "description": (
                         "Optional ISO date or datetime. Set together with time_to "
-                        "only when the user mentioned a time."
+                        "when the user mentioned a time or a Band C/D ISO range matches."
                     ),
                 },
                 "time_to": {
                     "type": "string",
                     "description": (
                         "Optional ISO date or datetime. Set together with time_from "
-                        "only when the user mentioned a time."
+                        "when the user mentioned a time or a Band C/D ISO range matches."
                     ),
                 },
             },

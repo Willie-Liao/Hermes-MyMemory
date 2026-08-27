@@ -35,11 +35,14 @@ _SKIP_WRITE_CONTEXTS = frozenset({"cron", "subagent", "flush"})
 _BOOTSTRAPPED = False
 
 _SYSTEM_PROMPT_BLOCK = (
-    "Digest recall bands (recent wrap-ups, entity index, week ladder, month "
-    "summaries) inject once per civil day. Fetch mem- ids from that index with "
-    "recall_memory / expand_memory; read daily YAML for bodies. MEMORY.md and "
-    "USER.md are already in the system prompt — do not expect those hot files "
-    "in the bands."
+    "Digest recall bands (recent wrap-ups, entity index, week summaries with "
+    "ISO ranges, month summaries with ISO ranges) inject once per civil day. "
+    "If a week or month block matches the question, call recall_memory with "
+    "time_from and time_to set to that block's printed ISO start and end. "
+    "Fetch mem- ids from that index with recall_memory / expand_memory; read "
+    "daily YAML for bodies. Do not treat weekly/*.md or monthly/*.md as the "
+    "card corpus. MEMORY.md and USER.md are already in the system prompt — "
+    "do not expect those hot files in the bands."
 )
 
 

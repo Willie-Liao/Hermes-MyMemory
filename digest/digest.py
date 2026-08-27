@@ -5950,7 +5950,7 @@ def _build_recall_manifest_section(
 def build_recall_injection_context(
     **_: Any,
 ) -> str:
-    """Inject Bands A–C (7-day wrap-ups, entity index, week ladder) plus Band D month summaries."""
+    """Inject Bands A–D: 7-day wrap-ups, entity index, week summaries with ranges, month summaries."""
     from recall.tools import render_bands
 
     staging = _hermes_home() / "memories" / "staging"

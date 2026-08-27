@@ -61,29 +61,28 @@ def test_unknown_review_and_generate():
         _assert_four_commands(out)
 
 
-_DISTILL_BRIEF_FIXTURE = """# Weekly Memory Review — 2026-W24
-
-## Distill
-
+_SUMMARY_FIXTURE = """---
+week: 2026-W24
+week_status: pending
 ---
-id: distill-1
-type: event
-entity: Launch
-related: ["[1] mem-2026-06-15-abc"]
----
-Distill body that must not appear in chat.
-
-## Brief
-
-Ship landed Monday; review focused on launch readiness and follow-ups.
+schema_version: 2
+cycle: weekly
+week_key: 2026-W24
+summary:
+- text: Ship landed Monday
+  weekdays:
+  - Monday
+intra-day-thread: []
+cross-day-thread: []
+entities: []
 """
 
 
 def test_update_pastes_brief_not_distill(tmp_path, monkeypatch):
-    """On generated: chat reply is Brief without dig-in ask; Distill YAML stays out."""
+    """On generated: chat reply is Chronicle summary without Distill YAML."""
     s = _load_slash()
     week_path = tmp_path / "2026-W24.md"
-    week_path.write_text(_DISTILL_BRIEF_FIXTURE, encoding="utf-8")
+    week_path.write_text(_SUMMARY_FIXTURE, encoding="utf-8")
 
     def fake_update(week_key=None, *, reason="slash"):
         return {
@@ -156,14 +155,12 @@ def test_update_does_not_arm_cite_dig_in(tmp_path, monkeypatch):
     assert cite.get_dig_in() is None
 
 
-def test_update_strips_theme_hashes_for_chat(monkeypatch):
-    """Slash update pastes processed Brief: plain theme titles, keep cites."""
+def test_update_pastes_chronicle_summary_for_chat(monkeypatch):
+    """Slash update pastes Chronicle bullets from generate_week brief."""
     s = _load_slash()
     raw = (
-        "### Events\n- Ship landed Monday [1].\n\n"
-        "### Hypothesis\n- None.\n\n"
-        "### Conflict\n- None.\n\n"
-        "### Procedure\n- Follow up Tuesday.\n"
+        "- Ship landed Monday (Monday)\n"
+        "- Follow up Tuesday (Tuesday)"
     )
 
     def fake_update(week_key=None, *, reason="slash"):
@@ -178,8 +175,8 @@ def test_update_strips_theme_hashes_for_chat(monkeypatch):
     monkeypatch.setattr(s.weekly_actions, "update_week", fake_update)
     out = s.handle_weekly("update 2026-W24")
     assert "###" not in out
-    assert "Events" in out
-    assert "[1]" in out
+    assert "Ship landed Monday" in out
+    assert "(Monday)" in out
 
 
 def test_update_uses_brief_field_when_present(monkeypatch):
@@ -784,21 +781,6 @@ def _purpose_keyed_llm(weekly, monkeypatch, handler) -> list[dict[str, object]]:
     monkeypatch.setattr(weekly, "_call_weekly_llm", fake)
     monkeypatch.setattr(weekly, "_call_weekly_llm_tools", fake_tools)
     return calls
-
-
-def test_build_prompt_retry_includes_validator_errors(tmp_path, monkeypatch):
-    weekly = _load_weekly_module(tmp_path, monkeypatch)
-    prompt = weekly._build_prompt(
-        "2026-W27",
-        "daily bundle",
-        attempt=2,
-        errors=("missing ## Distill section",),
-        previous_output="bad output",
-    )
-    assert "VALIDATION FAILED (attempt 2 of 3)" in prompt
-    assert "missing ## Distill section" in prompt
-    assert "bad output" in prompt
-    assert "## Distill" in prompt
 
 
 def test_generate_weekly_content_bounded_fallback_on_llm_error(

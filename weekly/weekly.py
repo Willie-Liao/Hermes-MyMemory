@@ -58,7 +58,6 @@ from worker_llm import worker_llm_scope as _weekly_worker_llm_scope
 
 try:
     from .weekly_brief_validate import format_brief_for_chat
-    from .weekly_citations import normalize_event_citations
     from . import hot_health
     from .weekly_cite import (
         clear_dig_in,
@@ -69,22 +68,14 @@ try:
         push_staging_recall,
         set_dig_in_progress,
     )
-    from .weekly_distill_validate import (
-        _distill_region,
-        _frontmatter_blocks,
-        validate_weekly_distill,
-    )
     from .weekly_event_schema import (
         WeeklyReviewPayload,
         assign_typed_citations,
-        render_weekly_review_brief,
-        validate_weekly_review_payload,
     )
     from .weekly_event_workers import run_parallel_worker1
     from . import weekly_json
 except ImportError:
     from weekly_brief_validate import format_brief_for_chat  # type: ignore[no-redef]
-    from weekly_citations import normalize_event_citations  # type: ignore[no-redef]
     import hot_health  # type: ignore[no-redef]
     from weekly_cite import (  # type: ignore[no-redef]
         clear_dig_in,
@@ -95,16 +86,9 @@ except ImportError:
         push_staging_recall,
         set_dig_in_progress,
     )
-    from weekly_distill_validate import (  # type: ignore[no-redef]
-        _distill_region,
-        _frontmatter_blocks,
-        validate_weekly_distill,
-    )
     from weekly_event_schema import (  # type: ignore[no-redef]
         WeeklyReviewPayload,
         assign_typed_citations,
-        render_weekly_review_brief,
-        validate_weekly_review_payload,
     )
     from weekly_event_workers import run_parallel_worker1  # type: ignore[no-redef]
     import weekly_json  # type: ignore[no-redef]
@@ -123,9 +107,6 @@ except Exception:  # pragma: no cover
 
 MAX_DAILY_CHARS = 28000
 MAX_WEEKS_PER_RUN = 1
-MAX_GENERATION_ATTEMPTS = 3
-MAX_WEEKLY_RETRY_CHARS = 4000
-MAX_ERRORS_IN_PROMPT = 8
 _DISTILL_HEADER_RE = re.compile(r"^##\s+Distill\s*$", re.IGNORECASE | re.MULTILINE)
 _LEVEL_TWO_HEADER_RE = re.compile(r"^##(?!#)\s+", re.MULTILINE)
 WEEKLY_ERROR_MARKERS = (
@@ -183,169 +164,6 @@ _WEEKLY_WORKER_PROMPT_MARKERS = (
 )
 # Process-wide worker flag lives in shared ``worker_llm`` (see imports above).
 _run_lock = threading.Lock()
-
-WEEKLY_POLICY = """Weekly memory consolidation policy (Worker 1 — Distill only):
-- Generate a review file only. Never call the memory tool.
-- Do not write MEMORY.md or USER.md.
-- Do not auto-promote staging items to hot memory.
-- Use daily typed staging blocks as source material.
-- Blocks already marked status: approved or rejected are excluded from sources — do not re-propose them.
-- Emit ONLY four block types: event | hypothesis | procedure | conflict.
-- Align frontmatter with daily digest contracts where types overlap (id, type, sources, related, confidence, status, …).
-- Prefer daily `participants` on events (not `involves`); note `predicate` when present.
-- Every block needs non-empty `sources` and `related`.
-- Non-events must `related` to at least one week event id from this Distill section.
-- conflict is weekly-only: id, type, confidence, status, sources, related (≥1 event id); body = short tension.
-- Event bodies use week-global continuous citation markers [1]…[N] after each staging-derived piece (do not restart per event).
-- Event `related` entries use the same markers: "[N] mem-…".
-- On event participants: include `role` only when clear from sources; otherwise `{entity: …}` only — never guess a role.
-- Boil the week into a small set of occasions (events); merge across dates when appropriate.
-- Do NOT write Proposed additions tables, Staging over 7 days, State snapshots, Capacity, or Action ledger rows.
-- Do NOT write ## Brief (deterministic Worker 2 formats Brief from Distill events).
-- Output ONLY a markdown document with ## Distill containing YAML frontmatter + body blocks.
-"""
-
-DISTILL_SHAPE_EXAMPLE = """EXAMPLE ## Distill schema (include all required keys per type; invent values from this week’s sources):
-
-## Distill
-
----
-id: wNN-e1-…
-type: event
-entity: …
-predicate: …
-participants:
-- entity: …
-  role: …          # only when role is clear from sources
-- entity: …        # omit role when not confident — never guess
-valid_from: YYYY-MM-DD
-valid_to: YYYY-MM-DD
-confidence: high
-status: candidate
-sources:
-- session:…
-related:
-- '[1] mem-…'
----
-Event body [1].
-
----
-id: wNN-h1-…
-type: hypothesis
-entity: …
-valid_from: YYYY-MM-DD
-confidence: medium
-status: candidate
-sources:
-- session:…
-related:
-- '[2] mem-…'
-- wNN-e1-…
----
-Hypothesis body [2].
-
----
-id: wNN-p1-…
-type: procedure
-confidence: explicit
-status: candidate
-sources:
-- session:…
-related:
-- '[3] mem-…'
-- wNN-e1-…
----
-Procedure body [3].
-
----
-id: wNN-c1-…
-type: conflict
-confidence: high
-status: candidate
-sources:
-- session:…
-related:
-- '[4] mem-…'
-- wNN-e1-…
----
-Short tension body [4].
-"""
-
-
-def _event_ids_from_previous(previous_output: str) -> list[str]:
-    region = _distill_region(previous_output) or previous_output
-    ids: list[str] = []
-    for _line_no, fm, _body in _frontmatter_blocks(region):
-        if fm.get("__yaml_error__"):
-            continue
-        if str(fm.get("type") or "").strip().casefold() != "event":
-            continue
-        block_id = str(fm.get("id") or "").strip()
-        if block_id:
-            ids.append(block_id)
-    return ids
-
-
-def format_distill_retry_guidance(
-    errors: tuple[str, ...] | list[str],
-    previous_output: str = "",
-) -> str:
-    """Actionable Fix hints for Worker 1 Distill validation retries."""
-    joined = "\n".join(errors)
-    hints: list[str] = []
-    lower = joined.casefold()
-
-    if "no yaml frontmatter" in lower or "missing ## distill" in lower:
-        hints.append(
-            "Re-emit ## Distill with full schema fences (see EXAMPLE below): "
-            "event needs entity/predicate/participants/valid_from/valid_to/"
-            "confidence/status/sources/related."
-        )
-    if "week event id" in lower:
-        available = _event_ids_from_previous(previous_output)
-        avail_bit = (
-            f" Available event ids: {', '.join(available)}."
-            if available
-            else " Add a bare event id from this Distill’s event blocks."
-        )
-        hints.append(
-            "Non-event related must include a bare week event id (not only mem-…)."
-            + avail_bit
-        )
-    if "event missing" in lower or "participants must be" in lower:
-        hints.append(
-            "Fill required event fields: entity, predicate, participants "
-            "(non-empty; each needs entity; omit role when unsure), "
-            "valid_from, valid_to, confidence, status."
-        )
-    if "hypothesis missing" in lower:
-        hints.append(
-            "Fill required hypothesis fields: entity, valid_from, confidence, status."
-        )
-    if "procedure missing" in lower:
-        hints.append("Fill required procedure fields: confidence, status.")
-    if "conflict missing" in lower:
-        hints.append(
-            "Fill required conflict fields: confidence, status "
-            "(plus id/type/sources/related)."
-        )
-    if "do not match" in lower or "body cites" in lower:
-        hints.append(
-            "Align event body [N] cites with related '[N] mem-…' markers (same multiset)."
-        )
-    if "contiguous" in lower:
-        hints.append("Renumber event cites to continuous week-global [1]…[N].")
-
-    if not hints:
-        hints.append("Fix ONLY the listed validator errors; re-emit full ## Distill.")
-
-    lines = ["Fix hints:"] + [f"- {h}" for h in hints]
-    lines.append(
-        "Non-events: related must include ≥1 bare event id from this Distill."
-    )
-    lines.append(DISTILL_SHAPE_EXAMPLE)
-    return "\n".join(lines)
-
 
 def _hermes_home() -> Path:
     return get_hermes_home()
@@ -1087,8 +905,25 @@ def _weekly_path(year: int, week: int) -> Path:
 
 def _commit_weekly_outputs(
     target: Path, content: str, payload: WeeklyReviewPayload, week_key: str
-) -> None:
-    """Dump YAML before replacing the md so a serializer crash cannot clobber last week's file."""
+) -> WeeklyReviewPayload:
+    """Dump YAML before replacing the md so a serializer crash cannot clobber last week's file.
+
+    Keep the previous Chronicle bullets only when this run has no events and no
+    threads — an event-sourced empty summary must not restore wrap-up-era rows.
+    """
+    has_story = bool(payload.cross_day_thread) or any(
+        not row.empty and str(row.text).strip() for row in payload.intra_day_thread
+    ) or any(brief.events or brief.sentences for brief in payload.days)
+    if not payload.summary and not has_story and target.is_file():
+        try:
+            prior = weekly_json.loads(target.read_text(encoding="utf-8"))
+        except (OSError, ValueError, yaml.YAMLError):
+            prior = None
+        if prior is not None and prior.summary:
+            payload = replace(payload, summary=prior.summary)
+            _log(
+                f"weekly summary carry-forward {week_key} rows={len(prior.summary)}"
+            )
     yaml_text = weekly_json.dump_yaml(payload)
     del content
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1099,60 +934,7 @@ def _commit_weekly_outputs(
         content=yaml_text.rstrip() + "\n",
     )
     weekly_json.write_sidecars(target, payload)
-
-
-def _build_prompt(
-    week_key: str,
-    daily_bundle: str,
-    *,
-    attempt: int = 1,
-    errors: tuple[str, ...] = (),
-    previous_output: str = "",
-) -> str:
-    base = (
-        "You are the weekly memory consolidation Worker 1 (Distill).\n\n"
-        f"Week: {week_key}\n\n"
-        f"{WEEKLY_POLICY}\n\n"
-        f"{DISTILL_SHAPE_EXAMPLE}\n\n"
-        "Return ONLY markdown with a ## Distill section of YAML frontmatter + body "
-        "blocks (types: event, hypothesis, procedure, conflict). "
-        "Use continuous week-global [1]…[N] cites on events. "
-        "Do not write ## Brief. Do not call tools. "
-        "Do not claim anything not grounded in the daily sources.\n\n"
-        "DAILY STAGING SOURCES:\n"
-        f"{daily_bundle}\n"
-    )
-    if attempt <= 1:
-        return base
-    error_lines = "\n".join(f"- {err}" for err in errors[:MAX_ERRORS_IN_PROMPT])
-    previous = (
-        previous_output[:MAX_WEEKLY_RETRY_CHARS]
-        if previous_output
-        else "(empty response)"
-    )
-    guidance = format_distill_retry_guidance(errors, previous_output)
-    return (
-        base
-        + f"\n\nVALIDATION FAILED (attempt {attempt} of {MAX_GENERATION_ATTEMPTS}).\n"
-        "Your previous output did not pass the Distill validator. Fix ONLY the listed issues.\n"
-        "Do not add new facts. Re-emit the full ## Distill markdown.\n\n"
-        "Validator errors:\n"
-        f"{error_lines}\n\n"
-        f"{guidance}\n\n"
-        f"Your previous output (truncated to {MAX_WEEKLY_RETRY_CHARS} chars):\n"
-        f"{previous}\n"
-    )
-
-
-def _fallback_report(week_key: str, files: list[Path], reason: str) -> str:
-    now = datetime.now(timezone.utc).isoformat()
-    source_list = "\n".join(f"- `{path.name}`" for path in files) or "- None"
-    return (
-        f"# Weekly distill {week_key}\n\n"
-        f"Generated at: {now}\n\n"
-        "## Source daily files\n\n"
-        f"{source_list}\n"
-    )
+    return payload
 
 
 def _distill_region_text(md_text: str) -> str:
@@ -1166,115 +948,7 @@ def _distill_region_text(md_text: str) -> str:
     return text[start:end].strip()
 
 
-def _parse_distill_blocks_for_normalize(md_text: str) -> list[dict[str, Any]]:
-    """Parse Distill YAML fences into ``{frontmatter, body}`` for citation normalize."""
-    region = _distill_region_text(md_text)
-    if not region:
-        # Allow bare YAML blocks if the model omitted the ## Distill header
-        region = (md_text or "").strip()
-    lines = region.splitlines()
-    blocks: list[dict[str, Any]] = []
-    idx = 0
-    while idx < len(lines):
-        if lines[idx].strip() != "---":
-            idx += 1
-            continue
-        idx += 1
-        frontmatter_lines: list[str] = []
-        while idx < len(lines) and lines[idx].strip() != "---":
-            frontmatter_lines.append(lines[idx])
-            idx += 1
-        if idx >= len(lines):
-            raw = "\n".join(frontmatter_lines)
-            try:
-                parsed = yaml.safe_load(raw) if raw.strip() else {}
-            except yaml.YAMLError:
-                parsed = {}
-            if isinstance(parsed, dict):
-                blocks.append({"frontmatter": parsed, "body": ""})
-            break
-        idx += 1
-        body_lines: list[str] = []
-        while idx < len(lines) and lines[idx].strip() != "---":
-            body_lines.append(lines[idx])
-            idx += 1
-        raw = "\n".join(frontmatter_lines)
-        try:
-            parsed = yaml.safe_load(raw) if raw.strip() else {}
-        except yaml.YAMLError:
-            parsed = {}
-        if not isinstance(parsed, dict):
-            continue
-        blocks.append(
-            {"frontmatter": parsed, "body": "\n".join(body_lines).strip()}
-        )
-    return blocks
-
-
-def _render_yaml_frontmatter(fm: dict[str, Any]) -> str:
-    dumped = yaml.safe_dump(
-        fm,
-        sort_keys=False,
-        allow_unicode=True,
-        default_flow_style=False,
-    ).rstrip()
-    return dumped
-
-
-def _render_weekly_distill_document(
-    week_key: str,
-    blocks: list[dict[str, Any]],
-    *,
-    brief: str = "",
-) -> str:
-    """Assemble Distill + Brief (+ Action ledger stub) weekly MD."""
-    parts: list[str] = [f"# Weekly distill {week_key}", "", "## Distill", ""]
-    for block in blocks:
-        fm = block.get("frontmatter")
-        if not isinstance(fm, dict):
-            fm = {}
-        body = str(block.get("body") or "").rstrip()
-        parts.append("---")
-        parts.append(_render_yaml_frontmatter(fm))
-        parts.append("---")
-        if body:
-            parts.append(body)
-        parts.append("")
-    parts.extend(["## Brief", ""])
-    brief_text = (brief or "").strip()
-    if brief_text:
-        parts.append(brief_text)
-        parts.append("")
-    else:
-        parts.append("")
-    parts.extend(
-        [
-            "## Action ledger",
-            "",
-            "| Status | Item | Notes |",
-            "| --- | --- | --- |",
-            "| — | — | stub |",
-            "",
-        ]
-    )
-    return "\n".join(parts).rstrip() + "\n"
-
-
-def _strip_code_fence(content: str) -> str:
-    text = (content or "").strip()
-    if not text.startswith("```"):
-        return text
-    lines = text.splitlines()
-    if lines and lines[0].startswith("```"):
-        lines = lines[1:]
-    if lines and lines[-1].strip() == "```":
-        lines = lines[:-1]
-    return "\n".join(lines).strip()
-
-
-# Set by `_generate_weekly_content` when four-part Brief assembly fails; cleared each generate.
 _last_brief_error: str | None = None
-# Last payload that produced Distill+Brief, so the writer can dump JSON/YAML without a second LLM.
 _last_weekly_payload: WeeklyReviewPayload | None = None
 
 
@@ -1316,36 +990,6 @@ def _call_weekly_llm_tools(
         enabled_toolsets=[weekly_tools.WEEKLY_TOOLSET],
         force_tool_name=force_tool_name,
     )
-
-
-def _prepare_distill_content(
-    week_key: str, raw: str
-) -> tuple[str, list[str], list[dict[str, Any]], dict[int, str]]:
-    """Normalize citations and assemble Distill MD.
-
-    Returns ``(md, prep_errors, blocks, legend)``. On prep failure, blocks/legend
-    are empty and ``md`` may be the raw/partial content for retry prompts.
-    """
-    content = _strip_code_fence(raw)
-    if not content:
-        return "", ["empty response"], [], {}
-
-    lowered = content.casefold()
-    for marker in WEEKLY_ERROR_MARKERS:
-        if marker in lowered:
-            return content, [f"error marker: {marker}"], [], {}
-    if "automatic llm consolidation was not completed" in lowered:
-        return content, ["fallback stub shape"], [], {}
-
-    blocks = _parse_distill_blocks_for_normalize(content)
-    if not blocks:
-        if not _DISTILL_HEADER_RE.search(content):
-            return content, ["missing ## Distill section"], [], {}
-        return content, ["## Distill has no YAML frontmatter blocks"], [], {}
-
-    normalized, legend = normalize_event_citations(blocks)
-    prepared = _render_weekly_distill_document(week_key, normalized)
-    return prepared, [], normalized, legend
 
 
 def _generate_weekly_content(
@@ -1490,7 +1134,7 @@ def _run_weekly(reason: str) -> None:
                 payload = _last_weekly_payload
                 if payload is None:
                     payload = WeeklyReviewPayload(days=(), week_key=key)
-                _commit_weekly_outputs(target, content, payload, key)
+                payload = _commit_weekly_outputs(target, content, payload, key)
 
                 state["last_generated_week"] = key
                 state["last_generated_at"] = datetime.now(timezone.utc).isoformat()

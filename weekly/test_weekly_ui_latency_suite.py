@@ -73,6 +73,25 @@ def test_write_report_json_and_md(tmp_path):
     assert "rescan" in md.read_text(encoding="utf-8")
 
 
+def test_token_sums_from_usage(tmp_path):
+    mod = _load_suite()
+    ledger = tmp_path / "metrics" / "llm-usage.jsonl"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text(
+        json.dumps({"purpose": "worker1_event", "input_tokens": 10, "output_tokens": 2, "total_tokens": 12})
+        + "\n"
+        + json.dumps({"purpose": "worker1_thread", "input_tokens": 5, "output_tokens": 3, "total_tokens": 8})
+        + "\n"
+        + json.dumps({"purpose": "worker1_summary", "input_tokens": 99, "output_tokens": 99, "total_tokens": 198})
+        + "\n",
+        encoding="utf-8",
+    )
+    sums = mod.token_sums_from_usage(tmp_path)
+    assert sums["input_tokens"] == 15
+    assert sums["output_tokens"] == 5
+    assert sums["total_tokens"] == 20
+
+
 def test_build_op_jobs_defaults_to_rescan_reorganise():
     mod = _load_suite()
     cfg = {

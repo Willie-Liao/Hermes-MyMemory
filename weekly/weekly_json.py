@@ -172,7 +172,6 @@ def _to_dict(payload: WeeklyReviewPayload, *, generated_at: str | None) -> dict[
                 key
                 for key, present in (
                     ("cross-day-thread", bool(payload.cross_day_thread)),
-                    ("summary", bool(payload.summary)),
                 )
                 if present
             ],
