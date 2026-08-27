@@ -180,11 +180,24 @@ def write_report(path: Path, run_id: str, rows: list[dict[str, Any]]) -> None:
     path.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
 
     md_path = path.with_suffix(".md")
+    has_tokens = any(
+        row.get("input_tokens") is not None or row.get("output_tokens") is not None
+        for row in rows
+    )
+    if has_tokens:
+        header = (
+            "| op | ok | e2e_ms | input_tokens | output_tokens | budget_ms | "
+            "over_budget | stages | error |"
+        )
+        align = "| --- | --- | ---: | ---: | ---: | ---: | --- | --- | --- |"
+    else:
+        header = "| op | ok | e2e_ms | budget_ms | over_budget | stages | error |"
+        align = "| --- | --- | ---: | ---: | --- | --- | --- |"
     lines = [
         f"# Weekly UI latency suite — {run_id}",
         "",
-        "| op | ok | e2e_ms | budget_ms | over_budget | stages | error |",
-        "| --- | --- | ---: | ---: | --- | --- | --- |",
+        header,
+        align,
     ]
     for row in rows:
         error = row.get("error")
@@ -194,18 +207,62 @@ def write_report(path: Path, run_id: str, rows: list[dict[str, Any]]) -> None:
             stage_cell = ", ".join(f"{k}={v}" for k, v in stages.items())
         else:
             stage_cell = ""
-        lines.append(
-            "| {op} | {ok} | {e2e_ms} | {budget_ms} | {over_budget} | {stages} | {error} |".format(
-                op=row.get("op", ""),
-                ok=row.get("ok"),
-                e2e_ms=row.get("e2e_ms"),
-                budget_ms=row.get("budget_ms"),
-                over_budget=row.get("over_budget"),
-                stages=stage_cell.replace("|", "\\|"),
-                error=error_cell,
+        if has_tokens:
+            lines.append(
+                "| {op} | {ok} | {e2e_ms} | {input_tokens} | {output_tokens} | "
+                "{budget_ms} | {over_budget} | {stages} | {error} |".format(
+                    op=row.get("op", ""),
+                    ok=row.get("ok"),
+                    e2e_ms=row.get("e2e_ms"),
+                    input_tokens=row.get("input_tokens") if row.get("input_tokens") is not None else "",
+                    output_tokens=row.get("output_tokens") if row.get("output_tokens") is not None else "",
+                    budget_ms=row.get("budget_ms"),
+                    over_budget=row.get("over_budget"),
+                    stages=stage_cell.replace("|", "\\|"),
+                    error=error_cell,
+                )
             )
-        )
+        else:
+            lines.append(
+                "| {op} | {ok} | {e2e_ms} | {budget_ms} | {over_budget} | {stages} | {error} |".format(
+                    op=row.get("op", ""),
+                    ok=row.get("ok"),
+                    e2e_ms=row.get("e2e_ms"),
+                    budget_ms=row.get("budget_ms"),
+                    over_budget=row.get("over_budget"),
+                    stages=stage_cell.replace("|", "\\|"),
+                    error=error_cell,
+                )
+            )
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def token_sums_from_usage(
+    hermes_home: Path,
+    *,
+    purposes: tuple[str, ...] = ("worker1_event", "worker1_thread"),
+) -> dict[str, int]:
+    """Sum llm-usage.jsonl for generate purposes so live rescan reports tokens."""
+    path = hermes_home / "metrics" / "llm-usage.jsonl"
+    totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    if not path.is_file():
+        return totals
+    wanted = set(purposes)
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return totals
+    for line in lines[-200:]:
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if rec.get("purpose") not in wanted:
+            continue
+        totals["input_tokens"] += int(rec.get("input_tokens") or 0)
+        totals["output_tokens"] += int(rec.get("output_tokens") or 0)
+        totals["total_tokens"] += int(rec.get("total_tokens") or 0)
+    return totals
 
 
 def _args_for_bridge_op(op: str, cfg: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -269,6 +326,11 @@ def run_suite_op(
             "e2e_ms": int(result.get("e2e_ms") or 0),
             "stages": {"generate_week_ms": int(result.get("e2e_ms") or 0)},
             "error": result.get("error"),
+            **(
+                token_sums_from_usage(hermes_home)
+                if os.environ.get("HERMES_WEEKLY_LIVE_TOKENS") == "1"
+                else {}
+            ),
         }
 
     if suite_op == "reorganise":

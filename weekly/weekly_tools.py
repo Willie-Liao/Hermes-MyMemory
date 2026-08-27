@@ -169,7 +169,13 @@ def skip_weekly_event_schema() -> dict[str, Any]:
 def _thread_step_props() -> dict[str, Any]:
     return {
         "seq": {"type": "integer"},
-        "date": {"type": "string"},
+        "date": {
+            "type": "string",
+            "description": (
+                "YYYY-MM-DD of this event's valid_from on an input day this week. "
+                "Do not use the story's origin date if that day is outside the week."
+            ),
+        },
         "event_id": {"type": "string"},
         "text": {"type": "string"},
         "via": {"type": "string", "enum": ["evolves", "invalidates"]},
@@ -203,7 +209,9 @@ def _thread_item_props() -> dict[str, Any]:
 def submit_weekly_thread_schema() -> dict[str, Any]:
     return _schema(
         "submit_weekly_thread",
-        "Submit cross-day-thread chains. Use existing daily event ids. Do not invent wrap-ups, entities, or legend.",
+        "Submit cross-day-thread chains. Use existing daily event ids. "
+        "Step date must be that event's valid_from on an input day this ISO week. "
+        "Do not invent wrap-ups, entities, legend, or dates from last week / future weekdays.",
         {
             "cross-day-thread": {
                 "type": "array",
