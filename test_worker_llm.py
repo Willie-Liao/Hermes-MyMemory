@@ -18,6 +18,46 @@ def _load_worker_llm():
     return mod
 
 
+def _install_fake_openai(monkeypatch, *, seen: dict, message):
+    class FakeMessage:
+        def __init__(self):
+            self.content = message.get("content")
+            self.tool_calls = message.get("tool_calls")
+
+    class FakeChoice:
+        def __init__(self):
+            self.message = FakeMessage()
+            self.finish_reason = "tool_calls"
+
+    class FakeUsage:
+        prompt_tokens = 12
+        completion_tokens = 8
+        total_tokens = 20
+        prompt_tokens_details = types.SimpleNamespace(cached_tokens=4)
+        completion_tokens_details = types.SimpleNamespace(reasoning_tokens=1)
+
+    class FakeResponse:
+        choices = [FakeChoice()]
+        usage = FakeUsage()
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            seen["create"] = kwargs
+            return FakeResponse()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            seen["client"] = kwargs
+            self.chat = FakeChat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = FakeClient
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+
+
 def test_worker_llm_scope_sets_and_clears_flag(monkeypatch):
     wl = _load_worker_llm()
     monkeypatch.delenv(wl._ENV_WORKER_LLM_DEPTH, raising=False)
@@ -288,11 +328,16 @@ def test_allowed_forced_worker_tool_names_includes_skips():
 
 
 def test_run_worker_llm_tools_binds_forced_tool_only(tmp_path, monkeypatch):
-    """Digest/weekly workers must see real submit schema, not tool_search bridge."""
+    """Forced workers must oneshot with one schema, not construct AIAgent."""
     wl = _load_worker_llm()
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("XIAOMI_API_KEY", "test-key")
+    monkeypatch.setenv("XIAOMI_BASE_URL", "https://example.test/v1")
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-digest:\n      provider: xiaomi\n      model: mimo-v2.5\n",
+        encoding="utf-8",
+    )
     seen: dict = {}
-
     catalog = [
         {"type": "function", "function": {"name": "submit_fact_block", "parameters": {"type": "object"}}},
         {"type": "function", "function": {"name": "submit_event_block", "parameters": {"type": "object"}}},
@@ -310,55 +355,24 @@ def test_run_worker_llm_tools_binds_forced_tool_only(tmp_path, monkeypatch):
     fake_model_tools.get_tool_definitions = fake_get_tool_definitions
     monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
 
-    class FakeAgent:
-        def __init__(self, **kwargs):
-            seen["agent_kwargs"] = dict(kwargs)
-            self.tools = [
-                {"type": "function", "function": {"name": "tool_search"}},
-                {"type": "function", "function": {"name": "tool_describe"}},
-            ]
-            self.valid_tool_names = {"tool_search", "tool_describe"}
-            self.model = "fake-model"
-            self.session_input_tokens = 1
-            self.session_output_tokens = 1
-            self.session_cache_read_tokens = 0
-            self.session_cache_write_tokens = 0
-            self.session_reasoning_tokens = 0
-            self.session_total_tokens = 2
-            self.session_estimated_cost_usd = 0.0
-            self.session_api_calls = 1
+    def boom(*_a, **_k):
+        raise AssertionError("AIAgent must not be constructed for forced tools")
 
-        def run_conversation(self, prompt):
-            seen["equipped_tools"] = [
-                (t.get("function") or {}).get("name") for t in (self.tools or [])
-            ]
-            seen["valid_tool_names"] = set(self.valid_tool_names or set())
-            return {
-                "final_response": "",
-                "messages": [
-                    {
-                        "role": "assistant",
-                        "tool_calls": [
-                            {
-                                "function": {
-                                    "name": "submit_fact_block",
-                                    "arguments": '{"body":"x"}',
-                                }
-                            }
-                        ],
-                    }
-                ],
-            }
-
-    fake_gateway_pkg = types.ModuleType("gateway")
-    fake_gateway_run = types.ModuleType("gateway.run")
-    fake_gateway_run._resolve_gateway_model = lambda: "fake-model"
-    fake_gateway_run._resolve_runtime_agent_kwargs = lambda: {}
     fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = FakeAgent
-    monkeypatch.setitem(sys.modules, "gateway", fake_gateway_pkg)
-    monkeypatch.setitem(sys.modules, "gateway.run", fake_gateway_run)
+    fake_run_agent.AIAgent = boom
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    tool_call = types.SimpleNamespace(
+        function=types.SimpleNamespace(
+            name="submit_fact_block",
+            arguments='{"body":"x"}',
+        )
+    )
+    _install_fake_openai(
+        monkeypatch,
+        seen=seen,
+        message={"content": "", "tool_calls": [tool_call]},
+    )
 
     out = wl.run_worker_llm_tools(
         "prompt",
@@ -368,11 +382,10 @@ def test_run_worker_llm_tools_binds_forced_tool_only(tmp_path, monkeypatch):
         force_tool_name="submit_fact_block",
     )
     assert seen["skip_tool_search_assembly"] is True
-    assert seen["equipped_tools"] == ["submit_fact_block", "skip_digest_worker"]
-    assert seen["valid_tool_names"] == {"submit_fact_block", "skip_digest_worker"}
-    assert "tool_search" not in seen["equipped_tools"]
-    overrides = seen["agent_kwargs"]["request_overrides"]
-    assert overrides["tool_choice"] == {
+    create = seen["create"]
+    names = [(t.get("function") or {}).get("name") for t in create["tools"]]
+    assert names == ["submit_fact_block"]
+    assert create["tool_choice"] == {
         "type": "function",
         "function": {"name": "submit_fact_block"},
     }
@@ -495,50 +508,26 @@ def test_extract_tool_calls_drops_tool_describe_keeps_submit():
 def test_run_worker_llm_tools_falls_back_when_callback_args_empty(tmp_path, monkeypatch):
     wl = _load_worker_llm()
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-
-    class FakeAgent:
-        def __init__(self, **kwargs):
-            self.tools = []
-            self.valid_tool_names = set()
-            self.model = "mimo-v2.5"
-            self.session_input_tokens = 0
-            self.session_output_tokens = 0
-            self.session_cache_read_tokens = 0
-            self.session_cache_write_tokens = 0
-            self.session_reasoning_tokens = 0
-            self.session_total_tokens = 0
-            self.session_estimated_cost_usd = 0.0
-            self.session_api_calls = 0
-            self._cb = kwargs.get("tool_start_callback")
-
-        def run_conversation(self, prompt):
-            if self._cb:
-                self._cb("call1", "submit_tighten_event", {})
-            return {
-                "final_response": '{"beginning": "a", "course": "b", "outcome": "c"}',
-                "messages": [
-                    {
-                        "role": "assistant",
-                        "content": '{"beginning": "a", "course": "b", "outcome": "c"}',
-                    }
-                ],
-            }
-
+    monkeypatch.setenv("XIAOMI_API_KEY", "test-key")
+    monkeypatch.setenv("XIAOMI_BASE_URL", "https://example.test/v1")
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-weekly:\n      provider: xiaomi\n      model: mimo-v2.5\n",
+        encoding="utf-8",
+    )
+    seen: dict = {}
     fake_model_tools = types.ModuleType("model_tools")
     fake_model_tools.get_tool_definitions = lambda **_k: [
         {"type": "function", "function": {"name": "submit_tighten_event"}},
     ]
     monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
-    fake_gateway_pkg = types.ModuleType("gateway")
-    fake_gateway_run = types.ModuleType("gateway.run")
-    fake_gateway_run._resolve_gateway_model = lambda: "mimo-v2.5"
-    fake_gateway_run._resolve_runtime_agent_kwargs = lambda: {}
-    fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = FakeAgent
-    monkeypatch.setitem(sys.modules, "gateway", fake_gateway_pkg)
-    monkeypatch.setitem(sys.modules, "gateway.run", fake_gateway_run)
-    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
-
+    _install_fake_openai(
+        monkeypatch,
+        seen=seen,
+        message={
+            "content": '{"beginning": "a", "course": "b", "outcome": "c"}',
+            "tool_calls": None,
+        },
+    )
     out = wl.run_worker_llm_tools(
         "prompt",
         plugin="memory-weekly",
@@ -548,107 +537,6 @@ def test_run_worker_llm_tools_falls_back_when_callback_args_empty(tmp_path, monk
     )
     assert out["tool_name"] == "submit_tighten_event"
     assert out["tool_args"] == {"beginning": "a", "course": "b", "outcome": "c"}
-
-
-def test_run_worker_llm_tools_ignores_blank_callback_strings(tmp_path, monkeypatch):
-    wl = _load_worker_llm()
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-
-    class FakeAgent:
-        def __init__(self, **kwargs):
-            self.tools = []
-            self.valid_tool_names = set()
-            self.model = "mimo-v2.5"
-            self.session_input_tokens = 0
-            self.session_output_tokens = 0
-            self.session_cache_read_tokens = 0
-            self.session_cache_write_tokens = 0
-            self.session_reasoning_tokens = 0
-            self.session_total_tokens = 0
-            self.session_estimated_cost_usd = 0.0
-            self.session_api_calls = 0
-            self._cb = kwargs.get("tool_start_callback")
-
-        def run_conversation(self, prompt):
-            if self._cb:
-                self._cb(
-                    "call1",
-                    "submit_tighten_event",
-                    {"beginning": "", "course": "", "outcome": ""},
-                )
-            return {
-                "final_response": '{"beginning": "a", "course": "b", "outcome": "c"}',
-                "messages": [
-                    {
-                        "role": "assistant",
-                        "content": '{"beginning": "a", "course": "b", "outcome": "c"}',
-                    }
-                ],
-            }
-
-    fake_model_tools = types.ModuleType("model_tools")
-    fake_model_tools.get_tool_definitions = lambda **_k: [
-        {"type": "function", "function": {"name": "submit_tighten_event"}},
-    ]
-    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
-    fake_gateway_pkg = types.ModuleType("gateway")
-    fake_gateway_run = types.ModuleType("gateway.run")
-    fake_gateway_run._resolve_gateway_model = lambda: "mimo-v2.5"
-    fake_gateway_run._resolve_runtime_agent_kwargs = lambda: {}
-    fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = FakeAgent
-    monkeypatch.setitem(sys.modules, "gateway", fake_gateway_pkg)
-    monkeypatch.setitem(sys.modules, "gateway.run", fake_gateway_run)
-    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
-
-    out = wl.run_worker_llm_tools(
-        "prompt",
-        plugin="memory-weekly",
-        purpose="ui_tighten",
-        enabled_toolsets=["memory_weekly"],
-        force_tool_name="submit_tighten_event",
-    )
-    assert out["tool_args"] == {"beginning": "a", "course": "b", "outcome": "c"}
-
-
-def _install_fake_openai(monkeypatch, *, seen: dict, message):
-    class FakeMessage:
-        def __init__(self):
-            self.content = message.get("content")
-            self.tool_calls = message.get("tool_calls")
-
-    class FakeChoice:
-        def __init__(self):
-            self.message = FakeMessage()
-            self.finish_reason = "tool_calls"
-
-    class FakeUsage:
-        prompt_tokens = 12
-        completion_tokens = 8
-        total_tokens = 20
-        prompt_tokens_details = types.SimpleNamespace(cached_tokens=4)
-        completion_tokens_details = types.SimpleNamespace(reasoning_tokens=1)
-
-    class FakeResponse:
-        choices = [FakeChoice()]
-        usage = FakeUsage()
-
-    class FakeCompletions:
-        def create(self, **kwargs):
-            seen["create"] = kwargs
-            return FakeResponse()
-
-    class FakeChat:
-        completions = FakeCompletions()
-
-    class FakeClient:
-        def __init__(self, **kwargs):
-            seen["client"] = kwargs
-            self.chat = FakeChat()
-
-    fake_openai = types.ModuleType("openai")
-    fake_openai.OpenAI = FakeClient
-    monkeypatch.setitem(sys.modules, "openai", fake_openai)
 
 
 def test_run_worker_llm_oneshot_skips_aiagent(tmp_path, monkeypatch):

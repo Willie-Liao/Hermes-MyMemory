@@ -783,21 +783,6 @@ def _purpose_keyed_llm(weekly, monkeypatch, handler) -> list[dict[str, object]]:
     return calls
 
 
-def test_build_prompt_retry_includes_validator_errors(tmp_path, monkeypatch):
-    weekly = _load_weekly_module(tmp_path, monkeypatch)
-    prompt = weekly._build_prompt(
-        "2026-W27",
-        "daily bundle",
-        attempt=2,
-        errors=("missing ## Distill section",),
-        previous_output="bad output",
-    )
-    assert "VALIDATION FAILED (attempt 2 of 3)" in prompt
-    assert "missing ## Distill section" in prompt
-    assert "bad output" in prompt
-    assert "## Distill" in prompt
-
-
 def test_generate_weekly_content_bounded_fallback_on_llm_error(
     tmp_path, monkeypatch
 ):

@@ -410,7 +410,7 @@ def test_run_analyst_attempt2_calls_patch_not_second_submit():
 
 
 def test_summary_worker_copies_wrapup_and_thread():
-    """Deterministic Chronicle rows: wrap-up dashes then thread label+outcome."""
+    """Chronicle rows: leftover event titles plus thread label+outcome."""
     workers_path = Path(__file__).with_name("weekly_event_workers.py")
     spec = importlib.util.spec_from_file_location(
         "memory_weekly_workers_summary", workers_path
@@ -424,7 +424,7 @@ def test_summary_worker_copies_wrapup_and_thread():
         schema.IntraDayThread(
             date=date(2026, 8, 17),
             weekday="Monday",
-            source_field="day_wrapup",
+            source_field="events",
             text="- parent photos",
             empty=False,
         ),
@@ -436,6 +436,7 @@ def test_summary_worker_copies_wrapup_and_thread():
             start_date=date(2026, 8, 17),
             end_date=date(2026, 8, 18),
             confidence="high",
+            related_event_ids=("mem-2026-08-17-a", "mem-2026-08-18-b"),
             steps=(
                 schema.ThreadStep(
                     seq=1,
@@ -454,19 +455,42 @@ def test_summary_worker_copies_wrapup_and_thread():
             outcome={"state": "resolved", "text": "legend retired"},
         ),
     )
+    event_blocks = [
+        {
+            "frontmatter": {
+                "id": "evt-photos",
+                "type": "event",
+                "entity": "photos",
+                "predicate": "shared",
+                "valid_from": "2026-08-17",
+            },
+            "body": "Beginning: parent photos.\nCourse: parent photos.\nOutcome: parent photos.",
+        },
+        {
+            "frontmatter": {
+                "id": "mem-2026-08-17-a",
+                "type": "event",
+                "entity": "ui hops",
+                "predicate": "shipped",
+                "valid_from": "2026-08-17",
+            },
+            "body": "Beginning: drop hops.\n",
+        },
+    ]
 
     rows = workers._run_summary_worker(
         week_key="2026-W34",
         intra=intra,
         cross=cross,
+        event_blocks=event_blocks,
         log=lambda _m: None,
     )
     assert [r.text for r in rows] == [
-        "parent photos",
         "ui hops. legend retired",
+        "Parent photos",
     ]
-    assert rows[0].weekdays == ("Monday",)
-    assert rows[1].weekdays == ("Monday", "Tuesday")
+    assert rows[0].weekdays == ("Monday", "Tuesday")
+    assert rows[1].weekdays == ("Monday",)
 
 
 def test_summary_worker_empty_when_no_wrapup_or_thread():
@@ -577,7 +601,7 @@ def test_run_analyst_rejects_second_submit_on_attempt2():
 
 
 def test_w35_wrapup_and_thread_make_four_summary_rows():
-    """Monday's three wrap-up dashes plus one cross-day thread become four Chronicle rows."""
+    """Three leftover Monday events plus one cross-day thread become four Chronicle rows."""
     workers_path = Path(__file__).with_name("weekly_event_workers.py")
     spec = importlib.util.spec_from_file_location(
         "memory_weekly_workers_w35_summary", workers_path
@@ -587,27 +611,18 @@ def test_w35_wrapup_and_thread_make_four_summary_rows():
     sys.modules[spec.name] = workers
     spec.loader.exec_module(workers)
     schema = _load()
-    wrap = (
-        "- The user iterated on a handwritten Qixi greeting card, transcribing, polishing, "
-        "and finalizing the message with structural parallelism.\n"
-        "- The user investigated MyMemory system issues including schema gaps, WeChat "
-        "integration, memory isolation, migration, chronicle performance, and message delivery "
-        "problems.\n"
-        "- The user requested to see the full day wrap-up prompt text to understand how "
-        "daily summaries are generated."
-    )
     intra = (
         schema.IntraDayThread(
             date=date(2026, 8, 24),
             weekday="Monday",
-            source_field="day_wrapup",
-            text=wrap,
+            source_field="events",
+            text="- a\n- b\n- c",
             empty=False,
         ),
         schema.IntraDayThread(
             date=date(2026, 8, 25),
             weekday="Tuesday",
-            source_field="day_wrapup",
+            source_field="events",
             text="",
             empty=True,
         ),
@@ -619,6 +634,10 @@ def test_w35_wrapup_and_thread_make_four_summary_rows():
             start_date=date(2026, 8, 24),
             end_date=date(2026, 8, 25),
             confidence="high",
+            related_event_ids=(
+                "mem-2026-08-24-fact-9605EB855DAA",
+                "mem-2026-08-25-fact-62BCB7010463",
+            ),
             steps=(
                 schema.ThreadStep(
                     seq=1,
@@ -643,20 +662,39 @@ def test_w35_wrapup_and_thread_make_four_summary_rows():
             },
         ),
     )
+    event_blocks = [
+        {
+            "frontmatter": {
+                "id": f"evt-mon-{i}",
+                "type": "event",
+                "entity": "week",
+                "predicate": "did",
+                "valid_from": "2026-08-24",
+            },
+            "body": f"Beginning: {title}\nCourse: {title}\nOutcome: {title}",
+        }
+        for i, title in enumerate(
+            (
+                "The user iterated on a handwritten Qixi greeting card",
+                "The user investigated MyMemory system issues",
+                "The user requested to see the full day wrap-up prompt",
+            ),
+            start=1,
+        )
+    ]
     rows = workers._run_summary_worker(
         week_key="2026-W35",
         intra=intra,
         cross=cross,
+        event_blocks=event_blocks,
         log=lambda _m: None,
     )
     assert len(rows) == 4
-    assert rows[0].weekdays == ("Monday",)
-    assert rows[1].weekdays == ("Monday",)
-    assert rows[2].weekdays == ("Monday",)
-    assert rows[3].weekdays == ("Monday", "Tuesday")
-    assert rows[0].text.startswith("The user iterated")
-    assert rows[1].text.startswith("The user investigated")
-    assert rows[2].text.startswith("The user requested")
-    assert rows[3].text.startswith("Codebase understanding")
+    assert rows[0].weekdays == ("Monday", "Tuesday")
+    assert "Codebase understanding" in rows[0].text
+    leftovers = [r.text for r in rows[1:]]
+    assert any("Qixi" in t for t in leftovers)
+    assert any("MyMemory" in t for t in leftovers)
+    assert any("wrap-up prompt" in t for t in leftovers)
 
 

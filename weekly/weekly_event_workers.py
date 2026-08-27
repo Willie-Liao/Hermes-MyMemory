@@ -17,7 +17,6 @@ from __future__ import annotations
 import re
 import sys
 from collections.abc import Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from pathlib import Path
@@ -1258,35 +1257,24 @@ def _run_summary_worker(
     week_key: str,
     intra: Sequence[IntraDayThread],
     cross: Sequence[SpanCandidate],
+    event_blocks: Sequence[dict[str, Any]] | None = None,
     call_llm_tools: CallLlmToolsFn | None = None,
     log: LogFn | None = None,
 ) -> tuple[WeeklySummaryItem, ...]:
-    """Copy wrap-up dashes and thread labels into Chronicle rows so generate cannot wait on a last LLM hop.
+    """Build Chronicle rows from leftover event titles plus cross-day threads.
 
-    ``call_llm_tools`` is ignored: summary used to be a forced tool call that the 300s
-    bridge killed, then dumped ``summary: []`` over a populated week file.
+    Wrap-up dashes must not become summary: a killed last LLM hop used to dump
+    those trailers over a week that already had event cards.
     """
-    del call_llm_tools
+    del call_llm_tools, intra
     _log: LogFn = log or (lambda _msg: None)
+    in_cross: set[str] = set()
+    for thread in cross:
+        in_cross.update(str(eid).strip() for eid in thread.related_event_ids if str(eid).strip())
+        in_cross.update(
+            str(step.event_id).strip() for step in thread.steps if str(step.event_id).strip()
+        )
     keyed: list[tuple[date, int, WeeklySummaryItem]] = []
-    for row in intra:
-        if row.empty or not str(row.text).strip():
-            continue
-        weekday = row.weekday or weekday_label(row.date)
-        for line in str(row.text).splitlines():
-            stripped = line.strip().lstrip("- ").strip()
-            if not stripped:
-                continue
-            keyed.append(
-                (
-                    row.date,
-                    0,
-                    WeeklySummaryItem(
-                        text=stripped,
-                        weekdays=_order_weekdays((weekday,)),
-                    ),
-                )
-            )
     for thread in cross:
         days = [step.date for step in thread.steps] or [thread.start_date]
         weekdays = _order_weekdays(weekday_label(d) for d in days)
@@ -1303,8 +1291,37 @@ def _run_summary_worker(
         keyed.append(
             (
                 min(days),
-                1,
+                0,
                 WeeklySummaryItem(text=text, weekdays=weekdays),
+            )
+        )
+    for block in event_blocks or ():
+        fm = block.get("frontmatter") or {}
+        if str(fm.get("type") or "").strip().casefold() != "event":
+            continue
+        eid = str(fm.get("id") or "").strip()
+        if not eid or eid in in_cross:
+            continue
+        vf = str(fm.get("valid_from") or "").strip()[:10]
+        try:
+            day = date.fromisoformat(vf)
+        except ValueError:
+            continue
+        title = _event_title_summary(
+            str(block.get("body") or ""),
+            predicate=str(fm.get("predicate") or ""),
+            entity=str(fm.get("entity") or ""),
+        )
+        if not title.strip():
+            continue
+        keyed.append(
+            (
+                day,
+                1,
+                WeeklySummaryItem(
+                    text=title,
+                    weekdays=_order_weekdays((weekday_label(day),)),
+                ),
             )
         )
     keyed.sort(key=lambda item: (item[0], item[1]))
@@ -1590,8 +1607,8 @@ def run_parallel_worker1(
 ) -> Worker1Result:
     """Build one week's payload so generate can dump YAML without a Distill document.
 
-    Summary is copied from wrap-up bullets and cross-day threads so a killed
-    LLM hop cannot dump an empty Chronicle over a populated week file.
+    Intra and Chronicle summary come from in-memory event cards so wrap-up trailers
+    on dailies cannot overwrite a week that already extracted events.
     """
     _log: LogFn = log or (lambda _msg: None)
     reason_bit = f" reason={reason}" if reason else ""
@@ -1663,15 +1680,11 @@ def run_parallel_worker1(
     event_id_set = set(event_ids)
     merged_events_md = "\n\n".join(_render_block(b) for b in event_blocks) or "(no events)"
 
-    # Worker 1 still dumps Possible overdue as ``- None.``; Weekly UI does not render it.
     span_candidates: list[SpanCandidate] = []
     cross_day: list[SpanCandidate] = []
-
-    with ThreadPoolExecutor(
-        max_workers=1, thread_name_prefix="memory-weekly-analyst"
-    ) as pool:
-        fut_thread = pool.submit(
-            _run_analyst,
+    purposes_called.append("worker1_thread")
+    try:
+        _blocks, cross_day = _run_analyst(
             role="thread",
             purpose="worker1_thread",
             week_key=week_key,
@@ -1682,16 +1695,87 @@ def run_parallel_worker1(
             call_llm_tools=call_llm_tools,
             log=_log,
         )
-        purposes_called.append("worker1_thread")
-        try:
-            _blocks, cross_day = fut_thread.result()
-        except Exception as exc:  # noqa: BLE001
-            _log(f"weekly worker1_thread future error {week_key}: {exc}")
-            cross_day = []
+    except Exception as exc:  # noqa: BLE001
+        _log(f"weekly worker1_thread future error {week_key}: {exc}")
+        cross_day = []
 
-    procedure_blocks = _procedure_blocks_from_claims(day_briefs, event_ids)
-    distill_blocks = list(event_blocks) + procedure_blocks
-    intra = _intra_day_from_dailies(week_dates, by_day)
+    if not cross_day:
+        try:
+            from .weekly_json import normalize_entity_key
+        except ImportError:  # pragma: no cover
+            from weekly_json import normalize_entity_key  # type: ignore
+        grouped: dict[str, list[tuple[date, str, str, str]]] = {}
+        for block in event_blocks:
+            fm = block.get("frontmatter") or {}
+            if str(fm.get("type") or "").strip().casefold() != "event":
+                continue
+            surface = str(fm.get("entity") or "").strip()
+            key = normalize_entity_key(surface)
+            if not key:
+                continue
+            vf = str(fm.get("valid_from") or "").strip()[:10]
+            try:
+                day = date.fromisoformat(vf)
+            except ValueError:
+                continue
+            eid = str(fm.get("id") or "").strip()
+            if not eid:
+                continue
+            title = _event_title_summary(
+                str(block.get("body") or ""),
+                predicate=str(fm.get("predicate") or ""),
+                entity=surface,
+            )
+            grouped.setdefault(key, []).append((day, eid, title, surface))
+        n = 0
+        for key, rows in grouped.items():
+            dates = {row[0] for row in rows}
+            if len(dates) < 2:
+                continue
+            n += 1
+            ordered = sorted(rows, key=lambda row: (row[0], row[1]))
+            steps = tuple(
+                ThreadStep(
+                    seq=i,
+                    date=day,
+                    event_id=eid,
+                    text=title or surface,
+                )
+                for i, (day, eid, title, surface) in enumerate(ordered, start=1)
+            )
+            cross_day.append(
+                SpanCandidate(
+                    id=f"w-ent-{n}",
+                    label=ordered[0][3],
+                    start_date=min(dates),
+                    end_date=max(dates),
+                    confidence="medium",
+                    related_event_ids=tuple(row[1] for row in ordered),
+                    steps=steps,
+                    outcome={"state": "open", "text": ordered[-1][2] or ordered[0][3]},
+                )
+            )
+
+    intra_rows: list[IntraDayThread] = []
+    briefs_by_day = {brief.day: brief for brief in day_briefs}
+    for day in week_dates:
+        brief = briefs_by_day.get(day)
+        titles = [
+            str(sentence.title or sentence.text).strip()
+            for sentence in (brief.sentences if brief else ())
+            if str(sentence.title or sentence.text).strip()
+        ]
+        text = "\n".join(f"- {title}" for title in titles)
+        intra_rows.append(
+            IntraDayThread(
+                date=day,
+                weekday=weekday_label(day),
+                source_field="events",
+                text=text,
+                empty=not bool(text.strip()),
+            )
+        )
+    intra = tuple(intra_rows)
     entities = _entities_from_dailies(week_dates, by_day)
     cross_day = _stamp_invalidates_from_supersedes(cross_day, by_day)
     cross_day = _fill_thread_entity_keys(cross_day, entities)
@@ -1712,6 +1796,7 @@ def run_parallel_worker1(
         week_key=week_key,
         intra=intra,
         cross=tuple(cross_day),
+        event_blocks=event_blocks,
         log=_log,
     )
     payload = replace(payload, summary=summary_items)
@@ -1726,7 +1811,7 @@ def run_parallel_worker1(
         )
 
     return Worker1Result(
-        blocks=distill_blocks,
+        blocks=list(event_blocks),
         legend=legend,
         payload=payload,
         errors=errors,
