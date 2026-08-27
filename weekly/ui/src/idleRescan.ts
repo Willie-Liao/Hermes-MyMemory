@@ -72,6 +72,14 @@ export function shouldApplyPostRescanRefresh(editing: boolean): boolean {
   return !editing;
 }
 
+/** Re-scan spinner must not treat "not started yet" as finished — generate_in_flight is false until the kick lands. */
+export function rescanPollJobFinished(args: {
+  sawGenerateInFlight: boolean;
+  generateInFlight: boolean;
+}): boolean {
+  return args.sawGenerateInFlight && !args.generateInFlight;
+}
+
 /**
  * While editing, hold remaining auto-rescan time by shifting the origin forward
  * each tick by `elapsedMs` (typically the interval tick size).

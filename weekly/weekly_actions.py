@@ -416,8 +416,9 @@ def generate_week(
 ) -> dict[str, Any]:
     """Generate a weekly review file, or kick the existing background thread.
 
-    Slash and UI Re-scan wait in-process (background=False). Overdue catch-up
-    still kicks a daemon via process_overdue_week_marks.
+    Slash waits in-process (background=False). UI Re-scan may pass background=True
+    so the button can poll generate_in_flight instead of dying on the 5-minute
+    bridge timeout. Overdue catch-up still kicks a daemon via process_overdue_week_marks.
     """
     _purge_orphan_daily_blocks_before_generate()
     if isinstance(background, str):

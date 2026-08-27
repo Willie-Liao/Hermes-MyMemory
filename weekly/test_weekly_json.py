@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import time
 from datetime import date
 from pathlib import Path
 
@@ -696,5 +697,280 @@ def test_w35_wrapup_and_thread_make_four_summary_rows():
     assert any("Qixi" in t for t in leftovers)
     assert any("MyMemory" in t for t in leftovers)
     assert any("wrap-up prompt" in t for t in leftovers)
+
+
+def _load_workers(mod_name: str):
+    workers_path = Path(__file__).with_name("weekly_event_workers.py")
+    spec = importlib.util.spec_from_file_location(mod_name, workers_path)
+    assert spec is not None and spec.loader is not None
+    workers = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = workers
+    spec.loader.exec_module(workers)
+    return workers
+
+
+def _write_typed_daily(
+    tmp_path: Path,
+    day: str,
+    *,
+    block_id: str,
+    block_type: str,
+    entity: str,
+    body: str,
+    wrapup: str | None = None,
+) -> Path:
+    daily = tmp_path / "memories" / "staging" / "daily" / f"{day}.md"
+    daily.parent.mkdir(parents=True, exist_ok=True)
+    text = (
+        f"---\nid: {block_id}\ntype: {block_type}\nentity: {entity}\n"
+        f"predicate: recorded\nvalid_from: {day}\nstatus: candidate\n"
+        "sources: [session s1]\n---\n"
+        f"{body}\n"
+    )
+    if wrapup:
+        text += f"\n## Day wrap-up\n{wrapup}\n"
+    daily.write_text(text, encoding="utf-8")
+    return daily
+
+
+def test_collect_daily_event_cards_skips_fact_and_wrapup(tmp_path):
+    workers = _load_workers("memory_weekly_collect_events")
+    event_id = "mem-2026-08-24-event-AAAA"
+    _write_typed_daily(
+        tmp_path,
+        "2026-08-24",
+        block_id=event_id,
+        block_type="event",
+        entity="Qixi",
+        body="User iterated on the Qixi greeting card.",
+        wrapup="- wrap-up must not become an event id",
+    )
+    fact_id = "mem-2026-08-24-fact-CDA5F9FF2BEB"
+    daily = tmp_path / "memories" / "staging" / "daily" / "2026-08-24.md"
+    daily.write_text(
+        daily.read_text(encoding="utf-8")
+        + (
+            f"---\nid: {fact_id}\ntype: fact\nentity: dating ideas\n"
+            "status: candidate\n---\nDating idea collection now totals 144 items.\n"
+        ),
+        encoding="utf-8",
+    )
+    by_day = {date(2026, 8, 24): daily}
+    cards = workers._collect_daily_event_cards(by_day, [date(2026, 8, 24)])
+    ids = {c["event_id"] for c in cards}
+    assert ids == {event_id}
+    assert fact_id not in ids
+
+
+def test_score_event_clusters_two_days_same_theme(monkeypatch):
+    workers = _load_workers("memory_weekly_score_link")
+    monkeypatch.setattr(
+        "recall.embed._encode_texts",
+        lambda texts: [],
+        raising=False,
+    )
+    a = {
+        "event_id": "mem-2026-08-24-event-QIXI1",
+        "date": date(2026, 8, 24),
+        "entity": "Qixi card",
+        "predicate": "wrote",
+        "body": "transcribed handwritten Qixi greeting card",
+        "snippet": "transcribed handwritten Qixi greeting card",
+    }
+    b = {
+        "event_id": "mem-2026-08-26-event-QIXI2",
+        "date": date(2026, 8, 26),
+        "entity": "Qixi card",
+        "predicate": "shared",
+        "body": "shared Qixi greeting card with partner",
+        "snippet": "shared Qixi greeting card with partner",
+    }
+    clusters = workers._score_event_clusters([a, b])
+    assert len(clusters) == 1
+    assert [c["event_id"] for c in clusters[0]] == [
+        a["event_id"],
+        b["event_id"],
+    ]
+
+
+def test_score_event_clusters_unrelated_no_cluster(monkeypatch):
+    workers = _load_workers("memory_weekly_score_skip")
+    monkeypatch.setattr(
+        "recall.embed._encode_texts",
+        lambda texts: [],
+        raising=False,
+    )
+    a = {
+        "event_id": "mem-2026-08-24-event-AAAA",
+        "date": date(2026, 8, 24),
+        "entity": "Qixi card",
+        "predicate": "wrote",
+        "body": "greeting card transcription",
+        "snippet": "greeting card transcription",
+    }
+    b = {
+        "event_id": "mem-2026-08-26-event-BBBB",
+        "date": date(2026, 8, 26),
+        "entity": "Smoothie reminders",
+        "predicate": "scheduled",
+        "body": "avocado mango shopping list",
+        "snippet": "avocado mango shopping list",
+    }
+    assert workers._score_event_clusters([a, b]) == []
+
+
+def test_score_event_clusters_same_day_no_emit(monkeypatch):
+    workers = _load_workers("memory_weekly_score_sameday")
+    monkeypatch.setattr(
+        "recall.embed._encode_texts",
+        lambda texts: [],
+        raising=False,
+    )
+    a = {
+        "event_id": "mem-2026-08-24-event-AAAA",
+        "date": date(2026, 8, 24),
+        "entity": "Qixi card",
+        "predicate": "wrote",
+        "body": "transcribed Qixi greeting",
+        "snippet": "transcribed Qixi greeting",
+    }
+    b = {
+        "event_id": "mem-2026-08-24-event-BBBB",
+        "date": date(2026, 8, 24),
+        "entity": "Qixi card",
+        "predicate": "polished",
+        "body": "polished Qixi greeting",
+        "snippet": "polished Qixi greeting",
+    }
+    assert workers._score_event_clusters([a, b]) == []
+
+
+def test_build_analyst_prompt_has_candidates_not_merged_events():
+    workers = _load_workers("memory_weekly_prompt_layout")
+    layout = workers.format_thread_candidate_layout(
+        [
+            {
+                "event_id": "mem-2026-08-24-event-AAAA",
+                "date": date(2026, 8, 24),
+                "snippet": "hello",
+            }
+        ],
+        [],
+    )
+    prompt = workers._build_analyst_prompt(
+        purpose="worker1_thread",
+        week_key="2026-W35",
+        role="thread",
+        merged_events_md="SHOULD_NOT_APPEAR " + ("x" * 200),
+        legend={1: "mem-2026-08-24-event-AAAA"},
+        candidate_layout=layout,
+        skeleton_json='{"cross-day-thread": []}',
+    )
+    assert "MERGED EVENTS" not in prompt
+    assert "CANDIDATE INDEX" in prompt
+    assert "mem-2026-08-24-event-AAAA" in prompt
+    assert "SHOULD_NOT_APPEAR" not in prompt
+
+
+def test_thread_prompt_token_time(tmp_path, monkeypatch):
+    """Pre-cutover worker1_thread dump was the full YAML; compare chars here.
+
+    Live eval_weekly_threads_mimo.py --full-generate now prints worker1_thread
+    vs worker1_event input_tokens separately. Record a pre-change thread
+    input_tokens from that script before relying on the live path.
+    """
+    workers = _load_workers("memory_weekly_token_time")
+    monkeypatch.setattr(
+        "recall.embed._encode_texts",
+        lambda texts: [],
+        raising=False,
+    )
+    blob = ("Qixi greeting card iteration paragraph. " * 40).strip()
+    days = ("2026-08-24", "2026-08-25", "2026-08-26")
+    event_ids = []
+    for i, day in enumerate(days, start=1):
+        eid = f"mem-{day}-event-TOKEN{i:04d}"
+        event_ids.append(eid)
+        _write_typed_daily(
+            tmp_path,
+            day,
+            block_id=eid,
+            block_type="event",
+            entity="Qixi card",
+            body=blob,
+            wrapup="- wrap-up ignored" if i == 1 else None,
+        )
+    _write_typed_daily(
+        tmp_path,
+        "2026-08-24",
+        block_id="mem-2026-08-24-fact-NOPE",
+        block_type="fact",
+        entity="noise",
+        body="fact must not enter the thread prompt " + blob,
+    )
+    # fact write overwrote 08-24; rewrite with both blocks
+    day24 = tmp_path / "memories" / "staging" / "daily" / "2026-08-24.md"
+    day24.write_text(
+        (
+            f"---\nid: {event_ids[0]}\ntype: event\nentity: Qixi card\n"
+            f"predicate: recorded\nvalid_from: 2026-08-24\nstatus: candidate\n"
+            "sources: [session s1]\n---\n"
+            f"{blob}\n"
+            "---\nid: mem-2026-08-24-fact-NOPE\ntype: fact\nentity: noise\n"
+            "status: candidate\n---\n"
+            f"fact must not enter the thread prompt {blob}\n"
+            "## Day wrap-up\n- wrap-up ignored\n"
+        ),
+        encoding="utf-8",
+    )
+    by_day = {
+        date.fromisoformat(d): tmp_path / "memories" / "staging" / "daily" / f"{d}.md"
+        for d in days
+    }
+    t0 = time.perf_counter()
+    cards = workers._collect_daily_event_cards(
+        by_day, [date.fromisoformat(d) for d in days]
+    )
+    clusters = workers._score_event_clusters(cards)
+    score_ms = (time.perf_counter() - t0) * 1000.0
+    layout = workers.format_thread_candidate_layout(cards, clusters)
+    skeleton = workers.thread_skeleton_args(clusters)
+    prompt = workers._build_analyst_prompt(
+        purpose="worker1_thread",
+        week_key="2026-W35",
+        role="thread",
+        merged_events_md="",
+        legend={},
+        candidate_layout=layout,
+        skeleton_json=json.dumps(skeleton, ensure_ascii=False),
+    )
+    event_blocks = [
+        {
+            "frontmatter": {
+                "id": c["event_id"],
+                "type": "event",
+                "entity": c["entity"],
+                "predicate": c["predicate"],
+                "valid_from": c["date"].isoformat(),
+            },
+            "body": c["body"],
+        }
+        for c in cards
+    ]
+    legacy_chars = len("\n\n".join(workers._render_block(b) for b in event_blocks))
+    new_chars = len(layout) + len(json.dumps(skeleton, ensure_ascii=False))
+    chars_ratio = new_chars / legacy_chars if legacy_chars else 1.0
+    est_tokens = new_chars // 4
+    line = (
+        f"legacy_chars={legacy_chars} new_chars={new_chars} "
+        f"chars_ratio={chars_ratio:.3f} est_tokens={est_tokens} "
+        f"score_ms={score_ms:.1f}"
+    )
+    print(line)
+    assert "legacy_chars=" in line and "new_chars=" in line
+    assert new_chars < 0.4 * legacy_chars
+    assert score_ms < 2000
+    assert "mem-2026-08-24-fact-NOPE" not in prompt
+    assert "wrap-up ignored" not in prompt
 
 

@@ -31,6 +31,7 @@ import {
   isEmptyDigestGenerateOutcome,
   resolveDefaultWeekSelection,
 } from '../softWeek';
+import { rescanPollJobFinished } from '../idleRescan';
 import {
   dailyBlockAnchorId,
   splitBriefDisplaySegments,
@@ -151,6 +152,7 @@ export default function WeekReview({
 
   const selectedWeekRef = useRef<WeekOverview | null>(null);
   selectedWeekRef.current = selectedWeek;
+  const rescanSawFlightRef = useRef(false);
   const [, setHotComposeActive] = useState(false);
   /** Nested list scrollers — window.scrollY alone misses halfway scroll inside these. */
   const stagingListScrollRef = useRef<HTMLDivElement>(null);
@@ -776,9 +778,18 @@ export default function WeekReview({
           const res = await fetch('/api/weekly/weeks');
           const rows = await res.json().catch(() => []);
           const row = Array.isArray(rows)
-            ? rows.find((w: { week?: string }) => w.week === current.week)
+            ? rows.find((w: { week?: string; generateInFlight?: boolean }) => w.week === current.week)
             : null;
-          if (row && !row.generateInFlight) {
+          const inFlight = Boolean(row?.generateInFlight);
+          if (inFlight) rescanSawFlightRef.current = true;
+          if (
+            row
+            && rescanPollJobFinished({
+              sawGenerateInFlight: rescanSawFlightRef.current,
+              generateInFlight: inFlight,
+            })
+          ) {
+            rescanSawFlightRef.current = false;
             setRescanLoading(false);
             setMessage({
               type: 'success',
@@ -834,6 +845,7 @@ export default function WeekReview({
   const handleRescanWeek = () => {
     if (!selectedWeek) return;
     const week = selectedWeek.week;
+    rescanSawFlightRef.current = false;
     setRescanLoading(true);
     setMessage({
       type: 'info',
@@ -920,7 +932,7 @@ export default function WeekReview({
         const updRes = await fetch('/api/weekly/update', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ week, reason: 'rescan' }),
+          body: JSON.stringify({ week, reason: 'rescan', background: true }),
         });
         const data = await updRes.json().catch(() => ({}));
         if (updRes.status === 409 || data.outcome === 'already_closed') {
@@ -946,9 +958,11 @@ export default function WeekReview({
           throw new Error(`Failed to re-scan ${week}. ${reason}${details}`.trim());
         }
         if (data.outcome === 'started' || data.generate_in_flight) {
-          throw new Error(
-            `Re-scan ${week} returned background start; generate must finish in this request.`,
-          );
+          setMessage({
+            type: 'info',
+            text: `Re-scan ${week}: running in background…`,
+          });
+          return;
         }
         if (hotChanged) {
           setMessage({
