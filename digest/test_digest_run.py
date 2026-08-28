@@ -359,6 +359,66 @@ def test_request_weekly_reorganise_wait_false_returns_in_flight(tmp_path, monkey
     raise AssertionError("background reorganise did not finish")
 
 
+def test_request_weekly_reorganise_wait_false_kicks_once(tmp_path, monkeypatch):
+    dr = _load_digest_run()
+    digest = dr.digest
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    daily = tmp_path / "memories" / "staging" / "daily"
+    daily.mkdir(parents=True, exist_ok=True)
+    (daily / "2026-07-27.md").write_text(_DAILY_TWO_FACTS, encoding="utf-8")
+    calls: list[int] = []
+    hold = threading.Event()
+    entered = threading.Event()
+
+    def fake_phase2(*_a, **_k):
+        calls.append(1)
+        entered.set()
+        hold.wait(timeout=2)
+        return {"outcome": "rewritten", "path": str(daily / "2026-07-27.md"), "date": "2026-07-27"}
+
+    monkeypatch.setattr(digest, "run_manual_phase2", fake_phase2)
+    first = dr.request_weekly_reorganise(date_str="2026-07-27", wait=False)
+    assert first["outcome"] == "in_flight"
+    assert entered.wait(timeout=2)
+    try:
+        second = dr.request_weekly_reorganise(date_str="2026-07-27", wait=False)
+        assert second["outcome"] == "in_flight"
+        assert len(calls) == 1
+    finally:
+        hold.set()
+
+
+def test_request_weekly_reorganise_rekicks_stale_in_flight(tmp_path, monkeypatch):
+    """Flag without a live weekly-reorganise thread would freeze the Reorganise spinner."""
+    dr = _load_digest_run()
+    digest = dr.digest
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    daily = tmp_path / "memories" / "staging" / "daily"
+    daily.mkdir(parents=True, exist_ok=True)
+    (daily / "2026-07-27.md").write_text(_DAILY_TWO_FACTS, encoding="utf-8")
+    entered = threading.Event()
+    hold = threading.Event()
+
+    def fake_phase2(*_a, **_k):
+        entered.set()
+        hold.wait(timeout=2)
+        return {"outcome": "rewritten", "path": str(daily / "2026-07-27.md"), "date": "2026-07-27"}
+
+    monkeypatch.setattr(digest, "run_manual_phase2", fake_phase2)
+    with digest._digest_lock:
+        state = digest._load_state()
+        state["weekly_reorganise_job"] = {
+            "in_flight": True,
+            "date": "2026-07-27",
+            "last_outcome": "",
+        }
+        digest._save_state(state)
+    result = dr.request_weekly_reorganise(date_str="2026-07-27", wait=False)
+    assert result["outcome"] == "in_flight"
+    assert entered.wait(timeout=2)
+    hold.set()
+
+
 def test_digest_oneshot_raises_completion_budget_for_four_type_ops(monkeypatch):
     """Phase-2 dumps event/fact/procedure/decision ops in one tool call."""
     digest = load_plugin_module("digest.py", "memory_digest_oneshot_budget_test")

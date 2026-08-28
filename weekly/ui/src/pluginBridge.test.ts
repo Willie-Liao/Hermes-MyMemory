@@ -18,9 +18,11 @@ import {
   resolveDefaultWeekSelection,
   resolveHermesHome,
   runBridge,
+  runDigestBridge,
   runSpawnedPython,
   stopWeeklyBridgeServe,
   tidyStateForWeeklyReport,
+  digestBridgeServeSpawnCount,
   weeklyBridgeServeSpawnCount,
   type BridgeRunResult,
   type BridgeRunner,
@@ -357,6 +359,23 @@ assert.equal(weekLifecycleLabel('re-review'), 'OPEN');
   await runBridge(payload);
   try {
     assert.equal(weeklyBridgeServeSpawnCount, afterFirst + 1);
+  } finally {
+    stopWeeklyBridgeServe();
+  }
+}
+
+{
+  stopWeeklyBridgeServe();
+  const before = digestBridgeServeSpawnCount;
+  const payload = JSON.stringify({ op: 'nope', args: {} });
+  const first = await runDigestBridge(payload);
+  const second = await runDigestBridge(payload);
+  try {
+    assert.equal(digestBridgeServeSpawnCount, before + 1);
+    assert.equal(first.status, 0);
+    assert.equal(second.status, 0);
+    assert.equal(parseBridgeStdout(first.stdout).ok, false);
+    assert.equal(parseBridgeStdout(second.stdout).ok, false);
   } finally {
     stopWeeklyBridgeServe();
   }

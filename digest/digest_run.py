@@ -139,6 +139,8 @@ def request_weekly_reorganise(
     ``session_key`` / ``force`` are kept for bridge compatibility and ignored.
     UI passes wait=False so the HTTP request returns while Phase-2 runs;
     status_only reads the in-flight flag without starting another job.
+    If in_flight is set but weekly-reorganise-{date} is dead, re-kick so the
+    spinner cannot stick after a crashed daemon thread.
     """
     _ = (session_key, force)
     from memory_staging import daily_staging_path, hermes_local_today_str
@@ -180,15 +182,23 @@ def request_weekly_reorganise(
     if wait:
         return digest.run_manual_phase2(daily_path, date_str=target_date)
 
+    worker_alive = any(
+        t.name == f"weekly-reorganise-{target_date}" and t.is_alive()
+        for t in threading.enumerate()
+    )
     with digest._digest_lock:
         state = digest._load_state()
         job = state.get(job_key) if isinstance(state.get(job_key), dict) else {}
-        if bool(job.get("in_flight")):
+        if bool(job.get("in_flight")) and worker_alive:
             return {
                 "outcome": "in_flight",
                 "path": str(daily_path),
                 "date": str(job.get("date") or target_date),
             }
+        if bool(job.get("in_flight")) and not worker_alive:
+            digest._log(
+                f"weekly reorganise in_flight stale, re-kick {target_date}"
+            )
         state[job_key] = {
             "in_flight": True,
             "date": target_date,

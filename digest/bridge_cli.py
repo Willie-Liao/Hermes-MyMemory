@@ -58,11 +58,15 @@ def _emit(payload: dict[str, Any], leaked: str = "") -> None:
     print(json.dumps(payload, default=str), file=sys.stdout, flush=True)
 
 
-def main() -> int:
+def _handle_raw(raw: str) -> tuple[dict[str, Any], str]:
+    """Dispatch one JSON request so --serve can reply without waiting for stdin EOF.
+
+    One-shot mode used to read() until close; that made Node wait for Phase-2 to
+    finish even after the JSON result was known.
+    """
     junk = io.StringIO()
     with redirect_stdout(junk):
         try:
-            raw = sys.stdin.read()
             req = json.loads(raw or "{}")
             if not isinstance(req, dict):
                 raise ValueError("request must be a JSON object")
@@ -118,8 +122,21 @@ def main() -> int:
             payload = {"ok": False, "error": f"invalid json: {exc}"}
         except Exception as exc:  # noqa: BLE001 — bridge must never raise to Node
             payload = {"ok": False, "error": str(exc)}
+    return payload, junk.getvalue()
 
-    _emit(payload, junk.getvalue())
+
+def main(argv: list[str] | None = None) -> int:
+    """One JSON request from stdin, or --serve NDJSON until EOF/blank line."""
+    args = sys.argv[1:] if argv is None else argv
+    if "--serve" in args:
+        while True:
+            line = sys.stdin.readline()
+            if line == "" or not line.strip():
+                return 0
+            payload, leaked = _handle_raw(line)
+            _emit(payload, leaked)
+    payload, leaked = _handle_raw(sys.stdin.read())
+    _emit(payload, leaked)
     return 0
 
 
