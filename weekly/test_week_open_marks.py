@@ -295,6 +295,40 @@ def test_sunday_close_is_plugin_clock_not_cron():
     assert not script.exists()
 
 
+def test_generate_week_background_returns_while_run_lock_held(tmp_path, monkeypatch):
+    """Background rescan must not sit on _run_lock or the serve queue stalls."""
+    import threading
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    actions = _load_actions()
+    _write_usable_daily(tmp_path, "2026-07-06", "W28 source")
+    kicked: list[str] = []
+    monkeypatch.setattr(actions, "_kick_background_generate_week", kicked.append)
+    actions.weekly._run_lock.acquire()
+    held = {"result": None}
+
+    def _call() -> None:
+        held["result"] = actions.generate_week(
+            "2026-W28", reason="rescan", background=True
+        )
+
+    try:
+        thread = threading.Thread(target=_call)
+        thread.start()
+        thread.join(timeout=2)
+        assert not thread.is_alive(), "generate_week blocked on _run_lock"
+    finally:
+        actions.weekly._run_lock.release()
+        thread.join(timeout=2)
+
+    assert held["result"] == {
+        "outcome": "started",
+        "week": "2026-W28",
+        "generate_in_flight": True,
+    }
+    assert kicked == []
+
+
 def test_generate_week_background_kicks_once(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     actions = _load_actions()
