@@ -302,6 +302,42 @@ def test_bridge_dispatches_tighten_hot_entry(monkeypatch, capsys):
     assert captured["guidance"] == "half length"
 
 
+def test_bridge_serve_handles_two_ndjson_requests_without_exit():
+    """--serve must answer two lines and stay alive until stdin closes.
+
+    One-shot spawn-and-wait is what made UI Re-scan wait for generate to finish.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, str(BRIDGE), "--serve"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+    try:
+        proc.stdin.write(json.dumps({"op": "nope", "args": {}}) + "\n")
+        proc.stdin.write(json.dumps({"op": "weekly_status", "args": {}}) + "\n")
+        proc.stdin.flush()
+        first = proc.stdout.readline()
+        second = proc.stdout.readline()
+        assert proc.poll() is None
+        a = json.loads(first)
+        b = json.loads(second)
+        assert a["ok"] is False
+        assert "unknown" in str(a.get("error", "")).casefold()
+        assert b["ok"] is True
+        assert isinstance(b.get("result"), dict)
+        proc.stdin.close()
+        proc.wait(timeout=15)
+        assert proc.returncode == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
 def test_bridge_stdout_stays_json_when_action_prints(monkeypatch, capsys):
     bridge = _load_bridge_module()
 
