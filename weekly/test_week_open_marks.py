@@ -348,3 +348,57 @@ def test_generate_week_background_kicks_once(tmp_path, monkeypatch):
     rows = actions.weekly._weeks_status_rows()
     row = next(r for r in rows if r["week"] == "2026-W28")
     assert row["generate_in_flight"] == "true"
+
+
+def test_generate_week_background_returns_while_generate_runs(tmp_path, monkeypatch):
+    """UI needs started before distill finishes so /api/weekly/update is not a 300s wait."""
+    import time
+    import threading
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    actions = _load_actions()
+    _write_usable_daily(tmp_path, "2026-07-06", "W28 source")
+    entered = threading.Event()
+
+    def slow_content(*_a, **_k):
+        entered.set()
+        time.sleep(2.0)
+        return None
+
+    monkeypatch.setattr(actions.weekly, "_generate_weekly_content", slow_content)
+    t0 = time.perf_counter()
+    result = actions.generate_week("2026-W28", reason="rescan", background=True)
+    elapsed = time.perf_counter() - t0
+    assert result["outcome"] == "started"
+    assert elapsed < 1.0
+    assert entered.wait(timeout=3)
+    mark = actions.weekly._load_state()["week_open_marks"]["2026-W28"]
+    assert mark["generate_in_flight"] is True
+    time.sleep(2.2)
+
+
+def test_generate_week_background_returns_while_generate_runs(tmp_path, monkeypatch):
+    """UI needs started before distill finishes so /api/weekly/update is not a 300s wait."""
+    import time
+    import threading
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    actions = _load_actions()
+    _write_usable_daily(tmp_path, "2026-07-06", "W28 source")
+    entered = threading.Event()
+
+    def slow_content(*_a, **_k):
+        entered.set()
+        time.sleep(2.0)
+        return None
+
+    monkeypatch.setattr(actions.weekly, "_generate_weekly_content", slow_content)
+    t0 = time.perf_counter()
+    result = actions.generate_week("2026-W28", reason="rescan", background=True)
+    elapsed = time.perf_counter() - t0
+    assert result["outcome"] == "started"
+    assert elapsed < 1.0
+    assert entered.wait(timeout=3)
+    mark = actions.weekly._load_state()["week_open_marks"]["2026-W28"]
+    assert mark["generate_in_flight"] is True
+    time.sleep(2.2)
