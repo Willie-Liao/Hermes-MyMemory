@@ -97,6 +97,8 @@ def test_list_weekly_status_includes_reviewed_only_files(tmp_path, monkeypatch):
         "week": "2026-W23",
         "status": "reviewed",
         "filename": "2026-W23.md",
+        "generate_in_flight": "false",
+        "reorganise_in_flight": "false",
     }
 
 

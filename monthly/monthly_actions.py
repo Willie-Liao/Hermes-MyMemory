@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sys
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,14 @@ from monthly_synth import synthesize_month  # noqa: E402
 from monthly_writer import load_month, write_month, loads  # noqa: E402
 
 _MONTH_KEY_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+_GUIDANCE_GATE = 0.30
+_BAND_DECISIONS = 4
+_BAND_PROCEDURES = 3
+_BAND_SUMMARY = 8
+_HELP = (
+    "/monthly update [YYYY-MM]  refresh that month (default: current)\n"
+    "/monthly show [YYYY-MM]    print story bullets and D/P guidance"
+)
 
 
 def parse_month_key(value: str | None) -> str | None:
@@ -49,7 +58,7 @@ def generate_month(
     key = parse_month_key(month_key)
     if key is None:
         return {"outcome": "bad_month", "month": month_key or ""}
-    slices = week_slices(key)
+    slices = week_slices(key, types=frozenset({"decision", "procedure"}))
     batches = pack_batches(slices)
     notes = [
         map_batch(key, batch, call_oneshot=call_oneshot, force_refresh=force_refresh)
@@ -88,33 +97,191 @@ def load_monthly_yaml(month_key: str | None = None) -> dict[str, Any]:
     return {"outcome": "ok", "month": key, "payload": payload.to_dict()}
 
 
-def month_band(limit: int = 8, staging: Path | None = None) -> str:
-    """Index last months as summary plus ISO range so Band D can pick a month window.
+def _month_folder(staging: Path | None) -> Path:
+    if staging is not None:
+        return Path(staging) / "monthly"
+    return month_file_path("x").parent
 
-    Optional staging points at a sandbox root so tests do not read live HERMES_HOME.
-    Prefetch passes limit=4; other callers keep the default eight.
-    """
-    folder = Path(staging) / "monthly" if staging is not None else month_file_path("x").parent
+
+def _iter_payloads(staging: Path | None = None):
+    folder = _month_folder(staging)
     if not folder.is_dir():
-        return ""
-    lines: list[str] = []
-    for path in sorted(folder.glob("????-??.md"), reverse=True)[:limit]:
+        return
+    for path in sorted(folder.glob("????-??.md"), reverse=True):
         try:
-            payload = loads(path.read_text(encoding="utf-8"))
+            yield loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError, FileNotFoundError):
             continue
-        summary = (payload.summary or "").strip()
-        if not summary:
-            continue
-        start = str(payload.range.start or "").strip()[:10]
-        end = str(payload.range.end or "").strip()[:10]
-        if start or end:
-            lines.append(f"{payload.key} {start}..{end}: {summary}")
+
+
+def _is_active_decision(row, superseded: set[str]) -> bool:
+    if row.id in superseded:
+        return False
+    valid = str(row.valid_to or "").strip().casefold()
+    return valid in {"", "open"}
+
+
+def _tokens(text: str) -> set[str]:
+    return {tok for tok in re.findall(r"[a-z0-9]+", (text or "").casefold()) if tok}
+
+
+def _lexical_sim(query: str, candidate: str) -> float:
+    qt, ct = _tokens(query), _tokens(candidate)
+    if not qt or not ct:
+        return 0.0
+    return len(qt & ct) / len(qt | ct)
+
+
+def _guidance_sim(query: str, candidate: str) -> float:
+    """Lexical overlap first; GTE cosine only if lexical misses the 0.30 gate."""
+    lexical = _lexical_sim(query, candidate)
+    if lexical >= _GUIDANCE_GATE:
+        return lexical
+    try:
+        from recall.embed import _cosine, _encode_texts
+
+        vecs = _encode_texts([query, candidate])
+        if vecs and len(vecs) == 2:
+            return float(_cosine(vecs[0], vecs[1]))
+    except Exception:
+        pass
+    return lexical
+
+
+def rank_monthly_guidance(
+    query: str,
+    *,
+    staging: Path | None = None,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    """Rank active monthly D/P for a task-shaped query so prefetch does not scan daily events first.
+
+    Strength may reorder inside the admitted set; it cannot rescue a row below the 0.30 gate.
+    """
+    q = str(query or "").strip()
+    if not q:
+        return []
+    admitted: list[dict[str, Any]] = []
+    for payload in _iter_payloads(staging):
+        superseded = {sid for row in payload.key_decisions for sid in row.supersedes}
+        for row in payload.key_decisions:
+            if not _is_active_decision(row, superseded):
+                continue
+            sim = _guidance_sim(q, row.lookup_text())
+            if sim < _GUIDANCE_GATE:
+                continue
+            rank = 0.8 * sim + 0.2 * (float(row.strength) / 10.0)
+            admitted.append(
+                {
+                    "kind": "decision",
+                    "month": payload.key,
+                    "sim": sim,
+                    "rank": rank,
+                    "row": row,
+                }
+            )
+        for row in payload.key_procedures:
+            sim = _guidance_sim(q, row.lookup_text())
+            if sim < _GUIDANCE_GATE:
+                continue
+            rank = 0.8 * sim + 0.2 * (float(row.strength) / 10.0)
+            admitted.append(
+                {
+                    "kind": "procedure",
+                    "month": payload.key,
+                    "sim": sim,
+                    "rank": rank,
+                    "row": row,
+                }
+            )
+    prefs = [h for h in admitted if h["kind"] == "decision"]
+    procs = [h for h in admitted if h["kind"] == "procedure"]
+    prefs.sort(key=lambda h: (-h["rank"], h["row"].id))
+    procs.sort(key=lambda h: (-h["rank"], h["row"].id))
+    ordered = prefs + procs
+    return ordered[: max(1, int(limit))]
+
+
+def format_guidance_hits(hits: list[dict[str, Any]]) -> str:
+    if not hits:
+        return ""
+    lines = ["## Memory / recall  channel=monthly_guidance"]
+    for hit in hits:
+        row = hit["row"]
+        if hit["kind"] == "decision":
+            extra = f" except {row.exceptions}" if row.exceptions else ""
+            lines.append(
+                f"- preference {row.id}  context={row.context or '-'}  "
+                f"{row.text}{extra}  strength={row.strength:.2f}"
+            )
         else:
-            lines.append(f"{payload.key}: {summary}")
+            obs = "; ".join(row.obstacles) if row.obstacles else ""
+            lines.append(
+                f"- procedure {row.id}  trigger={row.trigger or '-'}  "
+                f"obstacles={obs or '-'}  solution={row.solution}  strength={row.strength:.2f}"
+            )
+    return "\n".join(lines)
+
+
+def _paint_payload(payload) -> list[str]:
+    start = str(payload.range.start or "").strip()[:10]
+    end = str(payload.range.end or "").strip()[:10]
+    lines = [f"### {payload.key}  {start}..{end}".rstrip()]
+    for row in payload.summary[:_BAND_SUMMARY]:
+        weeks = ", ".join(row.weeks) if row.weeks else ""
+        suffix = f" ({weeks})" if weeks else ""
+        lines.append(f"- {row.text}{suffix}")
+    superseded = {sid for row in payload.key_decisions for sid in row.supersedes}
+    decisions = [row for row in payload.key_decisions if _is_active_decision(row, superseded)]
+    decisions.sort(key=lambda r: (-float(r.strength), r.id))
+    for row in decisions[:_BAND_DECISIONS]:
+        extra = f" except {row.exceptions}" if row.exceptions else ""
+        lines.append(f"- preference {row.id}  {row.context or '-'} — {row.text}{extra}")
+    procs = sorted(payload.key_procedures, key=lambda r: (-float(r.strength), r.id))
+    for row in procs[:_BAND_PROCEDURES]:
+        obs = "; ".join(row.obstacles) if row.obstacles else "-"
+        lines.append(f"- procedure {row.id}  {row.trigger or '-'} — {obs} — {row.solution}")
+    return lines
+
+
+def month_band(limit: int = 8, staging: Path | None = None) -> str:
+    """Paint month stories like weekly Band C, then bounded active D/P for first-turn guidance."""
+    lines: list[str] = []
+    for payload in list(_iter_payloads(staging))[:limit]:
+        painted = _paint_payload(payload)
+        if len(painted) == 1 and not payload.summary and not payload.key_decisions and not payload.key_procedures:
+            continue
+        lines.extend(painted)
     if not lines:
         return ""
     return "## Month summaries\n" + "\n".join(lines)
+
+
+def handle_monthly(raw_args: str) -> str:
+    """Slash/CLI dispatcher for update/show only — monthly has no UI/close lifecycle."""
+    tokens = str(raw_args or "").strip().split()
+    if not tokens or tokens[0] in {"help", "-h", "--help"}:
+        return _HELP
+    cmd = tokens[0]
+    rest = tokens[1] if len(tokens) > 1 else ""
+    if cmd == "update":
+        key = parse_month_key(rest) if rest else date.today().strftime("%Y-%m")
+        if rest and key is None:
+            return f"bad month {rest!r}; expected YYYY-MM"
+        result = generate_month(key, reason="slash", force_refresh=True)
+        if result.get("outcome") == "bad_month":
+            return f"bad month {rest!r}; expected YYYY-MM"
+        return f"updated {result.get('month')} ({result.get('outcome')})"
+    if cmd == "show":
+        key = parse_month_key(rest) if rest else date.today().strftime("%Y-%m")
+        if rest and key is None:
+            return f"bad month {rest!r}; expected YYYY-MM"
+        try:
+            payload = load_month(key)
+        except FileNotFoundError:
+            return f"missing {key}"
+        return "## Month summaries\n" + "\n".join(_paint_payload(payload))
+    return _HELP
 
 
 def lookup_by_id(mem_id: str) -> dict[str, Any] | None:

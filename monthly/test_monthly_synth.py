@@ -63,7 +63,7 @@ def test_reduce_drops_invented_ids_and_keeps_verbatim():
     assert kept.text
     assert "Decision:" not in kept.text or kept.text in real_decision.clause
     assert payload.comparison_with_last_month.empty_reason
-    assert "Beginning:" not in payload.summary
+    assert "Beginning:" not in " ".join(row.text for row in payload.summary)
     assert payload.user_image is not None
     assert payload.metrics.decisions >= 1
     clause = real_decision.clause
@@ -143,7 +143,7 @@ def test_synthesize_month_forced_tool(monkeypatch):
         carry="",
         facts=facts,
     )
-    assert payload.summary == "June start"
+    assert payload.summary[0].text == "June start"
     assert payload.key_decisions[0].id == real.id
     assert usage["input_tokens"] == 50
 
@@ -181,3 +181,34 @@ def test_payload_from_synthesis_passes_bilingual_aliases():
     digest = next(row for row in payload.entities if row.key == "memorydigest")
     assert digest.canonical
     assert "记忆摘要" in digest.aliases
+
+
+def test_summary_refuses_glued_paragraph_when_multiple_seeds():
+    facts = mechanical_facts("2026-08")
+    facts.story_seeds = (
+        {"text": "Qixi card from drafting to sharing", "weeks": ["2026-W34", "2026-W35"], "source": "cross-week"},
+        {"text": "Dating idea list grown", "weeks": ["2026-W35"], "source": "weekly-summary"},
+    )
+    payload = payload_from_synthesis(
+        "2026-08",
+        {"summary": "Qixi and dating were the month"},
+        facts,
+        carry="",
+        model="mimo-v2.5",
+        map_calls=1,
+        reduce_tokens=1,
+        generated_at="2026-09-01T08:00:00+08:00",
+    )
+    assert len(payload.summary) == 2
+    assert payload.summary[0].text == "Qixi card from drafting to sharing"
+    assert payload.summary[1].weeks == ("2026-W35",)
+
+
+def test_generate_month_map_input_has_no_event_blocks():
+    from monthly_slice import pack_batches, week_slices
+
+    slices = week_slices("2026-08", types=frozenset({"decision", "procedure"}))
+    types = {b.type for s in slices for b in s.blocks}
+    assert types <= {"decision", "procedure"}
+    for batch in pack_batches(slices):
+        assert "Beginning:" not in batch.rendered

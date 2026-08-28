@@ -26,8 +26,9 @@ from monthly_tools import (  # noqa: E402
 CallOneshot = Callable[..., dict[str, Any]]
 MAX_ATTEMPTS = 3
 MAP_SYSTEM = (
-    "You select the memory blocks that really matter for a monthly synthesis. "
-    "Cite only ids from the user message. At most 6 items. Each `what` is under 40 words."
+    "You select repeated reusable decision/preference and procedure patterns that matter for monthly guidance. "
+    "Cite only ids from the user message. At most 6 items. Each `what` is under 40 words. "
+    "Do not copy Beginning/Course/Outcome event prose."
 )
 
 

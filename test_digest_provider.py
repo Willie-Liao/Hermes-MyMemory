@@ -64,6 +64,7 @@ def test_plugin_manager_discover_registers_digest_and_weekly_slash(monkeypatch):
     cmds = mgr._plugin_commands
     assert cmds["digest"]["handler"].__name__ == "handle_digest"
     assert cmds["weekly"]["handler"].__name__ == "handle_weekly"
+    assert cmds["monthly"]["handler"].__name__ == "handle_monthly"
     assert "digest" in cmds
     assert "weekly" in cmds
 
@@ -173,6 +174,9 @@ def test_initialize_registers_digest_and_weekly_slash(monkeypatch):
     cmds = get_plugin_commands()
     assert cmds["digest"]["handler"] is digest_slash.handle_digest
     assert cmds["weekly"]["handler"] is weekly_slash.handle_weekly
+    from MyMemory.monthly.monthly_actions import handle_monthly
+
+    assert cmds["monthly"]["handler"] is handle_monthly
 
 
 @pytest.mark.skipif(
@@ -196,6 +200,9 @@ def test_initialize_registers_slash_in_skip_write_context(monkeypatch):
     cmds = get_plugin_commands()
     assert cmds["digest"]["handler"] is digest_slash.handle_digest
     assert cmds["weekly"]["handler"] is weekly_slash.handle_weekly
+    from MyMemory.monthly.monthly_actions import handle_monthly
+
+    assert cmds["monthly"]["handler"] is handle_monthly
 
 
 def test_initialize_starts_clock_weekly_retention_once(monkeypatch):
@@ -458,3 +465,10 @@ def test_recall_tool_schema_exposes_optional_time_bounds():
     assert "time_from" in props and "time_to" in props
     assert "time_from" not in schema["parameters"]["required"]
     assert "time_to" not in schema["parameters"]["required"]
+
+
+def test_provider_tool_schemas_include_monthly():
+    names = {row["name"] for row in MyMemoryProvider().get_tool_schemas()}
+    assert "mymemory_digest" in names
+    assert "mymemory_weekly" in names
+    assert "mymemory_monthly" in names

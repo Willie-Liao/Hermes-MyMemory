@@ -194,11 +194,12 @@ def recall_memory(
     index: BlockIndex | None = None,
     time_from: str | None = None,
     time_to: str | None = None,
+    mode: str = "normal",
 ) -> str:
     """Channel ladder: id → entity_key → fts5 → (gated embed) → l1 last resort.
 
-    Optional time_from/time_to OR-union approximate occurrence windows with
-    entity/lexical hits. Exact mem-id still pages a card in and ignores bounds.
+    mode=guidance ranks monthly D/P first and falls back to daily decision/procedure
+    only, so a task-shaped prefetch cannot inject events.
     """
     q = str(query or "").strip()
     root = staging_root(staging)
@@ -217,6 +218,9 @@ def recall_memory(
         rec = resolve_id(id_hits[0], staging=root, index=store)
         if rec:
             return format_id_block(rec)
+
+    if str(mode or "normal").strip().casefold() == "guidance":
+        return _guidance_recall(q, k=cap, staging=root, store=store)
 
     bounds = _parse_recall_bounds(time_from, time_to)
     timed: list[BlockRecord] = []
@@ -329,6 +333,59 @@ def recall_memory(
                 lines.append(f"- role={hit.get('role')}  {snippet}")
             return "\n".join(lines)
     return f"## Memory / recall  channel=miss  q={q}\n"
+
+
+def _guidance_recall(
+    query: str,
+    *,
+    k: int,
+    staging: Path,
+    store: BlockIndex,
+) -> str:
+    """Monthly D/P first; daily decision/procedure only on a monthly miss — never L1 or events."""
+    import sys
+
+    mdir = Path(__file__).resolve().parent.parent / "monthly"
+    if str(mdir) not in sys.path:
+        sys.path.insert(0, str(mdir))
+    from monthly_actions import format_guidance_hits, rank_monthly_guidance
+
+    hits = rank_monthly_guidance(query, staging=staging, limit=k)
+    if hits:
+        return format_guidance_hits(hits)
+    allowed = {"decision", "procedure"}
+    fts = search_lexical(query, k=k, staging=staging)
+    recs: list[BlockRecord] = []
+    seen: set[str] = set()
+    for row in fts:
+        rec = store.get(str(row["id"]))
+        if rec is None or rec.block_id in seen or _is_rejected(rec):
+            continue
+        if rec.item_type not in allowed:
+            continue
+        recs.append(rec)
+        seen.add(rec.block_id)
+    if not recs and embed_enabled(staging):
+        live = [
+            rec
+            for rec in store.records
+            if rec.item_type in allowed and not _is_rejected(rec)
+        ]
+        reranked = rerank_embed(query, live, k=k)
+        for mid in _MEM_ID_RE.findall(str(reranked or "")):
+            rec = store.get(mid)
+            if rec is None or rec.block_id in seen or rec.item_type not in allowed:
+                continue
+            recs.append(rec)
+            seen.add(rec.block_id)
+    if recs:
+        lines = [f"## Memory / recall  channel=daily_dp  q={query}"]
+        for rec in recs[:k]:
+            lines.append(
+                f"- {rec.block_id}  {rec.day} {_week(rec)}  {rec.item_type}  {one_line(rec.body, 80)}"
+            )
+        return "\n".join(lines)
+    return f"## Memory / recall  channel=miss  q={query}\n"
 
 
 def _neighborhood(
@@ -633,12 +690,12 @@ TOOL_SCHEMAS = [
     {
         "name": "recall_memory",
         "description": (
-            "Find memory cards by id, entity, or lexical match. When the user "
-            "mentions a time, or a week/month block in the memory bands matches, "
-            "pass time_from and time_to as that block's ISO start and end. "
-            "The host always runs expand_memory on the first seed id after "
-            "recall (depth 2). Do not call search_memory. Cards live in daily "
-            "YAML, not weekly/*.md or monthly/*.md."
+            "Find memory cards by id, entity, or lexical match. Task-shaped turns "
+            "should use monthly preference/procedure guidance first; daily YAML "
+            "holds card bodies. When the user mentions a time, or a week/month "
+            "block in the memory bands matches, pass time_from and time_to as "
+            "that block's ISO start and end. The host always runs expand_memory "
+            "on the first seed id after recall (depth 2). Do not call search_memory."
         ),
         "parameters": {
             "type": "object",

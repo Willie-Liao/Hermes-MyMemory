@@ -12,7 +12,7 @@ from .provider import MyMemoryProvider
 
 
 def register(ctx) -> None:
-    """Attach /digest and /weekly on a real PluginContext; keep the provider on the collector.
+    """Attach /digest, /weekly, and /monthly on a real PluginContext; keep the provider on the collector.
 
     PluginContext has no register_memory_provider (mempalace crash). The
     memory loader's collector has no register_command. hasattr so one
@@ -35,6 +35,14 @@ def register(ctx) -> None:
             weekly_slash.handle_weekly,
             description="Weekly memory: ui / update / close / reopen",
             args_hint="[ui|update [week]|close [week]|reopen [week]|help]",
+        )
+        from .monthly.monthly_actions import handle_monthly
+
+        ctx.register_command(
+            "monthly",
+            handle_monthly,
+            description="Monthly guidance: update / show",
+            args_hint="[update [YYYY-MM]|show [YYYY-MM]|help]",
         )
     if hasattr(ctx, "register_memory_provider"):
         ctx.register_memory_provider(MyMemoryProvider())

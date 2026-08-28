@@ -11,7 +11,7 @@ This repository is the **plugin root**. Copy or clone it to `$HERMES_HOME/plugin
 3. Merge the config below into `$HERMES_HOME/config.yaml` (do not overwrite the whole file).
 4. Put worker API keys in `$HERMES_HOME/.env` (never commit them).
 5. Create empty `memories/MEMORY.md`, `memories/USER.md`, and `memories/staging/daily/`, `memories/staging/weekly/` if missing.
-6. Restart the gateway. Verify with `hermes doctor`, then `/digest status` and `/weekly help` in chat, or `hermes MyMemory digest help`.
+6. Restart the gateway. Verify with `hermes doctor`, then `/digest status`, `/weekly help`, and `/monthly help` in chat, or `hermes MyMemory digest help`.
 
 ### Required config
 
@@ -49,11 +49,12 @@ plugins:
 
 Do **not** copy `weekly_brief_weixin` chat IDs, `auth.json`, `.env`, `state.db`, live `memories/`, snapshots, or `shell-hooks-allowlist.json` from someone else's machine.
 
-Slash commands `/digest` and `/weekly` register automatically when the plugin loads (`kind: standalone` + `plugins.enabled`). CLI:
+Slash commands `/digest`, `/weekly`, and `/monthly` register automatically when the plugin loads (`kind: standalone` + `plugins.enabled`). CLI:
 
 ```text
 hermes MyMemory digest …
 hermes MyMemory weekly …
+hermes MyMemory monthly …
 ```
 
 Sunday weekly generate/close and digest leftover/merge run on an **in-process civil clock**. No Hermes cron job is required.

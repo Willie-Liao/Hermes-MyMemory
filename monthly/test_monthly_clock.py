@@ -1,4 +1,4 @@
-"""Month-rollover clock against a sandboxed .monthly-state.json."""
+"""Civil-tick monthly clock: source fingerprint, backfill, rollover."""
 
 from __future__ import annotations
 
@@ -29,40 +29,85 @@ def _stub(monkeypatch, tmp_path, *, fail: bool = False):
     return generated
 
 
-def test_aug_31_idle(tmp_path, monkeypatch):
+def _write_decision(tmp_path, day: str, clause: str, extra: str = "") -> None:
+    daily = tmp_path / "memories" / "staging" / "daily"
+    daily.mkdir(parents=True, exist_ok=True)
+    daily.joinpath(f"{day}.md").write_text(
+        "---\n"
+        f"id: mem-{day}-decision-ABCD\n"
+        "type: decision\n"
+        "entity: Tooling\n"
+        "status: candidate\n"
+        f"{extra}"
+        "---\n"
+        f"{clause}\n",
+        encoding="utf-8",
+    )
+
+
+def test_aug_31_first_tick_refreshes_current_when_sources_exist(tmp_path, monkeypatch):
     generated = _stub(monkeypatch, tmp_path)
+    _write_decision(tmp_path, "2026-08-05", "Decision: keep the graph.")
     result = clock.maybe_run(AUG_31)
-    assert result["outcome"] == "idle"
-    assert generated == []
+    assert result["outcome"] == "generated"
+    assert "2026-08" in generated
+    assert "2026-07" in generated
 
 
 def test_sep_1_generates_august_once(tmp_path, monkeypatch):
     generated = _stub(monkeypatch, tmp_path)
+    _write_decision(tmp_path, "2026-08-05", "Decision: keep the graph.")
     first = clock.maybe_run(SEP_1)
     assert first["outcome"] == "generated"
-    assert generated == ["2026-08"]
+    assert generated[0] == "2026-08"
     second = clock.maybe_run(SEP_1)
     assert second["outcome"] == "idle"
-    assert generated == ["2026-08"]
+    assert generated.count("2026-08") == 1
 
 
 def test_sep_15_with_key_idle(tmp_path, monkeypatch):
     generated = _stub(monkeypatch, tmp_path)
+    _write_decision(tmp_path, "2026-08-05", "Decision: keep the graph.")
     clock.maybe_run(SEP_1)
     later = clock.maybe_run(SEP_15)
     assert later["outcome"] == "idle"
-    assert generated == ["2026-08"]
+    assert generated.count("2026-08") == 1
 
 
-def test_mid_month_never_generates_in_progress(tmp_path, monkeypatch):
+def test_mid_month_first_tick_backfills_then_idle_if_unchanged(tmp_path, monkeypatch):
     generated = _stub(monkeypatch, tmp_path)
-    result = clock.maybe_run(AUG_15)
-    assert result["outcome"] == "idle"
-    assert generated == []
+    _write_decision(tmp_path, "2026-08-05", "Decision: keep the graph.")
+    first = clock.maybe_run(AUG_15)
+    assert first["outcome"] == "generated"
+    assert generated == ["2026-07", "2026-08"]
+    second = clock.maybe_run(AUG_15)
+    assert second["outcome"] == "idle"
+    assert generated == ["2026-07", "2026-08"]
+
+
+def test_source_change_refreshes_current_recall_stamp_does_not(tmp_path, monkeypatch):
+    generated = _stub(monkeypatch, tmp_path)
+    _write_decision(tmp_path, "2026-08-05", "Decision: keep the graph.")
+    clock.maybe_run(AUG_15)
+    _write_decision(tmp_path, "2026-08-17", "Decision: prefer short reviews.")
+    changed = clock.maybe_run(AUG_15)
+    assert changed["outcome"] == "generated"
+    assert generated[-1] == "2026-08"
+    n = len(generated)
+    _write_decision(
+        tmp_path,
+        "2026-08-17",
+        "Decision: prefer short reviews.",
+        extra="recall_n: 9\nstrength: 4.2\nlast_recall_at: '2026-08-17T12:00:00+08:00'\n",
+    )
+    stamped = clock.maybe_run(AUG_15)
+    assert stamped["outcome"] == "idle"
+    assert len(generated) == n
 
 
 def test_failure_records_error_without_month_key(tmp_path, monkeypatch):
     _stub(monkeypatch, tmp_path, fail=True)
+    _write_decision(tmp_path, "2026-08-05", "Decision: keep the graph.")
     result = clock.maybe_run(SEP_1)
     assert result["outcome"] == "error"
     state = monthly_state.load_state()

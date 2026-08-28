@@ -71,9 +71,20 @@ def submit_month_synthesis_schema() -> dict[str, Any]:
     """One reduce call writes every narrative field; mechanical facts stay out of this tool."""
     return _schema(
         "submit_month_synthesis",
-        "Synthesize the month from notes and mechanical facts. Cite only ids you were given.",
+        "Synthesize the month from notes and mechanical facts. Cite only ids you were given. "
+        "summary is one-line bullets (text + weeks); never one paragraph.",
         {
-            "summary": {"type": "string"},
+            "summary": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "weeks": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["text"],
+                },
+            },
             "user_image": {
                 "type": "object",
                 "properties": {

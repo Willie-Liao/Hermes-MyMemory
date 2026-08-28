@@ -222,3 +222,118 @@ def test_batch_composition_deterministic_and_carry_under_budget():
     assert [frozenset(b.ids) for b in first] == [frozenset(b.ids) for b in second]
     assert count_tokens(carry_card("2026-07")) <= CARRY_CARD_TOKEN_CAP
     assert count_tokens(carry_card("2026-05")) <= CARRY_CARD_TOKEN_CAP
+
+
+def test_repeated_procedures_cluster_and_preference_uses_linked_event(monkeypatch, tmp_path):
+    from datetime import date
+
+    from monthly_slice import mechanical_facts
+
+    proc_a = (
+        date(2026, 8, 5),
+        {
+            "id": "mem-2026-08-05-procedure-AAAAAAA",
+            "type": "procedure",
+            "entity": "hermes-cron",
+            "importance": "3",
+            "status": "candidate",
+        },
+        "Obstacle: scheduled cron triggered a reminder at the wrong cadence instead of weekly; "
+        "Solution: treat the trigger as ad-hoc until the user confirms the next due date.",
+    )
+    proc_b = (
+        date(2026, 8, 17),
+        {
+            "id": "mem-2026-08-17-procedure-BBBBBBB",
+            "type": "procedure",
+            "entity": "hermes-cron",
+            "importance": "3",
+            "status": "candidate",
+        },
+        "Obstacle: scheduled cron triggered a reminder at the wrong cadence instead of weekly; "
+        "Solution: treat the trigger as ad-hoc until the user confirms the next due date.",
+    )
+    pref = (
+        date(2026, 8, 5),
+        {
+            "id": "mem-2026-08-05-decision-CCCCCCC",
+            "type": "decision",
+            "entity": "memorydigest",
+            "status": "candidate",
+        },
+        "Preference: user prefers concise review summaries. Exception: do not shorten explicit user quotes.",
+    )
+    ev = (
+        date(2026, 8, 5),
+        {
+            "id": "mem-2026-08-05-event-DDDDDDD",
+            "type": "event",
+            "entity": "memorydigest",
+            "related": ["mem-2026-08-05-decision-CCCCCCC"],
+            "status": "candidate",
+        },
+        "Beginning: user asked when writing weekly review summaries; Course: drafted; Outcome: accepted.",
+    )
+    singleton = (
+        date(2026, 8, 20),
+        {
+            "id": "mem-2026-08-20-procedure-EEEEEEE",
+            "type": "procedure",
+            "entity": "letterhead-printer",
+            "status": "candidate",
+        },
+        "Obstacle: printer jammed on letterhead stock; Solution: use plain paper until toner arrives.",
+    )
+    monkeypatch.setattr(
+        "monthly_slice.load_all_blocks",
+        lambda: [proc_a, proc_b, pref, ev, singleton],
+    )
+    weekly = tmp_path / "weekly"
+    weekly.mkdir()
+    w34 = (
+        "---\nweek: 2026-W34\nweek_status: closed\n---\n"
+        "week_key: 2026-W34\nbelongs_to: 2026-08\n"
+        "summary:\n  - text: leftover smoothie list\n    weekdays: [Wednesday]\n"
+        "cross-day-thread:\n"
+        "  - id: t-qixi-a\n    label: Qixi card drafting\n    entity_keys: [qixicard]\n"
+        "    steps:\n      - event_id: mem-2026-08-18-event-QIXIAAA\n        snippet: drafted card\n"
+    )
+    w35 = (
+        "---\nweek: 2026-W35\nweek_status: closed\n---\n"
+        "week_key: 2026-W35\nbelongs_to: 2026-08\n"
+        "summary:\n  - text: Qixi card drafting continued\n    weekdays: [Monday]\n"
+        "cross-day-thread:\n"
+        "  - id: t-qixi-b\n    label: Qixi card drafting\n    entity_keys: [qixicard]\n"
+        "    steps:\n      - event_id: mem-2026-08-25-event-QIXIBBB\n        snippet: shared card\n"
+    )
+    weekly.joinpath("2026-W34.md").write_text(w34, encoding="utf-8")
+    weekly.joinpath("2026-W35.md").write_text(w35, encoding="utf-8")
+    monkeypatch.setattr("monthly_slice.weekly_dir", lambda: weekly)
+    monkeypatch.setattr("recall.embed._encode_texts", lambda texts: [], raising=False)
+
+    facts = mechanical_facts("2026-08")
+    procs = [g for g in facts.dp_groups if g["type"] == "procedure"]
+    pair = next(g for g in procs if g["occurrence_n"] == 2)
+    single = next(g for g in procs if g["occurrence_n"] == 1)
+    assert pair["occurrence_n"] == 2
+    assert len(pair["evidence"]) == 2
+    assert len(pair["obstacles"]) == 1
+    from datetime import date as date_cls
+
+    from recall.strength import strength_value
+
+    solo = strength_value(
+        recall_n=1,
+        first_seen=pair["first_seen"],
+        importance=3,
+        now=date_cls.fromisoformat(pair["last_seen"]),
+    )
+    assert pair["strength"] > solo
+    prefs = [g for g in facts.dp_groups if g.get("kind") == "preference"]
+    assert prefs
+    assert "weekly review summaries" in prefs[0]["context"]
+    assert "do not shorten" in prefs[0]["exceptions"]
+    assert any(c["weeks"] == ["2026-W34", "2026-W35"] or set(c["weeks"]) == {"2026-W34", "2026-W35"} for c in facts.cross_week_candidates)
+    leftover = [s for s in facts.story_seeds if s["source"] == "weekly-summary"]
+    assert any("smoothie" in s["text"] for s in leftover)
+

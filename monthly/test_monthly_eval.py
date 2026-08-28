@@ -16,7 +16,12 @@ def test_live_august_pipeline_tokens():
     from monthly_slice import pack_batches, week_slices
 
     started = time.monotonic()
-    result = generate_month("2026-08", reason="eval", force_refresh=True)
+    try:
+        result = generate_month("2026-08", reason="eval", force_refresh=True)
+    except ValueError as exc:
+        if "API_KEY" in str(exc):
+            pytest.skip(str(exc))
+        raise
     elapsed_ms = (time.monotonic() - started) * 1000
     assert result["outcome"] == "ok"
     payload = result["payload"]

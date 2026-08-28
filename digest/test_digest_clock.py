@@ -28,10 +28,20 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 NEW_YORK = ZoneInfo("America/New_York")
 
 
-def _load_digest():
-    digest = load_plugin_module("digest.py", "memory_digest_clock_test")
+def _stub_side_clocks(digest):
+    """Keep leftover/phase2 tests from hitting weekly/monthly LLM via real HERMES_HOME."""
     digest._maybe_run_weekly_clock = lambda *a, **k: {"outcome": "stubbed"}
+    digest._maybe_run_monthly_clock = lambda *a, **k: {"outcome": "stubbed"}
     return digest
+
+
+def _load_digest():
+    """Isolate leftover/phase2 assertions from weekly/monthly generation.
+
+    Those clocks read HERMES_HOME, not digest.get_hermes_home, so a real staging
+    tree would otherwise fire live monthly map-reduce during digest grid tests.
+    """
+    return _stub_side_clocks(load_plugin_module("digest.py", "memory_digest_clock_test"))
 
 
 def test_digest_clock_tz_falls_back_on_invalid_name():
@@ -138,6 +148,29 @@ def test_parse_aware_iso_offset():
     parsed = parse_aware("2026-08-16T15:00:00+08:00", SHANGHAI)
     assert parsed is not None
     assert parsed.utcoffset() == timedelta(hours=8)
+
+
+def test_digest_clock_tick_invokes_monthly_entry(tmp_path, monkeypatch):
+    """Civil leftover/phase2 ticks must still call monthly maybe_run, not skip L4."""
+    digest = _load_digest()
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    monthly: list[datetime] = []
+    digest._maybe_run_monthly_clock = lambda local: monthly.append(local) or {
+        "outcome": "idle"
+    }
+    monkeypatch.setattr(digest, "hermes_local_today_str", lambda: "2026-08-16")
+    monkeypatch.setattr(digest.digest_clock, "digest_clock_tz", lambda **_k: SHANGHAI)
+    monkeypatch.setattr(digest, "_maybe_run_digest", lambda *a, **k: None)
+    monkeypatch.setattr(digest, "run_manual_phase2", lambda *a, **k: {"outcome": "idle"})
+    state_path = tmp_path / "memories" / "staging" / ".digest-state.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({"last_nightly_date": "2026-08-16", "sessions": {}}),
+        encoding="utf-8",
+    )
+    now = datetime(2026, 8, 16, 12, 0, tzinfo=SHANGHAI)
+    digest.maybe_run_digest_clock(now=now, sync=True)
+    assert monthly and monthly[0].hour == 12
 
 
 def _card_yaml(n: int) -> str:
@@ -352,7 +385,9 @@ def test_clock_leftover_then_one_phase2_when_over_gate(tmp_path, monkeypatch):
 
 
 def test_clock_weekly_hook_after_leftover(tmp_path, monkeypatch):
-    digest = load_plugin_module("digest.py", "memory_digest_clock_weekly_hook")
+    digest = _stub_side_clocks(
+        load_plugin_module("digest.py", "memory_digest_clock_weekly_hook")
+    )
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
     daily_dir = tmp_path / "memories" / "staging" / "daily"
     daily_dir.mkdir(parents=True)
@@ -511,9 +546,10 @@ def test_clock_loop_sleeps_until_deadline_not_sixty(tmp_path, monkeypatch):
 
     def fake_wait(timeout=None):
         waits.append(float(timeout))
+        digest._clock_stop.set()
         return True
 
-    monkeypatch.setattr(digest._clock_stop, "wait", fake_wait)
+    monkeypatch.setattr(digest._clock_wake, "wait", fake_wait)
     monkeypatch.setattr(
         digest.digest_clock, "digest_clock_tz", lambda **_k: SHANGHAI
     )
@@ -583,13 +619,16 @@ def test_clock_loop_passes_stored_tick_as_now(tmp_path, monkeypatch):
 
     def fake_wait(timeout=None):
         n["i"] += 1
-        return n["i"] > 1
+        if n["i"] > 1:
+            digest._clock_stop.set()
+            return True
+        return False
 
     def fake_clock(**kwargs):
         calls.append(kwargs)
         return {"outcome": "idle"}
 
-    monkeypatch.setattr(digest._clock_stop, "wait", fake_wait)
+    monkeypatch.setattr(digest._clock_wake, "wait", fake_wait)
     monkeypatch.setattr(digest, "maybe_run_digest_clock", fake_clock)
     monkeypatch.setattr(
         digest.digest_clock, "digest_clock_tz", lambda **_k: SHANGHAI

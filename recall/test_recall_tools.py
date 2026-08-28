@@ -460,3 +460,52 @@ def test_embed_real_peak_keeps_two(staging, monkeypatch):
     assert CASEY_ID in text
     assert HOP1 in text
     assert text.count("rank=") == 2
+
+
+def test_guidance_mode_monthly_preference_before_procedure(staging):
+    monthly = staging / "monthly" / "2026-08.md"
+    monthly.write_text(
+        monthly.read_text(encoding="utf-8")
+        + "key_decisions:\n"
+        + "  - id: mem-2026-08-05-decision-PREF\n"
+        + "    kind: preference\n"
+        + "    text: user prefers concise review summaries\n"
+        + "    context: when writing weekly review summaries\n"
+        + "    exceptions: do not shorten quotes\n"
+        + "    evidence: [mem-2026-08-05-decision-PREF]\n"
+        + "    strength: 1.0\n"
+        + "key_procedures:\n"
+        + "  - id: mem-2026-08-05-procedure-SUMM\n"
+        + "    trigger: writing weekly review summaries\n"
+        + "    problem: reviews too long\n"
+        + "    obstacles: [reviews too long]\n"
+        + "    solution: keep bullets under forty words\n"
+        + "    evidence: [mem-2026-08-05-procedure-SUMM]\n"
+        + "    strength: 9.0\n",
+        encoding="utf-8",
+    )
+    text = recall_memory(
+        "writing weekly review summaries",
+        staging=staging,
+        mode="guidance",
+    )
+    assert "channel=monthly_guidance" in text
+    assert "mem-2026-08-05-decision-PREF" in text
+    pref_at = text.index("mem-2026-08-05-decision-PREF")
+    proc_at = text.index("mem-2026-08-05-procedure-SUMM")
+    assert pref_at < proc_at
+    assert "channel=fts5" not in text
+    miss = recall_memory("unrelated weather chat", staging=staging, mode="guidance")
+    assert "channel=miss" in miss
+
+
+def test_guidance_mode_daily_dp_fallback_skips_events(staging):
+    text = recall_memory("strip semicolon digest bug", staging=staging, mode="guidance")
+    assert "channel=daily_dp" in text or "channel=miss" in text
+    if "channel=daily_dp" in text:
+        assert "type: event" not in text
+        assert "- mem-" in text
+    normal = recall_memory("what did we do about memory digest?", staging=staging)
+    assert "channel=" in normal
+    assert "channel=monthly_guidance" not in normal
+

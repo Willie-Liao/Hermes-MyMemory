@@ -35,6 +35,7 @@ from monthly_schema import (  # noqa: E402
     MonthlyRange,
     MonthlyRisk,
     MonthlyState,
+    MonthlySummaryItem,
     MonthlyUserImage,
     payload_to_dict,
 )
@@ -96,6 +97,34 @@ def _tuple(value: Any) -> tuple:
     return (value,)
 
 
+def _summary_items(raw: Any) -> tuple[MonthlySummaryItem, ...]:
+    """Wrap a v1 scalar summary as one bullet so old files still parse without a rewrite."""
+    if raw is None or raw == "":
+        return ()
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return ()
+        return (MonthlySummaryItem(text=text, weeks=()),)
+    rows: list[MonthlySummaryItem] = []
+    for item in raw if isinstance(raw, (list, tuple)) else ():
+        if isinstance(item, MonthlySummaryItem):
+            rows.append(item)
+            continue
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                rows.append(MonthlySummaryItem(text=text, weeks=()))
+            continue
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        rows.append(MonthlySummaryItem(text=text, weeks=_tuple(item.get("weeks"))))
+    return tuple(rows)
+
+
 def _evidence_text(raw: Any) -> MonthlyEvidenceText:
     if not isinstance(raw, dict):
         return MonthlyEvidenceText()
@@ -153,7 +182,7 @@ def payload_from_dict(obj: dict[str, Any]) -> MonthlyPayload:
             stages=dict(gen.get("stages") or {}),
             batch_tokens=int(gen.get("batch_tokens") or 8000),
         ),
-        summary=str(obj.get("summary") or ""),
+        summary=_summary_items(obj.get("summary")),
         user_image=MonthlyUserImage(
             goal_alignment=_evidence_text(img.get("goal_alignment")),
             cognition_change=tuple(cognition),
@@ -187,11 +216,17 @@ def payload_from_dict(obj: dict[str, Any]) -> MonthlyPayload:
                 kind=str(row.get("kind") or "decision"),
                 text=str(row.get("text") or ""),
                 why_it_matters=str(row.get("why_it_matters") or ""),
+                context=str(row.get("context") or ""),
+                exceptions=str(row.get("exceptions") or ""),
                 date=str(row.get("date") or ""),
                 valid_to=str(row.get("valid_to") or ""),
                 entity_keys=_tuple(row.get("entity_keys")),
                 supersedes=_tuple(row.get("supersedes")),
                 evidence=_tuple(row.get("evidence")),
+                occurrence_n=int(row.get("occurrence_n") or 1),
+                first_seen=str(row.get("first_seen") or ""),
+                last_seen=str(row.get("last_seen") or ""),
+                strength=float(row.get("strength") or 0.0),
             )
             for row in obj.get("key_decisions") or []
             if isinstance(row, dict)
@@ -199,11 +234,18 @@ def payload_from_dict(obj: dict[str, Any]) -> MonthlyPayload:
         key_procedures=tuple(
             MonthlyProcedure(
                 id=str(row.get("id") or ""),
+                trigger=str(row.get("trigger") or ""),
                 problem=str(row.get("problem") or ""),
+                obstacles=_tuple(row.get("obstacles")),
                 solution=str(row.get("solution") or ""),
                 insight=str(row.get("insight") or ""),
+                entity_keys=_tuple(row.get("entity_keys")),
                 weeks=_tuple(row.get("weeks")),
                 evidence=_tuple(row.get("evidence")),
+                occurrence_n=int(row.get("occurrence_n") or 1),
+                first_seen=str(row.get("first_seen") or ""),
+                last_seen=str(row.get("last_seen") or ""),
+                strength=float(row.get("strength") or 0.0),
             )
             for row in obj.get("key_procedures") or []
             if isinstance(row, dict)
