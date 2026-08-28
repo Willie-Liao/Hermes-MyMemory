@@ -60,6 +60,7 @@ import {
 } from '../viewScroll';
 import { canRunTightenGuidance, DEFAULT_TIGHTEN_GUIDANCE, resolveTightenGuidance } from '../hotHealthUi';
 import { runReorganiseSequence } from '../weeklyReorganise';
+import { formatEventBodyFromSlots, parseEventBodySlots } from '../weeklyReviewOps';
 
 const NEWSROOM_EMPTY_COPY = {
   title: 'No current news for this week',
@@ -1612,15 +1613,62 @@ export default function WeekReview({
                                             </div>
 
                                             {/* Body / Content */}
+                                            {(() => {
+                                              const isEventBody =
+                                                String(editingBlockData.type || block.type || '') === 'event';
+                                              const eventSlots = parseEventBodySlots(
+                                                editingBlockData.body || '',
+                                              );
+                                              const slotFieldClass =
+                                                'flex-1 bg-transparent border-0 px-0 py-0.5 text-slate-100 font-mono text-xs focus:outline-none min-h-[44px] resize-y';
+                                              return (
                                             <div className="rounded-lg border border-slate-700 bg-slate-950 overflow-hidden focus-within:border-indigo-500 transition-colors">
                                               <label className="block text-[10px] font-mono text-slate-200 px-2.5 pt-2 uppercase font-bold tracking-wide">Memory Description (Body)</label>
+                                              {isEventBody ? (
+                                                <div className="px-2.5 pb-2 space-y-2">
+                                                  {(
+                                                    [
+                                                      ['beginning', 'Beginning'],
+                                                      ['course', 'Course'],
+                                                      ['outcome', 'Outcome'],
+                                                    ] as const
+                                                  ).map(([key, label]) => (
+                                                    <div
+                                                      key={key}
+                                                      className="flex items-start gap-2 border-t border-slate-800/80 pt-2 first:border-t-0 first:pt-0"
+                                                    >
+                                                      <span className="shrink-0 pt-1 text-[10px] font-mono font-bold text-slate-400 select-none">
+                                                        {label}:
+                                                      </span>
+                                                      <textarea
+                                                        value={eventSlots[key]}
+                                                        onChange={(e) =>
+                                                          setEditingBlockData({
+                                                            ...editingBlockData,
+                                                            body: formatEventBodyFromSlots({
+                                                              ...eventSlots,
+                                                              [key]: e.target.value,
+                                                            }),
+                                                          })
+                                                        }
+                                                        className={slotFieldClass}
+                                                        placeholder={`${label} prose…`}
+                                                        aria-label={label}
+                                                      />
+                                                    </div>
+                                                  ))}
+                                                </div>
+                                              ) : (
                                               <textarea
                                                 value={editingBlockData.body || ''}
                                                 onChange={(e) => setEditingBlockData({ ...editingBlockData, body: e.target.value })}
                                                 className="w-full bg-transparent border-0 px-2.5 pb-2 pt-0.5 text-slate-100 font-mono text-xs focus:outline-none min-h-[90px] resize-y"
                                                 placeholder="Enter block narrative..."
                                               />
+                                              )}
                                             </div>
+                                              );
+                                            })()}
 
                                             {stagingTightenDraftId === block.id && stagingTightenDraft !== null && (
                                               <div className="rounded-lg border border-indigo-500/30 bg-indigo-950/20 p-3 space-y-2">
