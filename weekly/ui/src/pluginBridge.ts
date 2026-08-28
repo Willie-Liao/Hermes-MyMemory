@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { WeekOverview } from './types';
@@ -258,8 +258,134 @@ async function runPluginBridge(
   });
 }
 
-export const runBridge: BridgeRunner = (input) =>
-  runPluginBridge('MyMemory/weekly', 'bridge_cli.py', input);
+let weeklyServeChild: ChildProcessWithoutNullStreams | null = null;
+let weeklyServeStdout = '';
+let weeklyServeStderr = '';
+let weeklyServeWaiter: (() => void) | null = null;
+let weeklyServeQueue: Promise<unknown> = Promise.resolve();
+/** How many times the weekly --serve child was spawned (tests). */
+export let weeklyBridgeServeSpawnCount = 0;
+
+/** Kill the persistent weekly bridge so UI shutdown does not leave python around. */
+export function stopWeeklyBridgeServe(): void {
+  weeklyServeWaiter = null;
+  const child = weeklyServeChild;
+  weeklyServeChild = null;
+  weeklyServeStdout = '';
+  weeklyServeStderr = '';
+  if (child && child.exitCode == null && !child.killed) {
+    child.kill('SIGTERM');
+  }
+}
+
+function attachWeeklyServeIo(child: ChildProcessWithoutNullStreams): void {
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (chunk: string) => {
+    weeklyServeStdout += chunk;
+    weeklyServeWaiter?.();
+  });
+  child.stderr.on('data', (chunk: string) => {
+    weeklyServeStderr += chunk;
+  });
+  child.stdin.on('error', () => {
+    /* Child may close stdin before we finish writing. */
+  });
+  child.on('close', () => {
+    if (weeklyServeChild === child) {
+      weeklyServeChild = null;
+    }
+    weeklyServeWaiter?.();
+  });
+}
+
+function ensureWeeklyServeChild(): ChildProcessWithoutNullStreams {
+  if (weeklyServeChild && weeklyServeChild.exitCode == null) {
+    return weeklyServeChild;
+  }
+  const hermesHome = resolveHermesHome();
+  const bridgePath = path.join(hermesHome, 'plugins', 'MyMemory', 'weekly', 'bridge_cli.py');
+  weeklyBridgeServeSpawnCount += 1;
+  weeklyServeStdout = '';
+  weeklyServeStderr = '';
+  const child = spawn('python3', [bridgePath, '--serve'], {
+    env: { ...process.env, HERMES_HOME: hermesHome },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }) as ChildProcessWithoutNullStreams;
+  weeklyServeChild = child;
+  attachWeeklyServeIo(child);
+  return child;
+}
+
+function runWeeklyServeOnce(input: string): Promise<BridgeRunResult> {
+  const timeoutMs = BRIDGE_CHILD_TIMEOUT_MS;
+  return new Promise((resolve, reject) => {
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = ensureWeeklyServeChild();
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    let settled = false;
+    const finish = (result: BridgeRunResult) => {
+      if (settled) return;
+      settled = true;
+      weeklyServeWaiter = null;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      const timeoutNote = `bridge timed out after ${timeoutMs}ms`;
+      child.kill('SIGTERM');
+      const killTimer = setTimeout(() => child.kill('SIGKILL'), 2_000);
+      child.once('close', () => clearTimeout(killTimer));
+      weeklyServeChild = null;
+      finish({
+        status: -1,
+        stdout: weeklyServeStdout,
+        stderr: `${weeklyServeStderr}${weeklyServeStderr.trim() ? '\n' : ''}${timeoutNote}`,
+      });
+    }, timeoutMs);
+
+    weeklyServeWaiter = () => {
+      if (settled) return;
+      const nl = weeklyServeStdout.indexOf('\n');
+      if (nl >= 0) {
+        const line = weeklyServeStdout.slice(0, nl);
+        weeklyServeStdout = weeklyServeStdout.slice(nl + 1);
+        finish({ status: 0, stdout: line, stderr: weeklyServeStderr });
+        return;
+      }
+      if (child.exitCode != null || child.killed) {
+        finish({
+          status: child.exitCode ?? -1,
+          stdout: weeklyServeStdout,
+          stderr: weeklyServeStderr,
+        });
+      }
+    };
+
+    const line = input.endsWith('\n') ? input : `${input}\n`;
+    try {
+      child.stdin.write(line, 'utf8');
+    } catch (err) {
+      stopWeeklyBridgeServe();
+      reject(err);
+      return;
+    }
+    weeklyServeWaiter();
+  });
+}
+
+export const runBridge: BridgeRunner = (input) => {
+  const queued = weeklyServeQueue.then(
+    () => runWeeklyServeOnce(String(input)),
+    () => runWeeklyServeOnce(String(input)),
+  );
+  weeklyServeQueue = queued.then(() => undefined, () => undefined);
+  return queued;
+};
 
 export const runDigestBridge: BridgeRunner = (input) =>
   runPluginBridge('MyMemory/digest', 'bridge_cli.py', input);

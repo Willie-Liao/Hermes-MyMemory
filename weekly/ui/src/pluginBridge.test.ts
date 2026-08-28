@@ -12,12 +12,16 @@ import {
   isValidMonthKey,
   isValidWeekKey,
   mapListWeeks,
+  parseBridgeStdout,
   pluginOutcomeError,
   purgedWeekSoftLoadResult,
   resolveDefaultWeekSelection,
   resolveHermesHome,
+  runBridge,
   runSpawnedPython,
+  stopWeeklyBridgeServe,
   tidyStateForWeeklyReport,
+  weeklyBridgeServeSpawnCount,
   type BridgeRunResult,
   type BridgeRunner,
 } from './pluginBridge.ts';
@@ -324,4 +328,21 @@ assert.equal(weekLifecycleLabel('re-review'), 'OPEN');
     ticks >= 3,
     `event loop must tick during python child wait, got ${ticks} ticks`,
   );
+}
+
+{
+  stopWeeklyBridgeServe();
+  const before = weeklyBridgeServeSpawnCount;
+  const payload = JSON.stringify({ op: 'weekly_status', args: {} });
+  const first = await runBridge(payload);
+  const second = await runBridge(payload);
+  try {
+    assert.equal(weeklyBridgeServeSpawnCount, before + 1);
+    assert.equal(first.status, 0);
+    assert.equal(second.status, 0);
+    assert.equal(parseBridgeStdout(first.stdout).ok, true);
+    assert.equal(parseBridgeStdout(second.stdout).ok, true);
+  } finally {
+    stopWeeklyBridgeServe();
+  }
 }
