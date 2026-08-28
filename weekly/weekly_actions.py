@@ -419,8 +419,8 @@ def generate_week(
     Slash waits in-process (background=False). UI Re-scan may pass background=True
     so the button can poll generate_in_flight instead of dying on the 5-minute
     bridge timeout. Background must not wait on _run_lock — a persistent bridge
-    would stall every other op behind the LLM. Overdue catch-up still kicks a
-    daemon via process_overdue_week_marks.
+    would stall every other op behind the LLM. A stuck generate_in_flight flag
+    with no live weekly-gen thread is re-kicked so Re-scan cannot spin forever.
     """
     _purge_orphan_daily_blocks_before_generate()
     if isinstance(background, str):
@@ -478,9 +478,17 @@ def generate_week(
     if background:
         state = weekly._load_state()
         mark = weekly.ensure_week_open_mark(state, week_key)
-        if mark.get("generate_in_flight"):
+        worker_alive = any(
+            t.name == f"weekly-gen-{week_key}" and t.is_alive()
+            for t in threading.enumerate()
+        )
+        if mark.get("generate_in_flight") and worker_alive:
             weekly._save_state(state)
             return started
+        if mark.get("generate_in_flight") and not worker_alive:
+            weekly._log(
+                f"weekly generate_in_flight stale, re-kick {week_key} reason={reason}"
+            )
         weekly._log(f"weekly generation waiting for lock ({reason}) week={week_key}")
         if not weekly._run_lock.acquire(blocking=False):
             return started
@@ -516,10 +524,9 @@ def generate_week(
                 }
             state = weekly._load_state()
             mark = weekly.ensure_week_open_mark(state, week_key)
-            already = bool(mark.get("generate_in_flight"))
             mark["generate_in_flight"] = True
             weekly._save_state(state)
-            if not already:
+            if not worker_alive:
                 _kick_background_generate_week(week_key)
             return started
         finally:

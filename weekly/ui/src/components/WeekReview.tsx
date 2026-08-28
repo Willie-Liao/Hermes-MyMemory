@@ -1080,7 +1080,7 @@ export default function WeekReview({
               <button
                 onClick={handleRescanWeek}
                 disabled={rescanLoading || !selectedWeek}
-                className="flex items-center justify-center gap-1 px-2.5 py-1 bg-slate-950 hover:bg-slate-900 border border-slate-850 text-slate-400 hover:text-slate-200 rounded-lg transition-all cursor-pointer active:scale-95 disabled:opacity-50 text-[10px] font-semibold font-mono whitespace-nowrap"
+                className="relative z-50 flex items-center justify-center gap-1 px-2.5 py-1 bg-slate-950 hover:bg-slate-900 border border-slate-850 text-slate-400 hover:text-slate-200 rounded-lg transition-all cursor-pointer active:scale-95 disabled:opacity-50 text-[10px] font-semibold font-mono whitespace-nowrap"
                 title="Re-scan and regenerate weekly draft (same as /weekly update)"
               >
                 <RefreshCw className={`w-3 h-3 ${rescanLoading ? 'animate-spin' : ''}`} />
