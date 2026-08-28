@@ -346,3 +346,18 @@ assert.equal(weekLifecycleLabel('re-review'), 'OPEN');
     stopWeeklyBridgeServe();
   }
 }
+
+{
+  stopWeeklyBridgeServe();
+  const payload = JSON.stringify({ op: 'weekly_status', args: {} });
+  await runBridge(payload);
+  const afterFirst = weeklyBridgeServeSpawnCount;
+  stopWeeklyBridgeServe();
+  await new Promise((r) => setTimeout(r, 250));
+  await runBridge(payload);
+  try {
+    assert.equal(weeklyBridgeServeSpawnCount, afterFirst + 1);
+  } finally {
+    stopWeeklyBridgeServe();
+  }
+}

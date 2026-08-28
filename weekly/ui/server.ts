@@ -40,6 +40,7 @@ import {
   pluginOutcomeError,
   purgedWeekSoftLoadResult,
   resolveHermesHome,
+  stopWeeklyBridgeServe,
   tidyStateForWeeklyReport,
 } from './src/pluginBridge';
 import { appendWeeklyUiLog, truncateUiLogDetail } from './src/weeklyUiLog';
@@ -92,6 +93,7 @@ async function startServer() {
     },
     onShutdown: (reason) => {
       console.log(`Weekly UI shutting down (${reason}).`);
+      stopWeeklyBridgeServe();
       setTimeout(() => {
         process.exit(0);
       }, 150);
