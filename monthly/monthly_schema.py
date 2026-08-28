@@ -11,6 +11,7 @@ from typing import Any
 
 CAP_DECISIONS = 12
 CAP_PROCEDURES = 8
+CAP_SUMMARY = 8
 CAP_PROGRESS = 6
 CAP_CROSS_WEEK = 6
 CAP_RISKS = 5
@@ -115,6 +116,21 @@ class MonthlyUserImage:
 
 
 @dataclass(frozen=True)
+class MonthlySummaryItem:
+    """One main month story as a single line so Band D cannot glue two threads into a paragraph.
+
+    Weeks stay ISO week keys (not Monday–Sunday names) because a month story spans weekly files.
+    """
+
+    text: str
+    weeks: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not str(self.text).strip():
+            raise ValueError("MonthlySummaryItem.text must be non-empty")
+
+
+@dataclass(frozen=True)
 class MonthlyProgress:
     """Group a cross-week story without copying Distill bodies into L4."""
 
@@ -132,35 +148,78 @@ class MonthlyProgress:
 
 @dataclass(frozen=True)
 class MonthlyDecision:
-    """Keep the ruling verbatim so an LLM rewording cannot silently change a must-not."""
+    """Keep the ruling verbatim so an LLM rewording cannot silently change a must-not.
+
+    Context and exceptions exist so recall can match *when* the preference applies
+    instead of retrieving a standing rule for every chat turn.
+    """
 
     id: str
     kind: str
     text: str
     why_it_matters: str = ""
+    context: str = ""
+    exceptions: str = ""
     date: str = ""
     valid_to: str = ""
     entity_keys: tuple[str, ...] = ()
     supersedes: tuple[str, ...] = ()
     evidence: tuple[str, ...] = ()
+    occurrence_n: int = 1
+    first_seen: str = ""
+    last_seen: str = ""
+    strength: float = 0.0
 
     def __post_init__(self) -> None:
         _require_evidence(self.why_it_matters, self.evidence, "key_decisions")
 
+    def lookup_text(self) -> str:
+        """Join applicability fields so guidance ranking does not search verbatim rulings alone."""
+        parts = [
+            " ".join(self.entity_keys),
+            self.context,
+            self.text,
+            self.exceptions,
+            self.why_it_matters,
+        ]
+        return " ".join(p for p in parts if str(p).strip())
+
 
 @dataclass(frozen=True)
 class MonthlyProcedure:
-    """Store the reusable Solution: clause and an insight, never the Obstacle: dump."""
+    """Store the reusable Solution: plus trigger/obstacles so recall can match a task, not a dump.
+
+    Obstacle clauses stay mechanical so the model cannot invent a failure the daily cards never named.
+    """
 
     id: str
     problem: str
     solution: str
     insight: str = ""
+    trigger: str = ""
+    obstacles: tuple[str, ...] = ()
+    entity_keys: tuple[str, ...] = ()
     weeks: tuple[str, ...] = ()
     evidence: tuple[str, ...] = ()
+    occurrence_n: int = 1
+    first_seen: str = ""
+    last_seen: str = ""
+    strength: float = 0.0
 
     def __post_init__(self) -> None:
         _require_evidence(self.problem, self.evidence, "key_procedures")
+
+    def lookup_text(self) -> str:
+        """Join trigger/problem/obstacles/solution so a paraphrased task can hit the case."""
+        parts = [
+            " ".join(self.entity_keys),
+            self.trigger,
+            self.problem,
+            " ".join(self.obstacles),
+            self.solution,
+            self.insight,
+        ]
+        return " ".join(p for p in parts if str(p).strip())
 
 
 @dataclass(frozen=True)
@@ -295,7 +354,7 @@ class MonthlyPayload:
     range: MonthlyRange = field(default_factory=lambda: MonthlyRange(start="", end=""))
     generated_at: str = ""
     generator: MonthlyGenerator = field(default_factory=MonthlyGenerator)
-    summary: str = ""
+    summary: tuple[MonthlySummaryItem, ...] = ()
     user_image: MonthlyUserImage = field(default_factory=MonthlyUserImage)
     core_progress: tuple[MonthlyProgress, ...] = ()
     key_decisions: tuple[MonthlyDecision, ...] = ()
@@ -307,11 +366,12 @@ class MonthlyPayload:
     state: tuple[MonthlyState, ...] = ()
     entities: tuple[MonthlyEntity, ...] = ()
     metrics: MonthlyMetrics = field(default_factory=MonthlyMetrics)
-    schema_version: int = 1
+    schema_version: int = 2
     cycle: str = "monthly"
 
     def __post_init__(self) -> None:
         caps = (
+            (self.summary, CAP_SUMMARY, "summary"),
             (self.core_progress, CAP_PROGRESS, "core_progress"),
             (self.key_decisions, CAP_DECISIONS, "key_decisions"),
             (self.key_procedures, CAP_PROCEDURES, "key_procedures"),
@@ -356,7 +416,9 @@ def payload_to_dict(payload: MonthlyPayload) -> dict[str, Any]:
             "stages": dict(payload.generator.stages),
             "batch_tokens": payload.generator.batch_tokens,
         },
-        "summary": payload.summary,
+        "summary": [
+            {"text": row.text, "weeks": list(row.weeks)} for row in payload.summary
+        ],
         "user_image": {
             "goal_alignment": evidence_text(img.goal_alignment),
             "cognition_change": [
@@ -398,22 +460,35 @@ def payload_to_dict(payload: MonthlyPayload) -> dict[str, Any]:
                 "kind": row.kind,
                 "text": row.text,
                 "why_it_matters": row.why_it_matters,
+                "context": row.context,
+                "exceptions": row.exceptions,
                 "date": row.date,
                 "valid_to": row.valid_to,
                 "entity_keys": list(row.entity_keys),
                 "supersedes": list(row.supersedes),
                 "evidence": list(row.evidence),
+                "occurrence_n": row.occurrence_n,
+                "first_seen": row.first_seen,
+                "last_seen": row.last_seen,
+                "strength": row.strength,
             }
             for row in payload.key_decisions
         ],
         "key_procedures": [
             {
                 "id": row.id,
+                "trigger": row.trigger,
                 "problem": row.problem,
+                "obstacles": list(row.obstacles),
                 "solution": row.solution,
                 "insight": row.insight,
+                "entity_keys": list(row.entity_keys),
                 "weeks": list(row.weeks),
                 "evidence": list(row.evidence),
+                "occurrence_n": row.occurrence_n,
+                "first_seen": row.first_seen,
+                "last_seen": row.last_seen,
+                "strength": row.strength,
             }
             for row in payload.key_procedures
         ],

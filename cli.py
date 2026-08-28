@@ -1,4 +1,4 @@
-"""CLI for ``hermes MyMemory digest|weekly`` — same handlers as in-chat /digest /weekly."""
+"""CLI for ``hermes MyMemory digest|weekly|monthly`` — same handlers as in-chat slash commands."""
 
 from __future__ import annotations
 
@@ -12,10 +12,11 @@ if str(_plugins_root) not in sys.path:
 
 from .digest import slash as digest_slash
 from .weekly import slash as weekly_slash
+from .monthly.monthly_actions import handle_monthly
 
 
 def register_cli(subparser) -> None:
-    """Build ``hermes MyMemory digest …`` and ``hermes MyMemory weekly …``."""
+    """Build ``hermes MyMemory digest …``, weekly, and monthly subcommands."""
     subs = subparser.add_subparsers(dest="mymemory_command")
     digest_p = subs.add_parser(
         "digest",
@@ -35,10 +36,19 @@ def register_cli(subparser) -> None:
         nargs=argparse.REMAINDER,
         help="Same tokens as the old /weekly command",
     )
+    monthly_p = subs.add_parser(
+        "monthly",
+        help="Monthly guidance: update / show",
+    )
+    monthly_p.add_argument(
+        "tokens",
+        nargs=argparse.REMAINDER,
+        help="Same tokens as /monthly",
+    )
 
 
 def MyMemory_command(args) -> None:
-    """Dispatch ``hermes MyMemory`` to digest or weekly slash handlers.
+    """Dispatch ``hermes MyMemory`` to digest, weekly, or monthly handlers.
 
     Confirmed history runs stay on the CLI thread so the process cannot exit
     while Phase-1/Phase-2 workers are still writing staging.
@@ -55,4 +65,7 @@ def MyMemory_command(args) -> None:
     if cmd == "weekly":
         print(weekly_slash.handle_weekly(raw))
         return
-    print("Usage: hermes MyMemory digest|weekly [args]")
+    if cmd == "monthly":
+        print(handle_monthly(raw))
+        return
+    print("Usage: hermes MyMemory digest|weekly|monthly [args]")

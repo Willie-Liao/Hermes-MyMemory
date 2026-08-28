@@ -6,6 +6,7 @@ from monthly_schema import (
     MonthlyPayload,
     MonthlyProgress,
     MonthlyRange,
+    MonthlySummaryItem,
     payload_to_dict,
 )
 from monthly_writer import dump_yaml, load_month, loads, write_month
@@ -16,7 +17,7 @@ def _payload() -> MonthlyPayload:
         key="2026-08",
         weeks=("2026-W32",),
         range=MonthlyRange(start="2026-08-01", end="2026-08-31"),
-        summary="one line",
+        summary=(MonthlySummaryItem(text="one line", weeks=()),),
         core_progress=(
             MonthlyProgress(
                 id="cp-1",
@@ -43,7 +44,8 @@ def test_write_month_uses_month_status_and_round_trips(tmp_path, monkeypatch):
     text = path.read_text(encoding="utf-8")
     assert text.startswith("---\nmonth: 2026-08\nmonth_status: pending\n---\n")
     loaded = load_month("2026-08")
-    assert loaded.summary == "one line"
+    assert loaded.summary[0].text == "one line"
+    assert isinstance(loaded.summary, tuple)
     assert loaded.range.start == "2026-08-01"
     from monthly_writer import dumps
 

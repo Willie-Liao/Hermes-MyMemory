@@ -476,10 +476,10 @@ def test_analysts_receive_merged_event_context(tmp_path, monkeypatch):
     assert result is not None
     assert set(analyst_prompts) == {"worker1_thread"}
     for purpose, prompt in analyst_prompts.items():
-        assert "MERGED EVENTS" in prompt, purpose
+        assert "MERGED EVENTS" not in prompt, purpose
+        assert "CANDIDATE INDEX" in prompt, purpose
         assert "CITATION LEGEND" in prompt, purpose
-        # Merged context should mention at least one event id / date
-        assert "evt-" in prompt or "2026-06" in prompt, purpose
+        assert "evt-" in prompt or "2026-06" in prompt or "mem-" in prompt, purpose
 
 
 def test_event_worker_failure_bounded_fallback_keeps_day(tmp_path, monkeypatch):
@@ -844,8 +844,8 @@ def test_entity_span_fallback_when_thread_llm_empty(tmp_path, monkeypatch):
     assert w1.payload.cross_day_thread
     assert w1.cross_day_thread[0].confidence == "medium"
     assert set(w1.cross_day_thread[0].related_event_ids) >= {
-        "evt-2026-06-29",
-        "evt-2026-06-30",
+        "mem-2026-06-29-a",
+        "mem-2026-06-30-a",
     }
 
 

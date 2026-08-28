@@ -118,6 +118,51 @@ export function reviewPendingButtonLabel(op: WeeklyReviewPendingOp): string {
   }
 }
 
+/** Slot values for an event card; prefixes stay in formatEventBodyFromSlots, not here. */
+export type EventBodySlots = {
+  beginning: string;
+  course: string;
+  outcome: string;
+};
+
+const _EVENT_SEMI_RE =
+  /^Beginning:\s*(.*?);\s*Course:\s*(.*?);\s*Outcome:\s*(.*)$/s;
+const _EVENT_LOOSE_RE =
+  /Beginning:\s*(.*?)\s*Course:\s*(.*?)\s*Outcome:\s*(.*)$/is;
+
+function _trimSlot(value: string): string {
+  return value.trim().replace(/;+$/, '').trim();
+}
+
+/** Split a daily event body so the editor can lock Beginning:/Course:/Outcome: as labels.
+
+  A single textarea lets people delete those prefixes and save a card digest cannot re-parse.
+  */
+export function parseEventBodySlots(body: string): EventBodySlots {
+  const text = String(body || '').trim();
+  const match = text.match(_EVENT_SEMI_RE) || text.match(_EVENT_LOOSE_RE);
+  if (match) {
+    return {
+      beginning: _trimSlot(match[1] || ''),
+      course: _trimSlot(match[2] || ''),
+      outcome: (match[3] || '').trim(),
+    };
+  }
+  return { beginning: text, course: '', outcome: '' };
+}
+
+/** Join slot prose the same way digest_tools does so disk bodies stay machine-parseable.
+
+  Labels live only in this join; the UI never puts them in the editable fields.
+  */
+export function formatEventBodyFromSlots(slots: EventBodySlots): string {
+  return (
+    `Beginning: ${slots.beginning.trim()}; ` +
+    `Course: ${slots.course.trim()}; ` +
+    `Outcome: ${slots.outcome.trim()}`
+  );
+}
+
 /** After weekly review Save — per-row Recall labels. */
 export function reviewRecallButtonLabel(op: WeeklyReviewPendingOp): string {
   switch (op.kind) {

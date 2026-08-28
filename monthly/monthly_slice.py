@@ -31,7 +31,7 @@ from monthly_schema import (  # noqa: E402
     month_key as format_month_key,
 )
 from monthly_state import hermes_home  # noqa: E402
-from weekly_event_workers import parse_blocks  # noqa: E402
+from weekly_event_workers import _score_event_clusters, parse_blocks  # noqa: E402
 from weekly_json import load_sidecar, normalize_entity_key  # noqa: E402
 
 _MEM_ID_RE = re.compile(
@@ -166,6 +166,10 @@ class MechanicalFacts:
     behavior: dict[str, Any]
     blocks_by_id: dict[str, SliceBlock] = field(default_factory=dict)
     all_dpe: tuple[SliceBlock, ...] = ()
+    dp_groups: tuple[dict[str, Any], ...] = ()
+    weekly_summaries: tuple[dict[str, Any], ...] = ()
+    cross_week_candidates: tuple[dict[str, Any], ...] = ()
+    story_seeds: tuple[dict[str, Any], ...] = ()
 
     def rendered(self) -> str:
         lines = [
@@ -180,6 +184,18 @@ class MechanicalFacts:
         if self.intra_day_thread_text.strip():
             lines.append("intra_day_thread:")
             lines.append(self.intra_day_thread_text)
+        if self.dp_groups:
+            lines.append("dp_groups:")
+            lines.append(str([{"id": g["id"], "type": g["type"], "n": g["occurrence_n"]} for g in self.dp_groups]))
+        if self.weekly_summaries:
+            lines.append("weekly_summaries:")
+            lines.append(str(list(self.weekly_summaries)))
+        if self.cross_week_candidates:
+            lines.append("cross_week_candidates:")
+            lines.append(str(list(self.cross_week_candidates)))
+        if self.story_seeds:
+            lines.append("story_seeds:")
+            lines.append(str(list(self.story_seeds)))
         return "\n".join(lines)
 
 
@@ -387,6 +403,290 @@ def _kind_from_clause(clause: str) -> str:
     return "decision"
 
 
+def _importance_int(block: SliceBlock) -> int:
+    try:
+        return int(str(block.importance or "3").strip() or 3)
+    except ValueError:
+        return 3
+
+
+def _obstacle_clause(clause: str) -> str:
+    text = clause_body(clause)
+    if "Obstacle:" not in text:
+        return ""
+    chunk = text.split("Obstacle:", 1)[1]
+    if "Solution:" in chunk:
+        chunk = chunk.split("Solution:", 1)[0]
+    return chunk.strip().rstrip(".;")
+
+
+def _exception_clause(clause: str) -> str:
+    """Keep only explicit exception language so guidance cannot invent a carve-out."""
+    text = clause_body(clause)
+    lowered = text.casefold()
+    marker = "exception:"
+    if marker in lowered:
+        idx = lowered.index(marker)
+        return text[idx + len(marker) :].split(";", 1)[0].strip()
+    if " except " in f" {lowered} ":
+        return ""
+    return ""
+
+
+def _beginning_clause(clause: str) -> str:
+    text = clause_body(clause)
+    if "Beginning:" in text:
+        chunk = text.split("Beginning:", 1)[1]
+        for stop in ("Course:", "Outcome:"):
+            if stop in chunk:
+                chunk = chunk.split(stop, 1)[0]
+        return chunk.strip()
+    return text.strip()[:200]
+
+
+def _week_start(week_key: str) -> date | None:
+    year_s, _, week_s = (week_key or "").partition("-W")
+    try:
+        return date.fromisocalendar(int(year_s), int(week_s), 1)
+    except ValueError:
+        return None
+
+
+def _block_to_cluster_card(block: SliceBlock) -> dict[str, Any]:
+    return {
+        "event_id": block.id,
+        "date": block.day,
+        "entity": block.entity,
+        "predicate": block.type,
+        "body": clause_body(block.clause),
+        "snippet": clause_body(block.clause)[:180],
+    }
+
+
+def _inverse_event_text(
+    target_ids: set[str],
+    events: Iterable[SliceBlock],
+) -> str:
+    linked = [e for e in events if target_ids.intersection(e.related)]
+    if not linked:
+        return ""
+    linked.sort(key=lambda b: b.day, reverse=True)
+    return _beginning_clause(linked[0].clause)
+
+
+def _cluster_same_type(
+    blocks: list[SliceBlock],
+    *,
+    events: tuple[SliceBlock, ...],
+    group_type: str,
+    kind: str,
+) -> list[dict[str, Any]]:
+    """Group repeated same-type D/P cards; P=1 so a singleton still becomes a month row."""
+    if not blocks:
+        return []
+    cards = [_block_to_cluster_card(b) for b in blocks]
+    by_id = {b.id: b for b in blocks}
+    clusters = _score_event_clusters(cards, min_distinct_periods=1)
+    out: list[dict[str, Any]] = []
+    from recall.strength import strength_value
+
+    for members in clusters:
+        member_blocks = [by_id[m["event_id"]] for m in members if m["event_id"] in by_id]
+        if not member_blocks:
+            continue
+        superseded = {sid for b in member_blocks for sid in b.supersedes}
+        live = [b for b in member_blocks if b.id not in superseded] or member_blocks
+        live.sort(key=lambda b: (b.day, b.id), reverse=True)
+        rep = live[0]
+        evidence = tuple(b.id for b in sorted(member_blocks, key=lambda b: (b.day, b.id)))
+        first = min(b.day for b in member_blocks).isoformat()
+        last = max(b.day for b in member_blocks).isoformat()
+        n = len(evidence)
+        importance = max(_importance_int(b) for b in member_blocks)
+        strength = strength_value(
+            recall_n=n,
+            first_seen=first,
+            importance=importance,
+            now=max(b.day for b in member_blocks),
+        )
+        linked_ids = {b.id for b in member_blocks}
+        inverse = _inverse_event_text(linked_ids, events)
+        fallback = rep.entity or (rep.entity_key)
+        context = inverse or fallback
+        weeks = tuple(sorted({b.week_key for b in member_blocks}))
+        obstacles = tuple(
+            dict.fromkeys(text for b in member_blocks if (text := _obstacle_clause(b.clause)))
+        )
+        exceptions = next(
+            (text for b in member_blocks if (text := _exception_clause(b.clause))),
+            "",
+        )
+        row: dict[str, Any] = {
+            "type": group_type,
+            "kind": kind,
+            "id": rep.id,
+            "text": clause_body(rep.clause),
+            "problem": obstacles[0] if obstacles else "",
+            "solution": "",
+            "obstacles": obstacles,
+            "context": context if group_type == "decision" else "",
+            "trigger": context if group_type == "procedure" else "",
+            "exceptions": exceptions,
+            "entity_keys": tuple(dict.fromkeys(b.entity_key for b in member_blocks if b.entity_key)),
+            "supersedes": tuple(dict.fromkeys(sid for b in member_blocks for sid in b.supersedes)),
+            "evidence": evidence,
+            "occurrence_n": n,
+            "first_seen": first,
+            "last_seen": last,
+            "strength": strength,
+            "date": rep.valid_from,
+            "valid_to": rep.valid_to,
+            "weeks": weeks,
+        }
+        if group_type == "decision":
+            text = clause_body(rep.clause)
+            for prefix in ("Decision:", "Preference:"):
+                if text.startswith(prefix):
+                    text = text[len(prefix) :].strip()
+                    break
+            row["text"] = text
+        else:
+            text = clause_body(rep.clause)
+            if "Solution:" in text:
+                text = text.split("Solution:", 1)[1].strip()
+            row["solution"] = text
+            row["text"] = ""
+        out.append(row)
+    out.sort(key=lambda r: (-float(r["strength"]), r["last_seen"], r["id"]))
+    return out
+
+
+def _collect_weekly_inputs(month_key: str, weeks: tuple[str, ...]) -> tuple[
+    tuple[dict[str, Any], ...],
+    tuple[dict[str, Any], ...],
+    tuple[dict[str, Any], ...],
+]:
+    """Read overlapping weekly sidecars: summary rows, locked two-week clusters, story seeds."""
+    start, end = calendar_range(month_key)
+    summaries: list[dict[str, Any]] = []
+    thread_cards: list[dict[str, Any]] = []
+    folder = weekly_dir()
+    if not folder.is_dir():
+        return (), (), ()
+    for path in sorted(folder.glob("*.md")):
+        try:
+            obj = load_sidecar(path)
+        except (OSError, ValueError, FileNotFoundError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        week = str(obj.get("week_key") or path.stem)
+        week_start = _week_start(week)
+        belongs = str(obj.get("belongs_to") or "")
+        overlap = week in weeks or belongs == month_key
+        if week_start is not None:
+            week_end = week_start + timedelta(days=6)
+            overlap = overlap or (week_start <= end and week_end >= start)
+        if not overlap:
+            continue
+        for row in obj.get("summary") or []:
+            if isinstance(row, str) and row.strip():
+                summaries.append({"text": row.strip(), "week_key": week, "weeks": [week]})
+            elif isinstance(row, dict) and str(row.get("text") or "").strip():
+                summaries.append(
+                    {
+                        "text": str(row.get("text") or "").strip(),
+                        "week_key": week,
+                        "weeks": [week],
+                    }
+                )
+        for thread in obj.get("cross-day-thread") or []:
+            if not isinstance(thread, dict):
+                continue
+            label = str(thread.get("label") or "").strip()
+            steps = thread.get("steps") or []
+            step_text = []
+            evidence: list[str] = []
+            for step in steps if isinstance(steps, list) else []:
+                if not isinstance(step, dict):
+                    continue
+                eid = str(step.get("event_id") or "").strip()
+                if eid.startswith("mem-"):
+                    evidence.append(eid)
+                snippet = str(step.get("snippet") or step.get("text") or "").strip()
+                if snippet:
+                    step_text.append(snippet)
+            keys = thread.get("entity_keys") or []
+            entity = " ".join(str(k) for k in keys) if isinstance(keys, (list, tuple)) else ""
+            thread_cards.append(
+                {
+                    "event_id": str(thread.get("id") or f"{week}-{label}")[:80],
+                    "date": week_start or start,
+                    "entity": entity,
+                    "predicate": "cross-day-thread",
+                    "body": " ".join([label, *step_text]),
+                    "snippet": label or " ".join(step_text)[:180],
+                    "week_key": week,
+                    "label": label,
+                    "evidence": tuple(dict.fromkeys(evidence)),
+                }
+            )
+    clusters = _score_event_clusters(thread_cards, min_distinct_periods=2) if thread_cards else []
+    locked: list[dict[str, Any]] = []
+    clustered_text: list[str] = []
+    for i, members in enumerate(clusters, start=1):
+        weeks_hit = tuple(sorted({str(m.get("week_key") or "") for m in members if m.get("week_key")}))
+        evidence = tuple(
+            dict.fromkeys(eid for m in members for eid in (m.get("evidence") or ()) if eid)
+        )
+        label = str(members[0].get("label") or members[0].get("snippet") or f"cw-{i}")
+        locked.append(
+            {
+                "id": f"cw-{i}",
+                "name": label,
+                "label": label,
+                "weeks": list(weeks_hit),
+                "evidence": list(evidence),
+                "start_period": weeks_hit[0] if weeks_hit else "",
+            }
+        )
+        clustered_text.append(label.casefold())
+        for m in members:
+            clustered_text.append(str(m.get("snippet") or "").casefold())
+    seeds: list[dict[str, Any]] = []
+    for cluster in locked:
+        seeds.append(
+            {
+                "text": cluster["label"],
+                "weeks": list(cluster["weeks"]),
+                "source": "cross-week",
+            }
+        )
+    for row in summaries:
+        blob = row["text"].casefold()
+        absorbed = any(blob and blob in other or (other and other in blob) for other in clustered_text if other)
+        if absorbed:
+            continue
+        seeds.append({"text": row["text"], "weeks": list(row["weeks"]), "source": "weekly-summary"})
+    return tuple(summaries), tuple(locked), tuple(seeds)
+
+
+def _build_dp_groups(month_blocks: tuple[SliceBlock, ...]) -> tuple[dict[str, Any], ...]:
+    events = tuple(b for b in month_blocks if b.type == "event")
+    procedures = [b for b in month_blocks if b.type == "procedure"]
+    preferences = [
+        b for b in month_blocks if b.type == "decision" and _kind_from_clause(b.clause) == "preference"
+    ]
+    decisions = [
+        b for b in month_blocks if b.type == "decision" and _kind_from_clause(b.clause) != "preference"
+    ]
+    groups: list[dict[str, Any]] = []
+    groups.extend(_cluster_same_type(procedures, events=events, group_type="procedure", kind="procedure"))
+    groups.extend(_cluster_same_type(preferences, events=events, group_type="decision", kind="preference"))
+    groups.extend(_cluster_same_type(decisions, events=events, group_type="decision", kind="decision"))
+    return tuple(groups)
+
+
 def mechanical_facts(month_key: str) -> MechanicalFacts:
     """Build counts, state rows, and bilingual entity aliases with zero LLM calls so monthly roster keys cannot split on original-language surfaces."""
     month_blocks = blocks_for_month(month_key)
@@ -573,6 +873,9 @@ def mechanical_facts(month_key: str) -> MechanicalFacts:
             if intra:
                 intra_bits.append(f"{week}: {intra}")
 
+    dp_groups = _build_dp_groups(month_blocks)
+    weekly_summaries, cross_week_candidates, story_seeds = _collect_weekly_inputs(month_key, weeks)
+
     metrics = MonthlyMetrics(
         decisions=counts.get("decision", 0),
         procedures=counts.get("procedure", 0),
@@ -603,6 +906,10 @@ def mechanical_facts(month_key: str) -> MechanicalFacts:
         behavior=behavior,
         blocks_by_id={b.id: b for b in month_blocks},
         all_dpe=dpe,
+        dp_groups=dp_groups,
+        weekly_summaries=weekly_summaries,
+        cross_week_candidates=cross_week_candidates,
+        story_seeds=story_seeds,
     )
 
 
@@ -620,10 +927,11 @@ def carry_card(previous_month_key: str) -> str:
     unfinished = [
         item.name for item in payload.cross_week_items if item.current_status != "completed"
     ]
+    summary_bits = [row.text for row in payload.summary]
     text = "\n".join(
         [
             f"previous_month: {payload.key}",
-            f"summary: {payload.summary}",
+            f"summary: {summary_bits}",
             f"current_state: {current_state}",
             f"unfinished: {unfinished}",
         ]
@@ -635,3 +943,54 @@ def carry_card(previous_month_key: str) -> str:
 
 def slice_corpus_tokens(month_key: str) -> int:
     return sum(row.tokens for row in week_slices(month_key))
+
+
+def canonical_source_fingerprint(month_key: str) -> str:
+    """Hash semantic D/P + weekly story fields so recall stamps cannot retrigger a month generate."""
+    import json
+
+    start, end = calendar_range(month_key)
+    parts: list[str] = []
+    for day, fm, body in load_all_blocks():
+        if day < start or day > end:
+            continue
+        kind = str(fm.get("type") or "").strip().casefold()
+        if kind not in {"decision", "procedure"}:
+            continue
+        parts.append(
+            "|".join(
+                (
+                    str(fm.get("id") or ""),
+                    kind,
+                    clause_body(str(body or "")),
+                    str(fm.get("related") or ""),
+                    str(fm.get("supersedes") or ""),
+                )
+            )
+        )
+    folder = weekly_dir()
+    if folder.is_dir():
+        for path in sorted(folder.glob("*.md")):
+            try:
+                obj = load_sidecar(path)
+            except (OSError, ValueError, FileNotFoundError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            week = str(obj.get("week_key") or path.stem)
+            week_start = _week_start(week)
+            belongs = str(obj.get("belongs_to") or "")
+            overlap = belongs == month_key
+            if week_start is not None:
+                week_end = week_start + timedelta(days=6)
+                overlap = overlap or (week_start <= end and week_end >= start)
+            if not overlap:
+                continue
+            parts.append(week)
+            parts.append(json.dumps(obj.get("summary"), ensure_ascii=False, sort_keys=True, default=str))
+            parts.append(
+                json.dumps(obj.get("cross-day-thread"), ensure_ascii=False, sort_keys=True, default=str)
+            )
+    if not parts:
+        return ""
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()

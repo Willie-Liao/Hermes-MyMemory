@@ -36,13 +36,16 @@ _BOOTSTRAPPED = False
 
 _SYSTEM_PROMPT_BLOCK = (
     "Digest recall bands (recent wrap-ups, entity index, week summaries with "
-    "ISO ranges, month summaries with ISO ranges) inject once per civil day. "
-    "If a week or month block matches the question, call recall_memory with "
-    "time_from and time_to set to that block's printed ISO start and end. "
-    "Fetch mem- ids from that index with recall_memory / expand_memory; read "
-    "daily YAML for bodies. Do not treat weekly/*.md or monthly/*.md as the "
-    "card corpus. MEMORY.md and USER.md are already in the system prompt — "
-    "do not expect those hot files in the bands."
+    "ISO ranges, month stories as one dash per main story plus standing "
+    "preferences/procedures) inject once per civil day. Matching preference "
+    "is a constraint; matching procedure is a reusable case. If no monthly "
+    "guidance admits, search daily decision/procedure cards only. If a week "
+    "or month block matches the question, call recall_memory with time_from "
+    "and time_to set to that block's printed ISO start and end. Fetch mem- ids "
+    "from that index with recall_memory / expand_memory; read daily YAML for "
+    "bodies. Do not treat weekly/*.md or monthly/*.md as the card corpus. "
+    "MEMORY.md and USER.md are already in the system prompt — do not expect "
+    "those hot files in the bands."
 )
 
 
@@ -119,6 +122,18 @@ class MyMemoryProvider(MemoryProvider):
                 text = str(hit.get("context") or "").strip()
                 if text:
                     parts.append(text)
+        q = str(query or "").strip()
+        from recall.tools import _MEM_ID_RE, recall_memory
+
+        if q and not _MEM_ID_RE.search(q):
+            try:
+                root = Path(digest.get_hermes_home()) / "memories" / "staging"
+                guided = recall_memory(q, staging=root, mode="guidance")
+                head = (guided or "").split("\n", 1)[0]
+                if guided.strip() and "channel=miss" not in head:
+                    parts.append(guided.strip())
+            except Exception:
+                pass
         joined = "\n\n".join(parts)
         if "<memory-context>" in joined:
             joined = joined.replace("<memory-context>", "").replace("</memory-context>", "")
@@ -220,6 +235,22 @@ class MyMemoryProvider(MemoryProvider):
                     },
                 },
             },
+            {
+                "name": "mymemory_monthly",
+                "description": (
+                    "Monthly guidance: update or show. "
+                    "Pass the same tokens as /monthly (update, show, help)."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "args": {
+                            "type": "string",
+                            "description": "Monthly subcommand tokens, e.g. 'show' or 'update 2026-08'.",
+                        }
+                    },
+                },
+            },
             *TOOL_SCHEMAS,
         ]
 
@@ -277,6 +308,13 @@ class MyMemoryProvider(MemoryProvider):
                 {"ok": True, "text": weekly_slash.handle_weekly(raw)},
                 ensure_ascii=False,
             )
+        if tool_name == "mymemory_monthly":
+            from .monthly.monthly_actions import handle_monthly
+
+            return json.dumps(
+                {"ok": True, "text": handle_monthly(raw)},
+                ensure_ascii=False,
+            )
         raise NotImplementedError(f"Provider {self.name} does not handle tool {tool_name}")
 
     def shutdown(self) -> None:
@@ -286,7 +324,7 @@ class MyMemoryProvider(MemoryProvider):
 
 
 def _register_slash_commands() -> None:
-    """Put /digest and /weekly on PluginManager; exclusive load never calls register_command.
+    """Put /digest, /weekly, and /monthly on PluginManager; exclusive load never calls register_command.
 
     The memory loader's fake context has no register_command. Without this,
     those names never enter _plugin_commands and chat treats them as unknown.
@@ -322,6 +360,14 @@ def _register_slash_commands() -> None:
             weekly_slash.handle_weekly,
             description="Weekly memory: ui / update / close / reopen",
             args_hint="[ui|update [week]|close [week]|reopen [week]|help]",
+        )
+        from .monthly.monthly_actions import handle_monthly
+
+        ctx.register_command(
+            "monthly",
+            handle_monthly,
+            description="Monthly guidance: update / show",
+            args_hint="[update [YYYY-MM]|show [YYYY-MM]|help]",
         )
     except Exception:
         return

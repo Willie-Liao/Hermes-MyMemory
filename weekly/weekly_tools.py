@@ -8,6 +8,7 @@ Registration uses Hermes ``tools.registry.registry`` with toolset
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 from collections.abc import Mapping, Sequence
@@ -169,13 +170,7 @@ def skip_weekly_event_schema() -> dict[str, Any]:
 def _thread_step_props() -> dict[str, Any]:
     return {
         "seq": {"type": "integer"},
-        "date": {
-            "type": "string",
-            "description": (
-                "YYYY-MM-DD of this event's valid_from on an input day this week. "
-                "Do not use the story's origin date if that day is outside the week."
-            ),
-        },
+        "date": {"type": "string"},
         "event_id": {"type": "string"},
         "text": {"type": "string"},
         "via": {"type": "string", "enum": ["evolves", "invalidates"]},
@@ -206,12 +201,13 @@ def _thread_item_props() -> dict[str, Any]:
     }
 
 
-def submit_weekly_thread_schema() -> dict[str, Any]:
-    return _schema(
+def submit_weekly_thread_schema(
+    event_ids: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Lock event_id to this week's daily event mem-ids when provided so the model cannot mint w-evt-*."""
+    schema = _schema(
         "submit_weekly_thread",
-        "Submit cross-day-thread chains. Use existing daily event ids. "
-        "Step date must be that event's valid_from on an input day this ISO week. "
-        "Do not invent wrap-ups, entities, legend, or dates from last week / future weekdays.",
+        "Submit cross-day-thread chains. Copy event_id from the candidate index. Do not invent wrap-ups, entities, or legend.",
         {
             "cross-day-thread": {
                 "type": "array",
@@ -224,10 +220,26 @@ def submit_weekly_thread_schema() -> dict[str, Any]:
         },
         ["cross-day-thread"],
     )
+    allowed = sorted({str(i).strip() for i in (event_ids or ()) if str(i).strip()})
+    if not allowed:
+        return schema
+    schema = copy.deepcopy(schema)
+    step_props = schema["parameters"]["properties"]["cross-day-thread"]["items"][
+        "properties"
+    ]["steps"]["items"]["properties"]
+    step_props["event_id"] = {
+        "type": "string",
+        "enum": allowed,
+        "description": "Daily type:event mem-id from the candidate index.",
+    }
+    return schema
 
 
-def patch_weekly_thread_schema() -> dict[str, Any]:
-    return _schema(
+def patch_weekly_thread_schema(
+    event_ids: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Same event_id enum as submit so a patch cannot introduce a new mem-id."""
+    schema = _schema(
         "patch_weekly_thread",
         "Patch ONLY changed fields on previous submit_weekly_thread args.",
         {
@@ -241,6 +253,19 @@ def patch_weekly_thread_schema() -> dict[str, Any]:
         },
         [],
     )
+    allowed = sorted({str(i).strip() for i in (event_ids or ()) if str(i).strip()})
+    if not allowed:
+        return schema
+    schema = copy.deepcopy(schema)
+    step_props = schema["parameters"]["properties"]["cross-day-thread"]["items"][
+        "properties"
+    ]["steps"]["items"]["properties"]
+    step_props["event_id"] = {
+        "type": "string",
+        "enum": allowed,
+        "description": "Daily type:event mem-id from the candidate index.",
+    }
+    return schema
 
 
 def all_tool_schemas() -> list[dict[str, Any]]:
