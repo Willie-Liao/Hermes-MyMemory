@@ -279,3 +279,39 @@ def test_bridge_dispatch_failure_returns_error_envelope(monkeypatch, capsys):
     assert bridge.main() == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload == {"ok": False, "error": "dispatch failed"}
+
+
+def test_bridge_serve_handles_two_ndjson_requests_without_exit():
+    """--serve must answer two lines and stay alive until stdin closes.
+
+    One-shot spawn-and-wait is what made UI Reorganise wait for Phase-2 to finish.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, str(BRIDGE), "--serve"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+    try:
+        proc.stdin.write(json.dumps({"op": "nope", "args": {}}) + "\n")
+        proc.stdin.write(json.dumps({"op": "nope2", "args": {}}) + "\n")
+        proc.stdin.flush()
+        first = proc.stdout.readline()
+        second = proc.stdout.readline()
+        assert proc.poll() is None
+        a = json.loads(first)
+        b = json.loads(second)
+        assert a["ok"] is False
+        assert "unknown" in str(a.get("error", "")).casefold()
+        assert b["ok"] is False
+        assert "unknown" in str(b.get("error", "")).casefold()
+        proc.stdin.close()
+        proc.wait(timeout=15)
+        assert proc.returncode == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)

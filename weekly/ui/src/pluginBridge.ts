@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { WeekOverview } from './types';
@@ -258,11 +258,259 @@ async function runPluginBridge(
   });
 }
 
-export const runBridge: BridgeRunner = (input) =>
-  runPluginBridge('MyMemory/weekly', 'bridge_cli.py', input);
+let weeklyServeChild: ChildProcessWithoutNullStreams | null = null;
+let weeklyServeStdout = '';
+let weeklyServeStderr = '';
+let weeklyServeWaiter: (() => void) | null = null;
+let weeklyServeQueue: Promise<unknown> = Promise.resolve();
+/** How many times the weekly --serve child was spawned (tests). */
+export let weeklyBridgeServeSpawnCount = 0;
 
-export const runDigestBridge: BridgeRunner = (input) =>
-  runPluginBridge('MyMemory/digest', 'bridge_cli.py', input);
+/** Kill persistent weekly and digest --serve children so UI shutdown leaves no python. */
+export function stopWeeklyBridgeServe(): void {
+  weeklyServeWaiter = null;
+  const child = weeklyServeChild;
+  weeklyServeChild = null;
+  weeklyServeStdout = '';
+  weeklyServeStderr = '';
+  if (child && child.exitCode == null && !child.killed) {
+    child.kill('SIGTERM');
+  }
+  digestServeWaiter = null;
+  const digestChild = digestServeChild;
+  digestServeChild = null;
+  digestServeStdout = '';
+  digestServeStderr = '';
+  if (digestChild && digestChild.exitCode == null && !digestChild.killed) {
+    digestChild.kill('SIGTERM');
+  }
+}
+
+function attachWeeklyServeIo(child: ChildProcessWithoutNullStreams): void {
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (chunk: string) => {
+    weeklyServeStdout += chunk;
+    weeklyServeWaiter?.();
+  });
+  child.stderr.on('data', (chunk: string) => {
+    weeklyServeStderr += chunk;
+  });
+  child.stdin.on('error', () => {
+    /* Child may close stdin before we finish writing. */
+  });
+  child.on('close', () => {
+    if (weeklyServeChild === child) {
+      weeklyServeChild = null;
+    }
+    weeklyServeWaiter?.();
+  });
+}
+
+function ensureWeeklyServeChild(): ChildProcessWithoutNullStreams {
+  if (weeklyServeChild && weeklyServeChild.exitCode == null) {
+    return weeklyServeChild;
+  }
+  const hermesHome = resolveHermesHome();
+  const bridgePath = path.join(hermesHome, 'plugins', 'MyMemory', 'weekly', 'bridge_cli.py');
+  weeklyBridgeServeSpawnCount += 1;
+  weeklyServeStdout = '';
+  weeklyServeStderr = '';
+  const child = spawn('python3', [bridgePath, '--serve'], {
+    env: { ...process.env, HERMES_HOME: hermesHome },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }) as ChildProcessWithoutNullStreams;
+  weeklyServeChild = child;
+  attachWeeklyServeIo(child);
+  return child;
+}
+
+function runWeeklyServeOnce(input: string): Promise<BridgeRunResult> {
+  const timeoutMs = BRIDGE_CHILD_TIMEOUT_MS;
+  return new Promise((resolve, reject) => {
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = ensureWeeklyServeChild();
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    let settled = false;
+    const finish = (result: BridgeRunResult) => {
+      if (settled) return;
+      settled = true;
+      weeklyServeWaiter = null;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      const timeoutNote = `bridge timed out after ${timeoutMs}ms`;
+      child.kill('SIGTERM');
+      const killTimer = setTimeout(() => child.kill('SIGKILL'), 2_000);
+      child.once('close', () => clearTimeout(killTimer));
+      weeklyServeChild = null;
+      finish({
+        status: -1,
+        stdout: weeklyServeStdout,
+        stderr: `${weeklyServeStderr}${weeklyServeStderr.trim() ? '\n' : ''}${timeoutNote}`,
+      });
+    }, timeoutMs);
+
+    weeklyServeWaiter = () => {
+      if (settled) return;
+      const nl = weeklyServeStdout.indexOf('\n');
+      if (nl >= 0) {
+        const line = weeklyServeStdout.slice(0, nl);
+        weeklyServeStdout = weeklyServeStdout.slice(nl + 1);
+        finish({ status: 0, stdout: line, stderr: weeklyServeStderr });
+        return;
+      }
+      if (child.exitCode != null || child.killed) {
+        finish({
+          status: child.exitCode ?? -1,
+          stdout: weeklyServeStdout,
+          stderr: weeklyServeStderr,
+        });
+      }
+    };
+
+    const line = input.endsWith('\n') ? input : `${input}\n`;
+    try {
+      child.stdin.write(line, 'utf8');
+    } catch (err) {
+      stopWeeklyBridgeServe();
+      reject(err);
+      return;
+    }
+    weeklyServeWaiter();
+  });
+}
+
+export const runBridge: BridgeRunner = (input) => {
+  const queued = weeklyServeQueue.then(
+    () => runWeeklyServeOnce(String(input)),
+    () => runWeeklyServeOnce(String(input)),
+  );
+  weeklyServeQueue = queued.then(() => undefined, () => undefined);
+  return queued;
+};
+
+let digestServeChild: ChildProcessWithoutNullStreams | null = null;
+let digestServeStdout = '';
+let digestServeStderr = '';
+let digestServeWaiter: (() => void) | null = null;
+let digestServeQueue: Promise<unknown> = Promise.resolve();
+/** How many times the digest --serve child was spawned (tests). */
+export let digestBridgeServeSpawnCount = 0;
+
+function attachDigestServeIo(child: ChildProcessWithoutNullStreams): void {
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (chunk: string) => {
+    digestServeStdout += chunk;
+    digestServeWaiter?.();
+  });
+  child.stderr.on('data', (chunk: string) => {
+    digestServeStderr += chunk;
+  });
+  child.stdin.on('error', () => {
+    /* Child may close stdin before we finish writing. */
+  });
+  child.on('close', () => {
+    if (digestServeChild === child) {
+      digestServeChild = null;
+    }
+    digestServeWaiter?.();
+  });
+}
+
+function ensureDigestServeChild(): ChildProcessWithoutNullStreams {
+  if (digestServeChild && digestServeChild.exitCode == null) {
+    return digestServeChild;
+  }
+  const hermesHome = resolveHermesHome();
+  const bridgePath = path.join(hermesHome, 'plugins', 'MyMemory', 'digest', 'bridge_cli.py');
+  digestBridgeServeSpawnCount += 1;
+  digestServeStdout = '';
+  digestServeStderr = '';
+  const child = spawn('python3', [bridgePath, '--serve'], {
+    env: { ...process.env, HERMES_HOME: hermesHome },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  }) as ChildProcessWithoutNullStreams;
+  digestServeChild = child;
+  attachDigestServeIo(child);
+  return child;
+}
+
+function runDigestServeOnce(input: string): Promise<BridgeRunResult> {
+  const timeoutMs = BRIDGE_CHILD_TIMEOUT_MS;
+  return new Promise((resolve, reject) => {
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = ensureDigestServeChild();
+    } catch (err) {
+      reject(err);
+      return;
+    }
+    let settled = false;
+    const finish = (result: BridgeRunResult) => {
+      if (settled) return;
+      settled = true;
+      digestServeWaiter = null;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      const timeoutNote = `bridge timed out after ${timeoutMs}ms`;
+      child.kill('SIGTERM');
+      const killTimer = setTimeout(() => child.kill('SIGKILL'), 2_000);
+      child.once('close', () => clearTimeout(killTimer));
+      digestServeChild = null;
+      finish({
+        status: -1,
+        stdout: digestServeStdout,
+        stderr: `${digestServeStderr}${digestServeStderr.trim() ? '\n' : ''}${timeoutNote}`,
+      });
+    }, timeoutMs);
+
+    digestServeWaiter = () => {
+      if (settled) return;
+      const nl = digestServeStdout.indexOf('\n');
+      if (nl >= 0) {
+        const line = digestServeStdout.slice(0, nl);
+        digestServeStdout = digestServeStdout.slice(nl + 1);
+        finish({ status: 0, stdout: line, stderr: digestServeStderr });
+        return;
+      }
+      if (child.exitCode != null || child.killed) {
+        finish({
+          status: child.exitCode ?? -1,
+          stdout: digestServeStdout,
+          stderr: digestServeStderr,
+        });
+      }
+    };
+
+    const line = input.endsWith('\n') ? input : `${input}\n`;
+    try {
+      child.stdin.write(line, 'utf8');
+    } catch (err) {
+      stopWeeklyBridgeServe();
+      reject(err);
+      return;
+    }
+    digestServeWaiter();
+  });
+}
+
+export const runDigestBridge: BridgeRunner = (input) => {
+  const queued = digestServeQueue.then(
+    () => runDigestServeOnce(String(input)),
+    () => runDigestServeOnce(String(input)),
+  );
+  digestServeQueue = queued.then(() => undefined, () => undefined);
+  return queued;
+};
 
 async function callBridge(
   label: 'weekly' | 'digest',

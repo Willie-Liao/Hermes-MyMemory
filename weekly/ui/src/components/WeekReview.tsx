@@ -31,7 +31,11 @@ import {
   isEmptyDigestGenerateOutcome,
   resolveDefaultWeekSelection,
 } from '../softWeek';
-import { rescanPollJobFinished } from '../idleRescan';
+import {
+  rescanPollJobFinished,
+  reorganiseInFlightForWeek,
+  shouldAdoptInFlightJob,
+} from '../idleRescan';
 import {
   dailyBlockAnchorId,
   splitBriefDisplaySegments,
@@ -49,6 +53,7 @@ import {
   getISOWeekCode,
   listMonthsForYear,
   listYearsFromWeeks,
+  mondayOfISOWeek,
   MONTH_SELECT_LABELS,
   monthOfISOWeekMonday,
   parseISOWeekKey,
@@ -154,6 +159,7 @@ export default function WeekReview({
   const selectedWeekRef = useRef<WeekOverview | null>(null);
   selectedWeekRef.current = selectedWeek;
   const rescanSawFlightRef = useRef(false);
+  const lastReorgResumeWeekRef = useRef<string | null>(null);
   const [, setHotComposeActive] = useState(false);
   /** Nested list scrollers — window.scrollY alone misses halfway scroll inside these. */
   const stagingListScrollRef = useRef<HTMLDivElement>(null);
@@ -778,6 +784,9 @@ export default function WeekReview({
         try {
           const res = await fetch('/api/weekly/weeks');
           const rows = await res.json().catch(() => []);
+          if (Array.isArray(rows)) {
+            setWeeks(rows as WeekOverview[]);
+          }
           const row = Array.isArray(rows)
             ? rows.find((w: { week?: string; generateInFlight?: boolean }) => w.week === current.week)
             : null;
@@ -842,6 +851,63 @@ export default function WeekReview({
     return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- job listen uses refs
   }, [rescanLoading, reorganizeLoading, activeDate]);
+
+  useEffect(() => {
+    const row = weeks.find((w) => w.week === selectedWeek?.week);
+    if (!selectedWeek || !shouldAdoptInFlightJob(Boolean(row?.generateInFlight))) {
+      return;
+    }
+    rescanSawFlightRef.current = true;
+    setRescanLoading(true);
+  }, [weeks, selectedWeek?.week]);
+
+  useEffect(() => {
+    if (!selectedWeek) return;
+    const weekKey = selectedWeek.week;
+    const weekChanged =
+      lastReorgResumeWeekRef.current != null
+      && lastReorgResumeWeekRef.current !== weekKey;
+    lastReorgResumeWeekRef.current = weekKey;
+    const monday = mondayOfISOWeek(weekKey);
+    const probeDate = monday
+      ? `${monday.getUTCFullYear()}-${String(monday.getUTCMonth() + 1).padStart(2, '0')}-${String(monday.getUTCDate()).padStart(2, '0')}`
+      : '';
+    if (!probeDate) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch('/api/digest/run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ date: probeDate, status_only: true }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (cancelled) return;
+        const jobDate = typeof data.date === 'string' ? data.date : '';
+        if (
+          !reorganiseInFlightForWeek({
+            outcome: typeof data.outcome === 'string' ? data.outcome : '',
+            jobDate,
+            weekKey,
+          })
+        ) {
+          if (weekChanged) setReorganizeLoading(false);
+          return;
+        }
+        if (jobDate) setActiveDate(jobDate);
+        setReorganizeLoading(true);
+        setMessage({
+          type: 'info',
+          text: `Reorganise ${jobDate || probeDate}: still running…`,
+        });
+      } catch {
+        /* page can still click Reorganise */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedWeek?.week]);
 
   const handleRescanWeek = () => {
     if (!selectedWeek) return;
@@ -1080,7 +1146,7 @@ export default function WeekReview({
               <button
                 onClick={handleRescanWeek}
                 disabled={rescanLoading || !selectedWeek}
-                className="flex items-center justify-center gap-1 px-2.5 py-1 bg-slate-950 hover:bg-slate-900 border border-slate-850 text-slate-400 hover:text-slate-200 rounded-lg transition-all cursor-pointer active:scale-95 disabled:opacity-50 text-[10px] font-semibold font-mono whitespace-nowrap"
+                className="relative z-50 flex items-center justify-center gap-1 px-2.5 py-1 bg-slate-950 hover:bg-slate-900 border border-slate-850 text-slate-400 hover:text-slate-200 rounded-lg transition-all cursor-pointer active:scale-95 disabled:opacity-50 text-[10px] font-semibold font-mono whitespace-nowrap"
                 title="Re-scan and regenerate weekly draft (same as /weekly update)"
               >
                 <RefreshCw className={`w-3 h-3 ${rescanLoading ? 'animate-spin' : ''}`} />
@@ -1478,7 +1544,7 @@ export default function WeekReview({
                                 <button
                                   onClick={() => { void handleReorganizeWeek(); }}
                                   disabled={reorganizeLoading || !activeDate || !selectedWeek}
-                                  className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-400 border border-indigo-500/15 text-[10px] font-bold cursor-pointer transition-all active:scale-95 disabled:opacity-50"
+                                  className="relative z-50 flex items-center gap-1 px-2.5 py-1 rounded-lg bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-400 border border-indigo-500/15 text-[10px] font-bold cursor-pointer transition-all active:scale-95 disabled:opacity-50"
                                   title="Reorganise this day's staging blocks (merge/drop duplicates). Does not regenerate the weekly brief."
                                 >
                                   <Sparkles className={`w-3 h-3 ${reorganizeLoading ? 'animate-pulse text-indigo-300' : ''}`} />

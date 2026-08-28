@@ -418,7 +418,9 @@ def generate_week(
 
     Slash waits in-process (background=False). UI Re-scan may pass background=True
     so the button can poll generate_in_flight instead of dying on the 5-minute
-    bridge timeout. Overdue catch-up still kicks a daemon via process_overdue_week_marks.
+    bridge timeout. Background must not wait on _run_lock — a persistent bridge
+    would stall every other op behind the LLM. A stuck generate_in_flight flag
+    with no live weekly-gen thread is re-kicked so Re-scan cannot spin forever.
     """
     _purge_orphan_daily_blocks_before_generate()
     if isinstance(background, str):
@@ -467,6 +469,69 @@ def generate_week(
     if week_blocks_backlog_regenerate(hermes_home, year, week):
         return {"outcome": "already_closed", "week": week_key}
 
+    started = {
+        "outcome": "started",
+        "week": week_key,
+        "generate_in_flight": True,
+    }
+
+    if background:
+        state = weekly._load_state()
+        mark = weekly.ensure_week_open_mark(state, week_key)
+        worker_alive = any(
+            t.name == f"weekly-gen-{week_key}" and t.is_alive()
+            for t in threading.enumerate()
+        )
+        if mark.get("generate_in_flight") and worker_alive:
+            weekly._save_state(state)
+            return started
+        if mark.get("generate_in_flight") and not worker_alive:
+            weekly._log(
+                f"weekly generate_in_flight stale, re-kick {week_key} reason={reason}"
+            )
+        weekly._log(f"weekly generation waiting for lock ({reason}) week={week_key}")
+        if not weekly._run_lock.acquire(blocking=False):
+            return started
+        try:
+            weekly._log(f"weekly generation lock acquired ({reason}) week={week_key}")
+            files = weekly._usable_daily_files(weekly._daily_files_for_week(year, week))
+            if not files:
+                target = weekly._weekly_path(year, week)
+                draft_cleared = False
+                if target.exists():
+                    try:
+                        target.unlink()
+                        draft_cleared = True
+                        weekly._log(
+                            f"weekly empty digests cleared orphan draft {week_key} "
+                            f"path={target} reason={reason}"
+                        )
+                    except OSError as exc:
+                        weekly._log(
+                            f"weekly empty digests draft unlink failed {week_key}: {exc}"
+                        )
+                state = weekly._load_state()
+                presentation = weekly._presentation_state(state)
+                fp_map = weekly._digest_fingerprint_map(presentation)
+                if week_key in fp_map:
+                    del fp_map[week_key]
+                    weekly._save_state(state)
+                return {
+                    "outcome": "no_daily",
+                    "week": week_key,
+                    "empty_digests": True,
+                    "draft_cleared": draft_cleared,
+                }
+            state = weekly._load_state()
+            mark = weekly.ensure_week_open_mark(state, week_key)
+            mark["generate_in_flight"] = True
+            weekly._save_state(state)
+            if not worker_alive:
+                _kick_background_generate_week(week_key)
+            return started
+        finally:
+            weekly._run_lock.release()
+
     weekly._log(f"weekly generation waiting for lock ({reason}) week={week_key}")
     with weekly._run_lock:
         weekly._log(f"weekly generation lock acquired ({reason}) week={week_key}")
@@ -499,20 +564,6 @@ def generate_week(
                 "week": week_key,
                 "empty_digests": True,
                 "draft_cleared": draft_cleared,
-            }
-
-        if background:
-            state = weekly._load_state()
-            mark = weekly.ensure_week_open_mark(state, week_key)
-            already = bool(mark.get("generate_in_flight"))
-            mark["generate_in_flight"] = True
-            weekly._save_state(state)
-            if not already:
-                _kick_background_generate_week(week_key)
-            return {
-                "outcome": "started",
-                "week": week_key,
-                "generate_in_flight": True,
             }
 
         target = weekly._weekly_path(year, week)

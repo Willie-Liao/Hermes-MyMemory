@@ -1,3 +1,5 @@
+import { getISOWeekCode } from './isoWeek.ts';
+
 export const AUTO_RESCAN_MS = 180_000;
 export const IDLE_MS = 30_000;
 /** Shared Weekly UI server inactivity timeout (desktop + phone). */
@@ -78,6 +80,21 @@ export function rescanPollJobFinished(args: {
   generateInFlight: boolean;
 }): boolean {
   return args.sawGenerateInFlight && !args.generateInFlight;
+}
+
+/** After a browser remount, resume the spinner if the Python job is still marked in flight. */
+export function shouldAdoptInFlightJob(inFlight: boolean): boolean {
+  return Boolean(inFlight);
+}
+
+/** Reorganise is date-scoped; only resume the spinner when that date sits in the open week. */
+export function reorganiseInFlightForWeek(args: {
+  outcome: string;
+  jobDate: string;
+  weekKey: string;
+}): boolean {
+  if (args.outcome !== 'in_flight' || !args.weekKey) return false;
+  return getISOWeekCode(args.jobDate) === args.weekKey;
 }
 
 /**

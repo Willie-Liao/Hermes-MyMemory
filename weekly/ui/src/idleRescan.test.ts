@@ -9,6 +9,8 @@ import {
   shouldIdleShutdown,
   shouldSendActivityHeartbeat,
   rescanPollJobFinished,
+  shouldAdoptInFlightJob,
+  reorganiseInFlightForWeek,
   IDLE_MS,
   AUTO_RESCAN_MS,
   UI_IDLE_TIMEOUT_MS,
@@ -156,6 +158,33 @@ assert.equal(
 assert.equal(
   rescanPollJobFinished({ sawGenerateInFlight: true, generateInFlight: false }),
   true,
+);
+
+assert.equal(shouldAdoptInFlightJob(true), true);
+assert.equal(shouldAdoptInFlightJob(false), false);
+assert.equal(
+  reorganiseInFlightForWeek({
+    outcome: 'in_flight',
+    jobDate: '2026-08-24',
+    weekKey: '2026-W35',
+  }),
+  true,
+);
+assert.equal(
+  reorganiseInFlightForWeek({
+    outcome: 'in_flight',
+    jobDate: '2026-08-24',
+    weekKey: '2026-W34',
+  }),
+  false,
+);
+assert.equal(
+  reorganiseInFlightForWeek({
+    outcome: 'idle',
+    jobDate: '2026-08-24',
+    weekKey: '2026-W35',
+  }),
+  false,
 );
 
 console.log('idleRescan.test.ts: ok');

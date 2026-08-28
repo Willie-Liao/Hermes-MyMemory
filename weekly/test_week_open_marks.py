@@ -295,7 +295,43 @@ def test_sunday_close_is_plugin_clock_not_cron():
     assert not script.exists()
 
 
+def test_generate_week_background_returns_while_run_lock_held(tmp_path, monkeypatch):
+    """Background rescan must not sit on _run_lock or the serve queue stalls."""
+    import threading
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    actions = _load_actions()
+    _write_usable_daily(tmp_path, "2026-07-06", "W28 source")
+    kicked: list[str] = []
+    monkeypatch.setattr(actions, "_kick_background_generate_week", kicked.append)
+    actions.weekly._run_lock.acquire()
+    held = {"result": None}
+
+    def _call() -> None:
+        held["result"] = actions.generate_week(
+            "2026-W28", reason="rescan", background=True
+        )
+
+    try:
+        thread = threading.Thread(target=_call)
+        thread.start()
+        thread.join(timeout=2)
+        assert not thread.is_alive(), "generate_week blocked on _run_lock"
+    finally:
+        actions.weekly._run_lock.release()
+        thread.join(timeout=2)
+
+    assert held["result"] == {
+        "outcome": "started",
+        "week": "2026-W28",
+        "generate_in_flight": True,
+    }
+    assert kicked == []
+
+
 def test_generate_week_background_kicks_once(tmp_path, monkeypatch):
+    import threading
+
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     actions = _load_actions()
     _write_usable_daily(tmp_path, "2026-07-06", "W28 source")
@@ -307,10 +343,62 @@ def test_generate_week_background_kicks_once(tmp_path, monkeypatch):
     assert kicked == ["2026-W28"]
     mark = actions.weekly._load_state()["week_open_marks"]["2026-W28"]
     assert mark["generate_in_flight"] is True
+    hold = threading.Event()
+    dummy = threading.Thread(
+        target=hold.wait,
+        name="weekly-gen-2026-W28",
+        daemon=True,
+    )
+    dummy.start()
+    try:
+        second = actions.generate_week("2026-W28", reason="rescan", background=True)
+        assert second["outcome"] == "started"
+        assert kicked == ["2026-W28"]
+        _write_draft(tmp_path, "2026-W28")
+        rows = actions.weekly._weeks_status_rows()
+        row = next(r for r in rows if r["week"] == "2026-W28")
+        assert row["generate_in_flight"] == "true"
+    finally:
+        hold.set()
+        dummy.join(timeout=2)
+
+
+def test_generate_week_background_rekicks_stale_in_flight(tmp_path, monkeypatch):
+    """Flag without a live weekly-gen thread would freeze the Re-scan spinner."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    actions = _load_actions()
+    _write_usable_daily(tmp_path, "2026-07-06", "W28 source")
+    kicked: list[str] = []
+    monkeypatch.setattr(actions, "_kick_background_generate_week", kicked.append)
+    first = actions.generate_week("2026-W28", reason="rescan", background=True)
+    assert kicked == ["2026-W28"]
     second = actions.generate_week("2026-W28", reason="rescan", background=True)
     assert second["outcome"] == "started"
-    assert kicked == ["2026-W28"]
-    _write_draft(tmp_path, "2026-W28")
-    rows = actions.weekly._weeks_status_rows()
-    row = next(r for r in rows if r["week"] == "2026-W28")
-    assert row["generate_in_flight"] == "true"
+    assert kicked == ["2026-W28", "2026-W28"]
+
+
+def test_generate_week_background_returns_while_generate_runs(tmp_path, monkeypatch):
+    """UI needs started before distill finishes so /api/weekly/update is not a 300s wait."""
+    import time
+    import threading
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    actions = _load_actions()
+    _write_usable_daily(tmp_path, "2026-07-06", "W28 source")
+    entered = threading.Event()
+
+    def slow_content(*_a, **_k):
+        entered.set()
+        time.sleep(2.0)
+        return None
+
+    monkeypatch.setattr(actions.weekly, "_generate_weekly_content", slow_content)
+    t0 = time.perf_counter()
+    result = actions.generate_week("2026-W28", reason="rescan", background=True)
+    elapsed = time.perf_counter() - t0
+    assert result["outcome"] == "started"
+    assert elapsed < 1.0
+    assert entered.wait(timeout=3)
+    mark = actions.weekly._load_state()["week_open_marks"]["2026-W28"]
+    assert mark["generate_in_flight"] is True
+    time.sleep(2.2)

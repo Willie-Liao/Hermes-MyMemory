@@ -12,12 +12,18 @@ import {
   isValidMonthKey,
   isValidWeekKey,
   mapListWeeks,
+  parseBridgeStdout,
   pluginOutcomeError,
   purgedWeekSoftLoadResult,
   resolveDefaultWeekSelection,
   resolveHermesHome,
+  runBridge,
+  runDigestBridge,
   runSpawnedPython,
+  stopWeeklyBridgeServe,
   tidyStateForWeeklyReport,
+  digestBridgeServeSpawnCount,
+  weeklyBridgeServeSpawnCount,
   type BridgeRunResult,
   type BridgeRunner,
 } from './pluginBridge.ts';
@@ -324,4 +330,53 @@ assert.equal(weekLifecycleLabel('re-review'), 'OPEN');
     ticks >= 3,
     `event loop must tick during python child wait, got ${ticks} ticks`,
   );
+}
+
+{
+  stopWeeklyBridgeServe();
+  const before = weeklyBridgeServeSpawnCount;
+  const payload = JSON.stringify({ op: 'weekly_status', args: {} });
+  const first = await runBridge(payload);
+  const second = await runBridge(payload);
+  try {
+    assert.equal(weeklyBridgeServeSpawnCount, before + 1);
+    assert.equal(first.status, 0);
+    assert.equal(second.status, 0);
+    assert.equal(parseBridgeStdout(first.stdout).ok, true);
+    assert.equal(parseBridgeStdout(second.stdout).ok, true);
+  } finally {
+    stopWeeklyBridgeServe();
+  }
+}
+
+{
+  stopWeeklyBridgeServe();
+  const payload = JSON.stringify({ op: 'weekly_status', args: {} });
+  await runBridge(payload);
+  const afterFirst = weeklyBridgeServeSpawnCount;
+  stopWeeklyBridgeServe();
+  await new Promise((r) => setTimeout(r, 250));
+  await runBridge(payload);
+  try {
+    assert.equal(weeklyBridgeServeSpawnCount, afterFirst + 1);
+  } finally {
+    stopWeeklyBridgeServe();
+  }
+}
+
+{
+  stopWeeklyBridgeServe();
+  const before = digestBridgeServeSpawnCount;
+  const payload = JSON.stringify({ op: 'nope', args: {} });
+  const first = await runDigestBridge(payload);
+  const second = await runDigestBridge(payload);
+  try {
+    assert.equal(digestBridgeServeSpawnCount, before + 1);
+    assert.equal(first.status, 0);
+    assert.equal(second.status, 0);
+    assert.equal(parseBridgeStdout(first.stdout).ok, false);
+    assert.equal(parseBridgeStdout(second.stdout).ok, false);
+  } finally {
+    stopWeeklyBridgeServe();
+  }
 }
