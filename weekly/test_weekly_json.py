@@ -1145,3 +1145,32 @@ def test_thread_prompt_token_time(tmp_path, monkeypatch):
     assert "wrap-up ignored" not in prompt
 
 
+def test_score_event_clusters_min_distinct_periods_one_keeps_same_day(monkeypatch):
+    workers = _load_workers("memory_weekly_score_period1")
+    monkeypatch.setattr(
+        "recall.embed._encode_texts",
+        lambda texts: [],
+        raising=False,
+    )
+    a = {
+        "event_id": "mem-2026-08-24-event-AAAA",
+        "date": date(2026, 8, 24),
+        "entity": "Qixi card",
+        "predicate": "wrote",
+        "body": "transcribed Qixi greeting",
+        "snippet": "transcribed Qixi greeting",
+    }
+    b = {
+        "event_id": "mem-2026-08-24-event-BBBB",
+        "date": date(2026, 8, 24),
+        "entity": "Qixi card",
+        "predicate": "polished",
+        "body": "polished Qixi greeting",
+        "snippet": "polished Qixi greeting",
+    }
+    clusters = workers._score_event_clusters([a, b], min_distinct_periods=1)
+    assert len(clusters) == 1
+    assert workers._score_event_clusters([a, b]) == []
+
+
+

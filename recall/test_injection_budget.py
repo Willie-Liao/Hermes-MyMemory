@@ -48,14 +48,20 @@ def test_injection_budget_and_byte_stable(staging):
 def test_band_d_month_summaries_when_month_file_exists(staging):
     monthly = staging / "monthly" / "2026-08.md"
     monthly.write_text(
-        monthly.read_text(encoding="utf-8") + "summary: Shipped weekly review retries.\n",
+        monthly.read_text(encoding="utf-8")
+        + "summary:\n"
+        + "  - text: Shipped weekly review retries.\n"
+        + "    weeks: [2026-W33]\n"
+        + "  - text: Qixi card from drafting to sharing\n"
+        + "    weeks: [2026-W34, 2026-W35]\n",
         encoding="utf-8",
     )
     out = render_bands(staging, today=date(2026, 8, 18))
     assert "## Month summaries" in out
-    assert "2026-08" in out
-    assert "2026-08-01..2026-08-31" in out
-    assert "Shipped weekly review retries." in out
+    assert "### 2026-08  2026-08-01..2026-08-31" in out
+    assert "- Shipped weekly review retries. (2026-W33)" in out
+    assert "- Qixi card from drafting to sharing (2026-W34, 2026-W35)" in out
+    assert "2026-08  2026-08-01..2026-08-31:" not in out
     import tiktoken
 
     n = len(tiktoken.get_encoding("o200k_base").encode(out))

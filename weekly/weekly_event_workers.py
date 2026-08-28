@@ -275,8 +275,16 @@ def _mean_vec(rows: Sequence[Sequence[float]]) -> list[float]:
     return [v / n for v in acc]
 
 
-def _score_event_clusters(cards: Sequence[Mapping[str, Any]]) -> list[list[dict[str, Any]]]:
-    """Allaway sequential attach vs singleton; emit only clusters that span ≥2 dates."""
+def _score_event_clusters(
+    cards: Sequence[Mapping[str, Any]],
+    *,
+    min_distinct_periods: int = 2,
+) -> list[list[dict[str, Any]]]:
+    """Allaway sequential attach vs singleton; emit clusters spanning ≥ min_distinct_periods dates.
+
+    Weekly cross-day keeps the default of 2. Monthly repeated D/P passes 1 so a
+    singleton still becomes a guidance row instead of vanishing.
+    """
     ordered = [dict(c) for c in cards]
     if not ordered:
         return []
@@ -322,7 +330,7 @@ def _score_event_clusters(cards: Sequence[Mapping[str, Any]]) -> list[list[dict[
     for cl in clusters:
         members = [ordered[j] for j in cl["idx"]]
         dates = {m["date"] for m in members}
-        if len(dates) < 2:
+        if len(dates) < min_distinct_periods:
             continue
         members.sort(key=lambda m: (m["date"], m["event_id"]))
         out.append(members)
