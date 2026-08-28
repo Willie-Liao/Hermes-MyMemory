@@ -8,6 +8,7 @@ import {
   shouldApplyPostRescanRefresh,
   shouldIdleShutdown,
   shouldSendActivityHeartbeat,
+  rescanPollJobFinished,
   IDLE_MS,
   AUTO_RESCAN_MS,
   UI_IDLE_TIMEOUT_MS,
@@ -137,6 +138,23 @@ assert.equal(
     now: 1,
     lastSentAt: null,
   }),
+  true,
+);
+
+assert.equal(
+  rescanPollJobFinished({ sawGenerateInFlight: false, generateInFlight: false }),
+  false,
+);
+assert.equal(
+  rescanPollJobFinished({ sawGenerateInFlight: false, generateInFlight: true }),
+  false,
+);
+assert.equal(
+  rescanPollJobFinished({ sawGenerateInFlight: true, generateInFlight: true }),
+  false,
+);
+assert.equal(
+  rescanPollJobFinished({ sawGenerateInFlight: true, generateInFlight: false }),
   true,
 );
 

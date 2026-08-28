@@ -190,22 +190,6 @@ def _write_daily_wrapup(day: date, phrase: str) -> None:
     path.write_text(join_daily_wrapup(fences, phrase), encoding="utf-8")
 
 
-def _summary_llm(prompt: str, *, purpose: str, force_tool_name: str) -> dict[str, Any]:
-    schema = (
-        weekly_tools.submit_weekly_summary_schema()
-        if force_tool_name == "submit_weekly_summary"
-        else weekly_tools.patch_weekly_summary_schema()
-    )
-    return run_worker_llm_oneshot(
-        prompt,
-        plugin="memory-weekly",
-        purpose=purpose,
-        force_tool_name=force_tool_name,
-        tool_schema=schema,
-        max_tokens=4096,
-    )
-
-
 def _finish_week(week_key: str) -> dict[str, Any]:
     from weekly_event_workers import _intra_day_from_dailies  # noqa: E402
     from weekly_event_schema import WeeklyReviewPayload  # noqa: E402
@@ -236,16 +220,13 @@ def _finish_week(week_key: str) -> dict[str, Any]:
     )
     intra_n = sum(1 for row in intra if not row.empty)
     cross_n = len(payload.cross_day_thread)
-    summary_items = payload.summary
-    if (intra_n or cross_n) and not summary_items:
-        summary_items = _run_summary_worker(
-            week_key=week_key,
-            intra=intra,
-            cross=payload.cross_day_thread,
-            call_llm_tools=_summary_llm,
-            log=lambda msg: print(msg, flush=True),
-        )
-        payload = replace(payload, summary=summary_items)
+    summary_items = _run_summary_worker(
+        week_key=week_key,
+        intra=intra,
+        cross=payload.cross_day_thread,
+        log=lambda msg: print(msg, flush=True),
+    )
+    payload = replace(payload, summary=summary_items)
     yaml_text = dump_yaml(payload, generated_at=generated_at)
     write_week_status(path, status, week_key_str=week_key, content=yaml_text)
     write_sidecars(path, payload)

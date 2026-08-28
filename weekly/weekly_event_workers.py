@@ -14,6 +14,7 @@ four-part Brief deterministically from that payload.
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from collections.abc import Mapping, Sequence
@@ -47,6 +48,7 @@ try:
         weekday_label,
     )
     from .weekly_event_validate import (
+        _norm_tokens,
         index_daily_claim_blocks,
         validate_event_blocks_against_dailies,
     )
@@ -70,6 +72,7 @@ except ImportError:  # pragma: no cover - flat pytest load
         weekday_label,
     )
     from weekly_event_validate import (  # type: ignore[no-redef]
+        _norm_tokens,
         index_daily_claim_blocks,
         validate_event_blocks_against_dailies,
     )
@@ -99,6 +102,8 @@ _MEM_ID_RE = re.compile(
 )
 MAX_WORKER_ATTEMPTS = 3
 MAX_RETRY_CHARS = 4000
+_THREAD_SNIPPET_CHARS = 120
+_JACCARD_TAU = 0.30
 
 # Re-export for tests / callers that need the empty-day contract.
 __all__ = [
@@ -167,6 +172,211 @@ def _files_by_day(files: Sequence[Path]) -> dict[date, Path]:
             continue
         by_day[day] = path
     return by_day
+
+
+def _event_snippet(body: str) -> str:
+    """One line for the candidate index so the thread LLM never sees a full Distill dump."""
+    line = " ".join((body or "").split())
+    if len(line) <= _THREAD_SNIPPET_CHARS:
+        return line
+    return line[: _THREAD_SNIPPET_CHARS - 1] + "…"
+
+
+def _collect_daily_event_cards(
+    by_day: Mapping[date, Path], days: Sequence[date]
+) -> list[dict[str, Any]]:
+    """Index only daily type:event mem-ids so threads cannot paste wrap-ups, facts, or w-evt-* cards.
+
+    If valid_from sits outside this ISO week, use the daily file day so Allaway cannot chain last week's Saturday.
+    """
+    cards: list[dict[str, Any]] = []
+    for day in days:
+        path = by_day.get(day)
+        if path is None:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for _line_no, fm, body in _frontmatter_blocks(text):
+            if not isinstance(fm, dict) or fm.get("__yaml_error__"):
+                continue
+            if str(fm.get("type") or "").strip().casefold() != "event":
+                continue
+            if str(fm.get("status") or "").strip() in {
+                "approved",
+                "rejected",
+                "dropped",
+            }:
+                continue
+            event_id = str(fm.get("id") or "").strip()
+            if not event_id.lower().startswith("mem-"):
+                continue
+            vf = str(fm.get("valid_from") or "").strip()[:10]
+            try:
+                card_day = date.fromisoformat(vf) if vf else day
+            except ValueError:
+                card_day = day
+            if card_day not in days:
+                card_day = day
+            entity = str(fm.get("entity") or "").strip()
+            predicate = str(fm.get("predicate") or "").strip()
+            body_text = (body or "").strip()
+            cards.append(
+                {
+                    "event_id": event_id,
+                    "date": card_day,
+                    "entity": entity,
+                    "predicate": predicate,
+                    "body": body_text,
+                    "snippet": _event_snippet(body_text or entity or event_id),
+                }
+            )
+    cards.sort(key=lambda c: (c["date"], c["event_id"]))
+    return cards
+
+
+def _card_encode_text(card: Mapping[str, Any]) -> str:
+    return " ".join(
+        p
+        for p in (
+            str(card.get("entity") or "").strip(),
+            str(card.get("predicate") or "").strip(),
+            str(card.get("body") or "").strip(),
+        )
+        if p
+    )
+
+
+def _card_tokens(card: Mapping[str, Any]) -> set[str]:
+    tokens = _norm_tokens(_card_encode_text(card))
+    entity = str(card.get("entity") or "").strip().casefold()
+    if entity:
+        tokens = set(tokens)
+        tokens.add(entity)
+    return tokens
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _mean_vec(rows: Sequence[Sequence[float]]) -> list[float]:
+    if not rows:
+        return []
+    width = len(rows[0])
+    acc = [0.0] * width
+    for row in rows:
+        for i in range(min(width, len(row))):
+            acc[i] += float(row[i])
+    n = float(len(rows))
+    return [v / n for v in acc]
+
+
+def _score_event_clusters(cards: Sequence[Mapping[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Allaway sequential attach vs singleton; emit only clusters that span ≥2 dates."""
+    ordered = [dict(c) for c in cards]
+    if not ordered:
+        return []
+    texts = [_card_encode_text(c) for c in ordered]
+    vecs: list[list[float]] | None = None
+    tau = _JACCARD_TAU
+    cosine_fn = None
+    try:
+        from recall.embed import COSINE_FLOOR, _cosine, _encode_texts
+    except ImportError:
+        COSINE_FLOOR = 0.30  # type: ignore[misc]
+        _cosine = None  # type: ignore[assignment]
+        _encode_texts = None  # type: ignore[assignment]
+    if _encode_texts is not None:
+        encoded = _encode_texts(texts)
+        if encoded and len(encoded) == len(ordered):
+            vecs = encoded
+            tau = float(COSINE_FLOOR)
+            cosine_fn = _cosine
+    token_sets = [_card_tokens(c) for c in ordered]
+    clusters: list[dict[str, Any]] = []
+    for i, card in enumerate(ordered):
+        best_i = -1
+        best_s = -1.0
+        for ci, cl in enumerate(clusters):
+            members: list[int] = cl["idx"]
+            if vecs is not None and cosine_fn is not None:
+                centroid = _mean_vec([vecs[j] for j in members])
+                score = float(cosine_fn(vecs[i], centroid))
+            else:
+                union: set[str] = set()
+                for j in members:
+                    union |= token_sets[j]
+                score = _jaccard(token_sets[i], union)
+            if score > best_s:
+                best_s = score
+                best_i = ci
+        if best_i >= 0 and best_s >= tau:
+            clusters[best_i]["idx"].append(i)
+        else:
+            clusters.append({"idx": [i]})
+    out: list[list[dict[str, Any]]] = []
+    for cl in clusters:
+        members = [ordered[j] for j in cl["idx"]]
+        dates = {m["date"] for m in members}
+        if len(dates) < 2:
+            continue
+        members.sort(key=lambda m: (m["date"], m["event_id"]))
+        out.append(members)
+    return out
+
+
+def format_thread_candidate_layout(
+    cards: Sequence[Mapping[str, Any]],
+    clusters: Sequence[Sequence[Mapping[str, Any]]],
+) -> str:
+    """Compact E-number table so the thread prompt stays a cite index, not a week dump."""
+    lines = [
+        "# CITE INDEX — E-number is display-only; tool event_id MUST be the mem-… string"
+    ]
+    for i, card in enumerate(cards, start=1):
+        lines.append(f"- E: {i}")
+        lines.append(f"  event_id: {card['event_id']}")
+        lines.append(f"  date: {card['date'].isoformat()}")
+        lines.append(f"  snippet: {card.get('snippet') or ''}")
+    lines.append("# clusters (≥2 distinct dates only)")
+    if not clusters:
+        lines.append("- (none)")
+    for ci, members in enumerate(clusters, start=1):
+        lines.append(f"- C: {ci}")
+        lines.append(
+            "  dates: ["
+            + ", ".join(sorted({m["date"].isoformat() for m in members}))
+            + "]"
+        )
+        lines.append("  event_ids:")
+        for m in members:
+            lines.append(f"    - {m['event_id']}")
+    return "\n".join(lines)
+
+
+def thread_skeleton_args(
+    clusters: Sequence[Sequence[Mapping[str, Any]]],
+) -> dict[str, Any]:
+    """Pre-fill step event_id/date/seq so the LLM only writes label and via."""
+    threads: list[dict[str, Any]] = []
+    for i, members in enumerate(clusters, start=1):
+        steps: list[dict[str, Any]] = []
+        for seq, card in enumerate(members, start=1):
+            step: dict[str, Any] = {
+                "seq": seq,
+                "date": card["date"].isoformat(),
+                "event_id": card["event_id"],
+                "text": str(card.get("snippet") or ""),
+            }
+            if seq > 1:
+                step["via"] = "evolves"
+            steps.append(step)
+        threads.append({"id": f"c{i}", "label": "", "steps": steps})
+    return {"cross-day-thread": threads}
 
 
 def parse_blocks(content: str) -> list[dict[str, Any]]:
@@ -321,21 +531,23 @@ def _build_analyst_prompt(
     attempt: int = 1,
     errors: Sequence[str] = (),
     previous_args: Mapping[str, Any] | None = None,
+    candidate_layout: str = "",
+    skeleton_json: str = "",
 ) -> str:
     """Thread-only analyst prompt; conflict/hypothesis Distill fences would hide via: invalidates."""
-    _ = role
+    _ = role, merged_events_md
     legend_lines = "\n".join(
         f"[{n}] {mem}" for n, mem in sorted(legend.items())
     ) or "(empty legend)"
     submit = "submit_weekly_thread"
     patch = "patch_weekly_thread"
     rules = (
-        f"Call {submit} with cross-day-thread. Each chain needs ≥2 "
-        "distinct step dates, existing event_id values from MERGED EVENTS "
-        "(mem-…-event-… ids), label, and step text. Seq 1 has no via. "
-        "Later steps via evolves or invalidates (optional to_seq). "
-        "Drop one-day chains. Do not emit wrap-ups, entities, legend, "
-        "conflicts, or hypotheses."
+        f"Call {submit} with cross-day-thread. Copy event_id from the "
+        "CITE INDEX only (mem-… strings, never w-evt-*, wrap-ups, facts, "
+        "or decisions). Each chain needs ≥2 distinct step dates. Seq 1 has "
+        "no via. Later steps via evolves or invalidates (optional to_seq). "
+        "Fill label; keep skeleton event_id/date/seq. Drop one-day chains. "
+        "Do not emit wrap-ups, entities, legend, conflicts, or hypotheses."
     )
     base = (
         f"You are weekly Worker 1 thread analyst ({purpose}).\n\n"
@@ -346,8 +558,12 @@ def _build_analyst_prompt(
         f"CITATION LEGEND:\n{legend_lines}\n"
     )
     if attempt <= 1:
-        base += f"\nMERGED EVENTS:\n{merged_events_md}\n"
-        if extra_context.strip():
+        layout = candidate_layout.strip() or extra_context.strip()
+        if layout:
+            base += f"\nCANDIDATE INDEX:\n{layout}\n"
+        if skeleton_json.strip():
+            base += f"\nSKELETON (keep event_id/date/seq; fill label and via):\n{skeleton_json}\n"
+        elif extra_context.strip() and extra_context.strip() != layout:
             base += f"\n\nADDITIONAL CONTEXT:\n{extra_context}\n"
         return base
     return base + "\n" + weekly_tools.failed_fields_teach(
@@ -909,6 +1125,23 @@ def _event_body_plain_brief(body: str) -> str:
     return _event_body_narrative(body)
 
 
+def _daily_event_id_from_block(fm: Mapping[str, Any]) -> str:
+    """Prefer a related daily mem-… id so entity fallback cannot emit w-evt-* thread steps."""
+    related = fm.get("related") or []
+    if not isinstance(related, list):
+        related = [related]
+    for entry in related:
+        match = _MEM_ID_RE.search(str(entry))
+        if match:
+            return match.group(1)
+    eid = str(fm.get("id") or "").strip()
+    if eid.lower().startswith("mem-") and "w-evt-" not in eid.casefold():
+        return eid
+    if eid and "w-evt-" not in eid.casefold():
+        return eid
+    return ""
+
+
 def _event_title_summary(
     body: str, *, predicate: str = "", entity: str = ""
 ) -> str:
@@ -1046,15 +1279,18 @@ def _run_analyst(
     log: LogFn,
     extra_context: str = "",
     allowed_span_ids: set[str] | None = None,
-    event_dates: Mapping[str, date] | None = None,
-    allowed_dates: set[date] | None = None,
+    candidate_layout: str = "",
+    seed_args: Mapping[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[SpanCandidate]]:
     """Force submit then patch so a second submit cannot wipe a half-valid thread."""
     _ = call_llm, allowed_span_ids, role
     last_errors: list[str] = []
-    previous_args: dict[str, Any] = {}
+    previous_args: dict[str, Any] = dict(seed_args) if seed_args else {}
     submit_name = "submit_weekly_thread"
     patch_name = "patch_weekly_thread"
+    skeleton_json = ""
+    if seed_args:
+        skeleton_json = json.dumps(dict(seed_args), ensure_ascii=False, indent=2)
 
     for attempt in range(1, MAX_WORKER_ATTEMPTS + 1):
         force_name = submit_name if attempt == 1 else patch_name
@@ -1068,6 +1304,8 @@ def _run_analyst(
             attempt=attempt,
             errors=last_errors,
             previous_args=previous_args,
+            candidate_layout=candidate_layout if attempt == 1 else "",
+            skeleton_json=skeleton_json if attempt == 1 else "",
         )
         try:
             log(
@@ -1123,8 +1361,7 @@ def _run_analyst(
             previous_args,
             event_ids=event_ids,
             legend=legend,
-            event_dates=event_dates,
-            allowed_dates=allowed_dates,
+            week_dates=iso_week_dates(week_key),
         )
         if not errors:
             log(f"weekly {purpose} ok {week_key} threads={len(spans)}")
@@ -1144,19 +1381,18 @@ def threads_from_tool_args(
     *,
     event_ids: set[str],
     legend: dict[int, str],
-    event_dates: Mapping[str, date] | None = None,
-    allowed_dates: set[date] | None = None,
+    week_dates: Sequence[date],
 ) -> tuple[list[SpanCandidate], list[str]]:
-    """Keep only multi-day chains whose event_ids exist this week, so one-day LLM noise cannot become Chronicle rows.
+    """Keep only multi-day chains whose event_ids and dates belong to this ISO week.
 
-    Step ``date`` is the card's ``valid_from``, not the story's origin day: a Qixi
-    card written last Saturday must not stamp Saturday onto this week's YAML.
+    Out-of-week step dates would paint Saturday from last week on this week's Chronicle.
     """
     items = args.get("cross-day-thread")
     if not isinstance(items, list):
         return [], []
     cite_by_id = {mem: n for n, mem in legend.items()}
     allowed = set(event_ids) | set(legend.values())
+    in_week = set(week_dates)
     threads: list[SpanCandidate] = []
     errors: list[str] = []
     for i, item in enumerate(items):
@@ -1187,18 +1423,8 @@ def threads_from_tool_args(
                 errors.append(f"cross-day-thread[{i}] bad step date")
                 skip = True
                 break
-            card_day = None
-            if event_dates is not None:
-                card_day = event_dates.get(event_id)
-            if card_day is not None:
-                step_day = card_day
-            if allowed_dates is not None and step_day not in allowed_dates:
-                errors.append(
-                    f"cross-day-thread[{i}] date {step_day.isoformat()} "
-                    "not an input day this week"
-                )
-                skip = True
-                break
+            if step_day not in in_week:
+                continue
             seq = int(raw.get("seq") or len(steps) + 1)
             via = str(raw.get("via") or "").strip() or None
             if seq == 1:
@@ -1287,12 +1513,13 @@ def _run_summary_worker(
 ) -> tuple[WeeklySummaryItem, ...]:
     """Build Chronicle rows from leftover event titles plus cross-day threads.
 
+    Weekdays must be ISO-week days only; an Aug 22 Saturday must not paint on W35.
     Wrap-up dashes must not become summary: a killed last LLM hop used to dump
     those trailers over a week that already had event cards.
     """
     del call_llm_tools, intra
     _log: LogFn = log or (lambda _msg: None)
-    week_dates = set(iso_week_dates(week_key)) if week_key else set()
+    in_week = set(iso_week_dates(week_key))
     in_cross: set[str] = set()
     for thread in cross:
         in_cross.update(str(eid).strip() for eid in thread.related_event_ids if str(eid).strip())
@@ -1301,11 +1528,11 @@ def _run_summary_worker(
         )
     keyed: list[tuple[date, int, WeeklySummaryItem]] = []
     for thread in cross:
-        days = [step.date for step in thread.steps] or [thread.start_date]
-        if week_dates:
-            days = [d for d in days if d in week_dates]
-            if not days:
-                continue
+        days = [step.date for step in thread.steps if step.date in in_week]
+        if not days and thread.start_date in in_week:
+            days = [thread.start_date]
+        if not days:
+            continue
         weekdays = _order_weekdays(weekday_label(d) for d in days)
         outcome_text = ""
         if isinstance(thread.outcome, Mapping):
@@ -1336,7 +1563,7 @@ def _run_summary_worker(
             day = date.fromisoformat(vf)
         except ValueError:
             continue
-        if week_dates and day not in week_dates:
+        if day not in in_week:
             continue
         title = _event_title_summary(
             str(block.get("body") or ""),
@@ -1709,18 +1936,19 @@ def run_parallel_worker1(
         if str((b.get("frontmatter") or {}).get("id") or "").strip()
     ]
     event_id_set = set(event_ids)
-    merged_events_md = "\n\n".join(_render_block(b) for b in event_blocks) or "(no events)"
-    event_dates_map: dict[str, date] = {}
-    for block in event_blocks:
-        fm = block.get("frontmatter") or {}
-        eid = str(fm.get("id") or "").strip()
-        vf = str(fm.get("valid_from") or "").strip()[:10]
-        if not eid or not vf:
-            continue
-        try:
-            event_dates_map[eid] = date.fromisoformat(vf)
-        except ValueError:
-            continue
+
+    daily_cards = _collect_daily_event_cards(by_day, week_dates)
+    clusters = _score_event_clusters(daily_cards)
+    candidate_layout = format_thread_candidate_layout(daily_cards, clusters)
+    seed_args = thread_skeleton_args(clusters)
+    daily_event_ids = {str(c["event_id"]) for c in daily_cards}
+    thread_allowed = daily_event_ids if daily_event_ids else (
+        event_id_set | set(legend.values())
+    )
+    _log(
+        f"weekly worker1_thread candidates {week_key} "
+        f"daily_events={len(daily_cards)} clusters={len(clusters)}"
+    )
 
     span_candidates: list[SpanCandidate] = []
     cross_day: list[SpanCandidate] = []
@@ -1730,14 +1958,14 @@ def run_parallel_worker1(
             role="thread",
             purpose="worker1_thread",
             week_key=week_key,
-            merged_events_md=merged_events_md,
+            merged_events_md="",
             legend=legend,
-            event_ids=event_id_set | set(legend.values()),
+            event_ids=thread_allowed,
             call_llm=call_llm,
             call_llm_tools=call_llm_tools,
             log=_log,
-            event_dates=event_dates_map,
-            allowed_dates=set(active_days),
+            candidate_layout=candidate_layout,
+            seed_args=seed_args,
         )
     except Exception as exc:  # noqa: BLE001
         _log(f"weekly worker1_thread future error {week_key}: {exc}")
@@ -1749,6 +1977,7 @@ def run_parallel_worker1(
         except ImportError:  # pragma: no cover
             from weekly_json import normalize_entity_key  # type: ignore
         grouped: dict[str, list[tuple[date, str, str, str]]] = {}
+        in_week = set(iso_week_dates(week_key))
         for block in event_blocks:
             fm = block.get("frontmatter") or {}
             if str(fm.get("type") or "").strip().casefold() != "event":
@@ -1762,10 +1991,12 @@ def run_parallel_worker1(
                 day = date.fromisoformat(vf)
             except ValueError:
                 continue
-            if day not in active_days:
+            if day not in in_week:
                 continue
-            eid = str(fm.get("id") or "").strip()
+            eid = _daily_event_id_from_block(fm)
             if not eid:
+                continue
+            if daily_event_ids and eid not in daily_event_ids:
                 continue
             title = _event_title_summary(
                 str(block.get("body") or ""),

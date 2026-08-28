@@ -756,9 +756,11 @@ async function startServer() {
         return res.status(400).json({ error: 'A valid week code (YYYY-Www) is required.' });
       }
       const updateReason = reason === 'rescan' ? 'rescan' : 'update';
+      const background = Boolean(req.body?.background);
       const bridged = await callWeeklyBridge('generate_week', {
         ...(requestedWeek === undefined ? {} : { week_key: requestedWeek }),
         reason: updateReason,
+        ...(background ? { background: true } : {}),
       });
       if (!bridged.ok) {
         return res.status(502).json({ error: bridged.error });
@@ -785,7 +787,10 @@ async function startServer() {
           });
         }
       }
-      const outcomeError = pluginOutcomeError(bridged.result, ['generated']);
+      const outcomeError = pluginOutcomeError(
+        bridged.result,
+        background ? ['generated', 'started'] : ['generated'],
+      );
       if (outcomeError) {
         return res.status(outcomeError.status).json(outcomeError);
       }

@@ -84,6 +84,16 @@ def test_thread_tools_are_registered_conflict_hypothesis_are_not():
     assert "submit_weekly_hypothesis" not in names
     submit = weekly_tools.submit_weekly_thread_schema()
     assert "cross-day-thread" in submit["parameters"]["properties"]
+    locked = weekly_tools.submit_weekly_thread_schema(
+        ["mem-2026-08-24-event-aaaa", "mem-2026-08-26-event-bbbb"]
+    )
+    step_id = locked["parameters"]["properties"]["cross-day-thread"]["items"][
+        "properties"
+    ]["steps"]["items"]["properties"]["event_id"]
+    assert step_id["enum"] == [
+        "mem-2026-08-24-event-aaaa",
+        "mem-2026-08-26-event-bbbb",
+    ]
 
 
 def test_failed_fields_teach_names_patch_tool():

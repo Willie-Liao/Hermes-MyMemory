@@ -153,6 +153,35 @@ def run_full_generate() -> int:
         "output_tokens": None,
         "total_tokens": None,
     }
+    usage_path = HERMES_HOME / "metrics" / "llm-usage.jsonl"
+    if usage_path.is_file():
+        in_tok = out_tok = tot = 0
+        by_purpose: dict[str, dict[str, int]] = {
+            "worker1_event": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            "worker1_thread": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        }
+        saw_summary = False
+        for line in usage_path.read_text(encoding="utf-8").splitlines()[-80:]:
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            purpose = str(rec.get("purpose") or "")
+            if purpose == "worker1_summary":
+                saw_summary = True
+            if purpose in by_purpose:
+                by_purpose[purpose]["input_tokens"] += int(rec.get("input_tokens") or 0)
+                by_purpose[purpose]["output_tokens"] += int(rec.get("output_tokens") or 0)
+                by_purpose[purpose]["total_tokens"] += int(rec.get("total_tokens") or 0)
+                in_tok += int(rec.get("input_tokens") or 0)
+                out_tok += int(rec.get("output_tokens") or 0)
+                tot += int(rec.get("total_tokens") or 0)
+        report["input_tokens"] = in_tok
+        report["output_tokens"] = out_tok
+        report["total_tokens"] = tot
+        report["worker1_event"] = by_purpose["worker1_event"]
+        report["worker1_thread"] = by_purpose["worker1_thread"]
+        report["worker1_summary_in_usage"] = saw_summary
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if ok else 1
 
