@@ -1,8 +1,14 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
+  formatDecisionBodyFromSlots,
   formatEventBodyFromSlots,
+  formatFactBodyFromSlots,
+  formatProcedureBodyFromSlots,
+  parseDecisionBodySlots,
   parseEventBodySlots,
+  parseFactBodySlots,
+  parseProcedureBodySlots,
 } from './weeklyReviewOps.ts';
 
 describe('event body slots', () => {
@@ -47,5 +53,81 @@ describe('event body slots', () => {
     assert.equal(slots.beginning, 'freeform note without prefixes');
     assert.equal(slots.course, '');
     assert.equal(slots.outcome, '');
+  });
+});
+
+describe('procedure body slots', () => {
+  it('parses semicolon digest bodies', () => {
+    const slots = parseProcedureBodySlots(
+      'Obstacle: lock was stale; Solution: clear the lock then restart.',
+    );
+    assert.equal(slots.obstacle, 'lock was stale');
+    assert.equal(slots.solution, 'clear the lock then restart.');
+  });
+
+  it('round-trips through the digest join', () => {
+    const body = formatProcedureBodyFromSlots({
+      obstacle: 'jam',
+      solution: 'use plain paper',
+    });
+    assert.equal(body, 'Obstacle: jam; Solution: use plain paper');
+    assert.deepEqual(parseProcedureBodySlots(body), {
+      obstacle: 'jam',
+      solution: 'use plain paper',
+    });
+  });
+});
+
+describe('fact body slots', () => {
+  it('parses Factual and Narration prefixes', () => {
+    const factual = parseFactBodySlots('Factual: Alice lives in HK');
+    assert.equal(factual.kind, 'Factual');
+    assert.equal(factual.content, 'Alice lives in HK');
+    const narration = parseFactBodySlots('Narration: they walked by the lake');
+    assert.equal(narration.kind, 'Narration');
+    assert.equal(narration.content, 'they walked by the lake');
+  });
+
+  it('round-trips through the digest join', () => {
+    const body = formatFactBodyFromSlots({
+      kind: 'Narration',
+      content: 'cast shared a meal',
+    });
+    assert.equal(body, 'Narration: cast shared a meal');
+    assert.deepEqual(parseFactBodySlots(body), {
+      kind: 'Narration',
+      content: 'cast shared a meal',
+    });
+  });
+});
+
+describe('decision body slots', () => {
+  it('parses Preference and Decision prefixes', () => {
+    const pref = parseDecisionBodySlots(
+      'Preference: user prefers unobscured screenshots',
+    );
+    assert.equal(pref.kind, 'Preference');
+    assert.equal(pref.subject, 'user');
+    assert.equal(pref.ruling, 'prefers unobscured screenshots');
+    const dec = parseDecisionBodySlots(
+      'Decision: user must enable embedding-based semantic recall',
+    );
+    assert.equal(dec.kind, 'Decision');
+    assert.equal(dec.subject, 'user');
+    assert.equal(dec.ruling, 'must enable embedding-based semantic recall');
+  });
+
+  it('round-trips through the digest join', () => {
+    const body = formatDecisionBodyFromSlots({
+      kind: 'Preference',
+      subject: 'user',
+      ruling: 'must keep bodies prefixed',
+    });
+    assert.equal(body, 'Preference: user must keep bodies prefixed');
+    assert.deepEqual(parseDecisionBodySlots(body), {
+      kind: 'Preference',
+      subject: 'user',
+      ruling: 'must keep bodies prefixed',
+    });
   });
 });

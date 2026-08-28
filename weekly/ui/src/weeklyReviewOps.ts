@@ -163,6 +163,90 @@ export function formatEventBodyFromSlots(slots: EventBodySlots): string {
   );
 }
 
+export type ProcedureBodySlots = {
+  obstacle: string;
+  solution: string;
+};
+
+const _PROCEDURE_SEMI_RE = /^Obstacle:\s*(.*?);\s*Solution:\s*(.*)$/s;
+const _PROCEDURE_LOOSE_RE = /Obstacle:\s*(.*?)\s*Solution:\s*(.*)$/is;
+
+/** Split procedure bodies so Obstacle:/Solution: stay locked labels like event slots. */
+export function parseProcedureBodySlots(body: string): ProcedureBodySlots {
+  const text = String(body || '').trim();
+  const match = text.match(_PROCEDURE_SEMI_RE) || text.match(_PROCEDURE_LOOSE_RE);
+  if (match) {
+    return {
+      obstacle: _trimSlot(match[1] || ''),
+      solution: (match[2] || '').trim(),
+    };
+  }
+  return { obstacle: text, solution: '' };
+}
+
+/** Digest join: Obstacle: …; Solution: … */
+export function formatProcedureBodyFromSlots(slots: ProcedureBodySlots): string {
+  return `Obstacle: ${slots.obstacle.trim()}; Solution: ${slots.solution.trim()}`;
+}
+
+export type FactKind = 'Factual' | 'Narration';
+
+export type FactBodySlots = {
+  kind: FactKind;
+  content: string;
+};
+
+const _FACT_RE = /^(Factual|Narration):\s*(.*)$/s;
+
+/** Split fact bodies so Factual:/Narration: stay a locked kind, not editable prose. */
+export function parseFactBodySlots(body: string): FactBodySlots {
+  const text = String(body || '').trim();
+  const match = text.match(_FACT_RE);
+  if (match) {
+    const kind = match[1] === 'Narration' ? 'Narration' : 'Factual';
+    return { kind, content: (match[2] || '').trim() };
+  }
+  return { kind: 'Factual', content: text };
+}
+
+/** Digest join: Factual: … or Narration: … */
+export function formatFactBodyFromSlots(slots: FactBodySlots): string {
+  const kind = slots.kind === 'Narration' ? 'Narration' : 'Factual';
+  return `${kind}: ${slots.content.trim()}`.trim();
+}
+
+export type DecisionKind = 'Preference' | 'Decision';
+
+export type DecisionBodySlots = {
+  kind: DecisionKind;
+  subject: string;
+  ruling: string;
+};
+
+const _DECISION_RE = /^(Preference|Decision):\s+(\S+)\s+(.*)$/s;
+
+/** Split decision bodies so Preference:/Decision: and subject stay out of the ruling field. */
+export function parseDecisionBodySlots(body: string): DecisionBodySlots {
+  const text = String(body || '').trim();
+  const match = text.match(_DECISION_RE);
+  if (match) {
+    const kind = match[1] === 'Preference' ? 'Preference' : 'Decision';
+    return {
+      kind,
+      subject: (match[2] || '').trim(),
+      ruling: (match[3] || '').trim(),
+    };
+  }
+  return { kind: 'Preference', subject: 'user', ruling: text };
+}
+
+/** Digest join: Preference|Decision: {subject} {ruling} */
+export function formatDecisionBodyFromSlots(slots: DecisionBodySlots): string {
+  const kind = slots.kind === 'Decision' ? 'Decision' : 'Preference';
+  const subject = slots.subject.trim() || 'user';
+  return `${kind}: ${subject} ${slots.ruling.trim()}`.trim();
+}
+
 /** After weekly review Save — per-row Recall labels. */
 export function reviewRecallButtonLabel(op: WeeklyReviewPendingOp): string {
   switch (op.kind) {
