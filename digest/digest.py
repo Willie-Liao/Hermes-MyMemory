@@ -147,7 +147,7 @@ MAX_RETRY_ERROR_CHARS = 800
 IN_FLIGHT_STALE_SECONDS = 600
 # Phase-2 Pearson/MI prefilter (ES-Mem eqs 1–2). Lazy MiniLM; in-memory only.
 PHASE2_MINILM_MODEL = "all-MiniLM-L6-v2"
-PHASE2_MI_QUANTILE = 0.35
+PHASE2_MI_THRESHOLD = 0.10  # Absolute MI threshold (was quantile 0.35)
 _PHASE2_MINILM: Any = None
 _PHASE2_EMBED_CACHE: dict[str, list[float]] = {}
 
@@ -3487,14 +3487,8 @@ def _phase2_prompt_and_tool(
                 if len(scores) == 1:
                     kept.append((scores[0][0], scores[0][1]))
                     continue
-                values = sorted(item[2] for item in scores)
-                pos = PHASE2_MI_QUANTILE * (len(values) - 1)
-                lo = int(pos)
-                hi = min(lo + 1, len(values) - 1)
-                frac = pos - lo
-                threshold = values[lo] * (1.0 - frac) + values[hi] * frac
                 for left, right, mi in scores:
-                    if mi > threshold:
+                    if mi > PHASE2_MI_THRESHOLD:
                         kept.append((left, right))
             if not kept:
                 _log(
