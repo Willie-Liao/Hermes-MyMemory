@@ -1,4 +1,4 @@
 name: MyMemory
-version: 1.1.11
+version: 1.1.12
 kind: standalone
 description: "Digest, weekly, monthly, and retention as one Hermes memory provider. Last-3-days index and weekly Brief inject via prefetch. In-chat /digest, /weekly, and /monthly. First-run history estimates."

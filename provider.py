@@ -26,6 +26,7 @@ if _hermes_agent.is_dir() and str(_hermes_agent) not in sys.path:
 from agent.memory_provider import MemoryProvider
 
 from .digest import digest, slash as digest_slash
+from .recall import embed_cache
 from .retention import retention
 from .weekly import slash as weekly_slash
 from .weekly import weekly
@@ -318,9 +319,10 @@ class MyMemoryProvider(MemoryProvider):
         raise NotImplementedError(f"Provider {self.name} does not handle tool {tool_name}")
 
     def shutdown(self) -> None:
-        """Stop the digest clock only under pytest so production daemons keep ticking."""
+        """Stop clocks only under pytest so production daemons keep ticking."""
         if os.environ.get("PYTEST_CURRENT_TEST"):
             digest.stop_digest_clock_thread()
+            embed_cache.stop_embed_cache_clock_thread()
 
 
 def _register_slash_commands() -> None:
@@ -374,7 +376,7 @@ def _register_slash_commands() -> None:
 
 
 def _bootstrap_background() -> None:
-    """Idempotent clock + weekly/retention plugin_load equivalent."""
+    """Idempotent clock + weekly/retention/embed-cache plugin_load equivalent."""
     global _BOOTSTRAPPED
     if _BOOTSTRAPPED:
         return
@@ -387,6 +389,7 @@ def _bootstrap_background() -> None:
     except Exception:
         pass
     digest.start_digest_clock_thread()
+    embed_cache.start_embed_cache_clock_thread()
     try:
         weekly_tools.ensure_weekly_tools_registered()
     except Exception:

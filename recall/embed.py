@@ -21,6 +21,7 @@ import os
 from pathlib import Path
 from typing import Any, Sequence
 
+from . import embed_cache
 from .ids import (
     BlockRecord,
     classify_daily_id,
@@ -36,6 +37,7 @@ DEFAULT_MODEL = "Alibaba-NLP/gte-multilingual-base"
 UPGRADE_MODEL = "BAAI/bge-m3"
 FORBIDDEN_MODEL = "BAAI/bge-small-zh-v1.5"
 CANDIDATE_CAP = 48
+CACHE_MIN_ENTRIES = 10
 ENCODE_BATCH = 8
 COSINE_FLOOR = 0.30
 COSINE_GAP = 0.02
@@ -267,10 +269,11 @@ def rerank_embed(
     *_a,
     **_k,
 ) -> list | str:
-    """Cosine-rerank live cards; drop int8 pile-up tails so the LLM never sees a 0.82 sibling of a 0.83 hit.
+    """Cosine-rerank using pre-computed embedding cache; fall back to runtime encoding.
 
-    COSINE_FLOOR is only a prefilter. A flat top-2 gap below COSINE_GAP keeps rank 1;
-    a real peak keeps through the first cliff, still fail-open [] so L1 can run.
+    Cache-first: encode query once, search all cached block embeddings (<1ms).
+    Fall back to original pool encoding only when cache has < CACHE_MIN_ENTRIES matches.
+    COSINE_FLOOR is a prefilter. Gap-based pruning keeps rank separation.
     """
     q = str(query or "").strip()
     live = list(records or [])
@@ -281,28 +284,56 @@ def rerank_embed(
     if classify_daily_id(q) or classify_weekly_id(q) or q.startswith("mem-"):
         return []
     try:
-        ordered = sorted(live, key=lambda r: str(r.day or ""), reverse=True)
-        pool = ordered[:CANDIDATE_CAP]
-        passages = [_passage_text(rec) for rec in pool]
-        vectors = _encode_texts([q, *passages])
+        # Build a lookup from block_id -> BlockRecord
+        rec_by_id: dict[str, BlockRecord] = {}
+        for rec in live:
+            if rec.block_id:
+                rec_by_id[rec.block_id] = rec
+
+        cap = max(1, int(k))
+
+        # 1) Encode query only
+        qv_list = _encode_texts([q])
         if (os.environ.get("MYMEMORY_EMBED_UNLOAD") or "").strip() == "1":
             _drop_session()
-        if len(vectors) != 1 + len(pool) or not vectors[0]:
+        if not qv_list or not qv_list[0]:
             return []
-        qv = vectors[0]
-        scored: list[tuple[float, BlockRecord]] = []
-        for rec, vec in zip(pool, vectors[1:]):
-            score = _cosine(qv, vec)
-            if score >= COSINE_FLOOR:
-                scored.append((score, rec))
-        scored.sort(key=lambda row: row[0], reverse=True)
-        cap = max(1, int(k))
-        if len(scored) >= 2 and (scored[0][0] - scored[1][0]) < COSINE_GAP:
-            top = scored[:1]
+        qv = qv_list[0]
+
+        # 2) Search the pre-computed embedding cache
+        cache_hits = embed_cache.search_cache(qv, k=cap * 2)
+        matched: list[tuple[float, BlockRecord]] = []
+        for block_id, score, _entry in cache_hits:
+            rec = rec_by_id.get(block_id)
+            if rec is not None:
+                matched.append((score, rec))
+
+        # 3) Fall back to original runtime encoding if cache is too sparse
+        if len(matched) < CACHE_MIN_ENTRIES:
+            ordered = sorted(live, key=lambda r: str(r.day or ""), reverse=True)
+            pool = ordered[:CANDIDATE_CAP]
+            passages = [_passage_text(rec) for rec in pool]
+            vectors = _encode_texts([q, *passages])
+            if (os.environ.get("MYMEMORY_EMBED_UNLOAD") or "").strip() == "1":
+                _drop_session()
+            if len(vectors) != 1 + len(pool) or not vectors[0]:
+                return []
+            qv = vectors[0]
+            matched = []
+            for rec, vec in zip(pool, vectors[1:]):
+                score = _cosine(qv, vec)
+                if score >= COSINE_FLOOR:
+                    matched.append((score, rec))
+
+        matched.sort(key=lambda row: row[0], reverse=True)
+
+        # Gap-based pruning
+        if len(matched) >= 2 and (matched[0][0] - matched[1][0]) < COSINE_GAP:
+            top = matched[:1]
         else:
-            top1 = scored[0][0] if scored else 0.0
+            top1 = matched[0][0] if matched else 0.0
             top = []
-            for row in scored:
+            for row in matched:
                 if len(top) >= cap:
                     break
                 top.append(row)
