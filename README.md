@@ -6,12 +6,23 @@ This repository is the **plugin root**. Copy or clone it to `$HERMES_HOME/plugin
 
 ## Install
 
-1. Install [Hermes](https://github.com/NousResearch/hermes-agent) and know your home (`~/.hermes` or `$HERMES_HOME`).
-2. Place this tree at `$HERMES_HOME/plugins/MyMemory`.
-3. Merge the config below into `$HERMES_HOME/config.yaml` (do not overwrite the whole file).
-4. Put worker API keys in `$HERMES_HOME/.env` (never commit them).
-5. Create empty `memories/MEMORY.md`, `memories/USER.md`, and `memories/staging/daily/`, `memories/staging/weekly/` if missing.
-6. Restart the gateway. Verify with `hermes doctor`, then `/digest status`, `/weekly help`, and `/monthly help` in chat, or `hermes MyMemory digest help`.
+Hermes must already be installed (`~/.hermes` or `$HERMES_HOME`). Then clone this repo and run the installer (copies the plugin, enables it, runs unit tests, restarts the gateway):
+
+```bash
+git clone https://github.com/Willie-Liao/Hermes-MyMemory.git
+cd Hermes-MyMemory
+./scripts/install.sh
+```
+
+On macOS you can double-click `Install MyMemory.command` instead. Use `--skip-tests` to copy and restart without pytest, or `--force` to continue after a test failure.
+
+Manual steps if you prefer not to use the script:
+
+1. Place this tree at `$HERMES_HOME/plugins/MyMemory`.
+2. Merge the config below into `$HERMES_HOME/config.yaml` (do not overwrite the whole file).
+3. Put worker API keys in `$HERMES_HOME/.env` (never commit them).
+4. Create empty `memories/MEMORY.md`, `memories/USER.md`, and `memories/staging/daily/`, `memories/staging/weekly/` if missing.
+5. Restart the gateway. Verify with `hermes doctor`, then `/digest status`, `/weekly help`, and `/monthly help` in chat, or `hermes MyMemory digest help`.
 
 ### Required config
 
