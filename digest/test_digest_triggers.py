@@ -451,11 +451,11 @@ def test_append_policy_event_is_user_driven_causal_chain():
 
 
 def test_append_policy_procedure_and_decision_are_event_driven():
-    """procedure = agent process for the task; decision = user feedback + prefs."""
+    """procedure = task, obstacle, deliverable; decision = user feedback + prefs."""
     digest = _load_digest()
     policy = digest.DIGEST_POLICY
-    assert "procedure: agent process for the user-request task" in policy
-    assert "Not object documentation" in policy
+    assert "procedure: what the user asked the agent to do" in policy
+    assert "not object/API documentation" in policy
     assert "decision_constraint: user feedback on that procedure" in policy
     assert "First subject after Preference:/Decision: must be user/User" in policy
     assert "standing prefs" in policy or "agent behavior" in policy
