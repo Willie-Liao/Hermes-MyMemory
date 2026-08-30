@@ -19,7 +19,7 @@ This repository is the **plugin root**. Copy or clone it to `$HERMES_HOME/plugin
 memory:
   provider: MyMemory
 
-timezone: Asia/Shanghai   # civil digest clock; set yours
+timezone: Asia/Shanghai   # civil clocks (digest + Channel 4 embed cache 01:00); set yours
 
 plugins:
   enabled:
@@ -125,6 +125,7 @@ Default FTS/entity/embed recall and monthly synthesis **omit** `status: rejected
 
 - `memories/staging/.digest-state.json`
 - `memories/staging/daily/YYYY-MM-DD.md`
+- `memories/embeddings/embed-cache.json` (Channel 4; rebuilt at 01:00 in `timezone:`)
 - `logs/memory-digest.log`
 - `metrics/llm-usage.jsonl`
 
@@ -136,7 +137,7 @@ Default FTS/entity/embed recall and monthly synthesis **omit** `status: rejected
 | Provider not used | `memory.provider: MyMemory` |
 | Empty estimates | `state.db` exists and has `messages` with `active=1` |
 | Worker errors | Provider keys in `.env` matching `plugins.entries.MyMemory` |
-| Clock dates wrong | `timezone` in `config.yaml` |
+| Clock dates wrong | `timezone` in `config.yaml` (digest ticks and embed-cache 01:00) |
 
 ## Privacy and contributions
 

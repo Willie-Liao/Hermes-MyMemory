@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from recall.conftest import HOP1, HOP2, OVERLAP, SEED, _block, write_fake_staging
 from recall.embed import DEFAULT_MODEL, rerank_embed
@@ -508,4 +510,148 @@ def test_guidance_mode_daily_dp_fallback_skips_events(staging):
     normal = recall_memory("what did we do about memory digest?", staging=staging)
     assert "channel=" in normal
     assert "channel=monthly_guidance" not in normal
+
+
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+NEW_YORK = ZoneInfo("America/New_York")
+_CACHE_BLOCK_ID = "mem-2026-08-16-fact-embedcache01"
+
+
+def _embed_cache_staging(tmp_path: Path, monkeypatch, body: str = "Casey uses a blue notebook.") -> None:
+    from recall import embed_cache
+
+    staging = tmp_path / "staging"
+    daily = staging / "daily"
+    daily.mkdir(parents=True, exist_ok=True)
+    (staging / "weekly").mkdir(exist_ok=True)
+    (daily / "2026-08-16.md").write_text(
+        (
+            f"id: {_CACHE_BLOCK_ID}\n"
+            "type: fact\n"
+            "entity: Casey\n"
+            "predicate: notebook\n"
+            "confidence: high\n"
+            "status: candidate\n"
+            "related: []\n"
+            "---\n"
+            f"{body}\n"
+        ),
+        encoding="utf-8",
+    )
+    cache = tmp_path / "embeddings"
+    monkeypatch.setattr(embed_cache, "_staging_root", lambda: staging)
+    monkeypatch.setattr(embed_cache, "_cache_root", lambda: cache)
+    monkeypatch.setattr(embed_cache, "_embed_cache_tz", lambda: SHANGHAI)
+
+
+def test_embed_cache_reembeds_on_hash_change(tmp_path, monkeypatch):
+    from recall import embed_cache
+
+    calls: list[list[str]] = []
+
+    def encode_fn(texts):
+        calls.append(list(texts))
+        return [[1.0, 0.0] for _ in texts]
+
+    _embed_cache_staging(tmp_path, monkeypatch, "first body")
+    first = embed_cache.incremental_update(encode_fn=encode_fn)
+    assert first["embedded"] == 1
+    assert len(calls) == 1
+    same = embed_cache.incremental_update(encode_fn=encode_fn)
+    assert same["embedded"] == 0
+    assert len(calls) == 1
+    _embed_cache_staging(tmp_path, monkeypatch, "second body")
+    changed = embed_cache.incremental_update(encode_fn=encode_fn)
+    assert changed["embedded"] == 1
+    assert len(calls) == 2
+
+
+def test_embed_cache_skips_before_one_am_shanghai(tmp_path, monkeypatch):
+    from recall import embed_cache
+
+    calls: list[int] = []
+
+    def encode_fn(texts):
+        calls.append(len(texts))
+        return [[1.0, 0.0] for _ in texts]
+
+    _embed_cache_staging(tmp_path, monkeypatch)
+    now = datetime(2026, 8, 16, 0, 30, tzinfo=SHANGHAI)
+    stats = embed_cache.incremental_update(encode_fn=encode_fn, now=now)
+    assert calls == []
+    assert stats.get("embedded", 0) == 0
+    meta = json.loads((tmp_path / "embeddings" / "embed-cache-meta.json").read_text()) if (
+        tmp_path / "embeddings" / "embed-cache-meta.json"
+    ).is_file() else {}
+    assert meta.get("last_checked_on") != "2026-08-16"
+
+
+def test_embed_cache_one_am_stamps_last_checked_on(tmp_path, monkeypatch):
+    from recall import embed_cache
+
+    def encode_fn(texts):
+        return [[1.0, 0.0] for _ in texts]
+
+    _embed_cache_staging(tmp_path, monkeypatch)
+    now = datetime(2026, 8, 16, 1, 0, tzinfo=SHANGHAI)
+    stats = embed_cache.incremental_update(encode_fn=encode_fn, now=now)
+    assert stats["embedded"] == 1
+    meta = json.loads((tmp_path / "embeddings" / "embed-cache-meta.json").read_text(encoding="utf-8"))
+    assert meta["last_checked_on"] == "2026-08-16"
+
+
+def test_embed_cache_once_per_civil_day(tmp_path, monkeypatch):
+    from recall import embed_cache
+
+    calls: list[int] = []
+
+    def encode_fn(texts):
+        calls.append(len(texts))
+        return [[1.0, 0.0] for _ in texts]
+
+    _embed_cache_staging(tmp_path, monkeypatch)
+    embed_cache.incremental_update(
+        encode_fn=encode_fn, now=datetime(2026, 8, 16, 1, 0, tzinfo=SHANGHAI)
+    )
+    _embed_cache_staging(tmp_path, monkeypatch, "changed after first check")
+    later = embed_cache.incremental_update(
+        encode_fn=encode_fn, now=datetime(2026, 8, 16, 8, 0, tzinfo=SHANGHAI)
+    )
+    assert later["embedded"] == 0
+    assert len(calls) == 1
+
+
+def test_embed_clock_next_wake_shanghai(tmp_path, monkeypatch):
+    from recall import embed_cache
+
+    monkeypatch.setattr(embed_cache, "_embed_cache_tz", lambda: SHANGHAI)
+    before = datetime(2026, 8, 16, 0, 30, tzinfo=SHANGHAI)
+    assert embed_cache._next_embed_check_at(before, SHANGHAI) == datetime(
+        2026, 8, 16, 1, 0, tzinfo=SHANGHAI
+    )
+    after = datetime(2026, 8, 16, 1, 5, tzinfo=SHANGHAI)
+    assert embed_cache._next_embed_check_at(after, SHANGHAI) == datetime(
+        2026, 8, 17, 1, 0, tzinfo=SHANGHAI
+    )
+
+
+def test_embed_cache_gate_follows_injected_zone_not_host(tmp_path, monkeypatch):
+    from recall import embed_cache
+
+    calls: list[str] = []
+
+    def encode_fn(texts):
+        calls.append("ran")
+        return [[1.0, 0.0] for _ in texts]
+
+    utc = datetime(2026, 8, 16, 4, 30, tzinfo=ZoneInfo("UTC"))
+    _embed_cache_staging(tmp_path, monkeypatch)
+    monkeypatch.setattr(embed_cache, "_embed_cache_tz", lambda: NEW_YORK)
+    ny = embed_cache.incremental_update(encode_fn=encode_fn, now=utc)
+    assert calls == []
+    assert ny.get("embedded", 0) == 0
+    monkeypatch.setattr(embed_cache, "_embed_cache_tz", lambda: SHANGHAI)
+    sh = embed_cache.incremental_update(encode_fn=encode_fn, now=utc)
+    assert calls == ["ran"]
+    assert sh["embedded"] == 1
 

@@ -144,6 +144,10 @@ def _stub_bootstrap(monkeypatch) -> None:
         "MyMemory.provider.weekly_tools.ensure_weekly_tools_registered",
         lambda: None,
     )
+    monkeypatch.setattr(
+        "MyMemory.provider.embed_cache.start_embed_cache_clock_thread",
+        lambda: None,
+    )
 
 
 def _fresh_plugin_manager(monkeypatch):
@@ -208,12 +212,16 @@ def test_initialize_registers_slash_in_skip_write_context(monkeypatch):
 def test_initialize_starts_clock_weekly_retention_once(monkeypatch):
     reset_bootstrap_for_tests()
     clock = []
+    embed_clock = []
     weekly_reasons = []
     ret_reasons = []
     monkeypatch.setattr(digest, "start_digest_clock_thread", lambda: clock.append(1))
+    monkeypatch.setattr(
+        "MyMemory.provider.embed_cache.start_embed_cache_clock_thread",
+        lambda: embed_clock.append(1),
+    )
     from MyMemory.weekly import weekly
     from MyMemory.retention import retention
-
     monkeypatch.setattr(weekly, "run_async", lambda reason: weekly_reasons.append(reason))
     monkeypatch.setattr(retention, "run_async", lambda reason: ret_reasons.append(reason))
     monkeypatch.setattr("MyMemory.provider.weekly_tools.ensure_weekly_tools_registered", lambda: None)
@@ -221,6 +229,7 @@ def test_initialize_starts_clock_weekly_retention_once(monkeypatch):
     p.initialize("s1", hermes_home=str(_HERMES_HOME), platform="cli")
     p.initialize("s2", hermes_home=str(_HERMES_HOME), platform="cli")
     assert clock == [1]
+    assert embed_clock == [1]
     assert weekly_reasons == ["plugin_load"]
     assert ret_reasons == ["plugin_load"]
 

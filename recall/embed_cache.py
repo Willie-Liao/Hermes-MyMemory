@@ -14,8 +14,10 @@ import logging
 import os
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 logger = logging.getLogger("plugins.memory-embed-cache")
 
@@ -23,6 +25,8 @@ _CACHE_DIR_NAME = "embeddings"
 _CACHE_FILE = "embed-cache.json"
 _CACHE_META = "embed-cache-meta.json"
 _BUILD_LOCK = "embed-cache.lock"
+EMBED_TICK = (1, 0)
+_DEFAULT_TZ_NAME = "Asia/Shanghai"
 
 # Fields to include in content hash (semantic fields only)
 _HASH_FIELDS = ("id", "type", "entity", "predicate", "confidence", "status", "related", "body")
@@ -43,6 +47,67 @@ def _staging_root() -> Path:
 
 def _cache_root() -> Path:
     return _hermes_home() / "memories" / _CACHE_DIR_NAME
+
+
+def _embed_cache_tz() -> ZoneInfo:
+    """Civil zone for the 01:00 retrieval-cache check: hermes_time, then config.yaml timezone.
+
+    A bad IANA name must not take down the gateway. Digest is not imported.
+    """
+    try:
+        from hermes_time import get_timezone
+
+        resolved = get_timezone()
+        if resolved is not None:
+            return resolved
+    except Exception:
+        pass
+    try:
+        import yaml
+
+        path = _hermes_home() / "config.yaml"
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        name = str(data.get("timezone") or "").strip()
+        if name:
+            return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, OSError, TypeError, Exception):
+        pass
+    try:
+        return ZoneInfo(_DEFAULT_TZ_NAME)
+    except (ZoneInfoNotFoundError, Exception):
+        return ZoneInfo("Etc/UTC")
+
+
+def _as_local(now: datetime, tz: ZoneInfo) -> datetime:
+    """Attach or convert ``now`` into ``tz`` so 01:00 math never mixes naive UTC."""
+    if now.tzinfo is None:
+        return now.replace(tzinfo=tz)
+    return now.astimezone(tz)
+
+
+def _next_embed_check_at(now: datetime, tz: ZoneInfo) -> datetime:
+    """Next 01:00 in ``tz`` strictly after ``now`` so a 01:05 start waits until tomorrow."""
+    local = _as_local(now, tz)
+    today_tick = local.replace(
+        hour=EMBED_TICK[0], minute=EMBED_TICK[1], second=0, microsecond=0
+    )
+    if local < today_tick:
+        return today_tick
+    return (local + timedelta(days=1)).replace(
+        hour=EMBED_TICK[0], minute=EMBED_TICK[1], second=0, microsecond=0
+    )
+
+
+def _load_meta() -> dict[str, Any]:
+    """Read embed-cache-meta.json so last_checked_on survives a no-op hash scan."""
+    path = _cache_root() / _CACHE_META
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def _parse_blocks_from_file(path: Path) -> list[dict[str, Any]]:
@@ -153,6 +218,8 @@ def scan_all_blocks() -> dict[str, dict[str, Any]]:
 
 
 _cache_lock = threading.Lock()
+_embed_clock_stop = threading.Event()
+_embed_clock_thread: threading.Thread | None = None
 
 
 def load_cache() -> dict[str, dict[str, Any]]:
@@ -185,45 +252,61 @@ def save_cache(blocks: dict[str, dict[str, Any]], meta: dict[str, Any] | None = 
 def incremental_update(
     encode_fn=None,
     force: bool = False,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Scan files, compare hashes, re-embed changed blocks, save cache.
-    
-    Args:
-        encode_fn: callable(texts: list[str]) -> list[list[float]]
-        force: if True, re-embed all blocks regardless of hash
-    
-    Returns:
-        {"total": N, "embedded": M, "skipped": S, "removed": R}
+
+    Clock callers pass civil ``now`` so Channel 4 stays off the query path:
+    skip before 01:00 in the configured zone, and at most once per civil day.
+    ``now is None`` is a full hash pass for tests and a manual rebuild.
     """
     from .embed import _encode_texts
-    
+
     if encode_fn is None:
         encode_fn = _encode_texts
-    
+
+    stats: dict[str, Any] = {
+        "total": 0,
+        "embedded": 0,
+        "skipped": 0,
+        "removed": 0,
+    }
+    stamp_day: str | None = None
+    if now is not None:
+        tz = _embed_cache_tz()
+        local = _as_local(now, tz)
+        stamp_day = local.date().isoformat()
+        if (local.hour, local.minute) < EMBED_TICK:
+            stats["outcome"] = "idle"
+            return stats
+        if _load_meta().get("last_checked_on") == stamp_day:
+            stats["outcome"] = "idle"
+            return stats
+
     all_blocks = scan_all_blocks()
     cache = load_cache() if not force else {}
-    
-    # Find blocks to embed (changed or new)
+
     to_embed: list[dict[str, Any]] = []
     for block_id, block in all_blocks.items():
         current_hash = _compute_hash(block)
         cached = cache.get(block_id)
         if cached and cached.get("hash") == current_hash and not force:
-            continue  # unchanged
+            continue
         to_embed.append(block)
-    
-    # Find removed blocks
+
     removed_ids = set(cache.keys()) - set(all_blocks.keys())
-    
+
     stats = {
         "total": len(all_blocks),
         "embedded": len(to_embed),
         "skipped": len(all_blocks) - len(to_embed),
         "removed": len(removed_ids),
     }
-    
+
     if not to_embed and not removed_ids:
         logger.info("embed cache: no changes, skip update")
+        if stamp_day is not None:
+            _stamp_last_checked(load_cache(), stamp_day)
         return stats
     
     # Encode new/changed blocks
@@ -263,6 +346,8 @@ def incremental_update(
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "total_blocks": len(merged),
         }
+        if stamp_day is not None:
+            meta["last_checked_on"] = stamp_day
         save_cache(merged, meta)
     
     logger.info(
@@ -270,6 +355,69 @@ def incremental_update(
         stats["total"], stats["embedded"], stats["skipped"], stats["removed"],
     )
     return stats
+
+
+def _stamp_last_checked(blocks: dict[str, dict[str, Any]], stamp_day: str) -> None:
+    """Persist last_checked_on after a no-op scan so the 01:00 clock does not re-encode."""
+    meta = dict(_load_meta())
+    meta["last_checked_on"] = stamp_day
+    meta.setdefault("version", 1)
+    meta.setdefault("model", "gte-multilingual-base")
+    meta.setdefault("dim", 768)
+    meta["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    meta["total_blocks"] = len(blocks)
+    save_cache(blocks, meta)
+
+
+def start_embed_cache_clock_thread() -> None:
+    """Arm the retrieval-cache 01:00 sleeper without sharing the digest clock.
+
+    Pytest must not catch-up-encode live staging from unrelated initialize tests.
+    """
+    global _embed_clock_thread
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    if _embed_clock_thread is not None and _embed_clock_thread.is_alive():
+        return
+    _embed_clock_stop.clear()
+    _embed_clock_thread = threading.Thread(
+        target=_embed_cache_clock_loop,
+        name="memory-embed-cache-clock",
+        daemon=True,
+    )
+    _embed_clock_thread.start()
+
+
+def stop_embed_cache_clock_thread() -> None:
+    """Pytest-only stop so production daemons keep ticking."""
+    global _embed_clock_thread
+    _embed_clock_stop.set()
+    thread = _embed_clock_thread
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=2.0)
+    _embed_clock_thread = None
+
+
+def _embed_cache_clock_loop() -> None:
+    """Sleep until the next configured-zone 01:00; catch up if Hermes started later."""
+    while not _embed_clock_stop.is_set():
+        try:
+            tz = _embed_cache_tz()
+            local = datetime.now(tz)
+            today = local.date().isoformat()
+            if (local.hour, local.minute) >= EMBED_TICK and _load_meta().get(
+                "last_checked_on"
+            ) != today:
+                incremental_update(now=local)
+            local = datetime.now(tz)
+            nxt = _next_embed_check_at(local, tz)
+            delay = max(0.0, (nxt - local).total_seconds())
+            if _embed_clock_stop.wait(delay):
+                break
+        except Exception as exc:
+            logger.warning("embed cache clock: %s", exc)
+            if _embed_clock_stop.wait(60.0):
+                break
 
 
 def search_cache(
