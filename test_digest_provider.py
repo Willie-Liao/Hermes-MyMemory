@@ -94,6 +94,7 @@ def test_system_prompt_band_c_weekday_ladder_not_whole_week():
     assert "weekly.md canonical names" in text
     assert "last-7-day daily entity index" in text
     assert "If a month block matches, pass that block's printed ISO start and end." in text
+    assert "If Channel 4 (embed) locates" in text
     assert "If a week or month block matches the question" not in text
 
 
@@ -106,6 +107,7 @@ def test_eval_prefetch_fallback_band_c_weekday_ladder():
     assert "not the whole week span" in text
     assert "weekly.md canonical names" in text
     assert "last-7-day daily entity index" in text
+    assert "If embed locates a" in text
     assert "If a week or month block matches the question" not in text
 
 
@@ -499,6 +501,7 @@ def test_recall_tool_schema_exposes_optional_time_bounds():
     assert "time_from" not in schema["parameters"]["required"]
     assert "time_to" not in schema["parameters"]["required"]
     assert "not the week span" in schema["description"]
+    assert "locates the daily card" in schema["description"]
     assert "that block's ISO start and end" not in schema["description"]
 
 

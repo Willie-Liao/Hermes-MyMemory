@@ -5,6 +5,10 @@
 auth.json
 *.pem
 
+# Local embed-ladder before/after clocks (plan Step 1 / 5)
+recall/embed_scale_latency_before.json
+recall/embed_scale_latency_after.json
+
 # Python
 __pycache__/
 *.py[cod]

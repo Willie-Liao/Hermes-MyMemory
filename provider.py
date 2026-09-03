@@ -49,6 +49,8 @@ _SYSTEM_PROMPT_BLOCK = (
     "not the week span — optionally use a Band C canonical name as query. "
     "Prefer event cards in that day's dump; if a fact, procedure, or decision "
     "is needed, recall_memory a related: id or expand_memory on the event. "
+    "If Channel 4 (embed) locates a month, week, or daily match, the same "
+    "recall_memory call fills the card via mem-id or that civil day. "
     "If a month block matches, pass that block's printed ISO start and end. "
     "Fetch mem- ids from that index with recall_memory / expand_memory; read "
     "daily YAML for bodies. Do not treat weekly/*.md or monthly/*.md as the "
