@@ -692,9 +692,11 @@ TOOL_SCHEMAS = [
         "description": (
             "Find memory cards by id, entity, or lexical match. Task-shaped turns "
             "should use monthly preference/procedure guidance first; daily YAML "
-            "holds card bodies. When the user mentions a time, or a week/month "
-            "block in the memory bands matches, pass time_from and time_to as "
-            "that block's ISO start and end. The host always runs expand_memory "
+            "holds card bodies. For a Band C summary weekday, pass time_from and "
+            "time_to as that one civil ISO day (Monday = the week's printed start), "
+            "not the week span; a Band C entities: canonical name may be query. "
+            "When a Band D month range matches, pass that block's printed ISO "
+            "start and end. The host always runs expand_memory "
             "on the first seed id after recall (depth 2). Do not call search_memory."
         ),
         "parameters": {
@@ -705,15 +707,17 @@ TOOL_SCHEMAS = [
                 "time_from": {
                     "type": "string",
                     "description": (
-                        "Optional ISO date or datetime. Set together with time_to "
-                        "when the user mentioned a time or a Band C/D ISO range matches."
+                        "Optional ISO date or datetime. Set together with time_to: "
+                        "one civil day from a Band C weekday, a Band D month range, "
+                        "or a user-mentioned time — not the full Band C week span."
                     ),
                 },
                 "time_to": {
                     "type": "string",
                     "description": (
-                        "Optional ISO date or datetime. Set together with time_from "
-                        "when the user mentioned a time or a Band C/D ISO range matches."
+                        "Optional ISO date or datetime. Set together with time_from: "
+                        "one civil day from a Band C weekday, a Band D month range, "
+                        "or a user-mentioned time — not the full Band C week span."
                     ),
                 },
             },

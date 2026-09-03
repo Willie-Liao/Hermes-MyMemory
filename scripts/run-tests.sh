@@ -62,5 +62,4 @@ echo "agent root: $AGENT_ROOT"
 "$PY" -m pytest \
   --ignore=digest/test_digest_live_typed_prompt.py \
   --ignore=digest/test_digest_live_merge_slots.py \
-  --ignore=weekly/test_monthly_schema.py \
   -q --tb=line

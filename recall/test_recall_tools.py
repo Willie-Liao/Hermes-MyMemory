@@ -382,6 +382,10 @@ def test_recall_tool_schema_exposes_optional_time_bounds():
     assert "time_from" in props and "time_to" in props
     assert "time_from" not in schema["parameters"]["required"]
     assert "time_to" not in schema["parameters"]["required"]
+    assert "not the week span" in schema["description"]
+    assert "not the full Band C week span" in props["time_from"]["description"]
+    assert "not the full Band C week span" in props["time_to"]["description"]
+    assert "that block's ISO start and end" not in schema["description"]
 
 
 def test_recall_channel_embed_when_fts_misses(staging, monkeypatch):
