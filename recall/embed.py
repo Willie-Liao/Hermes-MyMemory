@@ -76,7 +76,13 @@ def miss_rate(staging: Path | None = None) -> float:
 
 
 def embed_enabled(staging: Path | None = None) -> bool:
-    """Channel 4 stays off below the gate so lexical wins cannot be reranked away."""
+    """Channel 4 stays off below the gate so lexical wins cannot be reranked away.
+
+    Mem_Eval sets MYMEMORY_EMBED_FORCE=1 so isolated per-question staging cannot
+    wait for a 20% FTS-miss history that never accumulates across instances.
+    """
+    if (os.environ.get("MYMEMORY_EMBED_FORCE") or "").strip() == "1":
+        return True
     return miss_rate(staging) > GATE_RATE
 
 
@@ -311,7 +317,11 @@ def rerank_embed(
         # 3) Fall back to original runtime encoding if cache is too sparse
         if len(matched) < CACHE_MIN_ENTRIES:
             ordered = sorted(live, key=lambda r: str(r.day or ""), reverse=True)
-            pool = ordered[:CANDIDATE_CAP]
+            try:
+                pool_cap = int(os.environ.get("MYMEMORY_EMBED_CANDIDATE_CAP") or CANDIDATE_CAP)
+            except ValueError:
+                pool_cap = CANDIDATE_CAP
+            pool = ordered[: max(1, pool_cap)]
             passages = [_passage_text(rec) for rec in pool]
             vectors = _encode_texts([q, *passages])
             if (os.environ.get("MYMEMORY_EMBED_UNLOAD") or "").strip() == "1":

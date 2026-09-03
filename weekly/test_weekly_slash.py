@@ -442,8 +442,15 @@ def test_ui_probes_local_even_when_share_url_is_public(monkeypatch):
     assert "http://example.test:4000" in out
 
 
-def test_ui_starts_dev_server_when_down(monkeypatch):
+def test_ui_starts_dev_server_when_down(tmp_path, monkeypatch):
+    """Spawn npm run dev when loopback is down; skip install if node_modules exists.
+
+    Patching Popen also wraps subprocess.run, so a missing node_modules would make
+    npm install look like the first Popen and fail this assertion.
+    """
     s = _load_slash()
+    ui = tmp_path / "ui"
+    (ui / "node_modules").mkdir(parents=True)
     calls = {"probe": 0, "popen": 0}
 
     def fake_probe(url):
@@ -457,6 +464,7 @@ def test_ui_starts_dev_server_when_down(monkeypatch):
         return object()
 
     monkeypatch.delenv("WEEKLY_UI_URL", raising=False)
+    monkeypatch.setattr(s, "_ui_dir", lambda: ui)
     monkeypatch.setattr(s, "_ui_probe", fake_probe)
     monkeypatch.setattr(s.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(s.time, "sleep", lambda *_: None)
@@ -516,9 +524,16 @@ def test_ui_skips_dev_when_npm_install_fails(tmp_path, monkeypatch):
     assert "no tsx" in out
 
 
-def test_ui_fails_clearly_when_start_does_not_come_up(monkeypatch):
+def test_ui_fails_clearly_when_start_does_not_come_up(tmp_path, monkeypatch):
+    """Report failure when :3000 never probes up after spawn.
+
+    Provide node_modules so npm install (subprocess.run → Popen) is skipped.
+    """
     s = _load_slash()
+    ui = tmp_path / "ui"
+    (ui / "node_modules").mkdir(parents=True)
     monkeypatch.delenv("WEEKLY_UI_URL", raising=False)
+    monkeypatch.setattr(s, "_ui_dir", lambda: ui)
     monkeypatch.setattr(s, "_ui_probe", lambda url: False)
     monkeypatch.setattr(s.subprocess, "Popen", lambda *a, **k: object())
     monkeypatch.setattr(s.time, "sleep", lambda *_: None)

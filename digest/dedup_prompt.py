@@ -44,6 +44,12 @@ An extension is any of:
 A restatement is the same content reworded. It is the easier case and also
 consolidates.
 
+## Entity hint
+When comparing event pairs, check the `entity` field first.
+- Two events with the same entity are very likely the same sitting/thread; re-examine their bodies carefully for A/B/C patterns.
+- Two events with different entities, even if their bodies use similar words, usually belong to different requests — do not merge them.
+- A shared namespace prefix is not enough: "Hermes Skill Management" and "Hermes Embedding Cache" are different topics, not the same entity.
+
 ## Resolution
 
 Cards are grouped into four JSON arrays (event, fact, procedure, decision).
@@ -146,6 +152,14 @@ Why C: same stall episode; later investigation and outcome.
 {"operation":"merge","survivor_id":"<importance-5-event>","absorbed_ids":["<importance-4-event>"],
  "reason":"C evolution: same stall episode; survivor has later investigation and clearer outcome, importance 5>4",
  "event":{"beginning":"stall investigated after unfinished report","course":"ImportError recovered then batch B re-run failed three retries","outcome":"daily file not written"}}
+
+### C evolution (same-entity events)
+Existing (event, entity: Hermes Embedding System, importance 4): Beginning: user asked about Hermes embedding system; Course: assistant validated MiniLM+MI pipeline; Outcome: validation confirmed.
+New (event, entity: Hermes Embedding Cache, importance 5): Beginning: user asked about embedding cache; Course: assistant built hash-based incremental cache; Outcome: cache operational.
+Why C: both events are about the same embedding workstream; the second is a later stage. Survivor is higher importance.
+{"operation":"merge","survivor_id":"<importance-5>","absorbed_ids":["<importance-4>"],
+ "reason":"C evolution: same Hermes embedding workstream; survivor has later cache outcome, importance 5>4",
+ "event":{"beginning":"user asked about Hermes embedding system","course":"MiniLM+MI pipeline validated then hash-based incremental cache built","outcome":"embedding cache operational"}}
 
 ### Restatement (same type, so merge; the easiest case)
 

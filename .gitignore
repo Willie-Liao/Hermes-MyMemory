@@ -1,26 +1,13 @@
-# Secrets and local runtime — never publish a live Hermes home
+# Secrets and local runtime
 .env
 .env.*
 !.env.example
 auth.json
 *.pem
-*.key
-*credentials*
-config.yaml
-shell-hooks-allowlist.json
-SOUL.md
-HERMES.md
 
-# Personal memory / session data
-memories/
-logs/
-sessions/
-state/
-state.db
-state.db-*
-*.db
-*.db-wal
-*.db-shm
+# Local embed-ladder before/after clocks (plan Step 1 / 5)
+recall/embed_scale_latency_before.json
+recall/embed_scale_latency_after.json
 
 # Python
 __pycache__/
@@ -39,7 +26,14 @@ node_modules/
 coverage/
 weekly/ui/dist/
 weekly/ui/build/
-.vite/
 *.log
 .DS_Store
-.gitnexus/
+
+# Hermes runtime that must never ship from a live home
+state.db
+state.db-*
+memories/staging/.digest-state.json
+memories/staging/.weekly-state.json
+memories/staging/.monthly-state.json
+*.db-wal
+*.db-shm

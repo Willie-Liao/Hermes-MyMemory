@@ -70,7 +70,7 @@ mkdir -p "$DEST" "$HERMES_HOME/agent-hooks"
 
 RSYNC_EXCLUDES=(
   --exclude '.git/'
-  --exclude 'scripts/'
+  --exclude '/scripts/'
   --exclude 'Install MyMemory.command'
   --exclude '__pycache__/'
   --exclude '.pytest_cache/'

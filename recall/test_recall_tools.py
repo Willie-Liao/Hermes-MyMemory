@@ -382,6 +382,10 @@ def test_recall_tool_schema_exposes_optional_time_bounds():
     assert "time_from" in props and "time_to" in props
     assert "time_from" not in schema["parameters"]["required"]
     assert "time_to" not in schema["parameters"]["required"]
+    assert "not the week span" in schema["description"]
+    assert "not the full Band C week span" in props["time_from"]["description"]
+    assert "not the full Band C week span" in props["time_to"]["description"]
+    assert "that block's ISO start and end" not in schema["description"]
 
 
 def test_recall_channel_embed_when_fts_misses(staging, monkeypatch):
@@ -398,8 +402,11 @@ def test_recall_channel_embed_when_fts_misses(staging, monkeypatch):
         return out
 
     monkeypatch.setattr("recall.embed._encode_texts", _stub_encode)
+    monkeypatch.setattr("recall.tools._encode_texts", _stub_encode)
+    monkeypatch.setattr("recall.tools._scale_embed_locate", lambda *_a, **_k: None)
     text = recall_memory("qzxnmprefersdeckstructure", staging=staging)
-    assert "channel=embed" in text
+    assert "channel=id" in text
+    assert "channel=embed" not in text
     assert "mem-20260616-1607-cognitive-directionality" in text
 
 
@@ -621,6 +628,36 @@ def test_embed_cache_once_per_civil_day(tmp_path, monkeypatch):
     assert len(calls) == 1
 
 
+def test_embed_cache_01am_includes_month_week_sidecar(tmp_path, monkeypatch):
+    """Month/week sentences share the daily 01:00 pass, not a 03:00 clock."""
+    from recall import embed_cache
+
+    _embed_cache_staging(tmp_path, monkeypatch)
+    staging = tmp_path / "staging"
+    (staging / "weekly" / "2026-W32.md").write_text(
+        "---\nweek: 2026-W32\n---\n"
+        "schema_version: 2\nweek_key: 2026-W32\n"
+        "range:\n  start: '2026-08-03'\n  end: '2026-08-09'\n"
+        "summary:\n  - text: Pitch-line WeChat to Zhang.\n    weekdays: [Wednesday]\n",
+        encoding="utf-8",
+    )
+    encode_calls: list[int] = []
+
+    def encode_fn(texts):
+        encode_calls.append(len(texts))
+        return [[1.0, 0.0] for _ in texts]
+
+    stats = embed_cache.incremental_update(
+        encode_fn=encode_fn, now=datetime(2026, 8, 16, 1, 0, tzinfo=SHANGHAI)
+    )
+    assert stats.get("outcome") != "idle"
+    assert stats["embedded"] >= 2
+    cache = json.loads((tmp_path / "embeddings" / "embed-cache.json").read_text())
+    scale_ids = [k for k in cache.get("blocks", {}) if str(k).startswith("emb-scale:")]
+    assert scale_ids, cache.get("blocks", {}).keys()
+    assert embed_cache.EMBED_TICK == (1, 0)
+
+
 def test_embed_clock_next_wake_shanghai(tmp_path, monkeypatch):
     from recall import embed_cache
 
@@ -654,4 +691,79 @@ def test_embed_cache_gate_follows_injected_zone_not_host(tmp_path, monkeypatch):
     sh = embed_cache.incremental_update(encode_fn=encode_fn, now=utc)
     assert calls == ["ran"]
     assert sh["embedded"] == 1
+
+
+def test_scale_embed_month_locates_civil_day_before_daily(staging, monkeypatch):
+    """Month cosine hit must re-enter recall_memory on one day, not dump channel=embed."""
+    monkeypatch.setattr("recall.tools.embed_enabled", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        "recall.tools.collect_month_scale_rows",
+        lambda *_a, **_k: [
+            {"kind": "summary", "text": "Pitch-line WeChat to Zhang", "weeks": ("2026-W32",)}
+        ],
+    )
+    monkeypatch.setattr(
+        "recall.tools.collect_week_scale_rows",
+        lambda *_a, **_k: [
+            {
+                "kind": "summary",
+                "text": "Pitch-line WeChat to Zhang",
+                "week_key": "2026-W32",
+                "start": "2026-08-03",
+                "weekdays": ("Monday",),
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "recall.tools.rank_plain_passages",
+        lambda _q, rows: [(0.91, dict(rows[0]))] if rows else [],
+    )
+    daily_calls: list[str] = []
+
+    def _spy_daily(query, records=None, k=8, *_a, **_k):
+        daily_calls.append(str(query))
+        return []
+
+    monkeypatch.setattr("recall.tools.rerank_embed", _spy_daily)
+    text = recall_memory("qzxnmprefersdeckstructure", staging=staging)
+    assert "channel=embed" not in text
+    assert "time_from=2026-08-03" in text or "channel=time_or" in text or "channel=l1" in text or "channel=miss" in text
+    assert daily_calls, "bounded re-entry should still be allowed to try daily embed"
+
+
+def test_scale_embed_skipped_when_time_bounds_set(staging, monkeypatch):
+    monkeypatch.setattr("recall.tools.embed_enabled", lambda *_a, **_k: True)
+
+    def _boom(*_a, **_k):
+        raise AssertionError("month/week bags must not run when bounds are set")
+
+    monkeypatch.setattr("recall.tools._scale_embed_locate", _boom)
+    text = recall_memory(
+        "picnic",
+        staging=staging,
+        time_from="2026-08-12",
+        time_to="2026-08-12",
+    )
+    assert "channel=time_or" in text or "channel=id" in text
+
+
+def test_scale_embed_dp_locates_channel_id(staging, monkeypatch):
+    monkeypatch.setattr("recall.tools.embed_enabled", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        "recall.tools._scale_embed_locate",
+        lambda *_a, **_k: ("id", "mem-20260616-1607-cognitive-directionality"),
+    )
+    text = recall_memory("qzxnmprefersdeckstructure", staging=staging)
+    assert "channel=id" in text
+    assert "mem-20260616-1607-cognitive-directionality" in text
+    assert "channel=embed" not in text
+
+
+def test_embed_all_scales_miss_falls_to_l1_or_miss(staging, monkeypatch):
+    monkeypatch.setattr("recall.tools.embed_enabled", lambda *_a, **_k: True)
+    monkeypatch.setattr("recall.tools._scale_embed_locate", lambda *_a, **_k: None)
+    monkeypatch.setattr("recall.tools.rerank_embed", lambda *_a, **_k: [])
+    text = recall_memory("qzxnmprefersdeckstructure", staging=staging)
+    assert "channel=embed" not in text
+    assert "channel=l1" in text or "channel=miss" in text
 

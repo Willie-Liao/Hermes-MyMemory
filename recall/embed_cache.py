@@ -1,9 +1,8 @@
 """Pre-computed embedding cache for Channel 4 recall.
 
-Scans all daily/weekly staging files, computes per-block content hash,
-and caches GTE embeddings. On incremental update, only re-embeds changed blocks.
-
-Cache lives at ~/.hermes/memories/embeddings/embed-cache.json
+Scans daily YAML cards plus monthly/weekly sidecar sentences, computes per-block
+content hash, and caches GTE embeddings. Incremental update runs on the same
+01:00 civil tick as daily cards (not 03:00).
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 logger = logging.getLogger("plugins.memory-embed-cache")
@@ -30,6 +29,16 @@ _DEFAULT_TZ_NAME = "Asia/Shanghai"
 
 # Fields to include in content hash (semantic fields only)
 _HASH_FIELDS = ("id", "type", "entity", "predicate", "confidence", "status", "related", "body")
+_SCALE_HASH_FIELDS = (
+    "scale",
+    "kind",
+    "weeks",
+    "weekdays",
+    "start",
+    "mem_id",
+    "week_key",
+    "month_key",
+)
 
 
 def _hermes_home() -> Path:
@@ -168,17 +177,38 @@ def _parse_blocks_from_file(path: Path) -> list[dict[str, Any]]:
 def _compute_hash(block: dict[str, Any]) -> str:
     """Compute content hash from semantic fields."""
     parts = []
-    for field in _HASH_FIELDS:
+    fields = _HASH_FIELDS + (_SCALE_HASH_FIELDS if block.get("scale") else ())
+    for field in fields:
         val = block.get(field, "")
-        if field == "related" and isinstance(val, list):
-            val = ",".join(str(v) for v in sorted(val))
+        if field in {"related", "weeks", "weekdays", "evidence"} and isinstance(val, (list, tuple)):
+            val = ",".join(str(v) for v in val)
         parts.append(f"{field}={val}")
     text = "\n".join(parts)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+def scale_block_id(row: Mapping[str, Any] | dict[str, Any]) -> str:
+    """Stable cache id so 01:00 re-embeds a sidecar sentence when its locator or text changes."""
+    payload = {
+        "scale": str(row.get("scale") or ("week" if row.get("week_key") else "month")),
+        "kind": str(row.get("kind") or ""),
+        "text": str(row.get("text") or row.get("body") or ""),
+        "weeks": [str(w) for w in (row.get("weeks") or ())],
+        "week_key": str(row.get("week_key") or ""),
+        "month_key": str(row.get("month_key") or ""),
+        "mem_id": str(row.get("mem_id") or ""),
+        "start": str(row.get("start") or ""),
+        "weekdays": [str(n) for n in (row.get("weekdays") or ())],
+    }
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return "emb-scale:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
 def _compose_embedding_text(block: dict[str, Any]) -> str:
-    """Compose text for embedding: [entity] (type) predicate body"""
+    """Daily cards keep entity/type/predicate; sidecar scale rows embed the sentence only."""
+    body = str(block.get("body") or "").strip()
+    if block.get("scale"):
+        return body
     parts = []
     entity = block.get("entity", "")
     if entity:
@@ -189,31 +219,74 @@ def _compose_embedding_text(block: dict[str, Any]) -> str:
     predicate = block.get("predicate", "")
     if predicate:
         parts.append(predicate)
-    body = block.get("body", "")
     if body:
-        parts.append(body.strip())
+        parts.append(body)
     return " ".join(parts)
 
 
+def _sidecar_scale_blocks() -> dict[str, dict[str, Any]]:
+    """Month/week sidecar sentences share the daily 01:00 incremental_update pass."""
+    try:
+        from .tools import collect_month_scale_rows, collect_week_scale_rows
+    except Exception:
+        return {}
+    root = _staging_root()
+    out: dict[str, dict[str, Any]] = {}
+    for row in collect_month_scale_rows(root):
+        item = dict(row)
+        item.setdefault("scale", "month")
+        bid = scale_block_id(item)
+        out[bid] = {
+            "id": bid,
+            "type": "",
+            "entity": "",
+            "predicate": "",
+            "body": str(item.get("text") or ""),
+            "scale": "month",
+            "kind": item.get("kind") or "",
+            "weeks": list(item.get("weeks") or ()),
+            "mem_id": str(item.get("mem_id") or ""),
+            "month_key": str(item.get("month_key") or ""),
+            "source_file": f"monthly/{item.get('month_key') or ''}.md",
+        }
+    for row in collect_week_scale_rows(root):
+        item = dict(row)
+        item.setdefault("scale", "week")
+        bid = scale_block_id(item)
+        out[bid] = {
+            "id": bid,
+            "type": "",
+            "entity": "",
+            "predicate": "",
+            "body": str(item.get("text") or ""),
+            "scale": "week",
+            "kind": item.get("kind") or "",
+            "week_key": str(item.get("week_key") or ""),
+            "start": str(item.get("start") or ""),
+            "weekdays": list(item.get("weekdays") or ()),
+            "source_file": f"weekly/{item.get('week_key') or ''}.md",
+        }
+    return out
+
+
 def scan_all_blocks() -> dict[str, dict[str, Any]]:
-    """Scan all daily and weekly staging files, return {block_id: block_dict}."""
+    """Scan daily YAML cards plus monthly/weekly sidecar sentences for the 01:00 cache."""
     root = _staging_root()
     all_blocks: dict[str, dict[str, Any]] = {}
-    
-    # Scan daily files
+
     daily_dir = root / "daily"
     if daily_dir.is_dir():
         for f in sorted(daily_dir.glob("*.md")):
             for block in _parse_blocks_from_file(f):
                 all_blocks[block["id"]] = block
-    
-    # Scan weekly files
+
     weekly_dir = root / "weekly"
     if weekly_dir.is_dir():
         for f in sorted(weekly_dir.glob("*.md")):
             for block in _parse_blocks_from_file(f):
                 all_blocks[block["id"]] = block
-    
+
+    all_blocks.update(_sidecar_scale_blocks())
     return all_blocks
 
 

@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import math
 import re
+import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .edges import WEIGHT_OVERLAP, adjacency, load_edges
-from .embed import embed_enabled, log_fts_miss, rerank_embed
+from .embed import COSINE_FLOOR, _cosine, _encode_texts, embed_enabled, log_fts_miss, rerank_embed
 from .ids import (
     BlockIndex,
     BlockRecord,
@@ -40,6 +41,253 @@ MAX_DEPTH = 2
 INDEX_TYPES = {"fact", "procedure", "decision", "event", "decision_constraint"}
 TIME_WIDEN_STAGES = (0, 3, 7)
 TIME_HIT_FLOOR = 3
+
+
+def _plugin_subpath(name: str) -> Path:
+    """Keep monthly/weekly imports on the plugin path so recall does not depend on Hermes cwd."""
+    return Path(__file__).resolve().parent.parent / name
+
+
+def collect_month_scale_rows(staging: Path) -> list[dict[str, Any]]:
+    """Index month stories and D/P lookup text so Channel 4 can rank a small bag before daily cards.
+
+    Daily YAML remains the card corpus; these rows only supply locators (weeks or mem-ids).
+    """
+    mdir = _plugin_subpath("monthly")
+    if str(mdir) not in sys.path:
+        sys.path.insert(0, str(mdir))
+    try:
+        from monthly_actions import _iter_payloads
+    except Exception:
+        return []
+    rows: list[dict[str, Any]] = []
+    try:
+        payloads = list(_iter_payloads(staging))
+    except Exception:
+        return []
+    for payload in payloads:
+        for item in payload.summary or ():
+            text = str(getattr(item, "text", "") or "").strip()
+            if not text:
+                continue
+            weeks = tuple(
+                str(w).strip() for w in (getattr(item, "weeks", ()) or ()) if str(w).strip()
+            )
+            rows.append(
+                {
+                    "scale": "month",
+                    "kind": "summary",
+                    "text": text,
+                    "weeks": weeks,
+                    "month_key": str(getattr(payload, "key", "") or "").strip(),
+                }
+            )
+        for row in list(payload.key_decisions or ()) + list(payload.key_procedures or ()):
+            text = str(row.lookup_text() if hasattr(row, "lookup_text") else "").strip()
+            if not text:
+                continue
+            evidence = tuple(
+                str(x).strip() for x in (getattr(row, "evidence", ()) or ()) if str(x).strip()
+            )
+            rows.append(
+                {
+                    "scale": "month",
+                    "kind": "dp",
+                    "text": text,
+                    "mem_id": str(getattr(row, "id", "") or "").strip(),
+                    "evidence": evidence,
+                    "month_key": str(getattr(payload, "key", "") or "").strip(),
+                }
+            )
+    return rows
+
+
+def collect_week_scale_rows(
+    staging: Path, week_keys: Sequence[str] | None = None
+) -> list[dict[str, Any]]:
+    """Index weekly.md summary bullets so a month/week cosine hit can map to one civil day."""
+    wdir = _plugin_subpath("weekly")
+    if str(wdir) not in sys.path:
+        sys.path.insert(0, str(wdir))
+    try:
+        from weekly_json import load_sidecar
+    except Exception:
+        return []
+    weekly = Path(staging) / "weekly"
+    if not weekly.is_dir():
+        return []
+    allow = {str(k).strip() for k in (week_keys or ()) if str(k).strip()}
+    rows: list[dict[str, Any]] = []
+    for path in sorted(weekly.glob("*.md")):
+        if allow and path.stem not in allow:
+            continue
+        try:
+            payload = load_sidecar(path)
+        except Exception:
+            continue
+        start = ""
+        rng = payload.get("range") or {}
+        if isinstance(rng, dict):
+            start = str(rng.get("start") or "")[:10]
+        if not start:
+            year_s, _, week_s = path.stem.partition("-W")
+            try:
+                start = date.fromisocalendar(int(year_s), int(week_s), 1).isoformat()
+            except ValueError:
+                start = ""
+        for item in payload.get("summary") or []:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            weekdays = tuple(
+                str(name).strip()
+                for name in (item.get("weekdays") or [])
+                if str(name).strip()
+            )
+            rows.append(
+                {
+                    "scale": "week",
+                    "kind": "summary",
+                    "text": text,
+                    "week_key": path.stem,
+                    "start": start,
+                    "weekdays": weekdays,
+                }
+            )
+    return rows
+
+
+def rank_plain_passages(
+    query: str, rows: Sequence[Mapping[str, Any]]
+) -> list[tuple[float, dict[str, Any]]]:
+    """Cosine-rank sidecar sentences without the daily [entity] (type) prefix that flattens cards.
+
+    Prefer vectors written at the 01:00 embed-cache tick; encode leftovers on the query path
+    so a cache miss cannot skip Channel 4.
+    """
+    from .embed_cache import load_cache, scale_block_id
+
+    q = str(query or "").strip()
+    live = [dict(row) for row in rows if str(row.get("text") or "").strip()]
+    if not q or not live:
+        return []
+    try:
+        qv_list = _encode_texts([q])
+    except Exception:
+        return []
+    if not qv_list or not qv_list[0]:
+        return []
+    qv = qv_list[0]
+    cache = load_cache()
+    scored: list[tuple[float, dict[str, Any]]] = []
+    missing: list[dict[str, Any]] = []
+    for row in live:
+        bid = scale_block_id(row)
+        vec = (cache.get(bid) or {}).get("embedding") or []
+        if vec:
+            score = _cosine(qv, vec)
+            if score >= COSINE_FLOOR:
+                scored.append((score, row))
+            continue
+        missing.append(row)
+    if missing:
+        try:
+            vecs = _encode_texts([str(row["text"]) for row in missing])
+        except Exception:
+            vecs = []
+        if len(vecs) == len(missing):
+            for row, vec in zip(missing, vecs):
+                score = _cosine(qv, vec)
+                if score >= COSINE_FLOOR:
+                    scored.append((score, row))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return scored
+
+
+def _weekday_names() -> tuple[str, ...]:
+    """Reuse weekly Monday=0 labels so locate cannot invent a calendar of its own."""
+    wdir = _plugin_subpath("weekly")
+    if str(wdir) not in sys.path:
+        sys.path.insert(0, str(wdir))
+    try:
+        from weekly_event_schema import WEEKDAY_NAMES
+
+        return WEEKDAY_NAMES
+    except Exception:
+        return (
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
+            "Sunday",
+        )
+
+
+def _civil_day_from_week_row(row: Mapping[str, Any], query: str) -> str | None:
+    """Map a Band C weekday suffix onto the week's printed Monday start as one ISO date."""
+    start_s = str(row.get("start") or "")[:10]
+    try:
+        start = date.fromisoformat(start_s)
+    except ValueError:
+        return None
+    names = [str(n).strip() for n in (row.get("weekdays") or ()) if str(n).strip()]
+    if not names:
+        return None
+    qcf = str(query or "").casefold()
+    pick = names[0]
+    for name in names:
+        if name.casefold() in qcf:
+            pick = name
+            break
+    try:
+        offset = _weekday_names().index(pick)
+    except ValueError:
+        return None
+    return (start + timedelta(days=offset)).isoformat()
+
+
+def _locator_from_week_hit(query: str, row: Mapping[str, Any]) -> tuple[str, str] | None:
+    """Refuse a whole-week dump: no weekday on the bullet means this scale missed."""
+    day = _civil_day_from_week_row(row, query)
+    if not day:
+        return None
+    return ("day", day)
+
+
+def _locator_from_scale_hit(
+    query: str, row: Mapping[str, Any], staging: Path
+) -> tuple[str, str] | None:
+    """Turn a month/week cosine row into Channel 1 id or one civil day for recall_memory re-entry."""
+    kind = str(row.get("kind") or "")
+    if kind == "dp":
+        for mid in (str(row.get("mem_id") or ""), *list(row.get("evidence") or ())):
+            mid = str(mid).strip()
+            if mid:
+                return ("id", mid)
+        return None
+    weeks = tuple(str(w).strip() for w in (row.get("weeks") or ()) if str(w).strip())
+    week_rows = collect_week_scale_rows(staging, weeks if weeks else None)
+    ranked = rank_plain_passages(query, week_rows)
+    if ranked:
+        return _locator_from_week_hit(query, ranked[0][1])
+    return _locator_from_week_hit(query, row)
+
+
+def _scale_embed_locate(query: str, staging: Path) -> tuple[str, str] | None:
+    """Month bag then week bag; first cosine hit above the floor yields a locate pair."""
+    month_hits = rank_plain_passages(query, collect_month_scale_rows(staging))
+    if month_hits:
+        loc = _locator_from_scale_hit(query, month_hits[0][1], staging)
+        if loc:
+            return loc
+    week_hits = rank_plain_passages(query, collect_week_scale_rows(staging))
+    if week_hits:
+        return _locator_from_week_hit(query, week_hits[0][1])
+    return None
 
 
 def _week(rec: BlockRecord) -> str:
@@ -195,11 +443,13 @@ def recall_memory(
     time_from: str | None = None,
     time_to: str | None = None,
     mode: str = "normal",
+    _skip_scale_embed: bool = False,
 ) -> str:
-    """Channel ladder: id → entity_key → fts5 → (gated embed) → l1 last resort.
+    """Channel ladder: id → entity_key → fts5 → month/week/daily embed locate → l1.
 
     mode=guidance ranks monthly D/P first and falls back to daily decision/procedure
-    only, so a task-shaped prefetch cannot inject events.
+    only, so a task-shaped prefetch cannot inject events. Scale embed is skipped on
+    re-entry so a locate hop cannot loop on the same unbounded query.
     """
     q = str(query or "").strip()
     root = staging_root(staging)
@@ -292,13 +542,54 @@ def recall_memory(
             return "\n".join(lines)
 
     if not semantic and embed_enabled(root):
+        if not bounds and not _skip_scale_embed:
+            loc = _scale_embed_locate(q, root)
+            if loc and loc[0] == "id":
+                return recall_memory(
+                    loc[1],
+                    k=k,
+                    staging=root,
+                    scope=scope,
+                    valid_from=valid_from,
+                    index=store,
+                    mode=mode,
+                    _skip_scale_embed=True,
+                )
+            if loc and loc[0] == "day":
+                return recall_memory(
+                    q,
+                    k=k,
+                    staging=root,
+                    scope=scope,
+                    valid_from=valid_from,
+                    index=store,
+                    time_from=loc[1],
+                    time_to=loc[1],
+                    mode=mode,
+                    _skip_scale_embed=True,
+                )
         live = [rec for rec in store.records if not _is_rejected(rec)]
         reranked = rerank_embed(q, live, k=cap)
         if reranked:
+            ids = _MEM_ID_RE.findall(str(reranked))
+            if ids and not bounds and not _skip_scale_embed:
+                hit_id = ids[0]
+                rec = store.get(hit_id) or resolve_id(hit_id, staging=root, index=store)
+                if rec:
+                    return recall_memory(
+                        rec.block_id,
+                        k=k,
+                        staging=root,
+                        scope=scope,
+                        valid_from=valid_from,
+                        index=store,
+                        mode=mode,
+                        _skip_scale_embed=True,
+                    )
             if not bounds:
                 return str(reranked)
             seen_sem = {r.block_id for r in semantic}
-            for mid in _MEM_ID_RE.findall(str(reranked)):
+            for mid in ids:
                 rec = store.get(mid)
                 if rec is not None and rec.block_id not in seen_sem:
                     semantic.append(rec)
@@ -692,9 +983,13 @@ TOOL_SCHEMAS = [
         "description": (
             "Find memory cards by id, entity, or lexical match. Task-shaped turns "
             "should use monthly preference/procedure guidance first; daily YAML "
-            "holds card bodies. When the user mentions a time, or a week/month "
-            "block in the memory bands matches, pass time_from and time_to as "
-            "that block's ISO start and end. The host always runs expand_memory "
+            "holds card bodies. For a Band C summary weekday, pass time_from and "
+            "time_to as that one civil ISO day (Monday = the week's printed start), "
+            "not the week span; a Band C entities: canonical name may be query. "
+            "After an embed hit the host locates the daily card (mem-id or one "
+            "civil day) through this same tool. "
+            "When a Band D month range matches, pass that block's printed ISO "
+            "start and end. The host always runs expand_memory "
             "on the first seed id after recall (depth 2). Do not call search_memory."
         ),
         "parameters": {
@@ -705,15 +1000,17 @@ TOOL_SCHEMAS = [
                 "time_from": {
                     "type": "string",
                     "description": (
-                        "Optional ISO date or datetime. Set together with time_to "
-                        "when the user mentioned a time or a Band C/D ISO range matches."
+                        "Optional ISO date or datetime. Set together with time_to: "
+                        "one civil day from a Band C weekday, a Band D month range, "
+                        "or a user-mentioned time — not the full Band C week span."
                     ),
                 },
                 "time_to": {
                     "type": "string",
                     "description": (
-                        "Optional ISO date or datetime. Set together with time_from "
-                        "when the user mentioned a time or a Band C/D ISO range matches."
+                        "Optional ISO date or datetime. Set together with time_from: "
+                        "one civil day from a Band C weekday, a Band D month range, "
+                        "or a user-mentioned time — not the full Band C week span."
                     ),
                 },
             },

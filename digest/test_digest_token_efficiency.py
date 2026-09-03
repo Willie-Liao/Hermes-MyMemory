@@ -749,9 +749,9 @@ def test_proposer_tool_loop_submit_then_patch(tmp_path, monkeypatch):
     assert "fact" in board and "procedure" in board
     fact_ids = [card["id"] for card in board["fact"]["cards"]]
     proc_ids = [card["id"] for card in board["procedure"]["cards"]]
-    assert fact_ids == ["mem-fact-apple", "mem-fact-banana"]
+    # Same-entity facts stay on the board even when MI would drop zebra.
+    assert fact_ids == ["mem-fact-apple", "mem-fact-banana", "mem-fact-zebra"]
     assert proc_ids == ["mem-proc-a", "mem-proc-b"]
-    assert "mem-fact-zebra" not in json.dumps(board)
     assert "mem-event-apple" not in json.dumps(board)
     for bucket in board.values():
         cards = bucket["cards"]

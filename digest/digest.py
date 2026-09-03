@@ -147,7 +147,7 @@ MAX_RETRY_ERROR_CHARS = 800
 IN_FLIGHT_STALE_SECONDS = 600
 # Phase-2 Pearson/MI prefilter (ES-Mem eqs 1–2). Lazy MiniLM; in-memory only.
 PHASE2_MINILM_MODEL = "all-MiniLM-L6-v2"
-PHASE2_MI_THRESHOLD = 0.10  # Absolute MI threshold (was quantile 0.35)
+PHASE2_MI_THRESHOLD = 0.06  # Absolute MI threshold (relaxed from 0.10)
 _PHASE2_MINILM: Any = None
 _PHASE2_EMBED_CACHE: dict[str, list[float]] = {}
 
@@ -341,7 +341,7 @@ Types: fact | procedure | decision | event. Never type: entity or hypothesis (en
 - User messages are the primary evidence; preserve the user's goal, wording, preferences, and corrections over assistant/tool narration.
 - event: user-driven causal chain and the user-request skeleton with exactly three stages — Beginning, Course, Outcome. Each of beginning, course, and outcome is one concise sentence (not a paragraph). Own the user goal, important phases, and current result/status; do not duplicate detailed facts, preferences, speculation, or tool logs. Required: entity; predicate snake_case user intent (e.g. user_requested_*) — not a tool-step name; participants MUST include {{entity: User, role: requester}} and {{entity: Assistant, role: executor}} (≤5 total; role optional on secondary; confidence: medium if any role missing); valid_from + valid_to (open if ongoing); no file paths / message ids / byte sizes (→ sources:); no 【过程性参考】.
 - fact: stable, observable observations; do not contain agent process or user preference. Two peer forms: Factual (kind=Factual + content; involves optional/single) or Narration (kind=Narration + content + involves cast `{{entity: Name, role?: optional}}`, role only when clear). Prefer one Narration card over N cast shards for the same story.
-- procedure: agent process for the user-request task — an abstract reusable process used by the agent. Own course obstacles and abstract solutions, not raw tool logs or the event outcome. Not object documentation; do not become object/API documentation.
+- procedure: what the user asked the agent to do, the obstacle encountered, and the concrete output produced. Capture the task scope (user request), the problem (obstacle), and the deliverable (file, config, message, code). Not raw tool logs; not object/API documentation.
 - decision: user-only rulings and preferences for agent behavior (must/must-not), including decision_constraint: user feedback on that procedure, corrections, and standing prefs. Scan the transcript for the user's must / must-not / standing prefs and emit them as subject=user plus a predicate ruling so Preference:/Decision: {{subject}} {{ruling}} is one clause. First subject after Preference:/Decision: must be user/User (plus USER.md aliases). Third-party traits/living/likes → fact (`Narration:` / kind=Narration), even when the user reported them. Do not duplicate the full procedure or event summary. Corrections use supersedes: + confidence: explicit. `decision_constraint` is accepted only as a legacy input alias and is normalized to canonical `decision`.
 - Legacy input alias detail: decision_constraint: user feedback on that procedure; it is never emitted as the canonical output type.
 - Episode-first: one outcome event per completed user request (not one per tool step). Grade/scrape snapshot → fact; multi-file deliverable arc → one event.
@@ -3453,6 +3453,38 @@ def _phase2_prompt_and_tool(
                 str(block.get("id")): (block, vectors[i])
                 for i, block in enumerate(board)
             }
+
+            def _same_entity_same_type_pairs(
+                grouped: dict[str, list[dict[str, Any]]],
+                by_id: dict[str, tuple[dict[str, Any], list[float]]],
+            ) -> list[tuple[str, str]]:
+                """Return (id_a, id_b) pairs for same-type blocks sharing the same entity.
+
+                WHY: MI-based filtering drops valid same-entity pairs when embeddings
+                diverge (e.g. different facets of the same person/project). These pairs
+                are nearly always worth LLM comparison, so we add them as a safety net.
+
+                HOW: Per type bucket, groups blocks by lowercased entity; emits all
+                distinct pairs within each entity group. Caller deduplicates via set
+                union with MI-selected pairs.
+                """
+                pairs: list[tuple[str, str]] = []
+                for kind in digest_dedup_prompt.BLOCK_TYPE_ORDER:
+                    cards = grouped.get(kind, [])
+                    entity_groups: dict[str, list[str]] = {}
+                    for b in cards:
+                        bid = str(b.get("id") or "").strip()
+                        if not bid or bid not in by_id:
+                            continue
+                        ent = str(b.get("entity") or "").strip().casefold()
+                        if ent:
+                            entity_groups.setdefault(ent, []).append(bid)
+                    for ids in entity_groups.values():
+                        for i, a in enumerate(ids):
+                            for b in ids[i + 1:]:
+                                pairs.append((a, b) if a < b else (b, a))
+                return pairs
+
             kept: list[tuple[str, str]] = []
             for kind in digest_dedup_prompt.BLOCK_TYPE_ORDER:
                 cards = [
@@ -3490,6 +3522,15 @@ def _phase2_prompt_and_tool(
                 for left, right, mi in scores:
                     if mi > PHASE2_MI_THRESHOLD:
                         kept.append((left, right))
+            # Entity-based fallback: same entity + same type → always candidate
+            entity_pairs = _same_entity_same_type_pairs(grouped, by_id)
+            kept_set = {pair if pair[0] < pair[1] else (pair[1], pair[0])
+                        for pair in kept}
+            for pair in entity_pairs:
+                canonical = pair if pair[0] < pair[1] else (pair[1], pair[0])
+                if canonical not in kept_set:
+                    kept.append(canonical)
+                    kept_set.add(canonical)
             if not kept:
                 _log(
                     "phase2 Pearson/MI gate: no candidate pairs; skip LLM"
