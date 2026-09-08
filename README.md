@@ -16,22 +16,24 @@ cd Hermes-MyMemory
 
 On macOS you can double-click `Install MyMemory.command` instead. Use `--skip-tests` to copy and restart without pytest, or `--force` to continue after a test failure.
 
-`install.sh` also installs Channel 4 **runtime** packages into the Hermes interpreter: `onnxruntime`, `tokenizers`, `numpy`. It does **not** install PyTorch / `sentence-transformers` on the gateway box.
+`install.sh` installs Channel 4 automatically:
 
-Weights live outside git (`~/.cache/mymemory/gte-multilingual-base-int8/` or `MYMEMORY_GTE_ONNX`). Export once on a Mac from the plugin directory:
+1. `onnxruntime`, `tokenizers`, `numpy` into the Hermes interpreter (not PyTorch).
+2. GTE int8 ONNX + tokenizer into `~/.cache/mymemory/gte-multilingual-base-int8/` (downloads ~200 MB from the `gte-int8-v1` GitHub Release if missing).
 
-```bash
-pip install 'sentence-transformers' optimum onnx onnxruntime
-python -c "from recall.embed import export_gte_int8; export_gte_int8()"
-```
-
-Smoke (expects 768 when the ONNX file is present; `[]` if still missing — Channel 4 fail-open):
+Override the bundle with `MYMEMORY_GTE_BUNDLE_URL` or a local file via `MYMEMORY_GTE_ONNX`. Smoke (expects 768):
 
 ```bash
 python -c "from recall.embed import _encode_texts; print(len(_encode_texts(['ping'])[0]))"
 ```
 
-Manual steps if you prefer not to use the script:
+Mac-only re-export (not needed for install):
+
+```bash
+pip install 'sentence-transformers' optimum onnx onnxruntime
+python -c "from recall.embed import export_gte_int8; export_gte_int8()"
+./scripts/pack-gte-int8.sh
+```
 
 1. Place this tree at `$HERMES_HOME/plugins/MyMemory`.
 2. Merge the config below into `$HERMES_HOME/config.yaml` (do not overwrite the whole file).
@@ -164,7 +166,7 @@ Default FTS/entity/embed recall and monthly synthesis **omit** `status: rejected
 | Empty estimates | `state.db` exists and has `messages` with `active=1` |
 | Worker errors | Provider keys in `.env` matching `plugins.entries.MyMemory` |
 | Clock dates wrong | `timezone` in `config.yaml` (digest ticks and embed-cache 01:00) |
-| Channel 4 empty / weekly entity `embedding: "false"` | Missing `onnxruntime`/`tokenizers`/`numpy`, or GTE int8 ONNX + `tokenizer.json` not under `~/.cache/mymemory` (or `MYMEMORY_GTE_ONNX`). The entity slot is a cache-presence flag, not the failure. |
+| Channel 4 empty / weekly entity `embedding: "false"` | `install.sh` did not finish GTE download; check `~/.cache/mymemory/gte-multilingual-base-int8/model_int8.onnx` and `onnxruntime`. |
 
 ## Privacy and contributions
 

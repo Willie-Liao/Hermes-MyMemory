@@ -125,6 +125,44 @@ resolve_runtime_python() {
   return 1
 }
 
+# Pre-exported GTE int8 (no PyTorch on the gateway). GitHub Release, not git.
+GTE_CACHE_DIR="${MYMEMORY_GTE_CACHE:-$HOME/.cache/mymemory/gte-multilingual-base-int8}"
+GTE_BUNDLE_URL="${MYMEMORY_GTE_BUNDLE_URL:-https://github.com/Willie-Liao/Hermes-MyMemory/releases/download/gte-int8-v1/gte-multilingual-base-int8.tar.gz}"
+
+gte_int8_ready() {
+  local dir="$1"
+  [[ -f "${dir}/model_int8.onnx" || -f "${dir}/model.onnx" ]] && [[ -f "${dir}/tokenizer.json" ]]
+}
+
+ensure_gte_int8() {
+  # Download Channel 4 weights so double-click install does not need a Mac PyTorch export.
+  if [[ -n "${MYMEMORY_GTE_ONNX:-}" && -f "${MYMEMORY_GTE_ONNX}" ]]; then
+    echo "ok: MYMEMORY_GTE_ONNX=${MYMEMORY_GTE_ONNX}"
+    return 0
+  fi
+  mkdir -p "$GTE_CACHE_DIR"
+  if gte_int8_ready "$GTE_CACHE_DIR"; then
+    echo "ok: GTE int8 weights under ${GTE_CACHE_DIR}"
+    return 0
+  fi
+  echo "Downloading Channel 4 GTE int8 (one-time, ~200 MB) from:"
+  echo "  ${GTE_BUNDLE_URL}"
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/mymemory-gte.XXXXXX.tar.gz")"
+  if ! curl -fL --retry 5 --retry-delay 2 -o "$tmp" "$GTE_BUNDLE_URL"; then
+    rm -f "$tmp"
+    echo "error: GTE int8 download failed. Set MYMEMORY_GTE_BUNDLE_URL or export locally:" >&2
+    echo "  python -c \"from recall.embed import export_gte_int8; export_gte_int8()\"" >&2
+    return 1
+  fi
+  tar -xzf "$tmp" -C "$GTE_CACHE_DIR"
+  rm -f "$tmp"
+  if ! gte_int8_ready "$GTE_CACHE_DIR"; then
+    echo "error: GTE bundle unpacked but model_int8.onnx or tokenizer.json is missing" >&2
+    return 1
+  fi
+  echo "ok: GTE int8 installed under ${GTE_CACHE_DIR}"
+}
 echo ""
 echo "Channel 4 runtime (onnxruntime, tokenizers, numpy)…"
 if RUNTIME_PY="$(resolve_runtime_python)"; then
@@ -136,20 +174,9 @@ if RUNTIME_PY="$(resolve_runtime_python)"; then
 else
   echo "note: no Python found — install onnxruntime tokenizers numpy into the Hermes interpreter" >&2
 fi
-ONNX_DIR="${HOME}/.cache/mymemory/gte-multilingual-base-int8"
-ONNX_HINT=""
-if [[ -n "${MYMEMORY_GTE_ONNX:-}" ]]; then
-  ONNX_HINT="${MYMEMORY_GTE_ONNX}"
-fi
-if [[ -n "$ONNX_HINT" && -f "$ONNX_HINT" ]]; then
-  echo "ok: MYMEMORY_GTE_ONNX=${ONNX_HINT}"
-elif [[ -f "${ONNX_DIR}/model_int8.onnx" || -f "${ONNX_DIR}/model.onnx" ]]; then
-  echo "ok: GTE int8 weights under ${ONNX_DIR}"
-else
-  echo "note: Channel 4 ONNX weights missing (not a plugin bug). Export once on a Mac:"
-  echo "  pip install 'sentence-transformers' optimum onnx onnxruntime"
-  echo "  cd ${DEST} && python -c \"from recall.embed import export_gte_int8; export_gte_int8()\""
-fi
+echo ""
+echo "Channel 4 GTE int8 weights…"
+ensure_gte_int8
 
 if [[ -f "$PACK_ROOT/examples/agent-hooks/block-hermes-root-junk.sh" ]]; then
   cp -p "$PACK_ROOT/examples/agent-hooks/block-hermes-root-junk.sh" \
