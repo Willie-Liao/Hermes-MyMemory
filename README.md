@@ -16,6 +16,21 @@ cd Hermes-MyMemory
 
 On macOS you can double-click `Install MyMemory.command` instead. Use `--skip-tests` to copy and restart without pytest, or `--force` to continue after a test failure.
 
+`install.sh` also installs Channel 4 **runtime** packages into the Hermes interpreter: `onnxruntime`, `tokenizers`, `numpy`. It does **not** install PyTorch / `sentence-transformers` on the gateway box.
+
+Weights live outside git (`~/.cache/mymemory/gte-multilingual-base-int8/` or `MYMEMORY_GTE_ONNX`). Export once on a Mac from the plugin directory:
+
+```bash
+pip install 'sentence-transformers' optimum onnx onnxruntime
+python -c "from recall.embed import export_gte_int8; export_gte_int8()"
+```
+
+Smoke (expects 768 when the ONNX file is present; `[]` if still missing — Channel 4 fail-open):
+
+```bash
+python -c "from recall.embed import _encode_texts; print(len(_encode_texts(['ping'])[0]))"
+```
+
 Manual steps if you prefer not to use the script:
 
 1. Place this tree at `$HERMES_HOME/plugins/MyMemory`.
@@ -149,6 +164,7 @@ Default FTS/entity/embed recall and monthly synthesis **omit** `status: rejected
 | Empty estimates | `state.db` exists and has `messages` with `active=1` |
 | Worker errors | Provider keys in `.env` matching `plugins.entries.MyMemory` |
 | Clock dates wrong | `timezone` in `config.yaml` (digest ticks and embed-cache 01:00) |
+| Channel 4 empty / weekly entity `embedding: "false"` | Missing `onnxruntime`/`tokenizers`/`numpy`, or GTE int8 ONNX + `tokenizer.json` not under `~/.cache/mymemory` (or `MYMEMORY_GTE_ONNX`). The entity slot is a cache-presence flag, not the failure. |
 
 ## Privacy and contributions
 

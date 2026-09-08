@@ -306,7 +306,6 @@ def test_thread_step_via_and_entity_record_shape():
         first_seen=date(2026, 8, 12),
         last_seen=date(2026, 8, 14),
         week_blocks=("mem-2026-08-12-event-9625547B667B",),
-        embedding=None,
     )
     wrap = schema.IntraDayThread(
         date=date(2026, 8, 15),

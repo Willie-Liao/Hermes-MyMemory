@@ -1173,4 +1173,53 @@ def test_score_event_clusters_min_distinct_periods_one_keeps_same_day(monkeypatc
     assert workers._score_event_clusters([a, b]) == []
 
 
+def test_entity_embedding_slot_false_without_cache():
+    schema = _load()
+    wj = _load_weekly_json()
+    payload = schema.WeeklyReviewPayload(
+        days=tuple(_week(schema, with_events=False)),
+        week_key="2026-W31",
+        entities=(
+            schema.WeeklyEntity(
+                key="memorydigest",
+                canonical="memory-digest",
+                week_blocks=("mem-1",),
+            ),
+        ),
+    )
+    obj = json.loads(wj.dumps(payload))
+    assert obj["entities"][0]["embedding"] == "false"
+    round_trip = wj.loads(json.dumps(obj))
+    assert round_trip.entities[0].embedding == "false"
+
+
+def test_entity_embedding_slot_true_when_week_blocks_cached(monkeypatch, tmp_path):
+    from recall import embed_cache
+
+    cache_dir = tmp_path / "embeddings"
+    cache_dir.mkdir()
+    (cache_dir / "embed-cache.json").write_text(
+        json.dumps({"blocks": {"mem-1": {"hash": "a", "embedding": [0.2, 0.1]}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(embed_cache, "_cache_root", lambda: cache_dir)
+    schema = _load()
+    wj = _load_weekly_json()
+    payload = schema.WeeklyReviewPayload(
+        days=tuple(_week(schema, with_events=False)),
+        week_key="2026-W31",
+        entities=(
+            schema.WeeklyEntity(
+                key="memorydigest",
+                canonical="memory-digest",
+                week_blocks=("mem-1",),
+            ),
+        ),
+    )
+    obj = json.loads(wj.dumps(payload))
+    assert obj["entities"][0]["embedding"] == "true"
+    restored = wj.loads(json.dumps(obj))
+    assert restored.entities[0].embedding == "true"
+
+
 

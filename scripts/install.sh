@@ -101,6 +101,56 @@ echo ""
 rsync -a "${RSYNC_EXCLUDES[@]}" "$PACK_ROOT/" "$DEST/"
 echo "installed: plugins/MyMemory"
 
+resolve_runtime_python() {
+  if [[ -n "${HERMES_PYTHON:-}" && -x "${HERMES_PYTHON}" ]]; then
+    echo "${HERMES_PYTHON}"
+    return 0
+  fi
+  local candidate
+  for candidate in \
+    "${HERMES_HOME}/hermes-agent/.venv/bin/python" \
+    "${HERMES_HOME}/.venv/bin/python" \
+    "/usr/local/lib/hermes-agent/venv/bin/python" \
+    "/usr/local/lib/hermes-agent/.venv/bin/python"
+  do
+    if [[ -x "$candidate" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+    return 0
+  fi
+  return 1
+}
+
+echo ""
+echo "Channel 4 runtime (onnxruntime, tokenizers, numpy)…"
+if RUNTIME_PY="$(resolve_runtime_python)"; then
+  if ! "${RUNTIME_PY}" -c "import onnxruntime, tokenizers, numpy" >/dev/null 2>&1; then
+    echo "Installing onnxruntime tokenizers numpy into ${RUNTIME_PY}"
+    "${RUNTIME_PY}" -m pip install --quiet onnxruntime tokenizers numpy
+  fi
+  echo "ok: ${RUNTIME_PY} can import onnxruntime, tokenizers, numpy"
+else
+  echo "note: no Python found — install onnxruntime tokenizers numpy into the Hermes interpreter" >&2
+fi
+ONNX_DIR="${HOME}/.cache/mymemory/gte-multilingual-base-int8"
+ONNX_HINT=""
+if [[ -n "${MYMEMORY_GTE_ONNX:-}" ]]; then
+  ONNX_HINT="${MYMEMORY_GTE_ONNX}"
+fi
+if [[ -n "$ONNX_HINT" && -f "$ONNX_HINT" ]]; then
+  echo "ok: MYMEMORY_GTE_ONNX=${ONNX_HINT}"
+elif [[ -f "${ONNX_DIR}/model_int8.onnx" || -f "${ONNX_DIR}/model.onnx" ]]; then
+  echo "ok: GTE int8 weights under ${ONNX_DIR}"
+else
+  echo "note: Channel 4 ONNX weights missing (not a plugin bug). Export once on a Mac:"
+  echo "  pip install 'sentence-transformers' optimum onnx onnxruntime"
+  echo "  cd ${DEST} && python -c \"from recall.embed import export_gte_int8; export_gte_int8()\""
+fi
+
 if [[ -f "$PACK_ROOT/examples/agent-hooks/block-hermes-root-junk.sh" ]]; then
   cp -p "$PACK_ROOT/examples/agent-hooks/block-hermes-root-junk.sh" \
     "$HERMES_HOME/agent-hooks/block-hermes-root-junk.sh"

@@ -40,6 +40,7 @@ from monthly_schema import (  # noqa: E402
     payload_to_dict,
 )
 from monthly_state import atomic_text_write, month_file_path, monthly_staging_dir  # noqa: E402
+from recall.embed_cache import parse_embedding_slot  # noqa: E402
 
 _KEY_ORDER = (
     "schema_version",
@@ -315,6 +316,7 @@ def payload_from_dict(obj: dict[str, Any]) -> MonthlyPayload:
                 first_seen=row.get("first_seen"),
                 last_seen=row.get("last_seen"),
                 aliases=_tuple(row.get("aliases")),
+                embedding=parse_embedding_slot(row.get("embedding")),
             )
             for row in obj.get("entities") or []
             if isinstance(row, dict)

@@ -245,7 +245,13 @@ class WeeklyEntity:
     first_seen: date | None = None
     last_seen: date | None = None
     week_blocks: tuple[str, ...] = ()
-    embedding: None = None
+    embedding: Literal["true", "false"] = "false"
+
+    def __post_init__(self) -> None:
+        if self.embedding not in ("true", "false"):
+            raise ValueError(
+                f"WeeklyEntity.embedding {self.embedding!r} must be 'true' or 'false'"
+            )
 
 
 @dataclass(frozen=True)

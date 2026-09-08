@@ -7,7 +7,7 @@ this layer exists to record.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 CAP_DECISIONS = 12
 CAP_PROCEDURES = 8
@@ -312,7 +312,13 @@ class MonthlyEntity:
     first_seen: str | None = None
     last_seen: str | None = None
     aliases: tuple[str, ...] = ()
-    embedding: None = None
+    embedding: Literal["true", "false"] = "false"
+
+    def __post_init__(self) -> None:
+        if self.embedding not in ("true", "false"):
+            raise ValueError(
+                f"MonthlyEntity.embedding {self.embedding!r} must be 'true' or 'false'"
+            )
 
 
 @dataclass(frozen=True)
@@ -402,6 +408,14 @@ def payload_to_dict(payload: MonthlyPayload) -> dict[str, Any]:
     """Serialize dataclasses with YAML names (`from`, not `from_id`) for the month file."""
     def evidence_text(item: MonthlyEvidenceText) -> dict[str, Any]:
         return {"text": item.text, "evidence": list(item.evidence)}
+
+    def entity_slot(row: MonthlyEntity) -> str:
+        try:
+            from recall.embed_cache import monthly_entity_embedded
+
+            return monthly_entity_embedded(row.key, row.weeks)
+        except Exception:
+            return "false"
 
     img = payload.user_image
     return {
@@ -569,7 +583,7 @@ def payload_to_dict(payload: MonthlyPayload) -> dict[str, Any]:
                 "first_seen": row.first_seen,
                 "last_seen": row.last_seen,
                 "aliases": list(row.aliases),
-                "embedding": row.embedding,
+                "embedding": entity_slot(row),
             }
             for row in payload.entities
         ],

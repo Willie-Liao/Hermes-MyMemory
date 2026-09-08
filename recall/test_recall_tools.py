@@ -672,6 +672,68 @@ def test_embed_clock_next_wake_shanghai(tmp_path, monkeypatch):
     )
 
 
+def test_parse_embedding_slot_coerces_none_and_yaml_bool():
+    from recall.embed_cache import parse_embedding_slot
+
+    assert parse_embedding_slot(None) == "false"
+    assert parse_embedding_slot("false") == "false"
+    assert parse_embedding_slot("true") == "true"
+    assert parse_embedding_slot(True) == "true"
+    assert parse_embedding_slot(False) == "false"
+
+
+def test_blocks_embedded_requires_every_id_with_vector(tmp_path, monkeypatch):
+    from recall import embed_cache
+
+    cache_dir = tmp_path / "embeddings"
+    cache_dir.mkdir()
+    (cache_dir / "embed-cache.json").write_text(
+        json.dumps(
+            {
+                "blocks": {
+                    "mem-1": {"hash": "a", "embedding": [0.1, 0.2]},
+                    "mem-empty": {"hash": "b", "embedding": []},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(embed_cache, "_cache_root", lambda: cache_dir)
+    assert embed_cache.blocks_embedded(()) == "false"
+    assert embed_cache.blocks_embedded(("mem-1",)) == "true"
+    assert embed_cache.blocks_embedded(("mem-1", "mem-missing")) == "false"
+    assert embed_cache.blocks_embedded(("mem-empty",)) == "false"
+
+
+def test_monthly_entity_embedded_unions_week_blocks(tmp_path, monkeypatch):
+    from recall import embed_cache
+
+    staging = tmp_path / "staging"
+    weekly = staging / "weekly"
+    weekly.mkdir(parents=True)
+    (weekly / "2026-W31.md").write_text(
+        "---\nweek: 2026-W31\n---\n"
+        "week_key: 2026-W31\n"
+        "entities:\n"
+        "  - key: memorydigest\n"
+        "    canonical: memory-digest\n"
+        "    week_blocks: [mem-1]\n",
+        encoding="utf-8",
+    )
+    cache_dir = tmp_path / "embeddings"
+    cache_dir.mkdir()
+    (cache_dir / "embed-cache.json").write_text(
+        json.dumps({"blocks": {"mem-1": {"hash": "a", "embedding": [1.0]}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(embed_cache, "_staging_root", lambda: staging)
+    monkeypatch.setattr(embed_cache, "_cache_root", lambda: cache_dir)
+    assert (
+        embed_cache.monthly_entity_embedded("memorydigest", ("2026-W31",)) == "true"
+    )
+    assert embed_cache.monthly_entity_embedded("memorydigest", ("2026-W99",)) == "false"
+
+
 def test_embed_cache_gate_follows_injected_zone_not_host(tmp_path, monkeypatch):
     from recall import embed_cache
 

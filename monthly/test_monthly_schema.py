@@ -58,12 +58,14 @@ def test_payload_round_trip_without_arcs():
     assert "week_blocks" not in str(data)
     assert data["month_key"] == "2026-08"
     assert data["entities"][0]["weeks"] == ["2026-W31", "2026-W32", "2026-W33"]
+    assert data["entities"][0]["embedding"] == "false"
     assert data["core_progress"][0]["evidence"]
     from monthly_writer import dump_yaml, loads
 
     restored = loads(dump_yaml(payload))
     assert restored.entities[0].weeks == ("2026-W31", "2026-W32", "2026-W33")
     assert restored.entities[0].aliases == ("记忆摘要",)
+    assert restored.entities[0].embedding == "false"
     assert "week_blocks" not in dump_yaml(payload)
 
 
@@ -185,6 +187,43 @@ def test_v1_scalar_summary_loads_as_one_bullet():
     assert len(loaded.summary) == 1
     assert loaded.summary[0].text == "a paragraph month story"
     assert loaded.summary[0].weeks == ()
+
+
+def test_monthly_entity_embedding_true_when_week_blocks_cached(tmp_path, monkeypatch):
+    import json
+
+    from recall import embed_cache
+
+    staging = tmp_path / "staging"
+    weekly = staging / "weekly"
+    weekly.mkdir(parents=True)
+    (weekly / "2026-W31.md").write_text(
+        "---\nweek: 2026-W31\n---\n"
+        "week_key: 2026-W31\n"
+        "entities:\n"
+        "  - key: memorydigest\n"
+        "    week_blocks: [mem-1]\n",
+        encoding="utf-8",
+    )
+    cache_dir = tmp_path / "embeddings"
+    cache_dir.mkdir()
+    (cache_dir / "embed-cache.json").write_text(
+        json.dumps({"blocks": {"mem-1": {"hash": "a", "embedding": [0.5]}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(embed_cache, "_staging_root", lambda: staging)
+    monkeypatch.setattr(embed_cache, "_cache_root", lambda: cache_dir)
+    payload = MonthlyPayload(
+        key="2026-08",
+        entities=(
+            MonthlyEntity(
+                key="memorydigest",
+                canonical="memory-digest",
+                weeks=("2026-W31",),
+            ),
+        ),
+    )
+    assert payload.to_dict()["entities"][0]["embedding"] == "true"
 
 
 def test_summary_cap_enforced():

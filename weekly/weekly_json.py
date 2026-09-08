@@ -185,6 +185,13 @@ def _to_dict(payload: WeeklyReviewPayload, *, generated_at: str | None) -> dict[
 
 
 def _entity_dict(entity: WeeklyEntity) -> dict[str, Any]:
+    slot = "false"
+    try:
+        from recall.embed_cache import blocks_embedded
+
+        slot = blocks_embedded(entity.week_blocks)
+    except Exception:
+        slot = "false"
     return {
         "key": entity.key,
         "canonical": entity.canonical,
@@ -192,7 +199,7 @@ def _entity_dict(entity: WeeklyEntity) -> dict[str, Any]:
         "first_seen": entity.first_seen.isoformat() if entity.first_seen else None,
         "last_seen": entity.last_seen.isoformat() if entity.last_seen else None,
         "week_blocks": list(entity.week_blocks),
-        "embedding": None,
+        "embedding": slot,
     }
 
 
@@ -316,6 +323,12 @@ def _intra_from(item: dict[str, Any]) -> IntraDayThread:
 def _entity_from(item: dict[str, Any]) -> WeeklyEntity:
     first = item.get("first_seen")
     last = item.get("last_seen")
+    try:
+        from recall.embed_cache import parse_embedding_slot
+
+        slot = parse_embedding_slot(item.get("embedding"))
+    except Exception:
+        slot = "false"
     return WeeklyEntity(
         key=str(item.get("key") or ""),
         canonical=str(item.get("canonical") or ""),
@@ -323,5 +336,5 @@ def _entity_from(item: dict[str, Any]) -> WeeklyEntity:
         first_seen=_parse_day(first) if first else None,
         last_seen=_parse_day(last) if last else None,
         week_blocks=tuple(str(b) for b in item.get("week_blocks") or ()),
-        embedding=None,
+        embedding=slot,
     )

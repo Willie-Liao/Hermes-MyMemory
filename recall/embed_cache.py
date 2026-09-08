@@ -11,11 +11,12 @@ import hashlib
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 logger = logging.getLogger("plugins.memory-embed-cache")
@@ -306,6 +307,78 @@ def load_cache() -> dict[str, dict[str, Any]]:
     except Exception as exc:
         logger.warning("embed cache load failed: %s", exc)
         return {}
+
+
+def parse_embedding_slot(value: object) -> Literal["true", "false"]:
+    """Coerce YAML/JSON None and booleans to the weekly/monthly string slot.
+
+    Unquoted YAML `true` becomes Python True; leaving that as None made the
+    roster look un-embedded after a successful 01:00 cache fill.
+    """
+    if value is True or value == "true":
+        return "true"
+    return "false"
+
+
+def blocks_embedded(
+    block_ids: Sequence[str], cache: dict[str, dict[str, Any]] | None = None
+) -> Literal["true", "false"]:
+    """Mark an entity embedded only when every linked daily mem-id has a vector.
+
+    An empty id list is not embedded yet — otherwise a roster row with no
+    week_blocks would dump as true and hide a skipped Channel 4 pass.
+    """
+    ids = [str(i).strip() for i in block_ids if str(i).strip()]
+    if not ids:
+        return "false"
+    rows = load_cache() if cache is None else cache
+    for bid in ids:
+        vec = (rows.get(bid) or {}).get("embedding") or []
+        if not vec:
+            return "false"
+    return "true"
+
+
+def monthly_entity_embedded(
+    key: str,
+    weeks: Sequence[str],
+    cache: dict[str, dict[str, Any]] | None = None,
+) -> Literal["true", "false"]:
+    """Union week_blocks for the same entity key across listed week sidecars.
+
+    A missing week file is false so monthly cannot claim true while weekly
+    YAML was never written (or still has embedding: null).
+    """
+    ids: list[str] = []
+    root = _staging_root()
+    try:
+        wdir = Path(__file__).resolve().parent.parent / "weekly"
+        if str(wdir) not in sys.path:
+            sys.path.insert(0, str(wdir))
+        from weekly_json import load_sidecar
+    except Exception:
+        return "false"
+    want = str(key or "").strip()
+    for week in weeks:
+        stem = str(week).strip()
+        if not stem:
+            continue
+        path = root / "weekly" / f"{stem}.md"
+        try:
+            obj = load_sidecar(path)
+        except Exception:
+            return "false"
+        for ent in obj.get("entities") or []:
+            if not isinstance(ent, dict):
+                continue
+            if str(ent.get("key") or "") != want:
+                continue
+            ids.extend(
+                str(b).strip()
+                for b in (ent.get("week_blocks") or ())
+                if str(b).strip()
+            )
+    return blocks_embedded(ids, cache)
 
 
 def save_cache(blocks: dict[str, dict[str, Any]], meta: dict[str, Any] | None = None) -> None:

@@ -17,7 +17,7 @@ entities:
   last_seen: null
   week_blocks:
   - mem-2026-07-27-event-aaaa
-  embedding: null
+  embedding: 'false'
 cross-day-thread: []
 intra-day-thread: []
 summary: []

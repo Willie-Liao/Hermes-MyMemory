@@ -1784,7 +1784,6 @@ def _entities_from_event_blocks(
                 first_seen=first,
                 last_seen=last,
                 week_blocks=tuple(dict.fromkeys(bag["blocks"])),
-                embedding=None,
             )
         )
     return tuple(entities)
