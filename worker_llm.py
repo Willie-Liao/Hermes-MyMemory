@@ -556,7 +556,65 @@ ONESHOT_SYSTEM = (
 
 _ONESHOT_PROVIDERS = {
     "xiaomi": ("XIAOMI_API_KEY", "XIAOMI_BASE_URL", "https://api.xiaomimimo.com/v1"),
+    "kimi-coding": ("KIMI_API_KEY", "KIMI_BASE_URL", "https://api.kimi.com/coding/v1"),
 }
+_K2_WORKER = ("kimi-coding", "kimi-for-coding-highspeed")
+_xiaomi_quota_dead = False
+_xiaomi_quota_lock = threading.Lock()
+
+
+def _xiaomi_worker_lane(provider: str, model: str) -> bool:
+    """True when this worker would hit Xiaomi MiMo (the lane that can burn quota)."""
+    plug = str(provider or "").strip().lower()
+    mdl = str(model or "").strip().lower()
+    if plug == "xiaomi" or mdl.startswith("mimo"):
+        return True
+    return False
+
+
+def _quota_exhausted(exc: BaseException) -> bool:
+    """Treat billing/rate-limit failures as 'MiMo used up' so ingest can finish on k2."""
+    code = getattr(exc, "status_code", None)
+    if code is None:
+        resp = getattr(exc, "response", None)
+        code = getattr(resp, "status_code", None)
+    try:
+        if int(code) in (402, 403, 429):
+            return True
+    except (TypeError, ValueError):
+        pass
+    text = str(exc).lower()
+    needles = (
+        "quota",
+        "rate limit",
+        "rate_limit",
+        "insufficient",
+        "balance",
+        "used up",
+        "exceeded",
+        "too many requests",
+        "billing",
+        "resource exhausted",
+    )
+    return any(n in text for n in needles)
+
+
+def _mark_xiaomi_quota_dead() -> None:
+    global _xiaomi_quota_dead
+    with _xiaomi_quota_lock:
+        _xiaomi_quota_dead = True
+
+
+def _xiaomi_quota_is_dead() -> bool:
+    with _xiaomi_quota_lock:
+        return _xiaomi_quota_dead
+
+
+def _maybe_k2_worker(provider: str, model: str) -> tuple[str, str]:
+    """Stay on MiMo until quota dies; then pin this process to kimi-k2."""
+    if _xiaomi_worker_lane(provider, model) and _xiaomi_quota_is_dead():
+        return _K2_WORKER
+    return (str(provider or "xiaomi").strip() or "xiaomi", str(model or "mimo-v2.5").strip() or "mimo-v2.5")
 
 
 def _ensure_hermes_dotenv() -> None:
@@ -674,18 +732,13 @@ def run_worker_llm_oneshot(
     plugin_runtime = _plugin_worker_runtime(plugin, purpose)
     provider = plugin_runtime.get("provider") or "xiaomi"
     model = plugin_runtime.get("model") or "mimo-v2.5"
+    provider, model = _maybe_k2_worker(provider, model)
     force = str(force_tool_name or "").strip() or None
     schema = dict(tool_schema or {})
     if force and not str(schema.get("name") or "").strip():
         fn = schema.get("function") if isinstance(schema.get("function"), Mapping) else None
         if not (fn and str(fn.get("name") or "").strip()):
             schema["name"] = force
-    api_key, base_url = _oneshot_credentials(provider)
-    from openai import OpenAI
-
-    client_kwargs: dict[str, Any] = {"api_key": api_key}
-    if base_url:
-        client_kwargs["base_url"] = base_url
     wrapped = openai_function_tool(schema) if schema else None
     tool_name = ""
     if wrapped:
@@ -708,67 +761,117 @@ def run_worker_llm_oneshot(
                 "type": "function",
                 "function": {"name": force},
             }
+    from openai import OpenAI
+
+    last_exc: BaseException | None = None
     with worker_llm_scope():
-        try:
-            client = OpenAI(**client_kwargs)
-            resp = client.chat.completions.create(**create_kwargs)
-        except Exception as exc:
+        for attempt in (0, 1):
+            try:
+                api_key, base_url = _oneshot_credentials(provider)
+            except Exception as exc:
+                last_exc = exc
+                break
+            client_kwargs: dict[str, Any] = {"api_key": api_key}
+            if base_url:
+                client_kwargs["base_url"] = base_url
+            create_kwargs["model"] = model
+            try:
+                client = OpenAI(**client_kwargs)
+                resp = client.chat.completions.create(**create_kwargs)
+            except Exception as exc:
+                last_exc = exc
+                if (
+                    attempt == 0
+                    and _xiaomi_worker_lane(provider, model)
+                    and _quota_exhausted(exc)
+                ):
+                    _mark_xiaomi_quota_dead()
+                    provider, model = _K2_WORKER
+                    print(
+                        f"worker_llm: MiMo quota/rate-limit; switching ingest to {model}",
+                        flush=True,
+                    )
+                    continue
+                record_worker_usage(
+                    {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "plugin": plugin,
+                        "purpose": purpose,
+                        "model": model,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cache_read_tokens": 0,
+                        "cache_write_tokens": 0,
+                        "reasoning_tokens": 0,
+                        "total_tokens": 0,
+                        "cost_usd": 0.0,
+                        "api_calls": 0,
+                    }
+                )
+                return {
+                    "final_response": str(exc),
+                    "tool_name": None,
+                    "tool_args": None,
+                    "tool_calls": [],
+                    "messages": [],
+                    "failed": True,
+                }
+            choice = resp.choices[0]
+            captured = _capture_from_oneshot_message(
+                choice.message, force_tool_name=force
+            )
+            usage = getattr(resp, "usage", None)
+            details = getattr(usage, "prompt_tokens_details", None) if usage is not None else None
+            reasoning = (
+                getattr(usage, "completion_tokens_details", None) if usage is not None else None
+            )
+            usage_fields = {
+                "input_tokens": _usage_int(usage, "prompt_tokens"),
+                "output_tokens": _usage_int(usage, "completion_tokens"),
+                "cache_read_tokens": _usage_int(details, "cached_tokens"),
+                "cache_write_tokens": 0,
+                "reasoning_tokens": _usage_int(reasoning, "reasoning_tokens"),
+                "total_tokens": _usage_int(usage, "total_tokens"),
+            }
             record_worker_usage(
                 {
                     "ts": datetime.now(timezone.utc).isoformat(),
                     "plugin": plugin,
                     "purpose": purpose,
                     "model": model,
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cache_read_tokens": 0,
-                    "cache_write_tokens": 0,
-                    "reasoning_tokens": 0,
-                    "total_tokens": 0,
+                    **usage_fields,
                     "cost_usd": 0.0,
-                    "api_calls": 0,
+                    "api_calls": 1,
                 }
             )
-            return {
-                "final_response": str(exc),
-                "tool_name": None,
-                "tool_args": None,
-                "tool_calls": [],
-                "messages": [],
-                "failed": True,
-            }
-        choice = resp.choices[0]
-        captured = _capture_from_oneshot_message(
-            choice.message, force_tool_name=force
-        )
-        usage = getattr(resp, "usage", None)
-        details = getattr(usage, "prompt_tokens_details", None) if usage is not None else None
-        reasoning = (
-            getattr(usage, "completion_tokens_details", None) if usage is not None else None
-        )
-        usage_fields = {
-            "input_tokens": _usage_int(usage, "prompt_tokens"),
-            "output_tokens": _usage_int(usage, "completion_tokens"),
-            "cache_read_tokens": _usage_int(details, "cached_tokens"),
+            captured.update(usage_fields)
+            captured["finish_reason"] = getattr(choice, "finish_reason", None)
+            captured["max_tokens"] = max_tokens
+            return captured
+    record_worker_usage(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "plugin": plugin,
+            "purpose": purpose,
+            "model": model,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
             "cache_write_tokens": 0,
-            "reasoning_tokens": _usage_int(reasoning, "reasoning_tokens"),
-            "total_tokens": _usage_int(usage, "total_tokens"),
+            "reasoning_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.0,
+            "api_calls": 0,
         }
-        record_worker_usage(
-            {
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "plugin": plugin,
-                "purpose": purpose,
-                "model": model,
-                **usage_fields,
-                "cost_usd": 0.0,
-                "api_calls": 1,
-            }
-        )
-        captured.update(usage_fields)
-        captured["finish_reason"] = getattr(choice, "finish_reason", None)
-        captured["max_tokens"] = max_tokens
-        return captured
+    )
+    return {
+        "final_response": str(last_exc or "oneshot failed"),
+        "tool_name": None,
+        "tool_args": None,
+        "tool_calls": [],
+        "messages": [],
+        "failed": True,
+    }
 
 
 def _run_worker_conversation(
@@ -801,20 +904,7 @@ def _run_worker_conversation(
         runtime_kwargs.pop("request_overrides", None)
         runtime_kwargs.pop("tool_start_callback", None)
         plugin_runtime = _plugin_worker_runtime(plugin, purpose)
-        if plugin_runtime.get("provider"):
-            runtime_kwargs["provider"] = plugin_runtime["provider"]
-            runtime_kwargs["requested_provider"] = plugin_runtime["provider"]
-            # Gateway kwargs are for the chat provider (e.g. Kimi Anthropic).
-            # Mixing them with a plugin worker provider (Xiaomi OpenAI) drops
-            # the worker into the wrong client with no API key.
-            for key in (
-                "api_key",
-                "base_url",
-                "api_base",
-                "api_mode",
-                "credential_pool",
-            ):
-                runtime_kwargs.pop(key, None)
+        plugin_provider = str(plugin_runtime.get("provider") or "").strip()
         model = (
             plugin_runtime.get("model")
             or (
@@ -824,41 +914,80 @@ def _run_worker_conversation(
             )
             or _resolve_gateway_model()
         )
-        agent_kwargs: dict[str, Any] = {
-            "model": model,
-            **runtime_kwargs,
-            "platform": platform or "cli",
-            "quiet_mode": True,
-            "skip_context_files": True,
-            "skip_memory": True,
-            "enabled_toolsets": list(enabled_toolsets),
-            "max_iterations": max_iterations,
-        }
-        if request_overrides:
-            agent_kwargs["request_overrides"] = dict(request_overrides)
-        if tool_start_callback is not None:
-            agent_kwargs["tool_start_callback"] = tool_start_callback
-        agent = AIAgent(**agent_kwargs)
-        agent.suppress_status_output = True
-        # Worker-only: re-equip after init so tool_search cannot strip schemas.
-        # Text-only workers (force_tool_name=None, no allow-list) stay untouched.
-        if force_tool_name or allowed_tool_names:
+        if plugin_provider:
+            provider, model = _maybe_k2_worker(plugin_provider, str(model or "mimo-v2.5"))
+        elif _xiaomi_quota_is_dead():
+            provider, model = _K2_WORKER
+        else:
+            provider = ""
+        result: Any = None
+        agent: Any = None
+        for attempt in (0, 1):
+            if provider:
+                runtime_kwargs["provider"] = provider
+                runtime_kwargs["requested_provider"] = provider
+                # Gateway kwargs are for the chat provider (e.g. Kimi Anthropic).
+                # Mixing them with a plugin worker provider (Xiaomi OpenAI) drops
+                # the worker into the wrong client with no API key.
+                for key in (
+                    "api_key",
+                    "base_url",
+                    "api_base",
+                    "api_mode",
+                    "credential_pool",
+                ):
+                    runtime_kwargs.pop(key, None)
+            agent_kwargs: dict[str, Any] = {
+                "model": model,
+                **runtime_kwargs,
+                "platform": platform or "cli",
+                "quiet_mode": True,
+                "skip_context_files": True,
+                "skip_memory": True,
+                "enabled_toolsets": list(enabled_toolsets),
+                "max_iterations": max_iterations,
+            }
+            if request_overrides:
+                agent_kwargs["request_overrides"] = dict(request_overrides)
+            if tool_start_callback is not None:
+                agent_kwargs["tool_start_callback"] = tool_start_callback
             try:
-                _apply_worker_tools(
-                    agent,
-                    enabled_toolsets=enabled_toolsets,
-                    force_tool_name=force_tool_name,
-                    allowed_tool_names=allowed_tool_names,
-                )
-            except Exception:
-                # Fail open to init-time tools rather than abort the digest/weekly run.
-                pass
-        result = agent.run_conversation(prompt)
+                agent = AIAgent(**agent_kwargs)
+                agent.suppress_status_output = True
+                # Worker-only: re-equip after init so tool_search cannot strip schemas.
+                # Text-only workers (force_tool_name=None, no allow-list) stay untouched.
+                if force_tool_name or allowed_tool_names:
+                    try:
+                        _apply_worker_tools(
+                            agent,
+                            enabled_toolsets=enabled_toolsets,
+                            force_tool_name=force_tool_name,
+                            allowed_tool_names=allowed_tool_names,
+                        )
+                    except Exception:
+                        # Fail open to init-time tools rather than abort the digest/weekly run.
+                        pass
+                result = agent.run_conversation(prompt)
+                break
+            except Exception as exc:
+                if (
+                    attempt == 0
+                    and _xiaomi_worker_lane(provider, model)
+                    and _quota_exhausted(exc)
+                ):
+                    _mark_xiaomi_quota_dead()
+                    provider, model = _K2_WORKER
+                    print(
+                        f"worker_llm: MiMo quota/rate-limit; switching ingest to {model}",
+                        flush=True,
+                    )
+                    continue
+                raise
         record_worker_usage({
             "ts": datetime.now(timezone.utc).isoformat(),
             "plugin": plugin,
             "purpose": purpose,
-            "model": getattr(agent, "model", "") or "",
+            "model": getattr(agent, "model", "") or model or "",
             "input_tokens": int(getattr(agent, "session_input_tokens", 0) or 0),
             "output_tokens": int(getattr(agent, "session_output_tokens", 0) or 0),
             "cache_read_tokens": int(getattr(agent, "session_cache_read_tokens", 0) or 0),

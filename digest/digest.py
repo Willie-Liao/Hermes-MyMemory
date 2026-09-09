@@ -148,6 +148,10 @@ IN_FLIGHT_STALE_SECONDS = 600
 # Phase-2 Pearson/MI prefilter (ES-Mem eqs 1–2). Lazy MiniLM; in-memory only.
 PHASE2_MINILM_MODEL = "all-MiniLM-L6-v2"
 PHASE2_MI_THRESHOLD = 0.06  # Absolute MI threshold (relaxed from 0.10)
+# Skip MiniLM on tiny boxes only. 768MiB available used to fail-open the 3.5GiB
+# Aliyun host under load even though total RAM is enough for all-MiniLM-L6-v2.
+PHASE2_MINILM_SKIP_TOTAL = 2 * 1024 * 1024 * 1024
+PHASE2_MINILM_SKIP_AVAIL = 256 * 1024 * 1024
 _PHASE2_MINILM: Any = None
 _PHASE2_EMBED_CACHE: dict[str, list[float]] = {}
 
@@ -3338,8 +3342,9 @@ def _phase2_prompt_and_tool(
     """Build Phase-2 submit/patch prompt after a local Pearson/MI pair filter.
 
     Without a same-type MI gate every daily card would enter the LLM context.
-    Embed or math failure fail-opens to the full board so merge quality is not
-    lost. Attempt ≥2 still shrinks to foul-touched cards only.
+    Skip MiniLM only on ≤2GiB boxes or <256MiB available so a 3.5GiB VPS can
+    still filter; embed/math failure fail-opens to the full board. Attempt ≥2
+    still shrinks to foul-touched cards only.
     """
     global _PHASE2_MINILM
     mode = "submit" if attempt == 1 or not previous_ops else "patch"
@@ -3428,14 +3433,17 @@ def _phase2_prompt_and_tool(
                         pass
                     skip_ram = (
                         skip_flag in {"1", "true", "yes"}
-                        or (0 < mem_total <= 2560 * 1024 * 1024)
-                        or (0 < mem_avail < 768 * 1024 * 1024)
+                        or (0 < mem_total <= PHASE2_MINILM_SKIP_TOTAL)
+                        or (0 < mem_avail < PHASE2_MINILM_SKIP_AVAIL)
                     )
                     if skip_ram:
-                        _log("phase2 Pearson/MI gate skipped MiniLM (ram)")
-                        raise RuntimeError(
-                            "phase2 Pearson/MI gate skipped MiniLM (ram)"
+                        msg = (
+                            "phase2 Pearson/MI gate skipped MiniLM (ram) "
+                            f"total_mib={mem_total // (1024 * 1024)} "
+                            f"avail_mib={mem_avail // (1024 * 1024)}"
                         )
+                        _log(msg)
+                        raise RuntimeError(msg)
                     from sentence_transformers import SentenceTransformer
 
                     _PHASE2_MINILM = SentenceTransformer(PHASE2_MINILM_MODEL)

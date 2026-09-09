@@ -605,6 +605,85 @@ def test_run_worker_llm_oneshot_skips_aiagent(tmp_path, monkeypatch):
     assert rec["cache_read_tokens"] == 4
 
 
+def test_run_worker_llm_oneshot_falls_back_to_k2_on_quota(tmp_path, monkeypatch):
+    """MiMo 429/quota must retry the same tool call on Kimi HighSpeed, not fail ingest."""
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("XIAOMI_API_KEY", "mi-key")
+    monkeypatch.setenv("XIAOMI_BASE_URL", "https://mimo.example/v1")
+    monkeypatch.setenv("KIMI_API_KEY", "kimi-key")
+    monkeypatch.setenv("KIMI_BASE_URL", "https://kimi.example/v1")
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-digest:\n      provider: xiaomi\n      model: mimo-v2.5\n",
+        encoding="utf-8",
+    )
+    seen: dict = {"models": [], "keys": []}
+
+    class QuotaErr(Exception):
+        status_code = 429
+
+    class FakeMessage:
+        content = ""
+        tool_calls = [
+            types.SimpleNamespace(
+                function=types.SimpleNamespace(
+                    name="submit_digest",
+                    arguments='{"ok": true}',
+                )
+            )
+        ]
+
+    class FakeChoice:
+        message = FakeMessage()
+        finish_reason = "tool_calls"
+
+    class FakeUsage:
+        prompt_tokens = 3
+        completion_tokens = 2
+        total_tokens = 5
+        prompt_tokens_details = types.SimpleNamespace(cached_tokens=0)
+        completion_tokens_details = types.SimpleNamespace(reasoning_tokens=0)
+
+    class FakeResponse:
+        choices = [FakeChoice()]
+        usage = FakeUsage()
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            seen["models"].append(kwargs.get("model"))
+            if len(seen["models"]) == 1:
+                raise QuotaErr("insufficient quota")
+            return FakeResponse()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            seen["keys"].append(kwargs.get("api_key"))
+            self.chat = FakeChat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = FakeClient
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+
+    out = wl.run_worker_llm_oneshot(
+        "digest this",
+        plugin="memory-digest",
+        purpose="digest-phase1",
+        force_tool_name="submit_digest",
+        tool_schema={"name": "submit_digest", "parameters": {"type": "object", "properties": {}}},
+    )
+    assert seen["models"] == ["mimo-v2.5", "kimi-for-coding-highspeed"]
+    assert seen["keys"] == ["mi-key", "kimi-key"]
+    assert out["failed"] is False
+    assert out["tool_name"] == "submit_digest"
+    rec = json.loads(
+        (tmp_path / "metrics" / "llm-usage.jsonl").read_text(encoding="utf-8").strip().splitlines()[-1]
+    )
+    assert rec["model"] == "kimi-for-coding-highspeed"
+
+
 def test_run_worker_llm_oneshot_parses_fenced_json_content(tmp_path, monkeypatch):
     wl = _load_worker_llm()
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

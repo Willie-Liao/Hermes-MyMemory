@@ -26,7 +26,7 @@ git init -b main
 git add -A
 git commit -m "MyMemory plugin snapshot for GitHub install"
 git remote add origin "$REMOTE"
-git push -u origin HEAD:main
+git push --force origin HEAD:main
 
 if command -v gh >/dev/null 2>&1 && [[ -f "$BUNDLE" ]]; then
   if gh release view gte-int8-v1 --repo Willie-Liao/Hermes-MyMemory >/dev/null 2>&1; then
