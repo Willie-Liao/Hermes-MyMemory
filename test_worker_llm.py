@@ -837,3 +837,167 @@ def test_run_worker_llm_oneshot_parses_fenced_json_content(tmp_path, monkeypatch
     )
     assert out["tool_name"] == "submit_tighten_text"
     assert out["tool_args"] == {"text": "Keep this."}
+
+
+def _install_fake_nested(monkeypatch, seen: dict) -> None:
+    """Stub nested AIAgent so tests can assert model/url without Hermes."""
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            seen["kwargs"] = dict(kwargs)
+            self.model = kwargs.get("model")
+            self.session_input_tokens = 0
+            self.session_output_tokens = 0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self.session_reasoning_tokens = 0
+            self.session_total_tokens = 0
+            self.session_estimated_cost_usd = 0.0
+            self.session_api_calls = 1
+
+        def run_conversation(self, prompt):
+            return {"final_response": "ok"}
+
+    fake_gateway_pkg = types.ModuleType("gateway")
+    fake_gateway_run = types.ModuleType("gateway.run")
+    fake_gateway_run._resolve_gateway_model = lambda: "gateway-model"
+    fake_gateway_run._resolve_runtime_agent_kwargs = lambda: {
+        "api_key": "chat-key",
+        "provider": "kimi-coding",
+        "base_url": "https://api.kimi.com/coding/v1",
+    }
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+    monkeypatch.setitem(sys.modules, "gateway", fake_gateway_pkg)
+    monkeypatch.setitem(sys.modules, "gateway.run", fake_gateway_run)
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+
+def test_undeclared_plugin_model_follows_chat_oneshot_and_nested(tmp_path, monkeypatch):
+    """Background workers use chat model: when MyMemory lanes omit model."""
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MINIMAX_CN_API_KEY", "mm-key")
+    monkeypatch.setenv("MINIMAX_CN_BASE_URL", "https://api.minimax.chat/v1")
+    (tmp_path / "config.yaml").write_text(
+        "model:\n"
+        "  provider: minimax-cn\n"
+        "  default: MiniMax-M3\n"
+        "plugins:\n"
+        "  entries:\n"
+        "    MyMemory:\n"
+        "      digest:\n"
+        "        allow_tool_override: false\n"
+        "      weekly:\n"
+        "        allow_tool_override: false\n",
+        encoding="utf-8",
+    )
+    seen: dict = {}
+    _install_fake_openai(
+        monkeypatch,
+        seen=seen,
+        message={"content": "", "tool_calls": None},
+    )
+    for purpose in ("digest-dedup", "digest-wrapup"):
+        seen.clear()
+        out = wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose=purpose)
+        assert out["failed"] is False
+        assert seen["create"]["model"] == "MiniMax-M3"
+        assert seen["client"]["base_url"] == "https://api.minimax.chat/v1"
+    nested: dict = {}
+    _install_fake_nested(monkeypatch, nested)
+    assert wl.run_worker_llm("hi", plugin="memory-digest", purpose="digest-phase1") == "ok"
+    assert nested["kwargs"]["model"] == "MiniMax-M3"
+    assert nested["kwargs"]["base_url"] == "https://api.minimax.chat/v1"
+    assert nested["kwargs"]["api_key"] == "mm-key"
+    nested.clear()
+    _install_fake_nested(monkeypatch, nested)
+    assert wl.run_worker_llm("hi", plugin="memory-weekly", purpose="ui_tighten") == "ok"
+    assert nested["kwargs"]["model"] == "MiniMax-M3"
+
+
+def test_declared_phase2_overlay_does_not_move_phase1(tmp_path, monkeypatch):
+    """A worker_llm.phase2 model overrides only digest-dedup oneshot."""
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MINIMAX_CN_API_KEY", "mm-key")
+    monkeypatch.setenv("MINIMAX_CN_BASE_URL", "https://api.minimax.chat/v1")
+    monkeypatch.setenv("KIMI_API_KEY", "kimi-key")
+    monkeypatch.setenv("KIMI_BASE_URL", "https://api.kimi.com/coding/v1")
+    (tmp_path / "config.yaml").write_text(
+        "model:\n"
+        "  provider: minimax-cn\n"
+        "  default: MiniMax-M3\n"
+        "plugins:\n"
+        "  entries:\n"
+        "    MyMemory:\n"
+        "      digest:\n"
+        "        worker_llm:\n"
+        "          phase2:\n"
+        "            provider: kimi-coding\n"
+        "            model: other-model\n",
+        encoding="utf-8",
+    )
+    seen: dict = {}
+    _install_fake_openai(
+        monkeypatch,
+        seen=seen,
+        message={"content": "", "tool_calls": None},
+    )
+    wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose="digest-dedup")
+    assert seen["create"]["model"] == "other-model"
+    assert seen["client"]["base_url"] == "https://api.kimi.com/coding/v1"
+    nested: dict = {}
+    _install_fake_nested(monkeypatch, nested)
+    wl.run_worker_llm("hi", plugin="memory-digest", purpose="digest-phase1")
+    assert nested["kwargs"]["model"] == "MiniMax-M3"
+
+
+def test_nested_overlay_reads_worker_env_url_not_chat(tmp_path, monkeypatch):
+    """Popped chat Kimi URL must not ride along when the worker is Xiaomi."""
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("XIAOMI_API_KEY", "mi-key")
+    monkeypatch.setenv("XIAOMI_BASE_URL", "https://mimo.example/v1")
+    (tmp_path / "config.yaml").write_text(
+        "model:\n"
+        "  provider: kimi-coding\n"
+        "  default: kimi-k2.6\n"
+        "plugins:\n"
+        "  entries:\n"
+        "    MyMemory:\n"
+        "      digest:\n"
+        "        provider: xiaomi\n"
+        "        model: mimo-v2.5\n",
+        encoding="utf-8",
+    )
+    nested: dict = {}
+    _install_fake_nested(monkeypatch, nested)
+    wl.run_worker_llm("hi", plugin="memory-digest", purpose="digest-phase1")
+    assert nested["kwargs"]["base_url"] == "https://mimo.example/v1"
+    assert nested["kwargs"]["api_key"] == "mi-key"
+    assert nested["kwargs"].get("provider") == "xiaomi"
+
+
+def test_oneshot_records_duration_ms(tmp_path, monkeypatch):
+    """Usage ledger needs wall time so prefetch vs digest timeout can be split."""
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MINIMAX_CN_API_KEY", "mm-key")
+    monkeypatch.setenv("MINIMAX_CN_BASE_URL", "https://api.minimax.chat/v1")
+    (tmp_path / "config.yaml").write_text(
+        "model:\n  provider: minimax-cn\n  default: MiniMax-M3\n",
+        encoding="utf-8",
+    )
+    seen: dict = {}
+    _install_fake_openai(
+        monkeypatch,
+        seen=seen,
+        message={"content": "", "tool_calls": None},
+    )
+    wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose="digest-dedup")
+    rec = json.loads(
+        (tmp_path / "metrics" / "llm-usage.jsonl").read_text(encoding="utf-8").strip().splitlines()[-1]
+    )
+    assert rec["api_calls"] == 1
+    assert rec["duration_ms"] >= 0

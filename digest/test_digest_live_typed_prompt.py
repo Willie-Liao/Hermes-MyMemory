@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -298,3 +299,230 @@ def test_live_typed_phase2_and_wrapup_on_full_2026_08_15(tmp_path, monkeypatch):
     dest_text = dest.read_text(encoding="utf-8")
     assert digest.DAY_WRAPUP_HEADING in dest_text
     assert phrase in dest_text
+
+
+def _load_live_dotenv(live_home: Path) -> None:
+    """Load live hermes-home/.env before HERMES_HOME is pointed at tmp_path."""
+    try:
+        from hermes_cli.env_loader import load_hermes_dotenv
+
+        load_hermes_dotenv(hermes_home=live_home)
+        return
+    except Exception:
+        pass
+    env_path = live_home / ".env"
+    try:
+        text = env_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        key, _, val = line.partition("=")
+        key = key.strip()
+        if not key:
+            continue
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        if not val:
+            continue
+        if not (os.environ.get(key) or "").strip():
+            os.environ[key] = val
+
+
+def _anthropic_messages_url() -> str:
+    """MiniMax Anthropic host from .env; never hardcode a MiniMax URL in plugin code."""
+    explicit = (os.environ.get("MINIMAX_CN_ANTHROPIC_URL") or "").strip().rstrip("/")
+    if explicit:
+        if explicit.endswith("/v1/messages"):
+            return explicit
+        return f"{explicit}/v1/messages"
+    base = (os.environ.get("MINIMAX_CN_BASE_URL") or "").strip().rstrip("/")
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+    return f"{base}/anthropic/v1/messages"
+
+
+def _probe_minimax_anthropic_tool_use(model: str) -> dict:
+    """Observational: MiniMax Messages + tool_use. 4xx is a recorded finding, not a fail."""
+    import urllib.error
+    import urllib.request
+
+    key = (os.environ.get("MINIMAX_CN_API_KEY") or "").strip()
+    url = _anthropic_messages_url()
+    payload = {
+        "model": model,
+        "max_tokens": 64,
+        "tools": [
+            {
+                "name": "ping",
+                "description": "noop ping",
+                "input_schema": {"type": "object", "properties": {}},
+            }
+        ],
+        "tool_choice": {"type": "tool", "name": "ping"},
+        "messages": [{"role": "user", "content": "Call ping."}],
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "content-type": "application/json",
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            status = int(getattr(resp, "status", 0) or 0)
+            body = json.loads(resp.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as exc:
+        err_body = ""
+        try:
+            err_body = exc.read().decode("utf-8", errors="replace")[:400]
+        except Exception:
+            err_body = str(exc)
+        return {
+            "anthropic_tool_use_ok": False,
+            "anthropic_http_status": int(exc.code or 0),
+            "anthropic_error": err_body or str(exc),
+        }
+    except Exception as exc:
+        return {
+            "anthropic_tool_use_ok": False,
+            "anthropic_http_status": 0,
+            "anthropic_error": str(exc)[:400],
+        }
+    content = body.get("content") if isinstance(body, dict) else None
+    has_tool_use = False
+    if isinstance(content, list):
+        has_tool_use = any(
+            isinstance(part, dict) and str(part.get("type") or "") == "tool_use"
+            for part in content
+        )
+    return {
+        "anthropic_tool_use_ok": bool(status >= 200 and status < 300 and has_tool_use),
+        "anthropic_http_status": status,
+        "anthropic_error": "" if has_tool_use else json.dumps(body)[:400],
+    }
+
+
+def test_live_prefetch_and_digest_follow_chat(tmp_path, monkeypatch):
+    """Prove follow-chat + .env URL; record prefetch vs digest and MiniMax tool formats."""
+    if os.environ.get("REAL_LLM_TEST", "").strip().lower() in {"0", "false", "no"}:
+        pytest.skip("REAL_LLM_TEST=0")
+    live_home = Path(__file__).resolve().parents[3]
+    _load_live_dotenv(live_home)
+    src_cfg = live_home / "config.yaml"
+    import yaml
+
+    raw_live = yaml.safe_load(src_cfg.read_text(encoding="utf-8")) or {}
+    model_bag = raw_live.get("model") if isinstance(raw_live, dict) else {}
+    yaml_url = str((model_bag or {}).get("base_url") or "").strip()
+    key = (
+        (os.environ.get("MINIMAX_CN_API_KEY") or "").strip()
+        or (os.environ.get("MINIMAX_API_KEY") or "").strip()
+    )
+    url = (os.environ.get("MINIMAX_CN_BASE_URL") or "").strip() or yaml_url
+    if not key or not url:
+        pytest.skip("missing MiniMax API key or base URL")
+    if not (os.environ.get("MINIMAX_CN_BASE_URL") or "").strip():
+        os.environ["MINIMAX_CN_BASE_URL"] = url
+    if not (os.environ.get("MINIMAX_CN_API_KEY") or "").strip():
+        os.environ["MINIMAX_CN_API_KEY"] = key
+
+    dest_cfg = tmp_path / "config.yaml"
+    shutil.copyfile(src_cfg, dest_cfg)
+    daily = tmp_path / "memories" / "staging" / "daily"
+    daily.mkdir(parents=True)
+    (daily / "2026-09-10.md").write_text(
+        "---\nid: mem-live-1\ntype: fact\nentity: Casey\n---\n"
+        "Casey decided workers follow chat then overlay then .env.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MINIMAX_CN_API_KEY", key)
+    monkeypatch.setenv("MINIMAX_CN_BASE_URL", url)
+
+    raw = yaml.safe_load(dest_cfg.read_text(encoding="utf-8")) or {}
+    model_bag = raw.get("model") if isinstance(raw, dict) else {}
+    chat_model = str((model_bag or {}).get("default") or "").strip()
+    chat_provider = str((model_bag or {}).get("provider") or "").strip()
+    assert chat_model == "MiniMax-M3"
+    assert chat_provider == "minimax-cn"
+
+    plugin_root = live_home / "plugins" / "MyMemory"
+    if str(plugin_root) not in sys.path:
+        sys.path.insert(0, str(plugin_root))
+    if str(plugin_root.parent) not in sys.path:
+        sys.path.insert(0, str(plugin_root.parent))
+
+    from MyMemory.digest import digest as digest_mod
+    from MyMemory.provider import MyMemoryProvider
+    from MyMemory.weekly import weekly as weekly_mod
+
+    monkeypatch.setattr(digest_mod, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(weekly_mod, "on_pre_llm_call", lambda **_: None)
+
+    provider = MyMemoryProvider()
+    t0 = time.perf_counter()
+    prefetch_text = provider.prefetch(
+        "what did we decide about memory", session_id="live-probe"
+    )
+    prefetch_ms = max(0, int((time.perf_counter() - t0) * 1000))
+
+    import worker_llm as wl
+
+    t1 = time.perf_counter()
+    ping_schema = {
+        "name": "ping",
+        "description": "noop ping",
+        "parameters": {"type": "object", "properties": {}},
+    }
+    capture = wl.run_worker_llm_oneshot(
+        "Call ping.",
+        plugin="memory-digest",
+        purpose="digest-wrapup",
+        force_tool_name="ping",
+        tool_schema=ping_schema,
+        max_tokens=128,
+    )
+    digest_ms = max(0, int((time.perf_counter() - t1) * 1000))
+    openai_tools_ok = (
+        not capture.get("failed")
+        and bool(capture.get("tool_calls") or capture.get("tool_name"))
+        and int(capture.get("api_calls") or 0) >= 1
+        and int(capture.get("total_tokens") or 0) > 0
+    )
+    anth = _probe_minimax_anthropic_tool_use(chat_model)
+    probe = {
+        "model": chat_model,
+        "provider": chat_provider,
+        "prefetch_ms": prefetch_ms,
+        "prefetch_chars": len(prefetch_text or ""),
+        "digest_ms": digest_ms,
+        "input_tokens": int(capture.get("input_tokens") or 0),
+        "output_tokens": int(capture.get("output_tokens") or 0),
+        "total_tokens": int(capture.get("total_tokens") or 0),
+        "api_calls": int(capture.get("api_calls") or 0),
+        "failed": bool(capture.get("failed")),
+        "tool_name": capture.get("tool_name"),
+        "openai_tools_ok": openai_tools_ok,
+        "anthropic_tool_use_ok": bool(anth.get("anthropic_tool_use_ok")),
+        "anthropic_http_status": int(anth.get("anthropic_http_status") or 0),
+        "anthropic_error": str(anth.get("anthropic_error") or ""),
+    }
+    dest = tmp_path / "live-probe.json"
+    dest.write_text(json.dumps(probe, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(probe, ensure_ascii=False, indent=2))
+    assert dest.is_file()
+    assert openai_tools_ok is True
+    assert isinstance(probe["anthropic_tool_use_ok"], bool)
+    assert not probe["failed"]
+    assert probe["api_calls"] >= 1
+    assert probe["total_tokens"] > 0

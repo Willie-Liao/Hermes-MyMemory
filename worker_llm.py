@@ -26,6 +26,7 @@ import json
 import os
 import re
 import threading
+import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -79,11 +80,15 @@ def _ledger_path() -> Path:
 
 
 def _runtime_from_mapping(bag: Mapping[str, Any] | None) -> dict[str, str]:
-    """Copy lane/entry endpoint fields so oneshot can use YAML instead of a hardcoded provider table."""
+    """Copy lane/entry/chat endpoint fields so workers are not a hardcoded provider table.
+
+    Chat YAML uses ``default`` for the model id; lanes use ``model``. Read both so
+    undeclared plugin lanes can inherit ``config.yaml`` ``model:`` without a second pin.
+    """
     if not isinstance(bag, Mapping):
         return {}
     out: dict[str, str] = {}
-    model = str(bag.get("model") or "").strip()
+    model = str(bag.get("model") or bag.get("default") or "").strip()
     provider = str(bag.get("provider") or "").strip()
     base_url = str(bag.get("base_url") or "").strip()
     key_env = str(bag.get("key_env") or "").strip()
@@ -163,10 +168,10 @@ def _worker_llm_lane(plugin: str, purpose: str) -> str | None:
 
 
 def _plugin_worker_runtime(plugin: str, purpose: str = "") -> dict[str, str]:
-    """Optional model/provider/base_url from config.yaml plugins.entries.<plugin>.
+    """Resolve worker model from chat ``model:``, then optional plugin/lane overlay.
 
-    Overlay: entry, then worker_llm.<lane>; then inherit chat/fallback URL when
-    the provider matches so MiniMax digest does not oneshot the default OpenAI host.
+    Background digest/weekly/monthly must follow the user's chat model unless
+    config declares a lane. Returning {} used to make oneshot resurrect MiMo.
     """
     name = str(plugin or "").strip()
     if not name:
@@ -178,14 +183,17 @@ def _plugin_worker_runtime(plugin: str, purpose: str = "") -> dict[str, str]:
         raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception:
         return {}
-    plugins = raw.get("plugins") if isinstance(raw, dict) else None
-    if not isinstance(plugins, dict):
+    if not isinstance(raw, dict):
         return {}
-    table = plugins.get("entries")
-    if not isinstance(table, dict):
-        return {}
-    entry = table.get(name)
-    if not isinstance(entry, dict):
+    chat = _runtime_from_mapping(
+        raw.get("model") if isinstance(raw.get("model"), Mapping) else None
+    )
+    out = dict(chat)
+    overlay: dict[str, str] = {}
+    plugins = raw.get("plugins")
+    table = plugins.get("entries") if isinstance(plugins, dict) else None
+    entry: Any = table.get(name) if isinstance(table, dict) else None
+    if not isinstance(entry, dict) and isinstance(table, dict):
         nested_key = {
             "memory-digest": "digest",
             "memory-weekly": "weekly",
@@ -195,16 +203,23 @@ def _plugin_worker_runtime(plugin: str, purpose: str = "") -> dict[str, str]:
         my_memory = table.get("MyMemory")
         if nested_key and isinstance(my_memory, dict):
             entry = my_memory.get(nested_key)
-        if not isinstance(entry, dict):
-            return {}
-    out = _runtime_from_mapping(entry)
-    lanes = entry.get("worker_llm")
-    if isinstance(lanes, dict):
-        out.update(_runtime_from_mapping(lanes.get("default")))
-        lane = _worker_llm_lane(name, purpose)
-        if lane:
-            out.update(_runtime_from_mapping(lanes.get(lane)))
-    _inherit_provider_endpoint(raw if isinstance(raw, dict) else {}, out)
+    if isinstance(entry, dict):
+        overlay.update(_runtime_from_mapping(entry))
+        lanes = entry.get("worker_llm")
+        if isinstance(lanes, dict):
+            overlay.update(_runtime_from_mapping(lanes.get("default")))
+            lane = _worker_llm_lane(name, purpose)
+            if lane:
+                overlay.update(_runtime_from_mapping(lanes.get(lane)))
+    if overlay:
+        overlay_prov = str(overlay.get("provider") or "").strip()
+        chat_prov = str(out.get("provider") or "").strip()
+        if overlay_prov and overlay_prov != chat_prov:
+            # Overlay switched providers: chat YAML URL must not ride along.
+            out.pop("base_url", None)
+            out.pop("key_env", None)
+        out.update(overlay)
+    _inherit_provider_endpoint(raw, out)
     return out
 
 
@@ -264,7 +279,10 @@ def _sync_llm_health(record: Mapping[str, Any]) -> None:
 
 
 def record_worker_usage(record: dict[str, Any]) -> None:
-    """Append one JSONL usage record and refresh llm-health. Fail-open — never raise to callers."""
+    """Append one JSONL usage record and refresh llm-health. Fail-open — never raise to callers.
+
+    Callers pass ``duration_ms`` so timeout vs LLM retry can be split without guessing.
+    """
     try:
         path = _ledger_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -741,10 +759,14 @@ def _xiaomi_quota_is_dead() -> bool:
 
 
 def _maybe_k2_worker(provider: str, model: str) -> tuple[str, str]:
-    """Stay on MiMo until quota dies; then pin this process to kimi-k2."""
+    """Stay on MiMo until quota dies; then pin this process to kimi-k2.
+
+    Empty provider/model stay empty so undeclared workers inherit chat instead
+    of resurrecting Xiaomi when ``config.yaml`` ``model:`` is MiniMax or Kimi.
+    """
     if _xiaomi_worker_lane(provider, model) and _xiaomi_quota_is_dead():
         return _K2_WORKER
-    return (str(provider or "xiaomi").strip() or "xiaomi", str(model or "mimo-v2.5").strip() or "mimo-v2.5")
+    return (str(provider or "").strip(), str(model or "").strip())
 
 
 def _ensure_hermes_dotenv() -> None:
@@ -883,11 +905,16 @@ def run_worker_llm_oneshot(
     max_tokens: int = 2048,
     temperature: float = 0.2,
 ) -> dict[str, Any]:
-    """One OpenAI-compatible chat.completions call. No nested Hermes AIAgent."""
+    """One OpenAI-compatible chat.completions call. No nested Hermes AIAgent.
+
+    Records ``duration_ms`` on the usage ledger so prefetch wall time and digest
+    LLM retries are not guessed from a single timeout.
+    """
     _ensure_hermes_dotenv()
+    started = time.perf_counter()
     plugin_runtime = _plugin_worker_runtime(plugin, purpose)
-    provider = plugin_runtime.get("provider") or "xiaomi"
-    model = plugin_runtime.get("model") or "mimo-v2.5"
+    provider = str(plugin_runtime.get("provider") or "").strip()
+    model = str(plugin_runtime.get("model") or "").strip()
     provider, model = _maybe_k2_worker(provider, model)
     force = str(force_tool_name or "").strip() or None
     schema = dict(tool_schema or {})
@@ -922,6 +949,9 @@ def run_worker_llm_oneshot(
     config_model = str(plugin_runtime.get("model") or model or "").strip()
     last_exc: BaseException | None = None
 
+    def _elapsed_ms() -> int:
+        return max(0, int((time.perf_counter() - started) * 1000))
+
     def _fail_record(exc: BaseException | None, used_model: str) -> dict[str, Any]:
         kind = _llm_issue_kind(exc)
         rec: dict[str, Any] = {
@@ -938,6 +968,7 @@ def run_worker_llm_oneshot(
             "total_tokens": 0,
             "cost_usd": 0.0,
             "api_calls": 0,
+            "duration_ms": _elapsed_ms(),
         }
         if kind:
             rec["issue"] = kind
@@ -993,6 +1024,7 @@ def run_worker_llm_oneshot(
                             "total_tokens": 0,
                             "cost_usd": 0.0,
                             "api_calls": 0,
+                            "duration_ms": _elapsed_ms(),
                         }
                     )
                     provider, model = _K2_WORKER
@@ -1029,11 +1061,15 @@ def run_worker_llm_oneshot(
                     **usage_fields,
                     "cost_usd": 0.0,
                     "api_calls": 1,
+                    "duration_ms": _elapsed_ms(),
                 }
             )
             captured.update(usage_fields)
             captured["finish_reason"] = getattr(choice, "finish_reason", None)
             captured["max_tokens"] = max_tokens
+            captured["api_calls"] = 1
+            captured["failed"] = False
+            captured["duration_ms"] = _elapsed_ms()
             return captured
     return _fail_record(last_exc, model)
 
@@ -1051,6 +1087,11 @@ def _run_worker_conversation(
     force_tool_name: str | None = None,
     allowed_tool_names: Sequence[str] | None = None,
 ) -> dict[str, Any]:
+    """Nested worker AIAgent after popping chat gateway creds.
+
+    Refills key/URL from ``.env`` for the effective provider so MiniMax/Xiaomi
+    workers cannot inherit a Kimi Anthropic base_url from the chat gateway.
+    """
     try:
         from hermes_cli.env_loader import load_hermes_dotenv
 
@@ -1059,6 +1100,11 @@ def _run_worker_conversation(
         pass
     from gateway.run import _resolve_gateway_model, _resolve_runtime_agent_kwargs
     from run_agent import AIAgent
+
+    started = time.perf_counter()
+
+    def _elapsed_ms() -> int:
+        return max(0, int((time.perf_counter() - started) * 1000))
 
     with worker_llm_scope():
         runtime_kwargs = dict(_resolve_runtime_agent_kwargs() or {})
@@ -1082,7 +1128,7 @@ def _run_worker_conversation(
         if not config_model:
             config_model = str(model or "").strip()
         if plugin_provider:
-            provider, model = _maybe_k2_worker(plugin_provider, str(model or "mimo-v2.5"))
+            provider, model = _maybe_k2_worker(plugin_provider, str(model or ""))
         elif _xiaomi_quota_is_dead():
             provider, model = _K2_WORKER
         else:
@@ -1104,6 +1150,16 @@ def _run_worker_conversation(
                     "credential_pool",
                 ):
                     runtime_kwargs.pop(key, None)
+                try:
+                    api_key, base_url = _oneshot_credentials(
+                        _oneshot_runtime(plugin_runtime, provider)
+                    )
+                    runtime_kwargs["api_key"] = api_key
+                    runtime_kwargs["base_url"] = base_url
+                except Exception:
+                    # Fail closed: no chat URL mix. Missing .env leaves creds unset
+                    # so test_plugin_config_model_overrides_gateway still holds.
+                    pass
             agent_kwargs: dict[str, Any] = {
                 "model": model,
                 **runtime_kwargs,
@@ -1155,6 +1211,7 @@ def _run_worker_conversation(
                             "total_tokens": 0,
                             "cost_usd": 0.0,
                             "api_calls": 0,
+                            "duration_ms": _elapsed_ms(),
                         }
                     )
                 if (
@@ -1184,5 +1241,6 @@ def _run_worker_conversation(
             "total_tokens": int(getattr(agent, "session_total_tokens", 0) or 0),
             "cost_usd": float(getattr(agent, "session_estimated_cost_usd", 0.0) or 0.0),
             "api_calls": int(getattr(agent, "session_api_calls", 0) or 0),
+            "duration_ms": _elapsed_ms(),
         })
         return result if isinstance(result, dict) else {"final_response": str(result or "")}

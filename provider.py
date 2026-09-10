@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -109,7 +110,9 @@ class MyMemoryProvider(MemoryProvider):
         """Compose Bands A–C plus weekly inject when those hooks would fire.
 
         Hermes wraps the return value; pre-wrapping ``<memory-context>`` would nest fences.
+        Ledger ``duration_ms`` with ``api_calls=0`` so a slow embed is not blamed on digest LLM.
         """
+        started = time.perf_counter()
         sid = str(session_id or self._session_id or "")
         first = sid not in self._prefetch_seen
         digest_hit = digest.on_pre_llm_call(
@@ -147,7 +150,32 @@ class MyMemoryProvider(MemoryProvider):
         joined = "\n\n".join(parts)
         if "<memory-context>" in joined:
             joined = joined.replace("<memory-context>", "").replace("</memory-context>", "")
-        return joined.strip()
+        out = joined.strip()
+        try:
+            from .worker_llm import record_worker_usage
+
+            record_worker_usage(
+                {
+                    "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "plugin": "memory-prefetch",
+                    "purpose": "prefetch",
+                    "model": "",
+                    "config_model": "",
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "total_tokens": 0,
+                    "cost_usd": 0.0,
+                    "api_calls": 0,
+                    "chars": len(out),
+                    "duration_ms": max(0, int((time.perf_counter() - started) * 1000)),
+                }
+            )
+        except Exception:
+            pass
+        return out
 
     def sync_turn(
         self,
