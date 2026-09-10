@@ -14,7 +14,14 @@ cd Hermes-MyMemory
 ./scripts/install.sh
 ```
 
-On macOS you can double-click `Install MyMemory.command` instead. Use `--skip-tests` to copy and restart without pytest, or `--force` to continue after a test failure.
+On macOS you can double-click `Install MyMemory.command` instead. Use `--skip-tests` to copy and restart without pytest, `--force` to continue after a test failure, `--skip-config` to leave worker YAML/.env alone, or `--worker-from-chat` to pin digest/weekly/monthly workers to your current Hermes chat model without a menu.
+
+On a TTY the installer asks:
+
+1. Use the current chat `model.provider` / `model.default` (and matching `$HERMES_HOME/.env` key, e.g. `MINIMAX_CN_API_KEY`).
+2. Custom provider, model, API key, and base URL (base URL required when the provider differs from chat).
+
+Non-TTY installs (CI, `git clone && ./scripts/install.sh`) behave like option 1. Chat `model:` is never rewritten. A backup is written to `config.yaml.bak-mymemory-install`. Automation can set `MYMEMORY_WORKER_PROVIDER`, `MYMEMORY_WORKER_MODEL`, `MYMEMORY_WORKER_BASE_URL`, and `MYMEMORY_WORKER_API_KEY` instead of the TTY custom form.
 
 `install.sh` installs Channel 4 automatically:
 
@@ -35,13 +42,15 @@ python -c "from recall.embed import export_gte_int8; export_gte_int8()"
 ./scripts/pack-gte-int8.sh
 ```
 
-1. Place this tree at `$HERMES_HOME/plugins/MyMemory`.
-2. Merge the config below into `$HERMES_HOME/config.yaml` (do not overwrite the whole file).
-3. Put worker API keys in `$HERMES_HOME/.env` (never commit them).
+The installer writes `plugins.entries.MyMemory` worker lanes. The YAML below is the **shape**, not a required hand-merge.
+
+1. Place this tree at `$HERMES_HOME/plugins/MyMemory` (or run `./scripts/install.sh`).
+2. Confirm workers in `$HERMES_HOME/config.yaml` (installer backup: `config.yaml.bak-mymemory-install`).
+3. Worker API keys stay in `$HERMES_HOME/.env` (never commit them).
 4. Create empty `memories/MEMORY.md`, `memories/USER.md`, and `memories/staging/daily/`, `memories/staging/weekly/` if missing.
 5. Restart the gateway. Verify with `hermes doctor`, then `/digest status`, `/weekly help`, and `/monthly help` in chat, or `hermes MyMemory digest help`.
 
-### Required config
+### Worker config shape
 
 ```yaml
 memory:
