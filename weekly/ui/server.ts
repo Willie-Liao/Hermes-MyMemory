@@ -104,6 +104,29 @@ async function startServer() {
   }, 15_000);
   idleWatch.unref?.();
 
+  function readLlmHealth(): {
+    kind: 'quota' | 'connection';
+    model: string;
+    ts: string;
+  } | null {
+    try {
+      const healthPath = path.join(hermesHome, 'metrics', 'llm-health.json');
+      if (!fs.existsSync(healthPath)) return null;
+      const raw = JSON.parse(fs.readFileSync(healthPath, 'utf8')) as {
+        kind?: unknown;
+        model?: unknown;
+        ts?: unknown;
+      };
+      if (raw.kind !== 'quota' && raw.kind !== 'connection') return null;
+      const model = typeof raw.model === 'string' ? raw.model.trim() : '';
+      const ts = typeof raw.ts === 'string' ? raw.ts : '';
+      if (!model) return null;
+      return { kind: raw.kind, model, ts };
+    } catch {
+      return null;
+    }
+  }
+
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
 
@@ -169,7 +192,8 @@ async function startServer() {
         memoryLimit: 4000,
         userSize: userFile.size,
         userLimit: 3000,
-        counts
+        counts,
+        llmHealth: readLlmHealth(),
       });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -637,14 +661,22 @@ async function startServer() {
         appendWeeklyUiLog(
           `ui approval tighten outcome=failed bridge_ms=${bridgeMs} error=${truncateUiLogDetail(bridged.error)}`,
         );
-        return res.status(502).json({ error: bridged.error });
+        const health = readLlmHealth();
+        return res.status(502).json({
+          error: bridged.error,
+          ...(health ? { llm_issue: health.kind, model: health.model } : {}),
+        });
       }
 
       const result = bridged.result as { tightened?: unknown };
       const tightened = String(result?.tightened ?? '').trim();
       if (!tightened) {
         appendWeeklyUiLog('ui approval tighten outcome=failed');
-        return res.status(502).json({ error: 'Empty tighten response.' });
+        const health = readLlmHealth();
+        return res.status(502).json({
+          error: 'Empty tighten response.',
+          ...(health ? { llm_issue: health.kind, model: health.model } : {}),
+        });
       }
 
       appendWeeklyUiLog(

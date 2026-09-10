@@ -118,6 +118,7 @@ export interface SystemStatus {
     types: Record<MemoryType, number>;
     status: Record<MemoryStatus, number>;
   };
+  llmHealth?: { kind: 'quota' | 'connection'; model: string; ts: string } | null;
 }
 
 export type HotMemoryFile = 'MEMORY.md' | 'USER.md' | 'HERMES.md';

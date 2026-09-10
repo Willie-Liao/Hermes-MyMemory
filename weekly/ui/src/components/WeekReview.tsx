@@ -32,6 +32,7 @@ import {
   resolveDefaultWeekSelection,
 } from '../softWeek';
 import {
+  appendLlmIssue,
   rescanPollJobFinished,
   reorganiseInFlightForWeek,
   shouldAdoptInFlightJob,
@@ -154,6 +155,7 @@ export default function WeekReview({
   const [viewMode, setViewMode] = useState<WeekViewMode>('approve');
 
   const [message, setMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
+  const bannerStartedAtRef = useRef(0);
   const [rescanLoading, setRescanLoading] = useState(false);
   const [closeLoading, setCloseLoading] = useState(false);
   const [reopenLoading, setReopenLoading] = useState(false);
@@ -172,6 +174,40 @@ export default function WeekReview({
   const [, setHotComposeActive] = useState(false);
   /** Nested list scrollers — window.scrollY alone misses halfway scroll inside these. */
   const stagingListScrollRef = useRef<HTMLDivElement>(null);
+
+  const beginJobBanner = (text: string) => {
+    bannerStartedAtRef.current = Date.now();
+    setMessage({ type: 'info', text });
+  };
+  const setRunningInfo = (text: string) => {
+    setMessage({
+      type: 'info',
+      text: appendLlmIssue(text, status?.llmHealth, bannerStartedAtRef.current),
+    });
+  };
+  const setLlmFail = (
+    jobText: string,
+    payload?: { llm_issue?: unknown; model?: unknown } | null,
+  ) => {
+    const kind = payload?.llm_issue;
+    const model = String(payload?.model || '').trim();
+    const fromPayload =
+      (kind === 'quota' || kind === 'connection') && model
+        ? { kind, model, ts: new Date().toISOString() }
+        : status?.llmHealth;
+    setMessage({
+      type: 'error',
+      text: appendLlmIssue(jobText, fromPayload, bannerStartedAtRef.current),
+    });
+  };
+
+  useEffect(() => {
+    if (message?.type !== 'info') return;
+    const next = appendLlmIssue(message.text, status?.llmHealth, bannerStartedAtRef.current);
+    if (next !== message.text) {
+      setMessage({ type: 'info', text: next });
+    }
+  }, [status?.llmHealth, message]);
 
   const weekKeys = useMemo(() => weeks.map((w) => w.week), [weeks]);
   const pickerYears = useMemo(() => listYearsFromWeeks(weekKeys), [weekKeys]);
@@ -470,10 +506,7 @@ export default function WeekReview({
     const resolvedGuidance = resolveTightenGuidance(guidance);
     const entryType = String(editingBlockData?.type ?? '').trim();
     setStagingTightening(true);
-    setMessage({
-      type: 'info',
-      text: 'Waiting for LLM worker to polish.',
-    });
+    beginJobBanner('Waiting for LLM worker to polish.');
     setStagingTightenDraftId(blockId);
     setStagingTightenDraft(null);
     try {
@@ -487,7 +520,15 @@ export default function WeekReview({
         }),
       });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || 'Tighten failed');
+      if (!res.ok) {
+        const err = new Error(data.error || 'Tighten failed') as Error & {
+          llm_issue?: unknown;
+          model?: unknown;
+        };
+        err.llm_issue = data.llm_issue;
+        err.model = data.model;
+        throw err;
+      }
       const next = String(data.tightened ?? '').replace(/§/g, '');
       if (!next.trim()) throw new Error('Tighten returned an empty body.');
       setStagingTightenDraft(next);
@@ -495,10 +536,10 @@ export default function WeekReview({
       setStagingTightenGuidance('');
       setMessage({ type: 'success', text: 'Tighten draft ready — Accept or Discard.' });
     } catch (err: unknown) {
-      setMessage({
-        type: 'error',
-        text: err instanceof Error ? err.message : 'Tighten failed',
-      });
+      const payload = err && typeof err === 'object'
+        ? err as { llm_issue?: unknown; model?: unknown }
+        : {};
+      setLlmFail('Tighten failed.', payload);
       setStagingTightenDraftId(null);
     } finally {
       setStagingTightening(false);
@@ -577,20 +618,14 @@ export default function WeekReview({
   const handleReorganizeWeek = async () => {
     if (!activeDate || !selectedWeek) return;
     setReorganizeLoading(true);
-    setMessage({
-      type: 'info',
-      text: `Reorganise ${activeDate}: starting Phase-2…`,
-    });
+    beginJobBanner(`Reorganise ${activeDate}: starting Phase-2…`);
     try {
       const result = await runReorganiseSequence(fetch, {
         date: activeDate,
         week: selectedWeek.week,
       });
       if (result.digestOutcome === 'in_flight') {
-        setMessage({
-          type: 'info',
-          text: `Reorganise ${activeDate}: running in background…`,
-        });
+        setRunningInfo(`Reorganise ${activeDate}: running in background…`);
         return;
       }
       setMessage({
@@ -602,10 +637,9 @@ export default function WeekReview({
       if (onRefresh) onRefresh();
       setReorganizeLoading(false);
     } catch (err: unknown) {
-      setMessage({
-        type: 'error',
-        text: err instanceof Error ? err.message : 'Reorganise failed.',
-      });
+      setLlmFail(
+        err instanceof Error ? err.message : `Reorganise failed for ${activeDate}.`,
+      );
       setReorganizeLoading(false);
     }
   };
@@ -834,10 +868,7 @@ export default function WeekReview({
           if (data.outcome === 'in_flight') return;
           setReorganizeLoading(false);
           if (data.outcome === 'failed') {
-            setMessage({
-              type: 'error',
-              text: `Reorganise failed for ${activeDate}.`,
-            });
+            setLlmFail(`Reorganise failed for ${activeDate}.`, data);
             return;
           }
           if (data.outcome === 'idle') {
@@ -905,10 +936,7 @@ export default function WeekReview({
         }
         if (jobDate) setActiveDate(jobDate);
         setReorganizeLoading(true);
-        setMessage({
-          type: 'info',
-          text: `Reorganise ${jobDate || probeDate}: still running…`,
-        });
+        beginJobBanner(`Reorganise ${jobDate || probeDate}: still running…`);
       } catch {
         /* page can still click Reorganise */
       }
@@ -923,10 +951,7 @@ export default function WeekReview({
     const week = selectedWeek.week;
     rescanSawFlightRef.current = false;
     setRescanLoading(true);
-    setMessage({
-      type: 'info',
-      text: `Re-scan ${week}: checking daily cards…`,
-    });
+    beginJobBanner(`Re-scan ${week}: checking daily cards…`);
 
     void (async () => {
       try {
@@ -974,10 +999,7 @@ export default function WeekReview({
         const hasWeeklyFile = Boolean(staleData.has_weekly_file);
 
         if (emptyDigests) {
-          setMessage({
-            type: 'info',
-            text: `Re-scan ${week}: no usable dailies — clearing empty week…`,
-          });
+          setRunningInfo(`Re-scan ${week}: no usable dailies — clearing empty week…`);
           await fetch('/api/weekly/update', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -985,26 +1007,19 @@ export default function WeekReview({
           });
           applySoftEmpty();
           if (hotChanged) {
-            setMessage({
-              type: 'info',
-              text: `Re-scan ${week}: refreshing hot memory…`,
-            });
+            setRunningInfo(`Re-scan ${week}: refreshing hot memory…`);
             await refreshHotKeepBanner();
-            setMessage({
-              type: 'info',
-              text: `Re-scan ${week}: no usable dailies — clearing empty week…`,
-            });
+            setRunningInfo(`Re-scan ${week}: no usable dailies — clearing empty week…`);
           }
           setRescanLoading(false);
           return;
         }
 
-        setMessage({
-          type: 'info',
-          text: hasWeeklyFile
+        setRunningInfo(
+          hasWeeklyFile
             ? `Re-scan ${week}: regenerating weekly schema…`
             : `Re-scan ${week}: generating weekly schema…`,
-        });
+        );
         const updRes = await fetch('/api/weekly/update', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1034,17 +1049,11 @@ export default function WeekReview({
           throw new Error(`Failed to re-scan ${week}. ${reason}${details}`.trim());
         }
         if (data.outcome === 'started' || data.generate_in_flight) {
-          setMessage({
-            type: 'info',
-            text: `Re-scan ${week}: running in background…`,
-          });
+          setRunningInfo(`Re-scan ${week}: running in background…`);
           return;
         }
         if (hotChanged) {
-          setMessage({
-            type: 'info',
-            text: `Re-scan ${week}: refreshing hot memory…`,
-          });
+          setRunningInfo(`Re-scan ${week}: refreshing hot memory…`);
           await refreshHotKeepBanner();
         }
         setMessage({
@@ -1056,7 +1065,7 @@ export default function WeekReview({
         if (onRefresh) onRefresh();
         setRescanLoading(false);
       } catch (err: any) {
-        setMessage({ type: 'error', text: err.message || String(err) });
+        setLlmFail(err.message || String(err));
         setRescanLoading(false);
       }
     })();

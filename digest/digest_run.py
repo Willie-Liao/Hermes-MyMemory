@@ -125,6 +125,27 @@ def request_resummarise(
     )
 
 
+def _with_llm_issue(payload: dict[str, Any]) -> dict[str, Any]:
+    """Attach current worker quota/connection so Reorganise fail JSON does not wait for the 4s status poll."""
+    try:
+        plugin_root = Path(__file__).resolve().parent.parent
+        if str(plugin_root) not in sys.path:
+            sys.path.insert(0, str(plugin_root))
+        from worker_llm import read_llm_health
+
+        health = read_llm_health() or {}
+    except Exception:
+        return payload
+    kind = health.get("kind")
+    if kind not in ("quota", "connection"):
+        return payload
+    extra: dict[str, Any] = {"llm_issue": kind}
+    model = str(health.get("model") or "").strip()
+    if model:
+        extra["model"] = model
+    return {**payload, **extra}
+
+
 def request_weekly_reorganise(
     *,
     date_str: str | None = None,
@@ -165,22 +186,23 @@ def request_weekly_reorganise(
         job_date = str(job.get("date") or "").strip()
         if status_only:
             if in_flight:
-                return {
+                return _with_llm_issue({
                     "outcome": "in_flight",
                     "path": str(daily_path),
                     "date": job_date or target_date,
-                }
-            return {
+                })
+            return _with_llm_issue({
                 "outcome": last_outcome or "idle",
                 "path": str(daily_path),
                 "date": job_date or target_date,
-            }
+            })
 
     if not daily_path.exists():
         return {"outcome": "missing", "path": str(daily_path), "date": target_date}
 
     if wait:
-        return digest.run_manual_phase2(daily_path, date_str=target_date)
+        result = digest.run_manual_phase2(daily_path, date_str=target_date)
+        return _with_llm_issue(result if isinstance(result, dict) else {"outcome": "failed"})
 
     worker_alive = any(
         t.name == f"weekly-reorganise-{target_date}" and t.is_alive()

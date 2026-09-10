@@ -116,3 +116,37 @@ export function onMouseMove(state: IdleRescanState, now: number): IdleRescanStat
     idle: false,
   };
 }
+
+/** Append quota/connection copy to a Week Review running sentence; ignore snapshots older than this banner. */
+export type LlmHealthIssue = {
+  kind: 'quota' | 'connection';
+  model: string;
+  ts?: string;
+} | null | undefined;
+
+export function appendLlmIssue(
+  runningText: string,
+  health: LlmHealthIssue,
+  bannerStartedAt?: number,
+): string {
+  const base = String(runningText || '').trim();
+  const kind = health?.kind;
+  const model = String(health?.model || '').trim();
+  if (!base || (kind !== 'quota' && kind !== 'connection') || !model) {
+    return base;
+  }
+  if (bannerStartedAt != null && health?.ts) {
+    const tsMs = Date.parse(health.ts);
+    if (Number.isFinite(tsMs) && tsMs < bannerStartedAt) {
+      return base;
+    }
+  }
+  const suffix =
+    kind === 'quota'
+      ? `${model} has no API budget left.`
+      : `${model} connection error.`;
+  if (base.includes(suffix)) {
+    return base;
+  }
+  return `${base} ${suffix}`;
+}

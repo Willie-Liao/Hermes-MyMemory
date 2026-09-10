@@ -79,16 +79,68 @@ def _ledger_path() -> Path:
 
 
 def _runtime_from_mapping(bag: Mapping[str, Any] | None) -> dict[str, str]:
+    """Copy lane/entry endpoint fields so oneshot can use YAML instead of a hardcoded provider table."""
     if not isinstance(bag, Mapping):
         return {}
     out: dict[str, str] = {}
     model = str(bag.get("model") or "").strip()
     provider = str(bag.get("provider") or "").strip()
+    base_url = str(bag.get("base_url") or "").strip()
+    key_env = str(bag.get("key_env") or "").strip()
     if model:
         out["model"] = model
     if provider:
         out["provider"] = provider
+    if base_url:
+        out["base_url"] = base_url
+    if key_env:
+        out["key_env"] = key_env
     return out
+
+
+def _provider_env_names(provider: str) -> tuple[str, str]:
+    """Map provider id to .env names (minimax-cn → MINIMAX_CN_*). kimi-coding keeps KIMI_* used by k2 failover."""
+    plug = str(provider or "").strip().lower() or "xiaomi"
+    if plug == "kimi-coding":
+        return ("KIMI_API_KEY", "KIMI_BASE_URL")
+    prefix = plug.replace("-", "_").upper()
+    return f"{prefix}_API_KEY", f"{prefix}_BASE_URL"
+
+
+def _inherit_provider_endpoint(raw: Mapping[str, Any], out: dict[str, str]) -> None:
+    """Fill missing base_url/key_env from chat model: or a matching fallback_providers row.
+
+    Plugin lanes that share the chat provider should not repeat the OpenAI /v1 URL.
+    """
+    provider = str(out.get("provider") or "").strip().lower()
+    if not provider or (out.get("base_url") and out.get("key_env")):
+        return
+
+    def _take(bag: Mapping[str, Any] | None) -> None:
+        if not isinstance(bag, Mapping):
+            return
+        if not out.get("base_url"):
+            url = str(bag.get("base_url") or "").strip()
+            if url:
+                out["base_url"] = url
+        if not out.get("key_env"):
+            key_env = str(bag.get("key_env") or "").strip()
+            if key_env:
+                out["key_env"] = key_env
+
+    model_bag = raw.get("model") if isinstance(raw, Mapping) else None
+    if isinstance(model_bag, Mapping):
+        chat_prov = str(model_bag.get("provider") or "").strip().lower()
+        if chat_prov == provider:
+            _take(model_bag)
+    fallbacks = raw.get("fallback_providers") if isinstance(raw, Mapping) else None
+    if isinstance(fallbacks, list):
+        for row in fallbacks:
+            if not isinstance(row, Mapping):
+                continue
+            if str(row.get("provider") or "").strip().lower() == provider:
+                _take(row)
+                break
 
 
 def _worker_llm_lane(plugin: str, purpose: str) -> str | None:
@@ -111,10 +163,10 @@ def _worker_llm_lane(plugin: str, purpose: str) -> str | None:
 
 
 def _plugin_worker_runtime(plugin: str, purpose: str = "") -> dict[str, str]:
-    """Optional model/provider from config.yaml plugins.entries.<plugin>.
+    """Optional model/provider/base_url from config.yaml plugins.entries.<plugin>.
 
-    Overlay: entry.model/provider, then worker_llm.<lane> for phase1 / phase2 /
-    wrapup / weekly when the purpose matches.
+    Overlay: entry, then worker_llm.<lane>; then inherit chat/fallback URL when
+    the provider matches so MiniMax digest does not oneshot the default OpenAI host.
     """
     name = str(plugin or "").strip()
     if not name:
@@ -152,16 +204,73 @@ def _plugin_worker_runtime(plugin: str, purpose: str = "") -> dict[str, str]:
         lane = _worker_llm_lane(name, purpose)
         if lane:
             out.update(_runtime_from_mapping(lanes.get(lane)))
+    _inherit_provider_endpoint(raw if isinstance(raw, dict) else {}, out)
     return out
 
 
+def _health_path() -> Path:
+    """Sibling of llm-usage.jsonl so the UI can poll the current issue without parsing the ledger."""
+    return _hermes_home() / "metrics" / "llm-health.json"
+
+
+def _write_llm_health(payload: Mapping[str, Any]) -> None:
+    """Overwrite the one-record snapshot; fail-open so a disk error cannot abort ingest."""
+    try:
+        path = _health_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(dict(payload), ensure_ascii=False) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def read_llm_health() -> dict[str, Any] | None:
+    """Return the last worker issue snapshot, or None if missing/unreadable."""
+    try:
+        raw = json.loads(_health_path().read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _sync_llm_health(record: Mapping[str, Any]) -> None:
+    """Keep one current-issue file: set on quota/connection, clear only on config-model success."""
+    issue = record.get("issue")
+    config_model = str(record.get("config_model") or "").strip()
+    used_model = str(record.get("model") or "").strip()
+    ts = str(record.get("ts") or datetime.now(timezone.utc).isoformat())
+    if issue in ("quota", "connection"):
+        _write_llm_health(
+            {
+                "kind": issue,
+                "model": config_model or used_model,
+                "plugin": record.get("plugin"),
+                "purpose": record.get("purpose"),
+                "ts": ts,
+            }
+        )
+        return
+    try:
+        calls = int(record.get("api_calls") or 0)
+    except (TypeError, ValueError):
+        calls = 0
+    if calls >= 1 and used_model != _K2_WORKER[1]:
+        _write_llm_health(
+            {
+                "kind": None,
+                "model": config_model or used_model,
+                "ts": ts,
+            }
+        )
+
+
 def record_worker_usage(record: dict[str, Any]) -> None:
-    """Append one JSONL usage record. Fail-open — never raise to callers."""
+    """Append one JSONL usage record and refresh llm-health. Fail-open — never raise to callers."""
     try:
         path = _ledger_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        _sync_llm_health(record)
     except Exception:
         pass  # fail-open
 
@@ -554,10 +663,6 @@ ONESHOT_SYSTEM = (
     "Do not start an agent. Do not load memory, SOUL, plugins, or any other tools."
 )
 
-_ONESHOT_PROVIDERS = {
-    "xiaomi": ("XIAOMI_API_KEY", "XIAOMI_BASE_URL", "https://api.xiaomimimo.com/v1"),
-    "kimi-coding": ("KIMI_API_KEY", "KIMI_BASE_URL", "https://api.kimi.com/coding/v1"),
-}
 _K2_WORKER = ("kimi-coding", "kimi-for-coding-highspeed")
 _xiaomi_quota_dead = False
 _xiaomi_quota_lock = threading.Lock()
@@ -572,19 +677,21 @@ def _xiaomi_worker_lane(provider: str, model: str) -> bool:
     return False
 
 
-def _quota_exhausted(exc: BaseException) -> bool:
-    """Treat billing/rate-limit failures as 'MiMo used up' so ingest can finish on k2."""
+def _llm_issue_kind(exc: BaseException | None) -> str | None:
+    """Classify worker failures so Week Review can name quota vs connection without changing bool callers."""
+    if exc is None:
+        return None
     code = getattr(exc, "status_code", None)
     if code is None:
         resp = getattr(exc, "response", None)
         code = getattr(resp, "status_code", None)
     try:
         if int(code) in (402, 403, 429):
-            return True
+            return "quota"
     except (TypeError, ValueError):
         pass
     text = str(exc).lower()
-    needles = (
+    quota_needles = (
         "quota",
         "rate limit",
         "rate_limit",
@@ -596,7 +703,30 @@ def _quota_exhausted(exc: BaseException) -> bool:
         "billing",
         "resource exhausted",
     )
-    return any(n in text for n in needles)
+    if any(n in text for n in quota_needles):
+        return "quota"
+    conn_needles = (
+        "connection error",
+        "api call failed",
+        "max retries",
+        "econnreset",
+        "timed out",
+        "timeout",
+        "client has been closed",
+        "cannot send a request",
+        "connection refused",
+        "nodename nor servname",
+        "name or service not known",
+        "missing ",
+    )
+    if any(n in text for n in conn_needles):
+        return "connection"
+    return None
+
+
+def _quota_exhausted(exc: BaseException) -> bool:
+    """Treat billing/rate-limit failures as 'MiMo used up' so ingest can finish on k2."""
+    return _llm_issue_kind(exc) == "quota"
 
 
 def _mark_xiaomi_quota_dead() -> None:
@@ -643,20 +773,46 @@ def openai_function_tool(schema: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _oneshot_credentials(provider: str) -> tuple[str, str]:
+def _oneshot_runtime(plugin_runtime: Mapping[str, str], provider: str) -> dict[str, str]:
+    """Credentials bag for this attempt: same-provider YAML URL, else inherit for failover (k2)."""
     plug = str(provider or "").strip().lower() or "xiaomi"
-    key_env, url_env, default_url = _ONESHOT_PROVIDERS.get(
-        plug,
-        (
-            f"{plug.upper().replace('-', '_')}_API_KEY",
-            f"{plug.upper().replace('-', '_')}_BASE_URL",
-            "",
-        ),
-    )
+    out: dict[str, str] = {"provider": plug}
+    same = str(plugin_runtime.get("provider") or "").strip().lower() == plug
+    if same:
+        if plugin_runtime.get("base_url"):
+            out["base_url"] = plugin_runtime["base_url"]
+        if plugin_runtime.get("key_env"):
+            out["key_env"] = plugin_runtime["key_env"]
+        return out
+    path = _hermes_home() / "config.yaml"
+    try:
+        import yaml
+
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        raw = {}
+    if isinstance(raw, dict):
+        _inherit_provider_endpoint(raw, out)
+    return out
+
+
+def _oneshot_credentials(runtime: Mapping[str, Any] | str) -> tuple[str, str]:
+    """Read API key from .env and base_url from YAML then env; empty URL fails closed as connection."""
+    if isinstance(runtime, str):
+        bag: dict[str, Any] = {"provider": runtime}
+    else:
+        bag = dict(runtime or {})
+    plug = str(bag.get("provider") or "").strip().lower() or "xiaomi"
+    derived_key, url_env = _provider_env_names(plug)
+    key_env = str(bag.get("key_env") or "").strip() or derived_key
     api_key = (os.environ.get(key_env) or "").strip()
     if not api_key:
         raise ValueError(f"missing {key_env} for oneshot worker provider {plug}")
-    base_url = (os.environ.get(url_env) or default_url).strip()
+    env_url = (os.environ.get(url_env) or "").strip()
+    yaml_url = str(bag.get("base_url") or "").strip()
+    base_url = env_url or yaml_url
+    if not base_url:
+        raise ValueError(f"missing {url_env} for oneshot worker provider {plug}")
     return api_key, base_url
 
 
@@ -763,14 +919,49 @@ def run_worker_llm_oneshot(
             }
     from openai import OpenAI
 
+    config_model = str(plugin_runtime.get("model") or model or "").strip()
     last_exc: BaseException | None = None
+
+    def _fail_record(exc: BaseException | None, used_model: str) -> dict[str, Any]:
+        kind = _llm_issue_kind(exc)
+        rec: dict[str, Any] = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "plugin": plugin,
+            "purpose": purpose,
+            "model": used_model,
+            "config_model": config_model,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.0,
+            "api_calls": 0,
+        }
+        if kind:
+            rec["issue"] = kind
+        record_worker_usage(rec)
+        return {
+            "final_response": str(exc or "oneshot failed"),
+            "tool_name": None,
+            "tool_args": None,
+            "tool_calls": [],
+            "messages": [],
+            "failed": True,
+            "llm_issue": kind,
+            "model": config_model,
+        }
+
     with worker_llm_scope():
         for attempt in (0, 1):
             try:
-                api_key, base_url = _oneshot_credentials(provider)
+                api_key, base_url = _oneshot_credentials(
+                    _oneshot_runtime(plugin_runtime, provider)
+                )
             except Exception as exc:
                 last_exc = exc
-                break
+                return _fail_record(exc, model)
             client_kwargs: dict[str, Any] = {"api_key": api_key}
             if base_url:
                 client_kwargs["base_url"] = base_url
@@ -786,36 +977,31 @@ def run_worker_llm_oneshot(
                     and _quota_exhausted(exc)
                 ):
                     _mark_xiaomi_quota_dead()
+                    record_worker_usage(
+                        {
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "plugin": plugin,
+                            "purpose": purpose,
+                            "model": model,
+                            "config_model": config_model,
+                            "issue": "quota",
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "cache_read_tokens": 0,
+                            "cache_write_tokens": 0,
+                            "reasoning_tokens": 0,
+                            "total_tokens": 0,
+                            "cost_usd": 0.0,
+                            "api_calls": 0,
+                        }
+                    )
                     provider, model = _K2_WORKER
                     print(
                         f"worker_llm: MiMo quota/rate-limit; switching ingest to {model}",
                         flush=True,
                     )
                     continue
-                record_worker_usage(
-                    {
-                        "ts": datetime.now(timezone.utc).isoformat(),
-                        "plugin": plugin,
-                        "purpose": purpose,
-                        "model": model,
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "cache_read_tokens": 0,
-                        "cache_write_tokens": 0,
-                        "reasoning_tokens": 0,
-                        "total_tokens": 0,
-                        "cost_usd": 0.0,
-                        "api_calls": 0,
-                    }
-                )
-                return {
-                    "final_response": str(exc),
-                    "tool_name": None,
-                    "tool_args": None,
-                    "tool_calls": [],
-                    "messages": [],
-                    "failed": True,
-                }
+                return _fail_record(exc, model)
             choice = resp.choices[0]
             captured = _capture_from_oneshot_message(
                 choice.message, force_tool_name=force
@@ -839,6 +1025,7 @@ def run_worker_llm_oneshot(
                     "plugin": plugin,
                     "purpose": purpose,
                     "model": model,
+                    "config_model": config_model,
                     **usage_fields,
                     "cost_usd": 0.0,
                     "api_calls": 1,
@@ -848,30 +1035,7 @@ def run_worker_llm_oneshot(
             captured["finish_reason"] = getattr(choice, "finish_reason", None)
             captured["max_tokens"] = max_tokens
             return captured
-    record_worker_usage(
-        {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "plugin": plugin,
-            "purpose": purpose,
-            "model": model,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cache_read_tokens": 0,
-            "cache_write_tokens": 0,
-            "reasoning_tokens": 0,
-            "total_tokens": 0,
-            "cost_usd": 0.0,
-            "api_calls": 0,
-        }
-    )
-    return {
-        "final_response": str(last_exc or "oneshot failed"),
-        "tool_name": None,
-        "tool_args": None,
-        "tool_calls": [],
-        "messages": [],
-        "failed": True,
-    }
+    return _fail_record(last_exc, model)
 
 
 def _run_worker_conversation(
@@ -905,6 +1069,7 @@ def _run_worker_conversation(
         runtime_kwargs.pop("tool_start_callback", None)
         plugin_runtime = _plugin_worker_runtime(plugin, purpose)
         plugin_provider = str(plugin_runtime.get("provider") or "").strip()
+        config_model = str(plugin_runtime.get("model") or "").strip()
         model = (
             plugin_runtime.get("model")
             or (
@@ -914,6 +1079,8 @@ def _run_worker_conversation(
             )
             or _resolve_gateway_model()
         )
+        if not config_model:
+            config_model = str(model or "").strip()
         if plugin_provider:
             provider, model = _maybe_k2_worker(plugin_provider, str(model or "mimo-v2.5"))
         elif _xiaomi_quota_is_dead():
@@ -970,6 +1137,26 @@ def _run_worker_conversation(
                 result = agent.run_conversation(prompt)
                 break
             except Exception as exc:
+                kind = _llm_issue_kind(exc)
+                if kind:
+                    record_worker_usage(
+                        {
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "plugin": plugin,
+                            "purpose": purpose,
+                            "model": model,
+                            "config_model": config_model,
+                            "issue": kind,
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "cache_read_tokens": 0,
+                            "cache_write_tokens": 0,
+                            "reasoning_tokens": 0,
+                            "total_tokens": 0,
+                            "cost_usd": 0.0,
+                            "api_calls": 0,
+                        }
+                    )
                 if (
                     attempt == 0
                     and _xiaomi_worker_lane(provider, model)
@@ -988,6 +1175,7 @@ def _run_worker_conversation(
             "plugin": plugin,
             "purpose": purpose,
             "model": getattr(agent, "model", "") or model or "",
+            "config_model": config_model,
             "input_tokens": int(getattr(agent, "session_input_tokens", 0) or 0),
             "output_tokens": int(getattr(agent, "session_output_tokens", 0) or 0),
             "cache_read_tokens": int(getattr(agent, "session_cache_read_tokens", 0) or 0),

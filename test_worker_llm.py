@@ -682,12 +682,135 @@ def test_run_worker_llm_oneshot_falls_back_to_k2_on_quota(tmp_path, monkeypatch)
         (tmp_path / "metrics" / "llm-usage.jsonl").read_text(encoding="utf-8").strip().splitlines()[-1]
     )
     assert rec["model"] == "kimi-for-coding-highspeed"
+    health = json.loads((tmp_path / "metrics" / "llm-health.json").read_text(encoding="utf-8"))
+    assert health["kind"] == "quota"
+    assert health["model"] == "mimo-v2.5"
+
+
+def test_oneshot_inherits_chat_base_url_for_minimax(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    assert not hasattr(wl, "_ONESHOT_PROVIDERS")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MINIMAX_CN_API_KEY", "mm-key")
+    monkeypatch.delenv("MINIMAX_CN_BASE_URL", raising=False)
+    (tmp_path / "config.yaml").write_text(
+        "model:\n"
+        "  provider: minimax-cn\n"
+        "  default: MiniMax-M3\n"
+        "  base_url: https://api.minimax.chat/v1\n"
+        "plugins:\n"
+        "  entries:\n"
+        "    MyMemory:\n"
+        "      digest:\n"
+        "        provider: minimax-cn\n"
+        "        model: MiniMax-M2.5\n",
+        encoding="utf-8",
+    )
+    seen: dict = {}
+    _install_fake_openai(
+        monkeypatch,
+        seen=seen,
+        message={"content": "", "tool_calls": None},
+    )
+    out = wl.run_worker_llm_oneshot(
+        "hi",
+        plugin="memory-digest",
+        purpose="digest-phase1",
+    )
+    assert out["failed"] is False
+    assert seen["client"]["base_url"] == "https://api.minimax.chat/v1"
+    assert seen["create"]["model"] == "MiniMax-M2.5"
+
+
+def test_oneshot_lane_base_url_wins_over_chat(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MINIMAX_CN_API_KEY", "mm-key")
+    monkeypatch.delenv("MINIMAX_CN_BASE_URL", raising=False)
+    (tmp_path / "config.yaml").write_text(
+        "model:\n"
+        "  provider: minimax-cn\n"
+        "  base_url: https://api.minimax.chat/v1\n"
+        "plugins:\n"
+        "  entries:\n"
+        "    MyMemory:\n"
+        "      digest:\n"
+        "        provider: minimax-cn\n"
+        "        model: MiniMax-M2.5\n"
+        "        worker_llm:\n"
+        "          phase1:\n"
+        "            provider: minimax-cn\n"
+        "            model: MiniMax-M2.5\n"
+        "            base_url: https://lane.example/v1\n",
+        encoding="utf-8",
+    )
+    seen: dict = {}
+    _install_fake_openai(
+        monkeypatch,
+        seen=seen,
+        message={"content": "", "tool_calls": None},
+    )
+    wl.run_worker_llm_oneshot(
+        "hi",
+        plugin="memory-digest",
+        purpose="digest-phase1",
+    )
+    assert seen["client"]["base_url"] == "https://lane.example/v1"
+
+
+def test_oneshot_missing_base_url_records_connection(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MINIMAX_CN_API_KEY", "mm-key")
+    monkeypatch.delenv("MINIMAX_CN_BASE_URL", raising=False)
+    (tmp_path / "config.yaml").write_text(
+        "model:\n"
+        "  provider: xiaomi\n"
+        "  base_url: https://api.xiaomimimo.com/v1\n"
+        "plugins:\n"
+        "  entries:\n"
+        "    MyMemory:\n"
+        "      digest:\n"
+        "        provider: minimax-cn\n"
+        "        model: MiniMax-M2.5\n",
+        encoding="utf-8",
+    )
+    out = wl.run_worker_llm_oneshot(
+        "hi",
+        plugin="memory-digest",
+        purpose="digest-phase1",
+    )
+    assert out["failed"] is True
+    assert out["llm_issue"] == "connection"
+    assert out["model"] == "MiniMax-M2.5"
+    health = json.loads((tmp_path / "metrics" / "llm-health.json").read_text(encoding="utf-8"))
+    assert health["kind"] == "connection"
+    assert health["model"] == "MiniMax-M2.5"
+
+
+def test_llm_issue_kind_and_quota_bool():
+    wl = _load_worker_llm()
+
+    class QuotaErr(Exception):
+        status_code = 429
+
+    class ConnErr(Exception):
+        pass
+
+    quota = QuotaErr("insufficient quota")
+    conn = ConnErr("connection error")
+    assert wl._llm_issue_kind(quota) == "quota"
+    assert wl._quota_exhausted(quota) is True
+    assert isinstance(wl._quota_exhausted(quota), bool)
+    assert wl._llm_issue_kind(conn) == "connection"
+    assert wl._quota_exhausted(conn) is False
 
 
 def test_run_worker_llm_oneshot_parses_fenced_json_content(tmp_path, monkeypatch):
     wl = _load_worker_llm()
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("XIAOMI_API_KEY", "test-key")
+    monkeypatch.setenv("XIAOMI_BASE_URL", "https://example.test/v1")
     (tmp_path / "config.yaml").write_text(
         "plugins:\n  entries:\n    memory-weekly:\n      provider: xiaomi\n      model: mimo-v2.5\n",
         encoding="utf-8",

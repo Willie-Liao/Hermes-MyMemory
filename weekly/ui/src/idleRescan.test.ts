@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import {
+  appendLlmIssue,
   isIdle,
   onMouseMove,
   shouldFireAutoRescan,
@@ -185,6 +186,37 @@ assert.equal(
     weekKey: '2026-W35',
   }),
   false,
+);
+
+assert.equal(
+  appendLlmIssue(
+    'Re-scan 2026-W36: running in background…',
+    { kind: 'quota', model: 'MiniMax-M2.5', ts: '2026-09-10T04:00:00.000Z' },
+    Date.parse('2026-09-10T03:59:00.000Z'),
+  ),
+  'Re-scan 2026-W36: running in background… MiniMax-M2.5 has no API budget left.',
+);
+assert.equal(
+  appendLlmIssue(
+    'Waiting for LLM worker to polish.',
+    { kind: 'connection', model: 'MiniMax-M2.5' },
+  ),
+  'Waiting for LLM worker to polish. MiniMax-M2.5 connection error.',
+);
+assert.equal(
+  appendLlmIssue(
+    'Reorganise 2026-09-08: running in background…',
+    { kind: 'quota', model: 'MiniMax-M2.5', ts: '2026-09-10T03:00:00.000Z' },
+    Date.parse('2026-09-10T04:00:00.000Z'),
+  ),
+  'Reorganise 2026-09-08: running in background…',
+);
+assert.equal(
+  appendLlmIssue(
+    'Re-scan 2026-W36: running in background… MiniMax-M2.5 connection error.',
+    { kind: 'connection', model: 'MiniMax-M2.5' },
+  ),
+  'Re-scan 2026-W36: running in background… MiniMax-M2.5 connection error.',
 );
 
 console.log('idleRescan.test.ts: ok');
