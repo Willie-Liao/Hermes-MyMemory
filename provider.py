@@ -91,12 +91,16 @@ class MyMemoryProvider(MemoryProvider):
         Exclusive plugins are not imported at PluginManager boot; the first
         primary-agent initialize is what arms the civil clock. Slash commands
         still register here for cron/subagent/flush so chat handlers exist
-        even when those contexts skip the clock.
+        even when those contexts skip the clock. Re-patch prefetch join here
+        because MemoryManager is often constructed before this plugin loads.
         """
         self._session_id = str(session_id or "")
         self._hermes_home = str(kwargs.get("hermes_home") or "")
         self._platform = str(kwargs.get("platform") or "")
         self._agent_context = str(kwargs.get("agent_context") or "primary")
+        from .prefetch_timeout import apply_external_prefetch_timeout
+
+        apply_external_prefetch_timeout()
         _register_slash_commands()
         if self._agent_context in _SKIP_WRITE_CONTEXTS:
             return

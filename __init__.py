@@ -8,6 +8,7 @@ initialize.
 
 from __future__ import annotations
 
+from .prefetch_timeout import apply_external_prefetch_timeout
 from .provider import MyMemoryProvider
 
 
@@ -17,7 +18,9 @@ def register(ctx) -> None:
     PluginContext has no register_memory_provider (mempalace crash). The
     memory loader's collector has no register_command. hasattr so one
     register() serves both loaders without dual recall hooks.
+    Re-apply prefetch join budget here so a Hermes upgrade cannot restore 8s.
     """
+    apply_external_prefetch_timeout()
     if hasattr(ctx, "register_command"):
         from .digest import slash as digest_slash
         from .weekly import slash as weekly_slash
