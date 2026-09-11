@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 from conftest import load_plugin_module
 
-pytestmark = pytest.mark.skipif(
+_LIVE_TYPED = pytest.mark.skipif(
     os.environ.get("HERMES_DIGEST_LIVE_LLM", "").strip() not in {"1", "true", "yes"},
     reason="Set HERMES_DIGEST_LIVE_LLM=1 to run live typed-prompt tests",
 )
@@ -74,6 +74,7 @@ def _dedup():
     return load_plugin_module("dedup_prompt.py", "memory_digest_live_typed_dedup")
 
 
+@_LIVE_TYPED
 def test_live_typed_phase2_and_wrapup_on_full_2026_08_15(tmp_path, monkeypatch):
     digest = _digest()
     dedup = _dedup()
@@ -412,10 +413,44 @@ def _probe_minimax_anthropic_tool_use(model: str) -> dict:
     }
 
 
+def _oneshot_ping(wl, *, plugin: str, purpose: str) -> dict:
+    """Tiny OpenAI-tool ping so live smoke does not run a full digest/weekly/monthly job."""
+    ping_schema = {
+        "name": "ping",
+        "description": "noop ping",
+        "parameters": {"type": "object", "properties": {}},
+    }
+    started = time.perf_counter()
+    capture = wl.run_worker_llm_oneshot(
+        "Call ping.",
+        plugin=plugin,
+        purpose=purpose,
+        force_tool_name="ping",
+        tool_schema=ping_schema,
+        max_tokens=128,
+    )
+    return {
+        "ms": max(0, int((time.perf_counter() - started) * 1000)),
+        "failed": bool(capture.get("failed")),
+        "api_calls": int(capture.get("api_calls") or 0),
+        "total_tokens": int(capture.get("total_tokens") or 0),
+        "tool_name": capture.get("tool_name"),
+        "tool_calls": bool(capture.get("tool_calls") or capture.get("tool_name")),
+    }
+
+
 def test_live_prefetch_and_digest_follow_chat(tmp_path, monkeypatch):
-    """Prove follow-chat + .env URL; record prefetch vs digest and MiniMax tool formats."""
+    """Prove follow-chat + .env URL; record prefetch vs digest and MiniMax tool formats.
+
+    REAL_LLM_TEST=1 also smokes digest-phase1, wrapup, weekly, and monthly oneshots
+    so an Anthropic chat base_url cannot silently break OpenAI worker /v1.
+    """
     if os.environ.get("REAL_LLM_TEST", "").strip().lower() in {"0", "false", "no"}:
         pytest.skip("REAL_LLM_TEST=0")
+    live_ok = os.environ.get("REAL_LLM_TEST", "").strip() in {"1", "true", "yes"}
+    typed_ok = os.environ.get("HERMES_DIGEST_LIVE_LLM", "").strip() in {"1", "true", "yes"}
+    if not live_ok and not typed_ok:
+        pytest.skip("Set REAL_LLM_TEST=1 to run live prefetch/digest/weekly/monthly smoke")
     live_home = Path(__file__).resolve().parents[3]
     _load_live_dotenv(live_home)
     src_cfg = live_home / "config.yaml"
@@ -428,9 +463,11 @@ def test_live_prefetch_and_digest_follow_chat(tmp_path, monkeypatch):
         (os.environ.get("MINIMAX_CN_API_KEY") or "").strip()
         or (os.environ.get("MINIMAX_API_KEY") or "").strip()
     )
-    url = (os.environ.get("MINIMAX_CN_BASE_URL") or "").strip() or yaml_url
+    url = (os.environ.get("MINIMAX_CN_BASE_URL") or "").strip()
     if not key or not url:
         pytest.skip("missing MiniMax API key or base URL")
+    if "/anthropic" in url.rstrip("/").lower():
+        pytest.skip("MINIMAX_CN_BASE_URL is Anthropic; workers need OpenAI /v1")
     if not (os.environ.get("MINIMAX_CN_BASE_URL") or "").strip():
         os.environ["MINIMAX_CN_BASE_URL"] = url
     if not (os.environ.get("MINIMAX_CN_API_KEY") or "").strip():
@@ -478,40 +515,27 @@ def test_live_prefetch_and_digest_follow_chat(tmp_path, monkeypatch):
 
     import worker_llm as wl
 
-    t1 = time.perf_counter()
-    ping_schema = {
-        "name": "ping",
-        "description": "noop ping",
-        "parameters": {"type": "object", "properties": {}},
-    }
-    capture = wl.run_worker_llm_oneshot(
-        "Call ping.",
-        plugin="memory-digest",
-        purpose="digest-wrapup",
-        force_tool_name="ping",
-        tool_schema=ping_schema,
-        max_tokens=128,
-    )
-    digest_ms = max(0, int((time.perf_counter() - t1) * 1000))
+    phase1 = _oneshot_ping(wl, plugin="memory-digest", purpose="digest-phase1")
+    wrapup = _oneshot_ping(wl, plugin="memory-digest", purpose="digest-wrapup")
+    weekly = _oneshot_ping(wl, plugin="memory-weekly", purpose="weekly")
+    monthly = _oneshot_ping(wl, plugin="memory-monthly", purpose="monthly")
     openai_tools_ok = (
-        not capture.get("failed")
-        and bool(capture.get("tool_calls") or capture.get("tool_name"))
-        and int(capture.get("api_calls") or 0) >= 1
-        and int(capture.get("total_tokens") or 0) > 0
+        not wrapup["failed"]
+        and wrapup["tool_calls"]
+        and wrapup["api_calls"] >= 1
+        and wrapup["total_tokens"] > 0
     )
     anth = _probe_minimax_anthropic_tool_use(chat_model)
     probe = {
         "model": chat_model,
         "provider": chat_provider,
+        "chat_base_url": yaml_url,
         "prefetch_ms": prefetch_ms,
         "prefetch_chars": len(prefetch_text or ""),
-        "digest_ms": digest_ms,
-        "input_tokens": int(capture.get("input_tokens") or 0),
-        "output_tokens": int(capture.get("output_tokens") or 0),
-        "total_tokens": int(capture.get("total_tokens") or 0),
-        "api_calls": int(capture.get("api_calls") or 0),
-        "failed": bool(capture.get("failed")),
-        "tool_name": capture.get("tool_name"),
+        "digest_phase1": phase1,
+        "digest_phase2": wrapup,
+        "weekly": weekly,
+        "monthly": monthly,
         "openai_tools_ok": openai_tools_ok,
         "anthropic_tool_use_ok": bool(anth.get("anthropic_tool_use_ok")),
         "anthropic_http_status": int(anth.get("anthropic_http_status") or 0),
@@ -523,6 +547,12 @@ def test_live_prefetch_and_digest_follow_chat(tmp_path, monkeypatch):
     assert dest.is_file()
     assert openai_tools_ok is True
     assert isinstance(probe["anthropic_tool_use_ok"], bool)
-    assert not probe["failed"]
-    assert probe["api_calls"] >= 1
-    assert probe["total_tokens"] > 0
+    for lane_name, lane in (
+        ("digest_phase1", phase1),
+        ("digest_phase2", wrapup),
+        ("weekly", weekly),
+        ("monthly", monthly),
+    ):
+        assert lane["failed"] is False, lane_name
+        assert lane["api_calls"] >= 1, lane_name
+        assert lane["total_tokens"] > 0, lane_name
