@@ -18,6 +18,7 @@ Default ``run_worker_llm`` remains text-only (``enabled_toolsets=[]``).
 
 UI Tighten / Rephrase / Merge use ``run_worker_llm_oneshot``: one
 OpenAI-compatible ``chat.completions`` call, no nested ``AIAgent``.
+``resolve_worker_endpoint`` maps that call onto the provider ``/v1`` surface.
 """
 
 from __future__ import annotations
@@ -32,6 +33,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from llm_wire import resolve_worker_endpoint
 
 _ENV_WORKER_LLM_DEPTH = "HERMES_WORKER_LLM_DEPTH"
 _worker_llm_depth = 0
@@ -907,8 +910,9 @@ def run_worker_llm_oneshot(
 ) -> dict[str, Any]:
     """One OpenAI-compatible chat.completions call. No nested Hermes AIAgent.
 
-    Records ``duration_ms`` on the usage ledger so prefetch wall time and digest
-    LLM retries are not guessed from a single timeout.
+    Prefers the local LiteLLM proxy when enabled so MiniMax/Kimi URL suffixes
+    cannot 404; records ``duration_ms`` on the usage ledger so prefetch wall
+    time and digest LLM retries are not guessed from a single timeout.
     """
     _ensure_hermes_dotenv()
     started = time.perf_counter()
@@ -993,6 +997,12 @@ def run_worker_llm_oneshot(
             except Exception as exc:
                 last_exc = exc
                 return _fail_record(exc, model)
+            try:
+                base_url, _used_gw = resolve_worker_endpoint(
+                    base_url, "chat_completions"
+                )
+            except Exception:
+                pass
             client_kwargs: dict[str, Any] = {"api_key": api_key}
             if base_url:
                 client_kwargs["base_url"] = base_url
@@ -1091,6 +1101,8 @@ def _run_worker_conversation(
 
     Refills key/URL from ``.env`` for the effective provider so MiniMax/Xiaomi
     workers cannot inherit a Kimi Anthropic base_url from the chat gateway.
+    MiniMax nested is Anthropic Messages even when env still has ``/v1``.
+    Xiaomi/Kimi OpenAI workers keep ``/v1`` and must not inherit ``api_mode``.
     """
     try:
         from hermes_cli.env_loader import load_hermes_dotenv
@@ -1154,8 +1166,22 @@ def _run_worker_conversation(
                     api_key, base_url = _oneshot_credentials(
                         _oneshot_runtime(plugin_runtime, provider)
                     )
+                    nest_mode = (
+                        "anthropic_messages"
+                        if str(provider).strip().lower()
+                        in {"minimax-cn", "minimax", "anthropic"}
+                        else "chat_completions"
+                    )
+                    try:
+                        base_url, _used_gw = resolve_worker_endpoint(
+                            base_url, nest_mode
+                        )
+                    except Exception:
+                        pass
                     runtime_kwargs["api_key"] = api_key
                     runtime_kwargs["base_url"] = base_url
+                    if nest_mode == "anthropic_messages":
+                        runtime_kwargs["api_mode"] = nest_mode
                 except Exception:
                     # Fail closed: no chat URL mix. Missing .env leaves creds unset
                     # so test_plugin_config_model_overrides_gateway still holds.

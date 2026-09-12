@@ -174,6 +174,8 @@ def test_run_worker_llm_pops_model_from_runtime_kwargs(tmp_path, monkeypatch):
 def test_plugin_config_model_overrides_gateway(tmp_path, monkeypatch):
     wl = _load_worker_llm()
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("XIAOMI_API_KEY", raising=False)
+    monkeypatch.delenv("XIAOMI_BASE_URL", raising=False)
     (tmp_path / "config.yaml").write_text(
         "plugins:\n  entries:\n    memory-digest:\n      provider: xiaomi\n      model: mimo-v2.5\n",
         encoding="utf-8",
@@ -908,7 +910,8 @@ def test_undeclared_plugin_model_follows_chat_oneshot_and_nested(tmp_path, monke
     _install_fake_nested(monkeypatch, nested)
     assert wl.run_worker_llm("hi", plugin="memory-digest", purpose="digest-phase1") == "ok"
     assert nested["kwargs"]["model"] == "MiniMax-M3"
-    assert nested["kwargs"]["base_url"] == "https://api.minimax.chat/v1"
+    assert nested["kwargs"]["base_url"] == "https://api.minimax.chat/anthropic"
+    assert nested["kwargs"]["api_mode"] == "anthropic_messages"
     assert nested["kwargs"]["api_key"] == "mm-key"
     nested.clear()
     _install_fake_nested(monkeypatch, nested)
@@ -1001,3 +1004,118 @@ def test_oneshot_records_duration_ms(tmp_path, monkeypatch):
     )
     assert rec["api_calls"] == 1
     assert rec["duration_ms"] >= 0
+
+
+_WORKER_YAML = (
+    "model:\n"
+    "  provider: minimax-cn\n"
+    "  default: MiniMax-M3\n"
+    "  base_url: https://api.minimax.chat/v1\n"
+    "plugins:\n"
+    "  entries:\n"
+    "    MyMemory:\n"
+    "      digest:\n"
+    "        provider: minimax-cn\n"
+    "        model: MiniMax-M2.5\n"
+    "      weekly:\n"
+    "        provider: minimax-cn\n"
+    "        model: MiniMax-M2.5\n"
+    "      monthly:\n"
+    "        provider: minimax-cn\n"
+    "        model: MiniMax-M2.5\n"
+)
+
+
+def _pin_minimax_worker(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MINIMAX_CN_API_KEY", "mm-key")
+    monkeypatch.delenv("MINIMAX_CN_BASE_URL", raising=False)
+    (tmp_path / "config.yaml").write_text(_WORKER_YAML, encoding="utf-8")
+
+
+def test_oneshot_uses_openai_v1_surface(tmp_path, monkeypatch):
+    _pin_minimax_worker(monkeypatch, tmp_path)
+    wl = _load_worker_llm()
+    seen: dict = {}
+    _install_fake_openai(
+        monkeypatch,
+        seen=seen,
+        message={"content": "ok", "tool_calls": None},
+    )
+    out = wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose="digest-dedup")
+    assert out["failed"] is False
+    assert seen["client"]["base_url"] == "https://api.minimax.chat/v1"
+    rec = json.loads(
+        (tmp_path / "metrics" / "llm-usage.jsonl").read_text(encoding="utf-8").strip().splitlines()[-1]
+    )
+    assert rec["input_tokens"] > 0 or rec["output_tokens"] > 0 or rec["api_calls"] == 1
+
+
+def test_nested_uses_anthropic_surface_and_api_mode(tmp_path, monkeypatch):
+    _pin_minimax_worker(monkeypatch, tmp_path)
+    wl = _load_worker_llm()
+    nested: dict = {}
+    _install_fake_nested(monkeypatch, nested)
+    assert wl.run_worker_llm("hi", plugin="memory-digest", purpose="digest-phase1") == "ok"
+    assert nested["kwargs"]["base_url"] == "https://api.minimax.chat/anthropic"
+    assert nested["kwargs"]["api_mode"] == "anthropic_messages"
+
+
+def test_oneshot_lanes_share_openai_v1(tmp_path, monkeypatch):
+    _pin_minimax_worker(monkeypatch, tmp_path)
+    wl = _load_worker_llm()
+    seen: dict = {}
+    _install_fake_openai(
+        monkeypatch,
+        seen=seen,
+        message={"content": "ok", "tool_calls": None},
+    )
+    lanes = (
+        ("memory-digest", "digest-dedup"),
+        ("memory-digest", "digest-wrapup"),
+        ("memory-monthly", "monthly-map"),
+        ("memory-monthly", "monthly-reduce"),
+        ("memory-weekly", "ui_tighten"),
+    )
+    for plugin, purpose in lanes:
+        seen.clear()
+        out = wl.run_worker_llm_oneshot("hi", plugin=plugin, purpose=purpose)
+        assert out["failed"] is False, purpose
+        assert seen["client"]["base_url"] == "https://api.minimax.chat/v1", purpose
+
+
+def test_nested_lanes_share_anthropic_surface(tmp_path, monkeypatch):
+    _pin_minimax_worker(monkeypatch, tmp_path)
+    wl = _load_worker_llm()
+    nested: dict = {}
+    lanes = (
+        ("memory-digest", "digest-phase1"),
+        ("memory-weekly", "weekly_llm"),
+        ("memory-weekly", "chronicle"),
+        ("memory-weekly", "hot_health"),
+        ("MyMemory", "recall-plan"),
+    )
+    for plugin, purpose in lanes:
+        nested.clear()
+        _install_fake_nested(monkeypatch, nested)
+        assert wl.run_worker_llm("hi", plugin=plugin, purpose=purpose) == "ok", purpose
+        assert nested["kwargs"]["base_url"] == "https://api.minimax.chat/anthropic", purpose
+        assert nested["kwargs"]["api_mode"] == "anthropic_messages", purpose
+
+
+def test_yaml_v1_still_reshapes_nested_to_anthropic(tmp_path, monkeypatch):
+    _pin_minimax_worker(monkeypatch, tmp_path)
+    wl = _load_worker_llm()
+    seen: dict = {}
+    _install_fake_openai(
+        monkeypatch,
+        seen=seen,
+        message={"content": "ok", "tool_calls": None},
+    )
+    wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose="digest-dedup")
+    assert seen["client"]["base_url"] == "https://api.minimax.chat/v1"
+    nested: dict = {}
+    _install_fake_nested(monkeypatch, nested)
+    wl.run_worker_llm("hi", plugin="memory-digest", purpose="digest-phase1")
+    assert nested["kwargs"]["base_url"] == "https://api.minimax.chat/anthropic"
+    assert nested["kwargs"]["api_mode"] == "anthropic_messages"
