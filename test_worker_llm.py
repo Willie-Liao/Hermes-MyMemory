@@ -455,6 +455,45 @@ def test_extract_tool_calls_from_fenced_json_in_content():
     ]
 
 
+def test_extract_tool_calls_ignores_thinking_json_keeps_body():
+    """CoT JSON with a text key must not steal the rewritten hot-file body."""
+    wl = _load_worker_llm()
+    result = {
+        "final_response": "",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": (
+                    "<thinking>{\"text\": \"I will shorten this.\"}</thinking>\n"
+                    '{"text": "## Path\\nKeep the gates."}'
+                ),
+            }
+        ],
+    }
+    found = wl.extract_tool_calls_from_result(
+        result, default_tool_name="submit_tighten_text"
+    )
+    assert found == [
+        ("submit_tighten_text", {"text": "## Path\nKeep the gates."})
+    ]
+
+
+def test_capture_strips_thinking_from_final_response():
+    wl = _load_worker_llm()
+    msg = types.SimpleNamespace(
+        content=(
+            "<thinking>plan the rewrite</thinking>\n"
+            "## USER.md\nPrefers concise notes."
+        ),
+        tool_calls=None,
+    )
+    captured = wl._capture_from_oneshot_message(
+        msg, force_tool_name="submit_tighten_text"
+    )
+    assert "thinking" not in captured["final_response"].lower()
+    assert "Prefers concise notes." in captured["final_response"]
+
+
 def test_extract_tool_calls_flat_shape_and_broken_arguments_string():
     wl = _load_worker_llm()
     result = {

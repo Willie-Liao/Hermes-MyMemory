@@ -62,6 +62,24 @@ def test_tighten_blank_guidance_defaults():
     assert out["kind"] == "text"
 
 
+def test_tighten_text_uses_body_after_thinking_not_cot_json():
+    wa = _load()
+    out = wa.tighten_hot_entry(
+        text="## Note\nKeep this longer original.",
+        guidance="make it concise.",
+        call_tools=lambda *_a, **_k: {
+            "tool_name": "submit_tighten_text",
+            "tool_args": {},
+            "final_response": (
+                '<thinking>{"text": "only the plan"}</thinking>\n'
+                "## Note\nKeep this."
+            ),
+        },
+    )
+    assert out["tightened"] == "## Note\nKeep this."
+    assert "only the plan" not in out["tightened"]
+
+
 def test_tighten_rejects_blank_text():
     wa = _load()
     with pytest.raises(ValueError, match="text"):

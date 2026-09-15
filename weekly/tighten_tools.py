@@ -270,7 +270,14 @@ def coerce_tighten_args(
                 if value and not str(bag.get(key) or "").strip():
                     bag[key] = value
     elif extra_text and not str(bag.get("text") or "").strip():
-        bag["text"] = extra_text
+        cleaned = re.sub(
+            r"<(thinking|think)>.*?</\1>",
+            "",
+            extra_text,
+            flags=re.DOTALL | re.I,
+        ).strip()
+        if cleaned:
+            bag["text"] = cleaned
     return bag
 
 

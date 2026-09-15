@@ -298,6 +298,71 @@ def record_worker_usage(record: dict[str, Any]) -> None:
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.I)
 _TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
+_THINK_RE = re.compile(r"<(thinking|think)>.*?</\1>", re.DOTALL | re.I)
+
+
+def _strip_think_blocks(text: str) -> str:
+    """Drop model CoT tags so JSON/body after </thinking> is what tighten renders.
+
+    Without this, a JSON object inside <thinking> can win as tool_args.text and
+    the rewritten MEMORY/USER/HERMES body never reaches the Weekly UI.
+    """
+    return _THINK_RE.sub("", str(text or "")).strip()
+
+
+def _json_object_slices(text: str) -> list[str]:
+    """Left-to-right top-level `{...}` slices so the last payload can beat CoT JSON."""
+    slices: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        start = text.find("{", i)
+        if start < 0:
+            break
+        depth = 0
+        in_str = False
+        escape = False
+        end: int | None = None
+        for j in range(start, n):
+            ch = text[j]
+            if in_str:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        if end is None:
+            break
+        slices.append(text[start : end + 1])
+        i = start + 1
+    return slices
+
+
+def _parse_json_mapping(blob: str) -> dict[str, Any] | None:
+    for attempt in (blob, _TRAILING_COMMA_RE.sub(r"\1", blob)):
+        try:
+            val = json.loads(attempt)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(val, Mapping):
+            return dict(val)
+        if isinstance(val, str):
+            nested = _loads_json_object(val)
+            if nested is not None:
+                return nested
+    return None
 
 
 def _loads_json_object(raw: Any) -> dict[str, Any] | None:
@@ -305,39 +370,33 @@ def _loads_json_object(raw: Any) -> dict[str, Any] | None:
 
     MiMo v2.5 often returns tool payloads as fenced / slightly-invalid JSON in
     assistant text instead of OpenAI ``tool_calls``. Weekly UI tighten needs a
-    dict it can render.
+    dict it can render. Prefer the last object so CoT JSON is not the winner.
     """
     if isinstance(raw, Mapping):
         return dict(raw)
     if not isinstance(raw, str):
         return None
-    text = raw.strip()
+    text = _strip_think_blocks(raw)
     if not text:
         return None
-    fence = _FENCE_RE.search(text)
-    if fence:
-        text = fence.group(1).strip()
-    candidates = [text]
-    start, end = text.find("{"), text.rfind("}")
-    if start >= 0 and end > start:
-        candidates.append(text[start : end + 1])
+    fences = [m.group(1).strip() for m in _FENCE_RE.finditer(text) if m.group(1).strip()]
+    slices = _json_object_slices(text)
+    candidates: list[str] = []
+    for blob in [*fences, *slices, text]:
+        if blob and blob not in candidates:
+            candidates.append(blob)
+    parsed: list[dict[str, Any]] = []
     seen: set[str] = set()
     for c in candidates:
-        for attempt in (c, _TRAILING_COMMA_RE.sub(r"\1", c)):
-            if attempt in seen:
-                continue
-            seen.add(attempt)
-            try:
-                val = json.loads(attempt)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(val, Mapping):
-                return dict(val)
-            if isinstance(val, str):
-                nested = _loads_json_object(val)
-                if nested is not None:
-                    return nested
-    return None
+        if c in seen:
+            continue
+        seen.add(c)
+        obj = _parse_json_mapping(c)
+        if obj is not None:
+            parsed.append(obj)
+    if not parsed:
+        return None
+    return parsed[-1]
 
 
 def _pair_from_tool_call(
@@ -861,7 +920,7 @@ def _capture_from_oneshot_message(
     *,
     force_tool_name: str | None,
 ) -> dict[str, Any]:
-    content = str(getattr(message, "content", None) or "")
+    content = _strip_think_blocks(str(getattr(message, "content", None) or ""))
     raw_calls = getattr(message, "tool_calls", None) or []
     packed: list[dict[str, Any]] = []
     for tc in raw_calls:
