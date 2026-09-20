@@ -119,18 +119,27 @@ class MyMemoryProvider(MemoryProvider):
         started = time.perf_counter()
         sid = str(session_id or self._session_id or "")
         first = sid not in self._prefetch_seen
+
+        # Stage 1: digest.on_pre_llm_call
+        t0_digest = time.perf_counter()
         digest_hit = digest.on_pre_llm_call(
             user_message=query,
             is_first_turn=first,
             session_id=sid,
             platform=self._platform,
         )
+        t_digest = time.perf_counter() - t0_digest
+
+        # Stage 2: weekly.on_pre_llm_call
+        t0_weekly = time.perf_counter()
         weekly_hit = weekly.on_pre_llm_call(
             user_message=query,
             is_first_turn=first,
             session_id=sid,
             platform=self._platform,
         )
+        t_weekly = time.perf_counter() - t0_weekly
+
         if sid:
             self._prefetch_seen.add(sid)
         parts: list[str] = []
@@ -142,6 +151,8 @@ class MyMemoryProvider(MemoryProvider):
         q = str(query or "").strip()
         from recall.tools import _MEM_ID_RE, recall_memory
 
+        # Stage 3: recall_memory
+        t0_recall = time.perf_counter()
         if q and not _MEM_ID_RE.search(q):
             try:
                 root = Path(digest.get_hermes_home()) / "memories" / "staging"
@@ -150,11 +161,14 @@ class MyMemoryProvider(MemoryProvider):
                 if guided.strip() and "channel=miss" not in head:
                     parts.append(guided.strip())
             except Exception:
-                pass
+                guided = None
+        t_recall = time.perf_counter() - t0_recall
+
         joined = "\n\n".join(parts)
         if "<memory-context>" in joined:
             joined = joined.replace("<memory-context>", "").replace("</memory-context>", "")
         out = joined.strip()
+        total_ms = max(0, int((time.perf_counter() - started) * 1000))
         try:
             from .worker_llm import record_worker_usage
 
@@ -174,8 +188,21 @@ class MyMemoryProvider(MemoryProvider):
                     "cost_usd": 0.0,
                     "api_calls": 0,
                     "chars": len(out),
-                    "duration_ms": max(0, int((time.perf_counter() - started) * 1000)),
+                    "duration_ms": total_ms,
                 }
+            )
+        except Exception:
+            pass
+        # Log per-stage timing for diagnostics
+        try:
+            from .worker_llm import _worker_logger
+
+            _worker_logger.info(
+                "[prefetch] digest=%.3fs weekly=%.3fs recall=%.3fs total=%.3fs",
+                t_digest,
+                t_weekly,
+                t_recall,
+                (time.perf_counter() - started),
             )
         except Exception:
             pass

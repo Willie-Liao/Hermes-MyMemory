@@ -19,7 +19,7 @@ import re
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -428,6 +428,49 @@ def _render_block(block: dict[str, Any]) -> str:
     if body:
         parts.append(body)
     return "\n".join(parts)
+
+
+def _parse_card_clock(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed
+
+
+def evening_daily_slice_text(
+    text: str,
+    *,
+    after: datetime,
+    before: datetime,
+    known_ids: set[str],
+) -> str:
+    """Keep Sunday cards that landed after 16:00 and are not already in the week YAML.
+
+    A full Worker-1 reread of the daily would duplicate 16:00 cites.
+    """
+    kept: list[dict[str, Any]] = []
+    for block in parse_blocks(text):
+        fm = block.get("frontmatter") or {}
+        mem_id = str(fm.get("id") or "").strip()
+        if not mem_id or mem_id in known_ids:
+            continue
+        clock = _parse_card_clock(fm.get("generated_at")) or _parse_card_clock(
+            fm.get("user_message_at")
+        )
+        if clock is None:
+            continue
+        if clock.tzinfo is None:
+            clock = clock.replace(tzinfo=after.tzinfo)
+        elif after.tzinfo is not None:
+            clock = clock.astimezone(after.tzinfo)
+        if after <= clock < before:
+            kept.append(block)
+    return "\n\n".join(_render_block(block) for block in kept)
+
 
 
 def _day_bundle(

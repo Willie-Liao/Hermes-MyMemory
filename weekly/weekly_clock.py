@@ -1,4 +1,4 @@
-"""Sunday 16:00 generate+WeChat link and 23:55 close without Hermes cron."""
+"""Sunday 16:00 generate+WeChat link; Monday 00:00 evening patch then close."""
 
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ except ImportError:  # pragma: no cover - pytest file load
 
 generate_week = weekly_actions.generate_week
 close_week = weekly_actions.close_week
+patch_sunday_evening_week = weekly.patch_sunday_evening_week
 _ui = slash._ui
 
 logger = logging.getLogger(__name__)
@@ -143,22 +144,25 @@ def _compose_ready_message(week_key: str) -> str:
 
 
 def maybe_run(local: datetime, leftover_ran: bool = False) -> dict[str, Any]:
-    """Sunday 16:00 generate+link, 23:55 close after leftover; Monday previous week only.
+    """Sunday 16:00 generate+link; Monday 00:00 patch Sunday 16:00–00:00 then close.
 
-    Catch-up keys live in ``.weekly-state.json`` so a stale cron ``next_run_at``
-    is not required and cannot close the new Monday week.
+    leftover_ran is kept so digest can still pass the 23:55 leftover flag; close
+    no longer uses it. Catch-up keys live in ``.weekly-state.json``.
     """
+    del leftover_ran
     payload: dict[str, Any] = {
         "outcome": "idle",
         "generate": None,
         "close": None,
         "send": None,
+        "patch": None,
     }
     day = local.date()
     current = _week_key_for(day)
     state = weekly._load_state()
     last_gen = state.get("last_sunday_generate_week")
     last_close = state.get("last_sunday_close_week")
+    last_patch = state.get("last_sunday_evening_patch_week")
 
     if local.weekday() == 6:
         if (local.hour, local.minute) < (16, 0):
@@ -172,23 +176,29 @@ def maybe_run(local: datetime, leftover_ran: bool = False) -> dict[str, Any]:
             payload["generate"] = target
             message = _compose_ready_message(target)
             payload["send"] = send_weekly_brief_weixin(message)
-        if leftover_ran and last_close != target:
-            close_week(target, enforce_sunday=False, today=day)
-            state = weekly._load_state()
-            state["last_sunday_close_week"] = target
-            weekly._save_state(state)
-            payload["close"] = target
     else:
         target = _previous_week_key(day)
         if last_gen != target:
             generate_week(target, reason="update")
             state = weekly._load_state()
             state["last_sunday_generate_week"] = target
+            state["last_sunday_evening_patch_week"] = target
             weekly._save_state(state)
+            last_patch = target
             payload["generate"] = target
             message = _compose_ready_message(target)
             payload["send"] = send_weekly_brief_weixin(message)
         if last_close != target:
+            if last_patch != target:
+                result = patch_sunday_evening_week(target)
+                if str(result.get("outcome") or "") == "error":
+                    payload["outcome"] = "error"
+                    payload["patch"] = None
+                    return payload
+                state = weekly._load_state()
+                state["last_sunday_evening_patch_week"] = target
+                weekly._save_state(state)
+                payload["patch"] = target
             close_week(target, enforce_sunday=False, today=day)
             state = weekly._load_state()
             state["last_sunday_close_week"] = target
@@ -199,6 +209,8 @@ def maybe_run(local: datetime, leftover_ran: bool = False) -> dict[str, Any]:
         payload["outcome"] = "generated_and_closed"
     elif payload["generate"]:
         payload["outcome"] = "generated"
+    elif payload["patch"] and payload["close"]:
+        payload["outcome"] = "patched_and_closed"
     elif payload["close"]:
         payload["outcome"] = "closed"
     return payload

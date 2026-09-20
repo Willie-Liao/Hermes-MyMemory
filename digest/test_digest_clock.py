@@ -71,7 +71,7 @@ def test_next_deadline_after_nightly_is_next_morning():
     now = datetime(2026, 8, 16, 23, 55, 1, tzinfo=SHANGHAI)
     kind, when = next_deadline(now, SHANGHAI)
     assert kind == "tick"
-    assert when == datetime(2026, 8, 17, 8, 0, tzinfo=SHANGHAI)
+    assert when == datetime(2026, 8, 17, 0, 0, tzinfo=SHANGHAI)
 
 
 def test_next_deadline_new_york_same_civil_grid():

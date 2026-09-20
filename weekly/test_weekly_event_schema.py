@@ -322,3 +322,151 @@ def test_thread_step_via_and_entity_record_shape():
     )
     assert payload.cross_day_thread[0].steps[0].via == "evolves"
     assert payload.entities[0].key == "memorydigest"
+
+
+def test_merge_sunday_evening_keeps_weekday_intra_and_appends_sunday():
+    schema = _load()
+    monday = date(2026, 8, 10)
+    sunday = date(2026, 8, 16)
+    base = schema.WeeklyReviewPayload(
+        days=(
+            schema.DayBrief(
+                day=monday,
+                events=(schema.EventCite(1, "mem-mon"),),
+                sentences=(schema.ClaimSentence("Monday kickoff.", cite=1),),
+            ),
+            schema.DayBrief(
+                day=sunday,
+                events=(schema.EventCite(2, "mem-sun-early"),),
+                sentences=(schema.ClaimSentence("Sunday afternoon.", cite=2),),
+            ),
+        ),
+        legend={1: "mem-mon", 2: "mem-sun-early"},
+        week_key="2026-W33",
+        intra_day_thread=(
+            schema.IntraDayThread(
+                date=monday,
+                weekday="Monday",
+                source_field="events",
+                text="- Monday kickoff",
+                empty=False,
+            ),
+            schema.IntraDayThread(
+                date=sunday,
+                weekday="Sunday",
+                source_field="events",
+                text="- Sunday afternoon",
+                empty=False,
+            ),
+        ),
+        entities=(
+            schema.WeeklyEntity(
+                key="weeklyui",
+                canonical="Weekly UI",
+                week_blocks=("mem-sun-early",),
+            ),
+        ),
+        summary=(schema.WeeklySummaryItem(text="Sunday afternoon", weekdays=("Sunday",)),),
+        cross_day_thread=(
+            schema.SpanCandidate(
+                id="thread-ui",
+                label="Weekly UI",
+                start_date=monday,
+                end_date=sunday,
+                confidence="high",
+                entity_keys=("weeklyui",),
+                steps=(
+                    schema.ThreadStep(
+                        seq=1,
+                        date=sunday,
+                        event_id="mem-sun-early",
+                        text="afternoon",
+                    ),
+                ),
+            ),
+        ),
+    )
+    delta = schema.WeeklyReviewPayload(
+        days=(
+            schema.DayBrief(
+                day=sunday,
+                events=(schema.EventCite(1, "mem-sun-late"),),
+                sentences=(schema.ClaimSentence("Sunday evening leftover.", cite=1),),
+            ),
+        ),
+        legend={1: "mem-sun-late"},
+        week_key="2026-W33",
+        intra_day_thread=(
+            schema.IntraDayThread(
+                date=sunday,
+                weekday="Sunday",
+                source_field="events",
+                text="- Sunday evening leftover\n- Sunday afternoon",
+                empty=False,
+            ),
+        ),
+        entities=(
+            schema.WeeklyEntity(
+                key="weeklyui",
+                canonical="Weekly UI",
+                week_blocks=("mem-sun-late",),
+            ),
+        ),
+        summary=(
+            schema.WeeklySummaryItem(text="Sunday evening leftover", weekdays=("Sunday",)),
+            schema.WeeklySummaryItem(text="Sunday afternoon", weekdays=("Sunday",)),
+        ),
+        cross_day_thread=(
+            schema.SpanCandidate(
+                id="thread-ui",
+                label="Weekly UI evening",
+                start_date=sunday,
+                end_date=sunday,
+                confidence="high",
+                entity_keys=("weeklyui",),
+                steps=(
+                    schema.ThreadStep(
+                        seq=1,
+                        date=sunday,
+                        event_id="mem-sun-late",
+                        text="leftover",
+                        cite_n=1,
+                    ),
+                ),
+            ),
+        ),
+    )
+    merged = schema._merge_sunday_evening_payload(base, delta)
+    monday_intra = next(row for row in merged.intra_day_thread if row.date == monday)
+    sunday_intra = next(row for row in merged.intra_day_thread if row.date == sunday)
+    assert monday_intra.text == "- Monday kickoff"
+    assert "- Sunday afternoon" in sunday_intra.text
+    assert "- Sunday evening leftover" in sunday_intra.text
+    assert sunday_intra.text.count("- Sunday afternoon") == 1
+    assert merged.legend[1] == "mem-mon"
+    assert merged.legend[2] == "mem-sun-early"
+    assert 3 in merged.legend
+    assert merged.legend[3] == "mem-sun-late"
+    ent = next(e for e in merged.entities if e.key == "weeklyui")
+    assert "mem-sun-early" in ent.week_blocks
+    assert "mem-sun-late" in ent.week_blocks
+    texts = [item.text for item in merged.summary]
+    assert texts.count("Sunday afternoon") == 1
+    assert "Sunday evening leftover" in texts
+    thread = merged.cross_day_thread[0]
+    assert [step.seq for step in thread.steps] == [1, 2]
+    assert thread.steps[1].event_id == "mem-sun-late"
+    sunday_brief = next(d for d in merged.days if d.day == sunday)
+    assert [e.mem_id for e in sunday_brief.events] == ["mem-sun-early", "mem-sun-late"]
+
+
+def test_merge_sunday_evening_empty_delta_is_base():
+    schema = _load()
+    base = schema.WeeklyReviewPayload(
+        days=tuple(_week(schema, with_events=False)),
+        week_key="2026-W31",
+        summary=(schema.WeeklySummaryItem(text="keep"),),
+    )
+    delta = schema.WeeklyReviewPayload(days=(), week_key="2026-W31")
+    assert schema._merge_sunday_evening_payload(base, delta) is base
+

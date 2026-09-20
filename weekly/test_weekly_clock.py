@@ -16,6 +16,7 @@ SUNDAY_1559 = datetime(2026, 8, 16, 15, 59, tzinfo=SHANGHAI)
 SUNDAY_1600 = datetime(2026, 8, 16, 16, 0, tzinfo=SHANGHAI)
 SUNDAY_1601 = datetime(2026, 8, 16, 16, 1, tzinfo=SHANGHAI)
 SUNDAY_2355 = datetime(2026, 8, 16, 23, 55, tzinfo=SHANGHAI)
+MONDAY_0000 = datetime(2026, 8, 17, 0, 0, tzinfo=SHANGHAI)
 MONDAY_0800 = datetime(2026, 8, 17, 8, 0, tzinfo=SHANGHAI)
 W33 = "2026-W33"
 W34 = "2026-W34"
@@ -39,6 +40,7 @@ def _stub_clock(clock, monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     generated: list[str] = []
     closed: list[str] = []
+    patched: list[str] = []
     sent: list[str] = []
 
     def fake_generate(week_key=None, *, reason="slash"):
@@ -49,20 +51,25 @@ def _stub_clock(clock, monkeypatch, tmp_path):
         closed.append(str(week_key))
         return {"outcome": "ok", "week": week_key}
 
+    def fake_patch(week_key: str):
+        patched.append(str(week_key))
+        return {"outcome": "ok", "week": week_key}
+
     monkeypatch.setattr(clock, "generate_week", fake_generate)
     monkeypatch.setattr(clock, "close_week", fake_close)
+    monkeypatch.setattr(clock, "patch_sunday_evening_week", fake_patch)
     monkeypatch.setattr(clock, "_ui", lambda: UI_TEXT)
     monkeypatch.setattr(
         clock,
         "send_weekly_brief_weixin",
         lambda text: sent.append(text) or {"outcome": "sent"},
     )
-    return generated, closed, sent
+    return generated, closed, sent, patched
 
 
 def test_sunday_1559_idle(tmp_path, monkeypatch):
     clock = _load_clock()
-    generated, closed, sent = _stub_clock(clock, monkeypatch, tmp_path)
+    generated, closed, sent, _patched = _stub_clock(clock, monkeypatch, tmp_path)
     result = clock.maybe_run(SUNDAY_1559, leftover_ran=False)
     assert result["outcome"] == "idle"
     assert generated == []
@@ -72,7 +79,7 @@ def test_sunday_1559_idle(tmp_path, monkeypatch):
 
 def test_sunday_1600_generate_once_and_send_link(tmp_path, monkeypatch):
     clock = _load_clock()
-    generated, closed, sent = _stub_clock(clock, monkeypatch, tmp_path)
+    generated, closed, sent, _patched = _stub_clock(clock, monkeypatch, tmp_path)
     first = clock.maybe_run(SUNDAY_1600, leftover_ran=False)
     assert first["outcome"] == "generated"
     assert generated == [W33]
@@ -87,21 +94,38 @@ def test_sunday_1600_generate_once_and_send_link(tmp_path, monkeypatch):
     assert sent == [sent[0]]
 
 
-def test_sunday_2355_closes_only_after_leftover(tmp_path, monkeypatch):
+def test_sunday_2355_does_not_close_after_leftover(tmp_path, monkeypatch):
     clock = _load_clock()
-    generated, closed, sent = _stub_clock(clock, monkeypatch, tmp_path)
+    _generated, closed, _sent, patched = _stub_clock(clock, monkeypatch, tmp_path)
     skipped = clock.maybe_run(SUNDAY_2355, leftover_ran=False)
     assert skipped["close"] is None
     assert closed == []
     clock.maybe_run(SUNDAY_1600, leftover_ran=False)
     done = clock.maybe_run(SUNDAY_2355, leftover_ran=True)
+    assert closed == []
+    assert patched == []
+    assert done["close"] is None
+
+
+def test_monday_0000_patches_then_closes_after_sunday_generate(tmp_path, monkeypatch):
+    clock = _load_clock()
+    generated, closed, _sent, patched = _stub_clock(clock, monkeypatch, tmp_path)
+    clock.maybe_run(SUNDAY_1600, leftover_ran=False)
+    done = clock.maybe_run(MONDAY_0000, leftover_ran=False)
+    assert generated == [W33]
+    assert patched == [W33]
     assert closed == [W33]
     assert done["close"] == W33
+    assert done.get("patch") == W33
+    again = clock.maybe_run(MONDAY_0800, leftover_ran=False)
+    assert patched == [W33]
+    assert closed == [W33]
+    assert again["outcome"] == "idle"
 
 
 def test_monday_does_not_close_new_week(tmp_path, monkeypatch):
     clock = _load_clock()
-    generated, closed, _sent = _stub_clock(clock, monkeypatch, tmp_path)
+    generated, closed, _sent, _patched = _stub_clock(clock, monkeypatch, tmp_path)
     result = clock.maybe_run(MONDAY_0800, leftover_ran=False)
     assert W34 not in generated
     assert W34 not in closed
@@ -110,10 +134,11 @@ def test_monday_does_not_close_new_week(tmp_path, monkeypatch):
 
 def test_monday_catchup_previous_week_only(tmp_path, monkeypatch):
     clock = _load_clock()
-    generated, closed, sent = _stub_clock(clock, monkeypatch, tmp_path)
+    generated, closed, sent, patched = _stub_clock(clock, monkeypatch, tmp_path)
     result = clock.maybe_run(MONDAY_0800, leftover_ran=False)
     assert generated == [W33]
     assert closed == [W33]
+    assert patched == []
     assert W34 not in generated
     assert result["generate"] == W33
     assert result["close"] == W33
@@ -187,10 +212,12 @@ def test_state_persists_sunday_keys(tmp_path, monkeypatch):
     _stub_clock(clock, monkeypatch, tmp_path)
     clock.maybe_run(SUNDAY_1600, leftover_ran=False)
     clock.maybe_run(SUNDAY_2355, leftover_ran=True)
+    clock.maybe_run(MONDAY_0000, leftover_ran=False)
     state = json.loads(
         (tmp_path / "memories" / "staging" / ".weekly-state.json").read_text(
             encoding="utf-8"
         )
     )
     assert state["last_sunday_generate_week"] == W33
+    assert state["last_sunday_evening_patch_week"] == W33
     assert state["last_sunday_close_week"] == W33

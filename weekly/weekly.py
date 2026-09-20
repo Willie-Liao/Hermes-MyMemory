@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import sys
+import tempfile
 import threading
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
@@ -71,8 +72,13 @@ try:
     from .weekly_event_schema import (
         WeeklyReviewPayload,
         assign_typed_citations,
+        known_week_mem_ids,
+        _merge_sunday_evening_payload,
     )
-    from .weekly_event_workers import run_parallel_worker1
+    from .weekly_event_workers import (
+        evening_daily_slice_text,
+        run_parallel_worker1,
+    )
     from . import weekly_json
 except ImportError:
     from weekly_brief_validate import format_brief_for_chat  # type: ignore[no-redef]
@@ -89,8 +95,13 @@ except ImportError:
     from weekly_event_schema import (  # type: ignore[no-redef]
         WeeklyReviewPayload,
         assign_typed_citations,
+        known_week_mem_ids,
+        _merge_sunday_evening_payload,
     )
-    from weekly_event_workers import run_parallel_worker1  # type: ignore[no-redef]
+    from weekly_event_workers import (  # type: ignore[no-redef]
+        evening_daily_slice_text,
+        run_parallel_worker1,
+    )
     import weekly_json  # type: ignore[no-redef]
 
 logger = logging.getLogger("plugins.memory-weekly")
@@ -935,6 +946,79 @@ def _commit_weekly_outputs(
     )
     weekly_json.write_sidecars(target, payload)
     return payload
+
+
+def patch_sunday_evening_week(week_key: str) -> dict[str, Any]:
+    """Fold Sunday 16:00–00:00 daily cards into the existing week YAML, then leave pending.
+
+    Full generate_week would rewrite Mon–Sat; close_week still happens in the clock.
+    """
+    parsed = _parse_week_key(week_key)
+    if parsed is None:
+        return {"outcome": "bad_week", "week": week_key}
+    year, week = parsed
+    target = _weekly_path(year, week)
+    if not target.is_file():
+        return {"outcome": "error", "week": week_key, "error": "no_draft"}
+    try:
+        base = weekly_json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        return {"outcome": "error", "week": week_key, "error": str(exc)}
+
+    sunday = date.fromisocalendar(year, week, 7)
+    digest_dir = Path(__file__).resolve().parent.parent / "digest"
+    if str(digest_dir) not in sys.path:
+        sys.path.insert(0, str(digest_dir))
+    import digest_clock as _digest_clock
+
+    zone = _digest_clock.digest_clock_tz()
+    after = datetime(sunday.year, sunday.month, sunday.day, 16, 0, tzinfo=zone)
+    before = datetime(sunday.year, sunday.month, sunday.day, 0, 0, tzinfo=zone) + timedelta(
+        days=1
+    )
+    daily_path = _staging_daily() / f"{sunday.isoformat()}.md"
+    if not daily_path.is_file():
+        return {"outcome": "empty", "week": week_key, "cards": 0}
+    try:
+        raw = daily_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return {"outcome": "error", "week": week_key, "error": str(exc)}
+    sliced = evening_daily_slice_text(
+        raw,
+        after=after,
+        before=before,
+        known_ids=known_week_mem_ids(base),
+    )
+    if not sliced.strip():
+        return {"outcome": "empty", "week": week_key, "cards": 0}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        slice_path = Path(tmp) / f"{sunday.isoformat()}.md"
+        slice_path.write_text(sliced.rstrip() + "\n", encoding="utf-8")
+        try:
+            w1 = run_parallel_worker1(
+                week_key,
+                [slice_path],
+                call_llm=_call_weekly_llm,
+                call_llm_tools=_call_weekly_llm_tools,
+                log=_log,
+                reason="sunday-evening-patch",
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log(f"weekly sunday evening worker1 failed {week_key}: {exc}")
+            return {"outcome": "error", "week": week_key, "error": str(exc)}
+
+    delta = replace(
+        w1.payload,
+        legend=dict(w1.legend) or dict(w1.payload.legend),
+        week_key=week_key,
+        cross_day_thread=w1.cross_day_thread or w1.payload.cross_day_thread,
+        entities=w1.entities or w1.payload.entities,
+    )
+    merged = _merge_sunday_evening_payload(base, delta)
+    _commit_weekly_outputs(target, "", merged, week_key)
+    return {"outcome": "ok", "week": week_key}
+
 
 
 def _distill_region_text(md_text: str) -> str:

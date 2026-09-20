@@ -338,6 +338,211 @@ class WeeklyReviewPayload:
     summary: tuple["WeeklySummaryItem", ...] = ()
 
 
+def known_week_mem_ids(payload: WeeklyReviewPayload) -> set[str]:
+    """Ids already in the 16:00 YAML so a midnight patch cannot duplicate those cards."""
+    ids: set[str] = set()
+    for value in payload.legend.values():
+        text = str(value or "").strip()
+        if text:
+            ids.add(text)
+    for entity in payload.entities:
+        for block_id in entity.week_blocks:
+            text = str(block_id or "").strip()
+            if text:
+                ids.add(text)
+    for day in payload.days:
+        for event in day.events:
+            text = str(event.mem_id or "").strip()
+            if text:
+                ids.add(text)
+    return ids
+
+
+def _offset_cite(value: int | None, offset: int) -> int | None:
+    if value is None:
+        return None
+    return value + offset
+
+
+def _delta_has_story(delta: WeeklyReviewPayload) -> bool:
+    if delta.legend or delta.entities or delta.summary or delta.cross_day_thread:
+        return True
+    if any(row.events or row.sentences for row in delta.days):
+        return True
+    return any(not row.empty and str(row.text).strip() for row in delta.intra_day_thread)
+
+
+def _merge_intra_day(
+    base: tuple[IntraDayThread, ...],
+    delta: tuple[IntraDayThread, ...],
+) -> tuple[IntraDayThread, ...]:
+    by_day = {row.date: row for row in base}
+    for row in delta:
+        if row.empty or not str(row.text).strip():
+            continue
+        existing = by_day.get(row.date)
+        if existing is None:
+            by_day[row.date] = row
+            continue
+        seen = {
+            line.strip()
+            for line in str(existing.text or "").splitlines()
+            if line.strip()
+        }
+        extra: list[str] = []
+        for line in str(row.text or "").splitlines():
+            stripped = line.strip()
+            if stripped and stripped not in seen:
+                extra.append(line if line.startswith("- ") else f"- {stripped}")
+                seen.add(stripped)
+        if not extra:
+            continue
+        prefix = str(existing.text or "").rstrip()
+        merged_text = f"{prefix}\n" + "\n".join(extra) if prefix else "\n".join(extra)
+        by_day[row.date] = replace(existing, text=merged_text, empty=False)
+    return tuple(sorted(by_day.values(), key=lambda row: row.date))
+
+
+def _merge_entities(
+    base: tuple[WeeklyEntity, ...],
+    delta: tuple[WeeklyEntity, ...],
+) -> tuple[WeeklyEntity, ...]:
+    by_key = {row.key: row for row in base}
+    for row in delta:
+        old = by_key.get(row.key)
+        if old is None:
+            by_key[row.key] = row
+            continue
+        blocks = tuple(dict.fromkeys((*old.week_blocks, *row.week_blocks)))
+        aliases = tuple(dict.fromkeys((*old.aliases, *row.aliases)))
+        seen_dates = [d for d in (old.first_seen, row.first_seen) if d is not None]
+        last_dates = [d for d in (old.last_seen, row.last_seen) if d is not None]
+        by_key[row.key] = replace(
+            old,
+            week_blocks=blocks,
+            aliases=aliases,
+            first_seen=min(seen_dates) if seen_dates else old.first_seen,
+            last_seen=max(last_dates) if last_dates else old.last_seen,
+            canonical=old.canonical or row.canonical,
+        )
+    return tuple(by_key.values())
+
+
+def _merge_cross_day(
+    base: tuple[SpanCandidate, ...],
+    delta: tuple[SpanCandidate, ...],
+    offset: int,
+) -> tuple[SpanCandidate, ...]:
+    merged = list(base)
+    for thread in delta:
+        overlap = None
+        delta_keys = set(thread.entity_keys)
+        if delta_keys:
+            for existing in merged:
+                if delta_keys & set(existing.entity_keys):
+                    overlap = existing
+                    break
+        if overlap is None:
+            new_id = thread.id
+            used = {row.id for row in merged}
+            if new_id in used:
+                new_id = f"{thread.id}-evening"
+            steps = tuple(
+                replace(
+                    step,
+                    cite_n=_offset_cite(step.cite_n, offset),
+                )
+                for step in thread.steps
+            )
+            merged.append(replace(thread, id=new_id, steps=steps, cite=_offset_cite(thread.cite, offset)))
+            continue
+        next_seq = max((step.seq for step in overlap.steps), default=0)
+        extra: list[ThreadStep] = []
+        for step in thread.steps:
+            next_seq += 1
+            extra.append(
+                replace(
+                    step,
+                    seq=next_seq,
+                    cite_n=_offset_cite(step.cite_n, offset),
+                    via=step.via or ("evolves" if next_seq > 1 else None),
+                )
+            )
+        if not extra:
+            continue
+        end = extra[-1].date if extra[-1].date > overlap.end_date else overlap.end_date
+        idx = merged.index(overlap)
+        merged[idx] = replace(
+            overlap,
+            steps=(*overlap.steps, *extra),
+            end_date=end,
+        )
+    return tuple(merged)
+
+
+def _merge_days(
+    base: tuple[DayBrief, ...],
+    delta: tuple[DayBrief, ...],
+    offset: int,
+) -> tuple[DayBrief, ...]:
+    by_day = {row.day: row for row in base}
+    for row in delta:
+        if not row.events and not row.sentences:
+            continue
+        events = tuple(
+            replace(event, number=event.number + offset) for event in row.events
+        )
+        sentences = tuple(
+            replace(sentence, cite=_offset_cite(sentence.cite, offset))
+            for sentence in row.sentences
+        )
+        existing = by_day.get(row.day)
+        if existing is None:
+            by_day[row.day] = replace(row, events=events, sentences=sentences)
+            continue
+        by_day[row.day] = replace(
+            existing,
+            events=(*existing.events, *events),
+            sentences=(*existing.sentences, *sentences),
+        )
+    return tuple(sorted(by_day.values(), key=lambda row: row.day))
+
+
+def _merge_sunday_evening_payload(
+    base: WeeklyReviewPayload,
+    delta: WeeklyReviewPayload,
+) -> WeeklyReviewPayload:
+    """Append Sunday-evening Worker-1 output onto the 16:00 YAML without rewriting weekday rows.
+
+    A second full generate_week would replace Mon–Sat intra-day and renumber cites.
+    """
+    if not _delta_has_story(delta):
+        return base
+    offset = max(base.legend.keys(), default=0)
+    legend = dict(base.legend)
+    for number, mem_id in sorted(delta.legend.items()):
+        legend[number + offset] = mem_id
+    summary_texts = {item.text for item in base.summary}
+    summary = list(base.summary)
+    for item in delta.summary:
+        if item.text not in summary_texts:
+            summary.append(item)
+            summary_texts.add(item.text)
+    return replace(
+        base,
+        days=_merge_days(base.days, delta.days, offset),
+        legend=legend,
+        intra_day_thread=_merge_intra_day(base.intra_day_thread, delta.intra_day_thread),
+        entities=_merge_entities(base.entities, delta.entities),
+        summary=tuple(summary),
+        cross_day_thread=_merge_cross_day(
+            base.cross_day_thread, delta.cross_day_thread, offset
+        ),
+        span_candidates=(*base.span_candidates, *delta.span_candidates),
+        week_key=base.week_key or delta.week_key,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Rendering helpers
 # ---------------------------------------------------------------------------

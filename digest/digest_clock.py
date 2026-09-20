@@ -1,6 +1,6 @@
 """Phase-2 plugin clock: civil ticks in the Hermes IANA timezone.
 
-Keeps merge off the extract path. Deadlines are local 08:00/12:00/16:00/20:00/23:55
+Keeps merge off the extract path. Deadlines are local 00:00/08:00/12:00/16:00/20:00/23:55
 so a quiet day does not pay for consolidate just because chat batched.
 """
 
@@ -11,6 +11,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 PHASE2_TICKS: tuple[tuple[int, int], ...] = (
+    (0, 0),
     (8, 0),
     (12, 0),
     (16, 0),
@@ -56,7 +57,7 @@ def _as_local(now: datetime, tz: ZoneInfo) -> datetime:
 
 
 def next_deadline(now: datetime, tz: ZoneInfo) -> tuple[str, datetime]:
-    """Next 08/12/16/20/23:55 civil instant strictly after ``now`` in ``tz``."""
+    """Next 00/08/12/16/20/23:55 civil instant strictly after ``now`` in ``tz``."""
     local = _as_local(now, tz)
     for hour, minute in PHASE2_TICKS:
         candidate = local.replace(
@@ -66,7 +67,7 @@ def next_deadline(now: datetime, tz: ZoneInfo) -> tuple[str, datetime]:
             kind = "nightly" if (hour, minute) == NIGHTLY_TICK else "tick"
             return kind, candidate
     nxt = (local + timedelta(days=1)).replace(
-        hour=8, minute=0, second=0, microsecond=0
+        hour=0, minute=0, second=0, microsecond=0
     )
     return "tick", nxt
 

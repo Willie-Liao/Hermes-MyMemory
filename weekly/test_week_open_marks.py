@@ -290,6 +290,8 @@ def test_sunday_close_is_plugin_clock_not_cron():
     assert "leftover_ran" in text
     assert "last_sunday_close_week" in text
     assert "last_sunday_generate_week" in text
+    assert "last_sunday_evening_patch_week" in text
+    assert "patch_sunday_evening_week" in text
     assert "_previous_week_key" in text
     script = Path(__file__).resolve().parents[3] / "scripts" / "weekly-sunday-close.sh"
     assert not script.exists()

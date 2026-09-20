@@ -11,7 +11,7 @@ import gc
 import os
 from typing import Any
 
-DEFAULT_PREFETCH_TIMEOUT_S = 20.0
+DEFAULT_PREFETCH_TIMEOUT_S = 45.0
 _ENV = "MYMEMORY_PREFETCH_TIMEOUT_S"
 
 

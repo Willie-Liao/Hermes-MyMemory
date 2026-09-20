@@ -30,6 +30,8 @@ import { stabilizeHeadingEntry } from '../hotMemoryFormat';
 import type { HotMemoryFile, HotMemoryMode } from '../types';
 
 const HOT_FILES: HotMemoryFile[] = ['MEMORY.md', 'USER.md', 'HERMES.md'];
+// Hidden UI tab: HERMES.md (2026-09). Edit session rules in chat (`~/.hermes/HERMES.md` is hook-allowlisted). Keep HERMES.md in HOT_FILES so merge/health still compile. To show the tab again, add 'HERMES.md' to HOT_FILE_TABS and drop the handleTabChange early-return.
+const HOT_FILE_TABS: HotMemoryFile[] = ['MEMORY.md', 'USER.md'];
 const GUIDANCE_STORAGE_KEY = 'hot-memory-guidance-enabled';
 
 interface HotFileResponse {
@@ -871,6 +873,8 @@ export default function HotMemoryEditor({ onComposeActiveChange }: HotMemoryEdit
 
   const handleTabChange = (next: HotMemoryFile) => {
     if (next === file) return;
+    // Hidden with HOT_FILE_TABS: do not switch to HERMES.md via health-peer jump until the tab is restored.
+    if (next === 'HERMES.md') return;
     resetEditorState();
     clearPending();
     setFile(next);
@@ -1303,7 +1307,7 @@ export default function HotMemoryEditor({ onComposeActiveChange }: HotMemoryEdit
               Hot Memory Files
             </h4>
             <p className="text-[10px] text-slate-500 font-mono mt-0.5">
-              Edit MEMORY · USER · HERMES entries
+              Edit MEMORY · USER entries
             </p>
           </div>
         </div>
@@ -1317,9 +1321,9 @@ export default function HotMemoryEditor({ onComposeActiveChange }: HotMemoryEdit
 
       {!folded && (
         <div className="space-y-4 pt-4 border-t border-slate-850 fade-in">
-          {/* File tabs */}
+          {/* File tabs — HERMES.md omitted on purpose; see HOT_FILE_TABS. */}
           <div className="flex flex-wrap items-center gap-2">
-            {HOT_FILES.map((f) => {
+            {HOT_FILE_TABS.map((f) => {
               const active = file === f;
               return (
                 <button

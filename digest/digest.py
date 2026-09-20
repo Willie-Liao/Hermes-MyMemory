@@ -471,7 +471,10 @@ def maybe_run_digest_clock(
 
 
 def _weekly_clock_leftover_flag(local: datetime, need_leftover: bool) -> bool:
-    """Pass leftover_ran after 23:55 Sunday so close can retry once leftover already ran."""
+    """Pass leftover_ran after 23:55 Sunday so the weekly clock can see leftover finished.
+
+    Close itself waits for Monday 00:00 evening patch.
+    """
     sunday_close = local.weekday() == 6 and (local.hour, local.minute) >= (23, 55)
     return bool(need_leftover) or sunday_close
 
