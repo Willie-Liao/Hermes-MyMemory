@@ -89,6 +89,43 @@ def test_generate_week_purges_before_content(tmp_path, monkeypatch):
     assert order == ["purge", "gen"]
 
 
+def test_generate_week_rescan_rewrites_existing_weekly_md(tmp_path, monkeypatch):
+    """Rescan must overwrite YYYY-Www.md from this run, not restore the prior summary."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    actions = _load_weekly_actions()
+    monkeypatch.setattr(actions.weekly, "hermes_local_today", lambda: date(2026, 7, 13))
+    _write_daily(tmp_path, "2026-07-13", "mid-week source")
+    from weekly_event_schema import WeeklyReviewPayload, WeeklySummaryItem
+
+    target = tmp_path / "memories" / "staging" / "weekly" / "2026-W29.md"
+    prior = WeeklyReviewPayload(
+        days=(),
+        week_key="2026-W29",
+        summary=(WeeklySummaryItem(text="old chronicle row", weekdays=("Monday",)),),
+    )
+    actions.weekly._commit_weekly_outputs(target, "ignored", prior, "2026-W29")
+    actions.weekly._last_weekly_payload = WeeklyReviewPayload(
+        days=(), week_key="2026-W29"
+    )
+    monkeypatch.setattr(
+        actions.weekly,
+        "_generate_weekly_content",
+        lambda *_a, **_k: actions.weekly.weekly_json.dump_yaml(
+            actions.weekly._last_weekly_payload
+        ),
+    )
+    monkeypatch.setattr(actions, "_refresh_chronicle_after_generate", lambda *_a, **_k: None)
+    monkeypatch.setattr(actions, "run_hot_health", lambda *, reason="bridge": {})
+
+    result = actions.generate_week("2026-W29", reason="rescan")
+
+    assert result["outcome"] == "generated"
+    dumped = target.read_text(encoding="utf-8")
+    assert "old chronicle row" not in dumped
+    reloaded = actions.weekly.weekly_json.loads(dumped)
+    assert reloaded.summary == ()
+
+
 def test_digest_staleness_false_right_after_generate_then_true_after_daily_touch(
     tmp_path, monkeypatch
 ):

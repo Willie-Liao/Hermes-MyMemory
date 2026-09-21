@@ -107,3 +107,106 @@ def test_failed_fields_teach_names_patch_tool():
     )
     assert "patch_weekly_event" in teach
     assert "Do NOT call submit again" in teach
+
+
+def test_failed_fields_teach_events_wrapper_when_flat_root():
+    teach = weekly_tools.failed_fields_teach(
+        ["zero events after render; retry"],
+        {"entity": "X", "predicate": "recorded"},
+        role="event",
+        patch_tool="patch_weekly_event",
+        attempt=2,
+        max_attempts=3,
+    )
+    assert 'top-level "events"' in teach
+
+
+def _sample_event(**overrides):
+    bag = {
+        "entity": "ThesisChapter",
+        "predicate": "recorded",
+        "participants": [
+            {"entity": "User", "role": "requester"},
+            {"entity": "Assistant", "role": "executor"},
+        ],
+        "valid_from": "2026-09-14",
+        "valid_to": "2026-09-14",
+        "confidence": "high",
+        "sources": ["session s1"],
+        "related": ["mem-2026-09-14-fact-XXXXXXXXXXXX"],
+        "beginning": "asked",
+        "course": "delivered",
+        "outcome": "done",
+    }
+    bag.update(overrides)
+    return bag
+
+
+def test_coerce_canonical_events_list_unchanged():
+    args = {"events": [_sample_event()]}
+    out = weekly_tools.coerce_event_tool_args(args)
+    assert out["events"][0]["entity"] == "ThesisChapter"
+    assert len(out["events"]) == 1
+
+
+def test_coerce_singleton_events_object_to_list():
+    out = weekly_tools.coerce_event_tool_args({"events": _sample_event()})
+    assert isinstance(out["events"], list)
+    assert out["events"][0]["predicate"] == "recorded"
+
+
+def test_coerce_flat_root_entity_predicate_into_events():
+    out = weekly_tools.coerce_event_tool_args(_sample_event())
+    assert isinstance(out["events"], list)
+    assert out["events"][0]["entity"] == "ThesisChapter"
+    blocks = weekly_tools.render_events_from_tool_args(_sample_event())
+    assert len(blocks) == 1
+    assert blocks[0]["frontmatter"]["entity"] == "ThesisChapter"
+
+
+def test_coerce_arguments_wrapper():
+    out = weekly_tools.coerce_event_tool_args(
+        {"arguments": {"events": [_sample_event()]}}
+    )
+    assert len(out["events"]) == 1
+
+
+def test_coerce_parameters_wrapper():
+    out = weekly_tools.coerce_event_tool_args(
+        {"parameters": {"events": [_sample_event()]}}
+    )
+    assert out["events"][0]["entity"] == "ThesisChapter"
+
+
+def test_coerce_input_wrapper():
+    out = weekly_tools.coerce_event_tool_args({"input": _sample_event()})
+    assert out["events"][0]["predicate"] == "recorded"
+
+
+def test_coerce_json_string_bag():
+    import json
+
+    out = weekly_tools.coerce_event_tool_args(
+        json.dumps({"events": [_sample_event()]})
+    )
+    assert len(out["events"]) == 1
+
+
+def test_coerce_events_json_string():
+    import json
+
+    out = weekly_tools.coerce_event_tool_args(
+        {"events": json.dumps([_sample_event()])}
+    )
+    assert out["events"][0]["entity"] == "ThesisChapter"
+
+
+def test_coerce_empty_events_list_skip_shape():
+    out = weekly_tools.coerce_event_tool_args({"events": []})
+    assert out["events"] == []
+
+
+def test_coerce_empty_or_unrelated_keys_unchanged():
+    assert weekly_tools.coerce_event_tool_args({}) == {}
+    assert weekly_tools.coerce_event_tool_args({"foo": 1}) == {"foo": 1}
+    assert weekly_tools.render_events_from_tool_args({}) == []

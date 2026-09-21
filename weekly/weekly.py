@@ -77,6 +77,7 @@ try:
     )
     from .weekly_event_workers import (
         evening_daily_slice_text,
+        overlay_evening_slice_on_payload,
         run_parallel_worker1,
     )
     from . import weekly_json
@@ -100,6 +101,7 @@ except ImportError:
     )
     from weekly_event_workers import (  # type: ignore[no-redef]
         evening_daily_slice_text,
+        overlay_evening_slice_on_payload,
         run_parallel_worker1,
     )
     import weekly_json  # type: ignore[no-redef]
@@ -915,17 +917,24 @@ def _weekly_path(year: int, week: int) -> Path:
 
 
 def _commit_weekly_outputs(
-    target: Path, content: str, payload: WeeklyReviewPayload, week_key: str
+    target: Path,
+    content: str,
+    payload: WeeklyReviewPayload,
+    week_key: str,
+    *,
+    reason: str = "",
 ) -> WeeklyReviewPayload:
     """Dump YAML before replacing the md so a serializer crash cannot clobber last week's file.
 
-    Keep the previous Chronicle bullets only when this run has no events and no
-    threads — an event-sourced empty summary must not restore wrap-up-era rows.
+    Carry-forward protects backlog and Sunday evening patch from wiping Chronicle
+    when Worker 1 returns no story. Explicit rescan/update must replace the week
+    file as a first write — restoring prior summary would make retries look frozen.
     """
     has_story = bool(payload.cross_day_thread) or any(
         not row.empty and str(row.text).strip() for row in payload.intra_day_thread
     ) or any(brief.events or brief.sentences for brief in payload.days)
-    if not payload.summary and not has_story and target.is_file():
+    skip_carry = reason in {"update", "rescan"}
+    if not skip_carry and not payload.summary and not has_story and target.is_file():
         try:
             prior = weekly_json.loads(target.read_text(encoding="utf-8"))
         except (OSError, ValueError, yaml.YAMLError):
@@ -946,6 +955,22 @@ def _commit_weekly_outputs(
     )
     weekly_json.write_sidecars(target, payload)
     return payload
+
+
+def _sunday_intra_is_stub_or_empty(row: Any) -> bool:
+    """Treat Worker-1 10-word Sunday titles as missing so leftover ids can re-enter the slice."""
+    if row is None:
+        return True
+    if bool(getattr(row, "empty", False)):
+        return True
+    lines = [
+        line.strip().lstrip("- ").strip()
+        for line in str(getattr(row, "text", None) or "").splitlines()
+        if line.strip()
+    ]
+    if not lines:
+        return True
+    return all(len(line.split()) <= 10 for line in lines)
 
 
 def patch_sunday_evening_week(week_key: str) -> dict[str, Any]:
@@ -983,11 +1008,20 @@ def patch_sunday_evening_week(week_key: str) -> dict[str, Any]:
         raw = daily_path.read_text(encoding="utf-8")
     except OSError as exc:
         return {"outcome": "error", "week": week_key, "error": str(exc)}
+    known = known_week_mem_ids(base)
+    sunday_intra = next(
+        (row for row in base.intra_day_thread if row.date == sunday),
+        None,
+    )
+    # Time window still drops pre-16:00 cards. Skip-known would block a repair
+    # when leftover ids are already in entities but Sunday is empty or a title stub.
+    if _sunday_intra_is_stub_or_empty(sunday_intra):
+        known = set()
     sliced = evening_daily_slice_text(
         raw,
         after=after,
         before=before,
-        known_ids=known_week_mem_ids(base),
+        known_ids=known,
     )
     if not sliced.strip():
         return {"outcome": "empty", "week": week_key, "cards": 0}
@@ -1015,6 +1049,7 @@ def patch_sunday_evening_week(week_key: str) -> dict[str, Any]:
         cross_day_thread=w1.cross_day_thread or w1.payload.cross_day_thread,
         entities=w1.entities or w1.payload.entities,
     )
+    delta = overlay_evening_slice_on_payload(delta, sliced, sunday)
     merged = _merge_sunday_evening_payload(base, delta)
     _commit_weekly_outputs(target, "", merged, week_key)
     return {"outcome": "ok", "week": week_key}

@@ -1228,3 +1228,26 @@ def test_commit_carries_forward_empty_summary(tmp_path, monkeypatch):
     assert replaced.summary[0].text == "new wrap-up"
 
 
+def test_commit_rescan_does_not_carry_forward_empty_summary(tmp_path, monkeypatch):
+    """Rescan/update must write this run's empty summary, not restore last week's Chronicle."""
+    weekly = _load_weekly(tmp_path, monkeypatch)
+    from weekly_event_schema import WeeklyReviewPayload, WeeklySummaryItem
+
+    target = tmp_path / "memories" / "staging" / "weekly" / "2026-W35.md"
+    prior = WeeklyReviewPayload(
+        days=(),
+        week_key="2026-W35",
+        summary=(WeeklySummaryItem(text="kept wrap-up", weekdays=("Monday",)),),
+    )
+    weekly._commit_weekly_outputs(target, "ignored", prior, "2026-W35")
+    empty = WeeklyReviewPayload(days=(), week_key="2026-W35")
+    for reason in ("rescan", "update"):
+        out = weekly._commit_weekly_outputs(
+            target, "ignored", empty, "2026-W35", reason=reason
+        )
+        assert out.summary == ()
+        reloaded = weekly.weekly_json.loads(target.read_text(encoding="utf-8"))
+        assert reloaded.summary == ()
+        weekly._commit_weekly_outputs(target, "ignored", prior, "2026-W35")
+
+

@@ -420,6 +420,8 @@ def generate_week(
 ) -> dict[str, Any]:
     """Generate a weekly review file, or kick the existing background thread.
 
+    Rescan/update must dump this run's payload without restoring the previous
+    Chronicle, so retries match a first write on the current unresolved dailies.
     Slash waits in-process (background=False). UI Re-scan may pass background=True
     so the button can poll generate_in_flight instead of dying on the 5-minute
     bridge timeout. Background must not wait on _run_lock — a persistent bridge
@@ -583,7 +585,9 @@ def generate_week(
         payload = weekly._last_weekly_payload
         if payload is None:
             payload = weekly.WeeklyReviewPayload(days=(), week_key=week_key)
-        payload = weekly._commit_weekly_outputs(target, content, payload, week_key)
+        payload = weekly._commit_weekly_outputs(
+            target, content, payload, week_key, reason=reason
+        )
 
         fingerprint = weekly._digest_fingerprint_for_files(files)
         state = weekly._load_state()

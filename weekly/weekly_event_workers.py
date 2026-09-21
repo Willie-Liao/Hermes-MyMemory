@@ -45,6 +45,8 @@ try:
         WeeklyEntity,
         WeeklyReviewPayload,
         WeeklySummaryItem,
+        _summary_items_are_twins,
+        _summary_text_key,
         weekday_label,
     )
     from .weekly_event_validate import (
@@ -69,6 +71,8 @@ except ImportError:  # pragma: no cover - flat pytest load
         WeeklyEntity,
         WeeklyReviewPayload,
         WeeklySummaryItem,
+        _summary_items_are_twins,
+        _summary_text_key,
         weekday_label,
     )
     from weekly_event_validate import (  # type: ignore[no-redef]
@@ -100,6 +104,7 @@ _MEM_ID_RE = re.compile(
     r"(mem-(?:\d{4}-\d{2}-\d{2}|\d{8})-[\w-]+)",
     re.IGNORECASE,
 )
+_DAILY_SOURCE_DAY_RE = re.compile(r"(?i)\bdaily:(\d{4}-\d{2}-\d{2})\.md\b")
 MAX_WORKER_ATTEMPTS = 3
 MAX_RETRY_CHARS = 4000
 _THREAD_SNIPPET_CHARS = 120
@@ -112,8 +117,11 @@ __all__ = [
     "EVENT_WORKER_PURPOSES",
     "Worker1Result",
     "attach_claim_sentences",
+    "evening_daily_slice_text",
+    "evening_slice_summary_items",
     "iso_week_dates",
     "merge_event_blocks",
+    "overlay_evening_slice_on_payload",
     "parse_blocks",
     "partition_days",
     "run_parallel_worker1",
@@ -174,6 +182,90 @@ def _files_by_day(files: Sequence[Path]) -> dict[date, Path]:
     return by_day
 
 
+def _mem_id_to_daily_file_day(by_day: Mapping[date, Path]) -> dict[str, date]:
+    """Map each daily mem-id to the digest filename date, not valid_from.
+
+    Leftover Sunday cards keep Saturday valid_from; without this index,
+    generate/re-scan would paint them on Saturday in the Chronicle.
+    Duplicate ids: later ISO day in ``by_day`` wins.
+    """
+    out: dict[str, date] = {}
+    for day in sorted(by_day):
+        path = by_day[day]
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for _line_no, fm, _body in _frontmatter_blocks(text):
+            if not isinstance(fm, dict) or fm.get("__yaml_error__"):
+                continue
+            mem_id = str(fm.get("id") or "").strip()
+            if mem_id.lower().startswith("mem-"):
+                out[mem_id] = day
+    return out
+
+
+def _iter_block_mem_ids(fm: Mapping[str, Any]) -> list[str]:
+    """Collect mem-ids from related then id so leftover w-evt rows can find the daily file."""
+    found: list[str] = []
+    related = fm.get("related") or []
+    if not isinstance(related, list):
+        related = [related]
+    for entry in related:
+        match = _MEM_ID_RE.search(str(entry or ""))
+        if match:
+            found.append(match.group(1))
+    bid = str(fm.get("id") or "").strip()
+    if bid.lower().startswith("mem-"):
+        found.append(bid)
+    return found
+
+
+def _chronicle_day_from_daily_file(
+    fm: Mapping[str, Any],
+    mem_to_day: Mapping[str, date],
+) -> date | None:
+    """Resolve Chronicle day from the containing daily file, never leftover valid_from."""
+    day: date | None = None
+    for mem_id in _iter_block_mem_ids(fm):
+        mapped = mem_to_day.get(mem_id)
+        if mapped is not None:
+            day = mapped
+    if day is not None:
+        return day
+    sources = fm.get("sources") or []
+    if not isinstance(sources, list):
+        sources = [sources]
+    for src in sources:
+        match = _DAILY_SOURCE_DAY_RE.search(str(src or ""))
+        if not match:
+            continue
+        try:
+            return date.fromisoformat(match.group(1))
+        except ValueError:
+            continue
+    return None
+
+
+def _stamp_event_blocks_to_daily_file_day(
+    blocks: Sequence[dict[str, Any]],
+    mem_to_day: Mapping[str, date],
+) -> list[dict[str, Any]]:
+    """Rewrite weekly w-evt valid_from/to to the daily file day; leave digest files alone."""
+    stamped: list[dict[str, Any]] = []
+    for block in blocks:
+        fm = dict(block.get("frontmatter") or {})
+        day = _chronicle_day_from_daily_file(fm, mem_to_day)
+        if day is None:
+            stamped.append(block)
+            continue
+        iso = day.isoformat()
+        fm["valid_from"] = iso
+        fm["valid_to"] = iso
+        stamped.append({**block, "frontmatter": fm})
+    return stamped
+
+
 def _event_snippet(body: str) -> str:
     """One line for the candidate index so the thread LLM never sees a full Distill dump."""
     line = " ".join((body or "").split())
@@ -187,7 +279,7 @@ def _collect_daily_event_cards(
 ) -> list[dict[str, Any]]:
     """Index only daily type:event mem-ids so threads cannot paste wrap-ups, facts, or w-evt-* cards.
 
-    If valid_from sits outside this ISO week, use the daily file day so Allaway cannot chain last week's Saturday.
+    Chronicle day is the digest filename (loop ``day``), not leftover valid_from.
     """
     cards: list[dict[str, Any]] = []
     for day in days:
@@ -212,13 +304,7 @@ def _collect_daily_event_cards(
             event_id = str(fm.get("id") or "").strip()
             if not event_id.lower().startswith("mem-"):
                 continue
-            vf = str(fm.get("valid_from") or "").strip()[:10]
-            try:
-                card_day = date.fromisoformat(vf) if vf else day
-            except ValueError:
-                card_day = day
-            if card_day not in days:
-                card_day = day
+            card_day = day
             entity = str(fm.get("entity") or "").strip()
             predicate = str(fm.get("predicate") or "").strip()
             body_text = (body or "").strip()
@@ -441,6 +527,12 @@ def _parse_card_clock(value: Any) -> datetime | None:
     return parsed
 
 
+_SLICE_BODY_PREFIX_RE = re.compile(
+    r"^(Factual|Narration|Decision|Procedure|Obstacle|Solution):\s*",
+    re.IGNORECASE,
+)
+
+
 def evening_daily_slice_text(
     text: str,
     *,
@@ -448,9 +540,10 @@ def evening_daily_slice_text(
     before: datetime,
     known_ids: set[str],
 ) -> str:
-    """Keep Sunday cards that landed after 16:00 and are not already in the week YAML.
+    """Keep Sunday 16:00–00:00 cards by extract clock without rewriting digest dates.
 
-    A full Worker-1 reread of the daily would duplicate 16:00 cites.
+    Leftover valid_from often stays Saturday; restamping it made Worker-1 titles
+    look like Sunday while the daily still said Saturday — and hid the bodies.
     """
     kept: list[dict[str, Any]] = []
     for block in parse_blocks(text):
@@ -470,6 +563,79 @@ def evening_daily_slice_text(
         if after <= clock < before:
             kept.append(block)
     return "\n\n".join(_render_block(block) for block in kept)
+
+
+def _slice_card_summary_text(card_type: str, body: str) -> str:
+    """Turn a leftover card into a Chronicle line without the 10-word Outcome clip."""
+    raw = str(body or "").strip()
+    if not raw:
+        return ""
+    wrap = re.search(r"^##\s+Day wrap-up\b", raw, flags=re.IGNORECASE | re.MULTILINE)
+    if wrap:
+        raw = raw[: wrap.start()].strip()
+        if not raw:
+            return ""
+    if str(card_type or "").strip().casefold() == "event":
+        return _event_body_plain_brief(raw)
+    return _SLICE_BODY_PREFIX_RE.sub("", raw, count=1).strip()
+
+
+def evening_slice_summary_items(slice_text: str) -> tuple[WeeklySummaryItem, ...]:
+    """Sunday Chronicle rows from leftover bodies so Weekly UI is not Worker-1 titles.
+
+    FourPartWeeklyCard paints summary; valid_from on the cards stays whatever digest wrote.
+    """
+    items: list[WeeklySummaryItem] = []
+    for block in parse_blocks(slice_text):
+        fm = block.get("frontmatter") or {}
+        text = _slice_card_summary_text(
+            str(fm.get("type") or ""),
+            str(block.get("body") or ""),
+        )
+        if not text:
+            continue
+        items.append(WeeklySummaryItem(text=text, weekdays=("Sunday",)))
+    return tuple(items)
+
+
+def overlay_evening_slice_on_payload(
+    payload: WeeklyReviewPayload,
+    slice_text: str,
+    sunday: date,
+) -> WeeklyReviewPayload:
+    """Replace Worker-1 Sunday story with leftover bodies; keep entities/legend/threads."""
+    items = evening_slice_summary_items(slice_text)
+    if not items:
+        return payload
+    intra_text = "\n".join(f"- {item.text}" for item in items)
+    sunday_row = IntraDayThread(
+        date=sunday,
+        weekday=weekday_label(sunday),
+        source_field="events",
+        text=intra_text,
+        empty=False,
+    )
+    rest: list[IntraDayThread] = []
+    for row in payload.intra_day_thread:
+        if row.date == sunday:
+            continue
+        kept = [
+            line
+            for line in str(row.text or "").splitlines()
+            if line.strip()
+            and not any(
+                _summary_items_are_twins(_summary_text_key(line), item.text)
+                for item in items
+            )
+        ]
+        rest.append(
+            replace(
+                row,
+                text="\n".join(kept),
+                empty=not bool("\n".join(kept).strip()),
+            )
+        )
+    return replace(payload, summary=items, intra_day_thread=(*rest, sunday_row))
 
 
 
@@ -544,16 +710,29 @@ def _build_event_worker_prompt(
         f"You are weekly Worker 1 event extractor ({purpose}).\n\n"
         f"Week: {week_key}\n"
         f"Active days: {day_list}\n\n"
-        "Call submit_weekly_event with an events array (type:event only).\n"
-        "Each event needs entity, predicate, participants "
-        "(User/requester + Assistant/executor), valid_from/valid_to, "
-        "confidence (explicit|high|medium|low), sources, related "
-        "(CITE_ONLY card id: only), beginning, course, outcome.\n"
-        f"{cite_block}\n"
+        "TOOL SHAPE (required — matches submit_weekly_event JSON Schema):\n"
+        '- Tool arguments object MUST include required key "events" (array).\n'
+        "- Each array element is one type:event object with the fields listed below.\n"
+        "- Do NOT place event fields (entity, predicate, participants, valid_from, valid_to,\n"
+        "  confidence, sources, related, beginning, course, outcome) at the top level of\n"
+        "  tool arguments — only inside events[].\n\n"
+        "VALID (one event):\n"
+        '{"events":[{"entity":"Example","predicate":"recorded","participants":[{"entity":"User","role":"requester"},{"entity":"Assistant","role":"executor"}],"valid_from":"2026-09-14","valid_to":"2026-09-14","confidence":"high","sources":["session s1"],"related":["mem-2026-09-14-fact-XXXXXXXXXXXX"],"beginning":"…","course":"…","outcome":"…"}]}\n\n'
+        "INVALID (do not use — will not parse):\n"
+        '{"entity":"Example","predicate":"recorded",...}\n\n'
+        'If the week has no events: call skip_weekly_event OR submit {"events":[]} — never flatten\n'
+        "one event to the root.\n\n"
+        "Per event (inside events[] only):\n"
+        "- entity, predicate, participants (User/requester + Assistant/executor)\n"
+        "- valid_from / valid_to = daily digest file date (YYYY-MM-DD.md from Active days)\n"
+        "- confidence: explicit|high|medium|low\n"
+        "- sources, related (CITE_ONLY card ids only)\n"
+        "- beginning, course, outcome\n\n"
         "Do NOT emit fact/procedure/decision/conflict/hypothesis.\n"
         "Do NOT write ## Brief. Do NOT write hot memory.\n"
         "Do NOT emit free-form YAML — use the tool call only.\n"
-        "If a day has no event evidence, omit events for that day.\n"
+        "If a day has no event evidence, omit that day from events[] (or skip when none).\n"
+        f"{cite_block}\n"
     )
     if attempt <= 1:
         return base + f"\nDAILY SOURCES (ALL ACTIVE DAYS):\n{day_bundle}\n"
@@ -719,7 +898,11 @@ def _fallback_events_from_dailies(
     *,
     purpose: str,
 ) -> list[dict[str, Any]]:
-    """Bounded deterministic fallback: promote daily event blocks for assigned days."""
+    """Bounded deterministic fallback: promote daily event blocks for assigned days.
+
+    Weekly valid_from/to follow the digest filename so leftover Saturday
+    valid_from cannot hide Sunday Chronicle rows. Daily files are not rewritten.
+    """
     blocks: list[dict[str, Any]] = []
     for day in days:
         path = by_day.get(day)
@@ -758,8 +941,8 @@ def _fallback_events_from_dailies(
                 "participants": fm.get("participants")
                 if isinstance(fm.get("participants"), list) and fm.get("participants")
                 else [{"entity": str(fm.get("entity") or "Unknown")}],
-                "valid_from": str(fm.get("valid_from") or day.isoformat()),
-                "valid_to": str(fm.get("valid_to") or day.isoformat()),
+                "valid_from": day.isoformat(),
+                "valid_to": day.isoformat(),
                 "confidence": fm.get("confidence") or "medium",
                 "status": "candidate",
                 "sources": fm.get("sources")
@@ -812,8 +995,8 @@ def _run_event_worker(
 ) -> tuple[list[dict[str, Any]], bool, list[str]]:
     """Returns (blocks, used_fallback, error notes). Uses forced submit/patch tools.
 
-    Schema failures and agreement-validator exhaustion both fall back to daily
-    events so wrap-up/summary still dump. Skip-analysts hard abort is retired.
+    Empty non-skip renders retry twice then daily fallback so W38-style
+    ok events=0 cannot skip the retry loop. Skip-analysts hard abort is retired.
     """
     day_bundle = _day_bundle(by_day, days)
     daily_files = [by_day[d] for d in days if d in by_day]
@@ -888,6 +1071,8 @@ def _run_event_worker(
                 continue
             previous_args = weekly_tools.merge_field_patch(previous_args, tool_args)
 
+        previous_args = weekly_tools.coerce_event_tool_args(previous_args)
+
         enum_errors = weekly_tools.validate_closed_choice_args(
             previous_args, role="event"
         )
@@ -897,6 +1082,14 @@ def _run_event_worker(
             continue
 
         blocks = weekly_tools.render_events_from_tool_args(previous_args)
+        if not blocks:
+            last_errors = ["zero events after render; retry"]
+            agreement_failed = False
+            log(
+                f"weekly {purpose} zero events {week_key} "
+                f"attempt={attempt}/{MAX_WORKER_ATTEMPTS}"
+            )
+            continue
         for block in blocks:
             fm = block.get("frontmatter")
             if not isinstance(fm, dict):
@@ -1955,6 +2148,8 @@ def run_parallel_worker1(
         fallback_days.extend(active_days)
 
     event_blocks, legend = merge_event_blocks(week_dates, [event_worker_blocks])
+    mem_to_day = _mem_id_to_daily_file_day(by_day)
+    event_blocks = _stamp_event_blocks_to_daily_file_day(event_blocks, mem_to_day)
 
     # Never silently drop an active day: cover gaps with bounded fallback events.
     covered_days: set[date] = set()
@@ -1977,6 +2172,7 @@ def run_parallel_worker1(
         event_blocks, legend = merge_event_blocks(
             week_dates, [event_blocks, gap_blocks]
         )
+        event_blocks = _stamp_event_blocks_to_daily_file_day(event_blocks, mem_to_day)
         fallback_days.extend(missing_days)
 
     day_briefs = _day_briefs_from_events(week_dates, event_blocks)

@@ -376,30 +376,56 @@ def _merge_intra_day(
     base: tuple[IntraDayThread, ...],
     delta: tuple[IntraDayThread, ...],
 ) -> tuple[IntraDayThread, ...]:
+    """Append new Sunday bullets and pull the same lines off other weekdays.
+
+    Leftover events often keep Saturday valid_from; without this strip they
+    stay on Saturday after a repair patch restamps them onto Sunday.
+    """
     by_day = {row.date: row for row in base}
+    filled_days: set[date] = set()
+    added_lines: set[str] = set()
     for row in delta:
         if row.empty or not str(row.text).strip():
             continue
         existing = by_day.get(row.date)
         if existing is None:
             by_day[row.date] = row
+            filled_days.add(row.date)
+            added_lines.update(
+                _summary_text_key(line)
+                for line in str(row.text or "").splitlines()
+                if _summary_text_key(line)
+            )
             continue
-        seen = {
-            line.strip()
-            for line in str(existing.text or "").splitlines()
-            if line.strip()
-        }
-        extra: list[str] = []
-        for line in str(row.text or "").splitlines():
-            stripped = line.strip()
-            if stripped and stripped not in seen:
-                extra.append(line if line.startswith("- ") else f"- {stripped}")
-                seen.add(stripped)
-        if not extra:
+        merged_text = _merge_intra_lines(str(existing.text or ""), str(row.text or ""))
+        if merged_text == str(existing.text or "").strip():
             continue
-        prefix = str(existing.text or "").rstrip()
-        merged_text = f"{prefix}\n" + "\n".join(extra) if prefix else "\n".join(extra)
-        by_day[row.date] = replace(existing, text=merged_text, empty=False)
+        by_day[row.date] = replace(existing, text=merged_text, empty=not bool(merged_text))
+        filled_days.add(row.date)
+        added_lines.update(
+            _summary_text_key(line)
+            for line in str(row.text or "").splitlines()
+            if _summary_text_key(line)
+        )
+    if added_lines:
+        for day, existing in list(by_day.items()):
+            if day in filled_days:
+                continue
+            kept_lines = [
+                line
+                for line in str(existing.text or "").splitlines()
+                if line.strip()
+                and not any(
+                    _summary_items_are_twins(_summary_text_key(line), other)
+                    for other in added_lines
+                )
+            ]
+            if kept_lines == [
+                line for line in str(existing.text or "").splitlines() if line.strip()
+            ]:
+                continue
+            text = "\n".join(kept_lines)
+            by_day[day] = replace(existing, text=text, empty=not bool(text.strip()))
     return tuple(sorted(by_day.values(), key=lambda row: row.date))
 
 
@@ -508,6 +534,89 @@ def _merge_days(
     return tuple(sorted(by_day.values(), key=lambda row: row.day))
 
 
+def _summary_text_key(text: str) -> str:
+    return str(text or "").strip().lstrip("- ").strip()
+
+
+def _summary_items_are_twins(left: str, right: str) -> bool:
+    """Treat a 10-word Outcome stub and the leftover B/C/O body as one Chronicle row.
+
+    Worker-1 titles clip Outcome; leftover bodies start at Beginning, so prefix
+    match on the whole string would keep both lines in the Weekly UI.
+    """
+    a = _summary_text_key(left)
+    b = _summary_text_key(right)
+    if not a or not b:
+        return False
+    if a == b or a.startswith(b) or b.startswith(a):
+        return True
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    if len(shorter.split()) > 10:
+        return False
+    return shorter in longer
+
+
+def _merge_intra_lines(old_text: str, new_text: str) -> str:
+    """Replace Outcome stubs with leftover bodies instead of listing both."""
+    lines: list[str] = []
+    keys: list[str] = []
+
+    def add(raw: str) -> None:
+        stripped = raw.strip()
+        if not stripped:
+            return
+        key = _summary_text_key(stripped)
+        formatted = stripped if stripped.startswith("- ") else f"- {stripped}"
+        for i, old_key in enumerate(keys):
+            if _summary_items_are_twins(old_key, key):
+                if len(key) >= len(old_key):
+                    lines[i] = formatted
+                    keys[i] = key
+                return
+        lines.append(formatted)
+        keys.append(key)
+
+    for line in str(old_text or "").splitlines():
+        add(line)
+    for line in str(new_text or "").splitlines():
+        add(line)
+    return "\n".join(lines)
+
+
+def _merge_evening_summary(
+    base: tuple[WeeklySummaryItem, ...],
+    delta: tuple[WeeklySummaryItem, ...],
+) -> tuple[WeeklySummaryItem, ...]:
+    """Replace truncated Saturday twins with the longer Sunday leftover line.
+
+    Unique-by-text would keep the stub and drop the body the Weekly UI needs.
+    """
+    summary = list(base)
+    for item in delta:
+        twin_i = next(
+            (
+                i
+                for i, old in enumerate(summary)
+                if _summary_items_are_twins(old.text, item.text)
+            ),
+            None,
+        )
+        if twin_i is None:
+            summary.append(item)
+            continue
+        old = summary[twin_i]
+        old_key = _summary_text_key(old.text)
+        new_key = _summary_text_key(item.text)
+        longer_text = item.text if len(new_key) >= len(old_key) else old.text
+        days = item.weekdays or old.weekdays
+        if "Sunday" in item.weekdays:
+            days = tuple(name for name in days if name != "Saturday")
+            if "Sunday" not in days:
+                days = (*days, "Sunday")
+        summary[twin_i] = WeeklySummaryItem(text=longer_text, weekdays=days)
+    return tuple(summary)
+
+
 def _merge_sunday_evening_payload(
     base: WeeklyReviewPayload,
     delta: WeeklyReviewPayload,
@@ -522,19 +631,14 @@ def _merge_sunday_evening_payload(
     legend = dict(base.legend)
     for number, mem_id in sorted(delta.legend.items()):
         legend[number + offset] = mem_id
-    summary_texts = {item.text for item in base.summary}
-    summary = list(base.summary)
-    for item in delta.summary:
-        if item.text not in summary_texts:
-            summary.append(item)
-            summary_texts.add(item.text)
+    intra = _merge_intra_day(base.intra_day_thread, delta.intra_day_thread)
     return replace(
         base,
         days=_merge_days(base.days, delta.days, offset),
         legend=legend,
-        intra_day_thread=_merge_intra_day(base.intra_day_thread, delta.intra_day_thread),
+        intra_day_thread=intra,
         entities=_merge_entities(base.entities, delta.entities),
-        summary=tuple(summary),
+        summary=_merge_evening_summary(base.summary, delta.summary),
         cross_day_thread=_merge_cross_day(
             base.cross_day_thread, delta.cross_day_thread, offset
         ),

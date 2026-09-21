@@ -451,8 +451,98 @@ def render_event_block_from_args(
     return {"frontmatter": fm, "body": body}
 
 
+_EVENT_FIELD_KEYS = frozenset(
+    {
+        "entity",
+        "predicate",
+        "participants",
+        "valid_from",
+        "valid_to",
+        "confidence",
+        "sources",
+        "related",
+        "beginning",
+        "course",
+        "outcome",
+        "status",
+        "id",
+    }
+)
+_WRAPPER_KEYS = ("arguments", "parameters", "input")
+
+
+def coerce_event_tool_args(args: Any, *, _depth: int = 0) -> dict[str, Any]:
+    """Hoist malformed weekly event bags into schema-shaped events[] so render cannot silently drop a real submit.
+
+    Without this, a flat root (entity+predicate, no events key) yields 0 blocks and Worker 1 logs ok events=0.
+    Structure-only and idempotent: no vendor branches. Recurse at most twice for wrappers/JSON strings.
+    """
+    if _depth > 2:
+        return dict(args) if isinstance(args, Mapping) else {}
+
+    if isinstance(args, str):
+        try:
+            parsed = json.loads(args)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return {}
+        return coerce_event_tool_args(parsed, _depth=_depth + 1)
+
+    if not isinstance(args, Mapping):
+        return {}
+
+    bag: dict[str, Any] = dict(args)
+    events = bag.get("events")
+    if not isinstance(events, (list, Mapping, str)):
+        for key in _WRAPPER_KEYS:
+            inner = bag.get(key)
+            if isinstance(inner, (Mapping, str)):
+                return coerce_event_tool_args(inner, _depth=_depth + 1)
+
+    events = bag.get("events")
+    if isinstance(events, str):
+        try:
+            parsed_events = json.loads(events)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return bag
+        bag["events"] = parsed_events
+        return coerce_event_tool_args(bag, _depth=_depth + 1)
+
+    if isinstance(events, Mapping):
+        bag["events"] = [dict(events)]
+        return bag
+
+    if isinstance(events, list):
+        return bag
+
+    entity = bag.get("entity")
+    predicate = bag.get("predicate")
+    if (
+        isinstance(entity, str)
+        and entity.strip()
+        and isinstance(predicate, str)
+        and predicate.strip()
+    ):
+        event: dict[str, Any] = {}
+        rest: dict[str, Any] = {}
+        for key, value in bag.items():
+            if key in _EVENT_FIELD_KEYS:
+                event[key] = value
+            else:
+                rest[key] = value
+        rest["events"] = [event]
+        return rest
+
+    return bag
+
+
 def render_events_from_tool_args(args: Mapping[str, Any]) -> list[dict[str, Any]]:
-    events = args.get("events")
+    """Render event blocks from tool args after coercing non-schema shapes.
+
+    Callers (Worker 1) used to miss a whole submit when events was missing but
+    entity/predicate sat at the root.
+    """
+    coerced = coerce_event_tool_args(args)
+    events = coerced.get("events")
     if not isinstance(events, list):
         return []
     return [
@@ -491,6 +581,14 @@ def failed_fields_teach(
     ]
     for err in list(errors)[:12]:
         lines.append(f"- {err}")
+    if (
+        role == "event"
+        and "entity" in previous
+        and not isinstance(previous.get("events"), list)
+    ):
+        lines.append(
+            'Wrap the event object in a top-level "events" array; do not leave entity at the root.'
+        )
     if previous:
         lines.append("Prior accepted/partial args (reference only):")
         preview = json.dumps(previous, ensure_ascii=False)
@@ -511,6 +609,7 @@ __all__ = [
     "WEEKLY_TOOLSET",
     "WORKER_STATUS_ENUM",
     "all_tool_schemas",
+    "coerce_event_tool_args",
     "ensure_weekly_tools_registered",
     "failed_fields_teach",
     "forced_tool_choice",

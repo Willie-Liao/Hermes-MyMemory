@@ -204,3 +204,66 @@ def test_event_prompt_cite_only_lists_card_ids_not_related_pointers(tmp_path: Pa
     assert "mem-2026-08-24-fact-9605EB855DAA" in cite_section
     assert "mem-2026-08-24-fact-CAC0A038911B" not in cite_section
     assert "WeeklyReviewPayload schema" in cite_section
+
+
+def test_event_prompt_requires_events_wrapper_not_vendor_names():
+    from datetime import date
+
+    from weekly_event_workers import _build_event_worker_prompt
+
+    prompt = _build_event_worker_prompt(
+        "2026-W38",
+        "worker1_event",
+        [date(2026, 9, 14)],
+        "(bundle)",
+    )
+    assert 'required key "events"' in prompt
+    assert "INVALID (do not use" in prompt
+    for vendor in ("MiniMax", "MiMo", "Kimi"):
+        assert vendor not in prompt
+
+
+def test_run_event_worker_zero_events_retries_then_fallback(tmp_path: Path):
+    from datetime import date
+
+    from weekly_event_workers import _run_event_worker
+
+    day = date(2026, 6, 30)
+    path = _write_daily(
+        tmp_path,
+        "2026-06-30.md",
+        "---\n"
+        "id: mem-2026-06-30-fact-AAAA\n"
+        "type: fact\n"
+        "entity: X\n"
+        "confidence: high\n"
+        "status: candidate\n"
+        "sources: [s]\n"
+        "---\n"
+        "Fact recorded on 2026-06-30.\n",
+    )
+    calls: list[str] = []
+    logs: list[str] = []
+
+    def tools(prompt, *, purpose, force_tool_name):
+        del prompt, purpose
+        calls.append(force_tool_name)
+        return {"tool_name": force_tool_name, "tool_args": {}}
+
+    blocks, used_fallback, _errs = _run_event_worker(
+        week_key="2026-W27",
+        purpose="worker1_event",
+        days=[day],
+        by_day={day: path},
+        call_llm_tools=tools,
+        log=logs.append,
+    )
+    assert calls == [
+        "submit_weekly_event",
+        "patch_weekly_event",
+        "patch_weekly_event",
+    ]
+    assert used_fallback is True
+    assert any("zero events" in line for line in logs)
+    assert not any("ok events=0" in line for line in logs)
+    assert blocks

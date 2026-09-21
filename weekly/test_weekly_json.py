@@ -915,6 +915,7 @@ def test_collect_daily_event_cards_skips_fact_and_wrapup(tmp_path):
 def test_collect_daily_event_cards_uses_file_day_when_valid_from_outside_week(
     tmp_path,
 ):
+    """Chronicle date is the daily filename even when valid_from is last week."""
     workers = _load_workers("memory_weekly_collect_vf_clip")
     daily = tmp_path / "memories" / "staging" / "daily" / "2026-08-24.md"
     daily.parent.mkdir(parents=True, exist_ok=True)

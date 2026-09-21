@@ -460,6 +460,83 @@ def test_merge_sunday_evening_keeps_weekday_intra_and_appends_sunday():
     assert [e.mem_id for e in sunday_brief.events] == ["mem-sun-early", "mem-sun-late"]
 
 
+def test_merge_sunday_evening_moves_misdated_leftover_off_saturday():
+    schema = _load()
+    saturday = date(2026, 8, 15)
+    sunday = date(2026, 8, 16)
+    stub = "User received comparison:"
+    full = (
+        "User asked for details on French language immigration policies from a "
+        "shared IRCC link. Assistant explained CRS French points (+25/+50). "
+        "User received comparison: French pathway CRS 400 vs regular pool "
+        "520-550+, with recommendation that French NCLC 7 is highest ROI "
+        "for their profile."
+    )
+    leftover_intra = f"- {full}"
+    base = schema.WeeklyReviewPayload(
+        days=(),
+        week_key="2026-W33",
+        intra_day_thread=(
+            schema.IntraDayThread(
+                date=saturday,
+                weekday="Saturday",
+                source_field="events",
+                text=f"- saturday original\n- {stub}",
+                empty=False,
+            ),
+            schema.IntraDayThread(
+                date=sunday,
+                weekday="Sunday",
+                source_field="events",
+                text="",
+                empty=True,
+            ),
+        ),
+        summary=(
+            schema.WeeklySummaryItem(
+                text=stub,
+                weekdays=("Saturday",),
+            ),
+            schema.WeeklySummaryItem(
+                text="monday keep",
+                weekdays=("Monday",),
+            ),
+        ),
+    )
+    delta = schema.WeeklyReviewPayload(
+        days=(),
+        week_key="2026-W33",
+        intra_day_thread=(
+            schema.IntraDayThread(
+                date=sunday,
+                weekday="Sunday",
+                source_field="events",
+                text=leftover_intra,
+                empty=False,
+            ),
+        ),
+        summary=(
+            schema.WeeklySummaryItem(
+                text=full,
+                weekdays=("Sunday",),
+            ),
+        ),
+    )
+    merged = schema._merge_sunday_evening_payload(base, delta)
+    sat = next(row for row in merged.intra_day_thread if row.date == saturday)
+    sun = next(row for row in merged.intra_day_thread if row.date == sunday)
+    assert leftover_intra in sun.text or full in sun.text
+    assert "- saturday original" in sat.text
+    assert sun.empty is False
+    leftover_summary = next(item for item in merged.summary if "French" in item.text)
+    assert leftover_summary.weekdays == ("Sunday",)
+    assert leftover_summary.text == full
+    assert not any(item.text == stub for item in merged.summary)
+    monday = next(item for item in merged.summary if item.text == "monday keep")
+    assert monday.weekdays == ("Monday",)
+    assert stub not in sat.text
+
+
 def test_merge_sunday_evening_empty_delta_is_base():
     schema = _load()
     base = schema.WeeklyReviewPayload(
