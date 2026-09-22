@@ -25,6 +25,16 @@ except ImportError:  # pragma: no cover - direct pytest collection path
     _spec.loader.exec_module(weekly)
 
 
+def _overlay_sunday_leftover_after_scan(week_key: str, reason: str) -> dict[str, Any] | None:
+    """Re-scan and /weekly update must paint Sunday 16:00–00:00 bodies onto the week just written.
+
+    The Monday 00:00 clock still patches; leaving overlay only there left Re-scan and slash with an empty Sunday row.
+    """
+    if reason not in {"update", "rescan"}:
+        return None
+    return weekly.patch_sunday_evening_week(week_key)
+
+
 def _purge_orphan_daily_blocks_before_generate() -> None:
     """Finish orphan retention before weekly generation (fail soft)."""
     try:
@@ -588,6 +598,18 @@ def generate_week(
         payload = weekly._commit_weekly_outputs(
             target, content, payload, week_key, reason=reason
         )
+        overlay = _overlay_sunday_leftover_after_scan(week_key, reason)
+        if overlay and overlay.get("outcome") == "ok" and target.is_file():
+            try:
+                payload = weekly.weekly_json.loads(target.read_text(encoding="utf-8"))
+            except Exception:
+                weekly._log(
+                    f"weekly sunday leftover overlay reload failed {week_key}"
+                )
+            else:
+                weekly._log(
+                    f"weekly sunday leftover overlay {week_key} outcome=ok"
+                )
 
         fingerprint = weekly._digest_fingerprint_for_files(files)
         state = weekly._load_state()

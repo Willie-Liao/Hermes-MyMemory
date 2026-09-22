@@ -322,6 +322,33 @@ def _collect_daily_event_cards(
     return cards
 
 
+def _format_events_by_date(
+    cards: Sequence[Mapping[str, Any]],
+    week_dates: Sequence[date],
+) -> str:
+    """List extracted daily events by weekday so the thread worker is not fed a capped md dump.
+
+    A 28k file paste dropped later days and the model returned one flat event.
+    """
+    grouped: dict[date, list[Mapping[str, Any]]] = {}
+    for card in cards:
+        day = card.get("date")
+        if isinstance(day, date):
+            grouped.setdefault(day, []).append(card)
+    lines = ["EVENTS BY DATE:"]
+    for day in week_dates:
+        rows = grouped.get(day) or []
+        if not rows:
+            continue
+        lines.append(f"{weekday_label(day)} {day.isoformat()}")
+        for card in rows:
+            lines.append(f"- id: {card.get('event_id')}")
+            lines.append(f"  entity: {card.get('entity') or ''}")
+            body = " ".join(str(card.get("body") or "").split())
+            lines.append(f"  body: {body}")
+    return "\n".join(lines) if len(lines) > 1 else "EVENTS BY DATE:\n(no daily events)"
+
+
 def _card_encode_text(card: Mapping[str, Any]) -> str:
     return " ".join(
         p
@@ -777,7 +804,8 @@ def _build_analyst_prompt(
         "or decisions). Each chain needs ≥2 distinct step dates. Seq 1 has "
         "no via. Later steps via evolves or invalidates (optional to_seq). "
         "Fill label; keep skeleton event_id/date/seq. Drop one-day chains. "
-        "Do not emit wrap-ups, entities, legend, conflicts, or hypotheses."
+        "Also return entities as a canonical list (canonical name plus aliases). "
+        "Do not emit wrap-ups, legend, conflicts, or hypotheses."
     )
     base = (
         f"You are weekly Worker 1 thread analyst ({purpose}).\n\n"
@@ -1525,6 +1553,7 @@ def _run_analyst(
     allowed_span_ids: set[str] | None = None,
     candidate_layout: str = "",
     seed_args: Mapping[str, Any] | None = None,
+    captured: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[SpanCandidate]]:
     """Force submit then patch so a second submit cannot wipe a half-valid thread."""
     _ = call_llm, allowed_span_ids, role
@@ -1608,6 +1637,9 @@ def _run_analyst(
             week_dates=iso_week_dates(week_key),
         )
         if not errors:
+            if captured is not None:
+                captured.clear()
+                captured.update(previous_args)
             log(f"weekly {purpose} ok {week_key} threads={len(spans)}")
             return [], spans
         last_errors = errors
@@ -1755,21 +1787,15 @@ def _run_summary_worker(
     call_llm_tools: CallLlmToolsFn | None = None,
     log: LogFn | None = None,
 ) -> tuple[WeeklySummaryItem, ...]:
-    """Build Chronicle rows from leftover event titles plus cross-day threads.
+    """Chronicle rows from Mon–Sat wrap-up bullets plus cross-day outcomes.
 
-    Weekdays must be ISO-week days only; an Aug 22 Saturday must not paint on W35.
-    Wrap-up dashes must not become summary: a killed last LLM hop used to dump
-    those trailers over a week that already had event cards.
+    Event Outcome titles used to become the Approve tab when Worker 1 returned one card.
+    Sunday wrap-up is left for the 00:00 leftover patch.
     """
-    del call_llm_tools, intra
+    del call_llm_tools, event_blocks
     _log: LogFn = log or (lambda _msg: None)
     in_week = set(iso_week_dates(week_key))
-    in_cross: set[str] = set()
-    for thread in cross:
-        in_cross.update(str(eid).strip() for eid in thread.related_event_ids if str(eid).strip())
-        in_cross.update(
-            str(step.event_id).strip() for step in thread.steps if str(step.event_id).strip()
-        )
+    sunday = next((d for d in in_week if d.weekday() == 6), None)
     keyed: list[tuple[date, int, WeeklySummaryItem]] = []
     for thread in cross:
         days = [step.date for step in thread.steps if step.date in in_week]
@@ -1788,44 +1814,26 @@ def _run_summary_worker(
             text = label or outcome_text
         if not text:
             continue
-        keyed.append(
-            (
-                min(days),
-                0,
-                WeeklySummaryItem(text=text, weekdays=weekdays),
+        keyed.append((min(days), 0, WeeklySummaryItem(text=text, weekdays=weekdays)))
+    for row in intra:
+        if sunday is not None and row.date == sunday:
+            continue
+        if row.date not in in_week or row.empty:
+            continue
+        for line in str(row.text or "").splitlines():
+            text = line.strip().lstrip("-").strip()
+            if not text:
+                continue
+            keyed.append(
+                (
+                    row.date,
+                    1,
+                    WeeklySummaryItem(
+                        text=text,
+                        weekdays=_order_weekdays((row.weekday,)),
+                    ),
+                )
             )
-        )
-    for block in event_blocks or ():
-        fm = block.get("frontmatter") or {}
-        if str(fm.get("type") or "").strip().casefold() != "event":
-            continue
-        eid = str(fm.get("id") or "").strip()
-        if not eid or eid in in_cross:
-            continue
-        vf = str(fm.get("valid_from") or "").strip()[:10]
-        try:
-            day = date.fromisoformat(vf)
-        except ValueError:
-            continue
-        if day not in in_week:
-            continue
-        title = _event_title_summary(
-            str(block.get("body") or ""),
-            predicate=str(fm.get("predicate") or ""),
-            entity=str(fm.get("entity") or ""),
-        )
-        if not title.strip():
-            continue
-        keyed.append(
-            (
-                day,
-                1,
-                WeeklySummaryItem(
-                    text=title,
-                    weekdays=_order_weekdays((weekday_label(day),)),
-                ),
-            )
-        )
     keyed.sort(key=lambda item: (item[0], item[1]))
     items = tuple(item[2] for item in keyed)
     _log(f"weekly summary assembled {week_key} rows={len(items)}")
@@ -2097,6 +2105,55 @@ def _blocks_to_hypothesis_items(
     return tuple(items)
 
 
+def _entities_from_tool_args(
+    args: Mapping[str, Any],
+    week_dates: Sequence[date],
+) -> tuple[WeeklyEntity, ...]:
+    """Turn the thread tool's canonical list into WeeklyEntity rows.
+
+    Missing or empty entities fall through to the daily roster so a thread-only
+    submit still has a roster.
+    """
+    raw = args.get("entities")
+    if not isinstance(raw, list) or not raw:
+        return ()
+    try:
+        from .weekly_json import normalize_entity_key
+    except ImportError:  # pragma: no cover
+        from weekly_json import normalize_entity_key  # type: ignore
+    first = week_dates[0] if week_dates else None
+    last = week_dates[-1] if week_dates else None
+    out: list[WeeklyEntity] = []
+    seen: set[str] = set()
+    for item in raw:
+        if isinstance(item, str):
+            canonical = item.strip()
+            aliases: tuple[str, ...] = ()
+        elif isinstance(item, Mapping):
+            canonical = str(item.get("canonical") or "").strip()
+            aliases = tuple(
+                str(a).strip()
+                for a in (item.get("aliases") or [])
+                if str(a).strip()
+            )
+        else:
+            continue
+        key = normalize_entity_key(canonical)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            WeeklyEntity(
+                key=key,
+                canonical=canonical,
+                aliases=aliases,
+                first_seen=first,
+                last_seen=last,
+            )
+        )
+    return tuple(out)
+
+
 def run_parallel_worker1(
     week_key: str,
     files: Sequence[Path],
@@ -2106,10 +2163,10 @@ def run_parallel_worker1(
     log: LogFn | None = None,
     reason: str = "",
 ) -> Worker1Result:
-    """Build one week's payload so generate can dump YAML without a Distill document.
+    """Build the week from extracted daily events plus one thread/entity LLM call.
 
-    Intra and Chronicle summary come from in-memory event cards so wrap-up trailers
-    on dailies cannot overwrite a week that already extracted events.
+    Intra-day and Chronicle come from Mon–Sat wrap-up, not rendered event titles.
+    Sunday leftover is filled later by patch_sunday_evening_week.
     """
     _log: LogFn = log or (lambda _msg: None)
     reason_bit = f" reason={reason}" if reason else ""
@@ -2121,84 +2178,13 @@ def run_parallel_worker1(
         f"{[d.isoformat() for d in active_days]}{reason_bit}"
     )
 
-    purposes_called: list[str] = []
-    fallback_days: list[date] = []
-    purpose = EVENT_WORKER_PURPOSES[0]
-    purposes_called.append(purpose)
-    worker_errs: list[str] = []
-    try:
-        event_worker_blocks, used_fallback, worker_errs = _run_event_worker(
-            week_key=week_key,
-            purpose=purpose,
-            days=active_days,
-            by_day=by_day,
-            call_llm=call_llm,
-            call_llm_tools=call_llm_tools,
-            log=_log,
-        )
-    except Exception as exc:  # noqa: BLE001
-        _log(f"weekly {purpose} future error {week_key}: {exc}")
-        event_worker_blocks = _fallback_events_from_dailies(
-            by_day, active_days, purpose=purpose
-        )
-        used_fallback = True
-        worker_errs = [str(exc)]
-
-    if used_fallback:
-        fallback_days.extend(active_days)
-
-    event_blocks, legend = merge_event_blocks(week_dates, [event_worker_blocks])
-    mem_to_day = _mem_id_to_daily_file_day(by_day)
-    event_blocks = _stamp_event_blocks_to_daily_file_day(event_blocks, mem_to_day)
-
-    # Never silently drop an active day: cover gaps with bounded fallback events.
-    covered_days: set[date] = set()
-    for block in event_blocks:
-        fm = block.get("frontmatter") or {}
-        vf = str(fm.get("valid_from") or "").strip()
-        try:
-            covered_days.add(date.fromisoformat(vf))
-        except ValueError:
-            continue
-    missing_days = [d for d in active_days if d not in covered_days]
-    if missing_days:
-        _log(
-            f"weekly worker1 covering missing active days {week_key}: "
-            f"{[d.isoformat() for d in missing_days]}{reason_bit}"
-        )
-        gap_blocks = _fallback_events_from_dailies(
-            by_day, missing_days, purpose="worker1_day_cover"
-        )
-        event_blocks, legend = merge_event_blocks(
-            week_dates, [event_blocks, gap_blocks]
-        )
-        event_blocks = _stamp_event_blocks_to_daily_file_day(event_blocks, mem_to_day)
-        fallback_days.extend(missing_days)
-
-    day_briefs = _day_briefs_from_events(week_dates, event_blocks)
-    event_ids = [
-        str((b.get("frontmatter") or {}).get("id") or "").strip()
-        for b in event_blocks
-        if str((b.get("frontmatter") or {}).get("id") or "").strip()
-    ]
-    event_id_set = set(event_ids)
-
+    purposes_called: list[str] = ["worker1_thread"]
     daily_cards = _collect_daily_event_cards(by_day, week_dates)
-    clusters = _score_event_clusters(daily_cards)
-    candidate_layout = format_thread_candidate_layout(daily_cards, clusters)
-    seed_args = thread_skeleton_args(clusters)
-    daily_event_ids = {str(c["event_id"]) for c in daily_cards}
-    thread_allowed = daily_event_ids if daily_event_ids else (
-        event_id_set | set(legend.values())
-    )
-    _log(
-        f"weekly worker1_thread candidates {week_key} "
-        f"daily_events={len(daily_cards)} clusters={len(clusters)}"
-    )
-
-    span_candidates: list[SpanCandidate] = []
+    candidate_layout = _format_events_by_date(daily_cards, week_dates)
+    legend = {i + 1: str(card["event_id"]) for i, card in enumerate(daily_cards)}
+    thread_allowed = {str(card["event_id"]) for card in daily_cards}
+    captured: dict[str, Any] = {}
     cross_day: list[SpanCandidate] = []
-    purposes_called.append("worker1_thread")
     try:
         _blocks, cross_day = _run_analyst(
             role="thread",
@@ -2211,7 +2197,7 @@ def run_parallel_worker1(
             call_llm_tools=call_llm_tools,
             log=_log,
             candidate_layout=candidate_layout,
-            seed_args=seed_args,
+            captured=captured,
         )
     except Exception as exc:  # noqa: BLE001
         _log(f"weekly worker1_thread future error {week_key}: {exc}")
@@ -2223,35 +2209,20 @@ def run_parallel_worker1(
         except ImportError:  # pragma: no cover
             from weekly_json import normalize_entity_key  # type: ignore
         grouped: dict[str, list[tuple[date, str, str, str]]] = {}
-        in_week = set(iso_week_dates(week_key))
-        for block in event_blocks:
-            fm = block.get("frontmatter") or {}
-            if str(fm.get("type") or "").strip().casefold() != "event":
-                continue
-            surface = str(fm.get("entity") or "").strip()
+        for card in daily_cards:
+            surface = str(card.get("entity") or "").strip()
             key = normalize_entity_key(surface)
-            if not key:
-                continue
-            vf = str(fm.get("valid_from") or "").strip()[:10]
-            try:
-                day = date.fromisoformat(vf)
-            except ValueError:
-                continue
-            if day not in in_week:
-                continue
-            eid = _daily_event_id_from_block(fm)
-            if not eid:
-                continue
-            if daily_event_ids and eid not in daily_event_ids:
+            day = card.get("date")
+            eid = str(card.get("event_id") or "").strip()
+            if not key or not isinstance(day, date) or not eid:
                 continue
             title = _event_title_summary(
-                str(block.get("body") or ""),
-                predicate=str(fm.get("predicate") or ""),
+                str(card.get("body") or ""),
                 entity=surface,
             )
             grouped.setdefault(key, []).append((day, eid, title, surface))
         n = 0
-        for key, rows in grouped.items():
+        for _key, rows in grouped.items():
             dates = {row[0] for row in rows}
             if len(dates) < 2:
                 continue
@@ -2279,66 +2250,48 @@ def run_parallel_worker1(
                 )
             )
 
-    intra_rows: list[IntraDayThread] = []
-    briefs_by_day = {brief.day: brief for brief in day_briefs}
-    for day in week_dates:
-        brief = briefs_by_day.get(day)
-        titles = [
-            str(sentence.title or sentence.text).strip()
-            for sentence in (brief.sentences if brief else ())
-            if str(sentence.title or sentence.text).strip()
+    intra_rows = list(_intra_day_from_dailies(week_dates, by_day))
+    if reason != "sunday-evening-patch":
+        sunday = next((d for d in week_dates if d.weekday() == 6), None)
+        intra_rows = [
+            replace(row, text="", empty=True) if sunday is not None and row.date == sunday else row
+            for row in intra_rows
         ]
-        text = "\n".join(f"- {title}" for title in titles)
-        intra_rows.append(
-            IntraDayThread(
-                date=day,
-                weekday=weekday_label(day),
-                source_field="events",
-                text=text,
-                empty=not bool(text.strip()),
-            )
-        )
     intra = tuple(intra_rows)
-    entities = _entities_from_dailies(week_dates, by_day)
+    entities = _entities_from_tool_args(captured, week_dates) or _entities_from_dailies(
+        week_dates, by_day
+    )
     cross_day = _stamp_invalidates_from_supersedes(cross_day, by_day)
     cross_day = _fill_thread_entity_keys(cross_day, entities)
 
     payload = WeeklyReviewPayload(
-        days=tuple(day_briefs),
+        days=(),
         conflicts=(),
         hypotheses=(),
-        span_candidates=tuple(span_candidates),
+        span_candidates=(),
         legend=dict(legend),
         week_key=week_key,
         cross_day_thread=tuple(cross_day),
         intra_day_thread=intra,
         entities=entities,
     )
-
     summary_items = _run_summary_worker(
         week_key=week_key,
         intra=intra,
         cross=tuple(cross_day),
-        event_blocks=event_blocks,
         log=_log,
     )
     payload = replace(payload, summary=summary_items)
-
-    errors: list[str] = list(worker_errs)
-    if not event_blocks:
-        errors.append("no event blocks after parallel Worker 1")
-    if fallback_days:
-        _log(
-            f"weekly worker1 bounded fallback days "
-            f"{[d.isoformat() for d in sorted(set(fallback_days))]}{reason_bit}"
-        )
-
+    _log(
+        f"weekly worker1_thread candidates {week_key} "
+        f"daily_events={len(daily_cards)}{reason_bit}"
+    )
     return Worker1Result(
-        blocks=list(event_blocks),
+        blocks=[],
         legend=legend,
         payload=payload,
-        errors=errors,
-        fallback_days=tuple(sorted(set(fallback_days))),
+        errors=[],
+        fallback_days=(),
         purposes_called=tuple(purposes_called),
         cross_day_thread=tuple(cross_day),
         entities=entities,

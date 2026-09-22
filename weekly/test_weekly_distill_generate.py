@@ -337,13 +337,9 @@ def test_single_event_worker_purpose_called(tmp_path, monkeypatch):
     event_purposes = sorted(
         {c["purpose"] for c in calls if str(c["purpose"]).startswith("worker1_event")}
     )
-    assert event_purposes == ["worker1_event"]
-    assert sum(1 for c in calls if c["purpose"] == "worker1_event") >= 1
-    # Analysts still run after the single event worker.
-    assert {c["purpose"] for c in calls} >= {
-        "worker1_event",
-        "worker1_thread",
-    }
+    assert event_purposes == []
+    assert sum(1 for c in calls if c["purpose"] == "worker1_thread") >= 1
+    assert {c["purpose"] for c in calls} >= {"worker1_thread"}
     assert not any(c["purpose"] == "worker1_span" for c in calls)
 
 
@@ -407,14 +403,9 @@ def test_all_active_dates_represented_mon_sun_order(tmp_path, monkeypatch):
         log=lambda _m: None,
     )
     active = {date.fromisoformat(d) for d in days}
-    covered = {
-        date.fromisoformat(str((b.get("frontmatter") or {}).get("valid_from") or ""))
-        for b in w1.blocks
-        if str((b.get("frontmatter") or {}).get("type") or "").casefold() == "event"
-    }
+    covered = {row.date for row in w1.payload.intra_day_thread}
     assert active <= covered
-    # Payload days are Monday..Sunday ordered
-    assert [d.day.isoformat() for d in w1.payload.days] == [
+    assert [row.date.isoformat() for row in w1.payload.intra_day_thread] == [
         "2026-06-29",
         "2026-06-30",
         "2026-07-01",
@@ -434,8 +425,8 @@ def test_all_active_dates_represented_mon_sun_order(tmp_path, monkeypatch):
 def test_analysts_receive_merged_event_context(tmp_path, monkeypatch):
     weekly = _load_weekly(tmp_path, monkeypatch)
     files = [
-        _write_daily(tmp_path, "2026-06-29"),
-        _write_daily(tmp_path, "2026-06-30"),
+        _write_daily(tmp_path, "2026-06-29", block_type="event"),
+        _write_daily(tmp_path, "2026-06-30", block_type="event"),
     ]
     analyst_prompts: dict[str, str] = {}
 
@@ -477,9 +468,10 @@ def test_analysts_receive_merged_event_context(tmp_path, monkeypatch):
     assert set(analyst_prompts) == {"worker1_thread"}
     for purpose, prompt in analyst_prompts.items():
         assert "MERGED EVENTS" not in prompt, purpose
+        assert "EVENTS BY DATE" in prompt, purpose
         assert "CANDIDATE INDEX" in prompt, purpose
         assert "CITATION LEGEND" in prompt, purpose
-        assert "evt-" in prompt or "2026-06" in prompt or "mem-" in prompt, purpose
+        assert "mem-2026-06-29-a" in prompt, purpose
 
 
 def test_event_worker_failure_bounded_fallback_keeps_day(tmp_path, monkeypatch):
@@ -504,60 +496,45 @@ def test_event_worker_failure_bounded_fallback_keeps_day(tmp_path, monkeypatch):
     _purpose_keyed_llm(weekly, monkeypatch, handler)
     result = weekly._generate_weekly_content("2026-W27", files, reason="test")
     assert result is not None
-    # All three active dates still appear (bounded fallback covers the week)
     assert "2026-06-29" in result
     assert "2026-06-30" in result
     assert "2026-07-01" in result
-    assert any("fallback" in line.casefold() for line in logs)
 
 
 def test_event_workers_never_emit_non_event_types(tmp_path, monkeypatch):
-    """Forbidden types from an event worker are rejected; fallback keeps the day."""
+    """The thread prompt lists daily events, not fact cards."""
     weekly = _load_weekly(tmp_path, monkeypatch)
     day = "2026-06-30"
-    files = [_write_daily(tmp_path, day)]
-    event_prompts: list[str] = []
+    path = _write_daily(
+        tmp_path, day, mem_id=f"mem-{day}-event", block_type="event"
+    )
+    fact_id = f"mem-{day}-fact"
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + (
+            f"\n---\nid: {fact_id}\ntype: fact\nentity: FactOnly\n"
+            "confidence: high\nstatus: candidate\nsources: [session s1]\n---\n"
+            "Fact must not be a weekly event.\n"
+        ),
+        encoding="utf-8",
+    )
+    thread_prompts: list[str] = []
 
     def handler(prompt: str, purpose: str, force_tool_name: str = "") -> object:
-        if purpose.startswith("worker1_event"):
-            event_prompts.append(prompt)
-            # Deliberately omit required event slots — must fail validation.
-            return {
-                "tool_name": force_tool_name or "submit_weekly_event",
-                "tool_args": {
-                    "events": [
-                        {
-                            "entity": "X",
-                            "predicate": "bad",
-                            "participants": [],
-                            "valid_from": day,
-                            "valid_to": day,
-                            "confidence": "high",
-                            "sources": ["session s1"],
-                            "related": [],
-                            "beginning": "x",
-                            "course": "y",
-                            "outcome": "z",
-                        }
-                    ]
-                },
-            }
         if purpose == "worker1_thread":
+            thread_prompts.append(prompt)
             return _empty_analyst(purpose, force_tool_name)
         if purpose == "worker2_brief":
             return _brief_ok()
         return ""
 
     _purpose_keyed_llm(weekly, monkeypatch, handler)
-    result = weekly._generate_weekly_content("2026-W27", files, reason="test")
+    result = weekly._generate_weekly_content("2026-W27", [path], reason="test")
     assert result is not None
     assert day in result
-    # Prompts instruct event-only contract
-    assert event_prompts
-    for prompt in event_prompts:
-        if "worker1_event" in prompt or "event extractor" in prompt.casefold():
-            lowered = prompt.casefold()
-            assert "submit_weekly_event" in lowered or "type:event" in lowered.replace(" ", "")
+    assert thread_prompts
+    assert f"mem-{day}-event" in thread_prompts[0]
+    assert f"- id: {fact_id}" not in thread_prompts[0]
     assert "fact-bad" not in result
 
 
@@ -592,17 +569,16 @@ def test_generate_weekly_content_fills_brief_after_w1(tmp_path, monkeypatch):
     assert "cross-day-thread" in result
     assert "intra-day-thread" in result
     assert "summary:" in result
-    assert "source_field: events" in result
-    assert "Monday wrap-up only" not in result
+    assert "source_field: day_wrapup" in result
+    assert "Monday wrap-up only" in result
     assert "summary: []" not in result
     assert "legend:" not in result
     assert "Conflict" not in result
     assert "Hypothesis" not in result
     assert not any(c["purpose"] == "worker2_brief" for c in calls)
     assert not any(c["purpose"] == "worker1_span" for c in calls)
-    assert any(
-        str(c["purpose"]).startswith("worker1_event") for c in calls
-    )
+    assert not any(str(c["purpose"]).startswith("worker1_event") for c in calls)
+    assert any(c["purpose"] == "worker1_thread" for c in calls)
 
 
 def test_generate_weekly_content_soft_fails_brief_keeps_distill(tmp_path, monkeypatch):
@@ -693,7 +669,7 @@ def _w1_tools(handler):
     return tools
 
 
-def test_intra_and_summary_from_events_not_wrapup(tmp_path, monkeypatch):
+def test_intra_and_summary_from_wrapup_not_event_titles(tmp_path, monkeypatch):
     weekly = _load_weekly(tmp_path, monkeypatch)
     files = [
         _write_daily(tmp_path, "2026-06-29", wrapup="- Monday wrap-up only."),
@@ -720,23 +696,23 @@ def test_intra_and_summary_from_events_not_wrapup(tmp_path, monkeypatch):
     intra = {row.date.isoformat(): row for row in w1.payload.intra_day_thread}
     mon = intra["2026-06-29"]
     tue = intra["2026-06-30"]
-    assert mon.source_field == "events"
-    assert tue.source_field == "events"
-    assert "Monday wrap-up only" not in mon.text
-    assert "Fact recorded" in mon.text
-    assert tue.empty is False
+    assert mon.source_field == "day_wrapup"
+    assert tue.source_field == "day_wrapup"
+    assert "Monday wrap-up only" in mon.text
+    assert "Fact recorded" not in mon.text
+    assert tue.empty is True
     texts = " ".join(item.text for item in w1.payload.summary)
     weekdays = {name for item in w1.payload.summary for name in item.weekdays}
-    assert "Monday wrap-up only" not in texts
-    assert "Tuesday" in weekdays
+    assert "Monday wrap-up only" in texts
+    assert "Tuesday" not in weekdays
     assert "Monday" in weekdays
 
 
 def test_summary_dedup_when_event_in_cross_thread(tmp_path, monkeypatch):
     weekly = _load_weekly(tmp_path, monkeypatch)
     files = [
-        _write_daily(tmp_path, "2026-06-29"),
-        _write_daily(tmp_path, "2026-06-30"),
+        _write_daily(tmp_path, "2026-06-29", block_type="event", wrapup="- leftover prompt"),
+        _write_daily(tmp_path, "2026-06-30", block_type="event"),
     ]
 
     def handler(prompt: str, purpose: str, force_tool_name: str = "") -> object:
@@ -778,13 +754,13 @@ def test_summary_dedup_when_event_in_cross_thread(tmp_path, monkeypatch):
                                 {
                                     "seq": 1,
                                     "date": "2026-06-29",
-                                    "event_id": "evt-2026-06-29",
+                                    "event_id": "mem-2026-06-29-a",
                                     "text": "Transcribe the card.",
                                 },
                                 {
                                     "seq": 2,
                                     "date": "2026-06-30",
-                                    "event_id": "evt-2026-06-30",
+                                    "event_id": "mem-2026-06-30-a",
                                     "text": "Combine pages.",
                                     "via": "evolves",
                                 },
@@ -813,15 +789,16 @@ def test_summary_dedup_when_event_in_cross_thread(tmp_path, monkeypatch):
     assert any("Qixi greeting card" in t and "Card text shipped" in t for t in texts)
     leftover = [t for t in texts if "Qixi greeting card" not in t]
     assert leftover, texts
-    assert leftover[0].startswith("Fact recorded")
+    assert any(t.startswith("leftover prompt") for t in leftover)
+    assert not any(t.startswith("Fact recorded") for t in texts)
     assert "Card text shipped" in joined
 
 
 def test_entity_span_fallback_when_thread_llm_empty(tmp_path, monkeypatch):
     weekly = _load_weekly(tmp_path, monkeypatch)
     files = [
-        _write_daily(tmp_path, "2026-06-29"),
-        _write_daily(tmp_path, "2026-06-30"),
+        _write_daily(tmp_path, "2026-06-29", block_type="event"),
+        _write_daily(tmp_path, "2026-06-30", block_type="event"),
     ]
     days = ("2026-06-29", "2026-06-30")
 
@@ -852,8 +829,8 @@ def test_entity_span_fallback_when_thread_llm_empty(tmp_path, monkeypatch):
 def test_entity_span_fallback_does_not_replace_analyst_threads(tmp_path, monkeypatch):
     weekly = _load_weekly(tmp_path, monkeypatch)
     files = [
-        _write_daily(tmp_path, "2026-06-29"),
-        _write_daily(tmp_path, "2026-06-30"),
+        _write_daily(tmp_path, "2026-06-29", block_type="event"),
+        _write_daily(tmp_path, "2026-06-30", block_type="event"),
     ]
     days = ("2026-06-29", "2026-06-30")
 
@@ -874,13 +851,13 @@ def test_entity_span_fallback_does_not_replace_analyst_threads(tmp_path, monkeyp
                                 {
                                     "seq": 1,
                                     "date": "2026-06-29",
-                                    "event_id": "evt-2026-06-29",
+                                    "event_id": "mem-2026-06-29-a",
                                     "text": "first",
                                 },
                                 {
                                     "seq": 2,
                                     "date": "2026-06-30",
-                                    "event_id": "evt-2026-06-30",
+                                    "event_id": "mem-2026-06-30-a",
                                     "text": "second",
                                     "via": "evolves",
                                 },
@@ -935,12 +912,11 @@ def test_generate_pipeline_two_llm_purposes_and_elapsed(tmp_path, monkeypatch):
     )
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
     assert elapsed_ms > 0
-    assert "worker1_event" in w1.purposes_called
+    assert "worker1_event" not in w1.purposes_called
     assert "worker1_thread" in w1.purposes_called
     assert "worker1_summary" not in w1.purposes_called
     assert "worker1_summary" not in tool_purposes
     assert set(p for p in tool_purposes if p.startswith("worker1_")) <= {
-        "worker1_event",
         "worker1_thread",
     }
 
@@ -972,17 +948,17 @@ def test_summary_runs_when_monday_wrapup_and_other_days_empty(tmp_path, monkeypa
     assert "worker1_summary" not in w1.purposes_called
     assert w1.payload.summary
     texts = " ".join(item.text for item in w1.payload.summary)
-    assert "Monday wrap-up only" not in texts
+    assert "Monday wrap-up only" in texts
     weekdays = {name for item in w1.payload.summary for name in item.weekdays}
     assert "Monday" in weekdays
-    assert "Tuesday" in weekdays
+    assert "Tuesday" not in weekdays
 
 
 def test_summary_runs_when_wrapups_empty_but_cross_day_exists(tmp_path, monkeypatch):
     weekly = _load_weekly(tmp_path, monkeypatch)
     files = [
-        _write_daily(tmp_path, "2026-06-29"),
-        _write_daily(tmp_path, "2026-06-30"),
+        _write_daily(tmp_path, "2026-06-29", block_type="event"),
+        _write_daily(tmp_path, "2026-06-30", block_type="event"),
     ]
     days = ("2026-06-29", "2026-06-30")
 
@@ -1003,13 +979,13 @@ def test_summary_runs_when_wrapups_empty_but_cross_day_exists(tmp_path, monkeypa
                                 {
                                     "seq": 1,
                                     "date": "2026-06-29",
-                                    "event_id": "evt-2026-06-29",
+                                    "event_id": "mem-2026-06-29-a",
                                     "text": "first",
                                 },
                                 {
                                     "seq": 2,
                                     "date": "2026-06-30",
-                                    "event_id": "evt-2026-06-30",
+                                    "event_id": "mem-2026-06-30-a",
                                     "text": "second",
                                     "via": "evolves",
                                 },
@@ -1059,8 +1035,7 @@ def test_summary_skipped_when_all_intra_and_cross_empty(tmp_path, monkeypatch):
         log=lambda _m: None,
     )
     assert "worker1_summary" not in w1.purposes_called
-    assert w1.payload.summary
-    assert all("Monday wrap-up only" not in item.text for item in w1.payload.summary)
+    assert w1.payload.summary == ()
 
 
 def test_strips_related_only_id_keeps_claim_card(tmp_path, monkeypatch):
@@ -1097,22 +1072,11 @@ def test_strips_related_only_id_keeps_claim_card(tmp_path, monkeypatch):
         "WeeklyReviewPayload schema has no summary or brief field.\n",
         encoding="utf-8",
     )
-    args = _event_tool_args(evt_id="evt-mon", day=day, mem_id=legal)
-    args["related"] = [dangling, legal]
-    args["beginning"] = "WeeklyReviewPayload schema has no summary"
-    args["course"] = "WeeklyReviewPayload schema progress"
-    args["outcome"] = "WeeklyReviewPayload schema has no summary or brief field"
+    seen: dict[str, str] = {}
 
     def handler(prompt: str, purpose: str, force_tool_name: str = "") -> object:
-        if purpose.startswith("worker1_event"):
-            assert "CITE_ONLY" in prompt
-            assert legal in prompt.split("DAILY SOURCES")[0]
-            assert dangling not in prompt.split("DAILY SOURCES")[0]
-            return {
-                "tool_name": force_tool_name or "submit_weekly_event",
-                "tool_args": {"events": [args]},
-            }
         if purpose == "worker1_thread":
+            seen["prompt"] = prompt
             return _empty_analyst(purpose, force_tool_name)
         return ""
 
@@ -1124,14 +1088,11 @@ def test_strips_related_only_id_keeps_claim_card(tmp_path, monkeypatch):
         call_llm_tools=_w1_tools(handler),
         log=lambda _m: None,
     )
-    related = []
-    for block in result.blocks:
-        fm = block.get("frontmatter") or {}
-        if str(fm.get("type") or "").casefold() == "event":
-            related.extend(fm.get("related") or [])
-    joined = " ".join(str(x) for x in related)
-    assert legal in joined
-    assert dangling not in joined
+    prompt = seen["prompt"]
+    assert "EVENTS BY DATE" in prompt
+    assert "mem-2026-08-24-event-04689ED86657" in prompt
+    assert f"- id: {legal}" not in prompt
+    assert result.blocks == []
     assert not result.fallback_days
 
 
@@ -1172,9 +1133,9 @@ def test_agreement_exhaustion_fallback_still_runs_summary(tmp_path, monkeypatch)
         log=logs.append,
     )
     assert "worker1_summary" not in w1.purposes_called
-    assert any("fallback after failures" in line for line in logs)
+    assert not any("fallback after failures" in line for line in logs)
     assert not any("skip analysts" in line for line in logs)
-    assert "Monday wrap-up only" not in " ".join(
+    assert "Monday wrap-up only" in " ".join(
         item.text for item in w1.payload.summary
     )
 

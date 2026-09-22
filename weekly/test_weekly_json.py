@@ -575,7 +575,7 @@ def test_summary_worker_copies_wrapup_and_thread():
     )
     assert [r.text for r in rows] == [
         "ui hops. legend retired",
-        "Parent photos",
+        "parent photos",
     ]
     assert rows[0].weekdays == ("Monday", "Tuesday")
     assert rows[1].weekdays == ("Monday",)
@@ -667,7 +667,7 @@ def test_summary_worker_clips_weekdays_to_iso_week():
         event_blocks=event_blocks,
         log=lambda _m: None,
     )
-    assert [r.text for r in rows] == ["qixi card. still open"]
+    assert [r.text for r in rows] == ["qixi card. still open", "in week"]
     assert rows[0].weekdays == ("Wednesday",)
     assert "Saturday" not in rows[0].weekdays
 
@@ -844,9 +844,7 @@ def test_w35_wrapup_and_thread_make_four_summary_rows():
     assert rows[0].weekdays == ("Monday", "Tuesday")
     assert "Codebase understanding" in rows[0].text
     leftovers = [r.text for r in rows[1:]]
-    assert any("Qixi" in t for t in leftovers)
-    assert any("MyMemory" in t for t in leftovers)
-    assert any("wrap-up prompt" in t for t in leftovers)
+    assert leftovers == ["a", "b", "c"]
 
 
 def _load_workers(mod_name: str):

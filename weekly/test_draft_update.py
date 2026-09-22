@@ -126,6 +126,122 @@ def test_generate_week_rescan_rewrites_existing_weekly_md(tmp_path, monkeypatch)
     assert reloaded.summary == ()
 
 
+def test_rescan_and_slash_overlay_sunday_leftover(tmp_path, monkeypatch):
+    """Re-scan and /weekly update fold post-16:00 Sunday cards into the written week."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    actions = _load_weekly_actions()
+    monkeypatch.setattr(actions.weekly, "hermes_local_today", lambda: date(2026, 9, 20))
+    _write_daily(tmp_path, "2026-09-14", "Monday source")
+    sunday = tmp_path / "memories" / "staging" / "daily" / "2026-09-20.md"
+    sunday.write_text(
+        "---\n"
+        "id: mem-2026-09-20-event-FRENCH01\n"
+        "type: event\n"
+        "entity: Express Entry French Policy\n"
+        "generated_at: '2026-09-20T23:55:34+08:00'\n"
+        "valid_from: 2026-09-20\n"
+        "confidence: high\n"
+        "status: candidate\n"
+        "sources: [test]\n"
+        "---\n"
+        "Outcome: French NCLC 7 is highest ROI.\n",
+        encoding="utf-8",
+    )
+    from weekly_event_schema import IntraDayThread, WeeklyReviewPayload, WeeklySummaryItem
+
+    actions.weekly._last_weekly_payload = WeeklyReviewPayload(
+        days=(),
+        week_key="2026-W38",
+        intra_day_thread=(
+            IntraDayThread(
+                date=date(2026, 9, 14),
+                weekday="Monday",
+                source_field="day_wrapup",
+                text="- Monday wrap-up stays",
+                empty=False,
+            ),
+            IntraDayThread(
+                date=date(2026, 9, 20),
+                weekday="Sunday",
+                source_field="day_wrapup",
+                text="",
+                empty=True,
+            ),
+        ),
+        summary=(WeeklySummaryItem(text="Monday wrap-up stays", weekdays=("Monday",)),),
+    )
+    monkeypatch.setattr(
+        actions.weekly,
+        "_generate_weekly_content",
+        lambda *_a, **_k: actions.weekly.weekly_json.dump_yaml(
+            actions.weekly._last_weekly_payload
+        ),
+    )
+    monkeypatch.setattr(
+        actions.weekly,
+        "_call_weekly_llm_tools",
+        lambda *_a, **_k: {
+            "tool_name": "submit_weekly_thread",
+            "tool_args": {"cross-day-thread": [], "entities": []},
+            "failed": False,
+        },
+    )
+    monkeypatch.setattr(actions, "_refresh_chronicle_after_generate", lambda *_a, **_k: None)
+    monkeypatch.setattr(actions, "run_hot_health", lambda *, reason="bridge": {})
+
+    scanned = actions.generate_week("2026-W38", reason="rescan")
+    assert scanned["outcome"] == "generated"
+    text = Path(scanned["path"]).read_text(encoding="utf-8")
+    assert "French NCLC 7" in text
+    assert "Monday wrap-up stays" in text
+    assert "French NCLC 7" in scanned["brief"]
+
+    actions.weekly._last_weekly_payload = WeeklyReviewPayload(
+        days=(),
+        week_key="2026-W38",
+        intra_day_thread=(
+            IntraDayThread(
+                date=date(2026, 9, 14),
+                weekday="Monday",
+                source_field="day_wrapup",
+                text="- Monday wrap-up stays",
+                empty=False,
+            ),
+            IntraDayThread(
+                date=date(2026, 9, 20),
+                weekday="Sunday",
+                source_field="day_wrapup",
+                text="",
+                empty=True,
+            ),
+        ),
+        summary=(WeeklySummaryItem(text="Monday wrap-up stays", weekdays=("Monday",)),),
+    )
+    slashed = actions.generate_week("2026-W38", reason="update")
+    slash_text = Path(slashed["path"]).read_text(encoding="utf-8")
+    assert "French NCLC 7" in slash_text
+    assert "Monday wrap-up stays" in slash_text
+
+    actions.weekly._last_weekly_payload = WeeklyReviewPayload(
+        days=(),
+        week_key="2026-W38",
+        intra_day_thread=(
+            IntraDayThread(
+                date=date(2026, 9, 14),
+                weekday="Monday",
+                source_field="day_wrapup",
+                text="- Monday wrap-up stays",
+                empty=False,
+            ),
+        ),
+        summary=(WeeklySummaryItem(text="Monday wrap-up stays", weekdays=("Monday",)),),
+    )
+    plain = actions.generate_week("2026-W38", reason="test")
+    plain_text = Path(plain["path"]).read_text(encoding="utf-8")
+    assert "French NCLC 7" not in plain_text
+    assert "Monday wrap-up stays" in plain_text
+
+
 def test_digest_staleness_false_right_after_generate_then_true_after_daily_touch(
     tmp_path, monkeypatch
 ):

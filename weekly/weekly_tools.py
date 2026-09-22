@@ -207,8 +207,20 @@ def submit_weekly_thread_schema(
     """Lock event_id to this week's daily event mem-ids when provided so the model cannot mint w-evt-*."""
     schema = _schema(
         "submit_weekly_thread",
-        "Submit cross-day-thread chains. Copy event_id from the candidate index. Do not invent wrap-ups, entities, or legend.",
+        "Submit canonical entities and cross-day-thread chains. Copy event_id from the candidate index. Do not invent wrap-ups or legend.",
         {
+            "entities": {
+                "type": "array",
+                "description": "Canonical entity roster for the week.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "canonical": {"type": "string"},
+                        "aliases": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["canonical"],
+                },
+            },
             "cross-day-thread": {
                 "type": "array",
                 "items": {
