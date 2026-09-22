@@ -35,7 +35,9 @@ _BAND_PROCEDURES = 3
 _BAND_SUMMARY = 8
 _HELP = (
     "/monthly update [YYYY-MM]  refresh that month (default: current)\n"
-    "/monthly show [YYYY-MM]    print story bullets and D/P guidance"
+    "/monthly show [YYYY-MM]    print story bullets and D/P guidance\n"
+    "/monthly suggest YYYY-MM [YYYY-MM ...]  up to four months, then talk: "
+    "create a skill, add, replace, or remove"
 )
 
 
@@ -258,12 +260,20 @@ def month_band(limit: int = 8, staging: Path | None = None) -> str:
 
 
 def handle_monthly(raw_args: str) -> str:
-    """Slash/CLI dispatcher for update/show only — monthly has no UI/close lifecycle."""
+    """Slash/CLI dispatcher for update, show, and suggest — monthly has no UI lifecycle.
+
+    Suggest prints a list and a conversation guide. Later edits happen in chat, so this
+    dispatcher does not grow apply, drop, or confirm commands.
+    """
     tokens = str(raw_args or "").strip().split()
     if not tokens or tokens[0] in {"help", "-h", "--help"}:
         return _HELP
     cmd = tokens[0]
     rest = tokens[1] if len(tokens) > 1 else ""
+    if cmd == "suggest":
+        from monthly_suggest import suggest_from_tokens
+
+        return suggest_from_tokens(tokens[1:])
     if cmd == "update":
         key = parse_month_key(rest) if rest else date.today().strftime("%Y-%m")
         if rest and key is None:

@@ -510,3 +510,6 @@ def test_provider_tool_schemas_include_monthly():
     assert "mymemory_digest" in names
     assert "mymemory_weekly" in names
     assert "mymemory_monthly" in names
+    monthly = next(row for row in MyMemoryProvider().get_tool_schemas() if row["name"] == "mymemory_monthly")
+    assert "suggest" in monthly["description"]
+    assert "apply" not in monthly["description"]

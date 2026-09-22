@@ -268,7 +268,10 @@ class MyMemoryProvider(MemoryProvider):
         retention.run_async(reason)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        """LLM tools for digest/weekly plus recall_memory / expand_memory."""
+        """Expose digest, weekly, and monthly slash tokens, including suggest, as chat tools.
+
+        Suggest has to be on this schema or the model cannot pass YYYY-MM tokens for a month list.
+        """
         from recall.tools import TOOL_SCHEMAS
 
         return [
@@ -307,8 +310,10 @@ class MyMemoryProvider(MemoryProvider):
             {
                 "name": "mymemory_monthly",
                 "description": (
-                    "Monthly guidance: update or show. "
-                    "Pass the same tokens as /monthly (update, show, help)."
+                    "Monthly guidance: update, show, or suggest. "
+                    "suggest takes one to four YYYY-MM tokens, then the user talks "
+                    "to create a skill, add, replace, or remove. "
+                    "Pass the same tokens as /monthly (update, show, suggest, help)."
                 ),
                 "parameters": {
                     "type": "object",
