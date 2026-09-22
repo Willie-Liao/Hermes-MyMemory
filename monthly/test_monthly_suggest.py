@@ -98,45 +98,80 @@ def test_suggest_saves_numbered_items(monkeypatch):
     _month()
     seen: dict[str, object] = {}
 
+    calls: list[str] = []
+
     def fake(prompt, **kwargs):
-        seen["prompt"] = prompt
+        calls.append(str(prompt))
         seen["max_tokens"] = kwargs.get("max_tokens")
-        return {
-            "failed": False,
-            "tool_args": {
-                "items": [
-                    {
-                        "bucket": "USER.md",
-                        "text": "keep bilingual parent notes",
-                        "evidence": ["mem-2026-08-01-decision-AAAA"],
-                        "why": "repeated across the month",
-                    },
-                    {
-                        "bucket": "skill",
-                        "text": "progressive recall",
-                        "evidence": ["mem-2026-08-15-decision-SAME"],
-                        "why": "same-day id must be dropped",
-                    },
-                ]
-            },
-        }
+        bucket = "skill" if "schema: key_procedure" in prompt else "USER.md"
+        text = "progressive recall" if bucket == "skill" else "keep bilingual parent notes"
+        return {"failed": False, "tool_args": {"text": text, "bucket": bucket}}
 
     text = suggest_from_tokens(["2026-08,"], call_oneshot=fake)
     assert seen["max_tokens"] == 4096
-    prompt = str(seen["prompt"])
+    assert len(calls) == 3
+    prompt = "\n".join(calls)
     assert '"entities"' not in prompt
-    assert "repeats across more than one day" in prompt
-    assert "preference about the user" in prompt
-    assert "how Hermes must behave" in prompt
-    assert "situation they will hit again" in prompt
-    assert "cut at 200 characters" in prompt
+    assert '"summary"' not in prompt
+    assert "strength" not in prompt
+    assert "schema: key_decision" in prompt
+    assert "body: keep bilingual parent notes" in prompt
     assert "mem-2026-08-15-decision-SAME" not in prompt
-    assert "mem-2026-08-01-decision-AAAA" in prompt
+    assert "mem-2026-08-01-decision-AAAA" not in prompt
     record = json.loads(suggest_path().read_text(encoding="utf-8"))
-    assert record["items"][0]["n"] == 1
+    assert record["items"][0]["schema"] == "key_decision"
     assert record["items"][0]["bucket"] == "USER.md"
-    assert record["items"][0]["evidence"] == ["mem-2026-08-01-decision-AAAA"]
-    assert len(record["items"]) == 1
+    assert record["items"][2]["schema"] == "key_procedure"
+    assert record["items"][2]["bucket"] == "skill"
+    assert "n" not in record["items"][0]
+    assert "evidence" not in record["items"][0]
+    assert len(record["items"]) == 3
+    assert "### key_decision" in text
+    assert "suggested to add to: [USER.md]" in text
+    assert "from a number" not in text
     assert "create a skill" in text
     assert "add" in text and "replace" in text and "remove" in text
     assert "/monthly suggest apply" not in text
+
+
+def test_suggest_keeps_a_bare_item(monkeypatch):
+    _month()
+
+    def fake(prompt, **kwargs):
+        return {
+            "failed": False,
+            "tool_args": {
+                "text": "keep bilingual parent notes",
+                "bucket": "USER.md",
+            },
+        }
+
+    text = suggest_from_tokens(["2026-08"], call_oneshot=fake)
+    assert "### key_decision" in text
+    assert "suggested to add to: [USER.md]" in text
+    assert "(no suggestions)" not in text
+
+
+def test_suggest_keeps_nested_items_without_schema(monkeypatch):
+    _month()
+
+    def fake(prompt, **kwargs):
+        return {
+            "failed": False,
+            "tool_calls": [
+                (
+                    "submit_month_suggest",
+                    {
+                        "items": [
+                            {"text": "keep bilingual parent notes", "bucket": "USER.md"},
+                            {"text": "should not attach to the next body", "bucket": "HERMES.md"},
+                        ]
+                    },
+                )
+            ],
+        }
+
+    text = suggest_from_tokens(["2026-08"], call_oneshot=fake)
+    assert text.count("suggested to add to:") == 3
+    assert "should not attach" not in text
+    assert "### key_procedure" in text

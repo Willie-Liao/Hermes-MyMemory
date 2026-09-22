@@ -1,4 +1,4 @@
-"""Turn up to four month files into a numbered suggestion list and a chat guide.
+"""Turn up to four month files into a sectioned suggestion list and a chat guide.
 
 The list is the whole command. Create-skill, add, replace, and remove stay in the
 next chat turn, so this module never writes MEMORY.md, USER.md, HERMES.md, or a skill.
@@ -27,10 +27,20 @@ CallOneshot = Callable[..., dict[str, Any]]
 SUGGEST_MAX_TOKENS = 4096
 MAX_MONTHS = 4
 _BUCKETS = frozenset({"skill", "HERMES.md", "USER.md", "MEMORY.md"})
+_SCHEMAS = (
+    "cognition_change",
+    "behavior_pattern",
+    "core_progress",
+    "key_decision",
+    "key_procedure",
+    "comparison_with_last_month",
+)
+_SCHEMA_SET = frozenset(_SCHEMAS)
 GUIDE = (
     "## How to continue\n"
-    "You can say create a skill from a number, add a number into USER.md, MEMORY.md, "
-    "or HERMES.md, replace an existing entry with a number, or remove a number.\n"
+    "Name the sentence. You can ask to add that sentence into USER.md, MEMORY.md, "
+    "or HERMES.md, create a skill from that sentence, replace an existing entry with "
+    "that sentence, or remove that sentence.\n"
     "No further slash command.\n"
     "Before any write, read the target, say whether the change is a new entry, a merge "
     "into an existing entry, or a replace of a contradicting or dated entry, and show "
@@ -39,15 +49,12 @@ GUIDE = (
     "when one already covers the same trigger. Show that draft and wait for agreement too."
 )
 _PREFIX = (
-    "Read the month JSON and assign each kept row to one bucket. Cite only evidence ids present in the JSON.\n"
-    "skill: a procedure that repeats across more than one day and has a trigger and a solution. "
-    "The stored solution is one daily sentence cut at 200 characters. The evidence ids are the real steps.\n"
-    "USER.md: a preference about the user that spans more than one day, such as language, how they decide, "
-    "or how they like explanations. Portrait text is often empty; use the decision rows.\n"
+    "This body is one monthly section. schema names the section. "
+    "Fill only text and bucket for this body.\n"
+    "skill: a procedure with a trigger and a solution.\n"
+    "USER.md: a preference about the user, such as language, how they decide, or how they like explanations.\n"
     "HERMES.md: a rule for how Hermes must behave in this workspace, such as paths, tools, or write gates.\n"
-    "MEMORY.md: a situation they will hit again, such as a class, a WeChat template, or a phrase that should route to a skill. "
-    "Summary bullets are month stories and stay out of MEMORY.md.\n"
-    "Skip a row that fits none of these."
+    "MEMORY.md: a situation they will hit again, such as a class, a WeChat template, or a phrase that should route to a skill."
 )
 
 
@@ -65,7 +72,7 @@ def _default_oneshot(prompt: str, **kwargs: Any) -> dict[str, Any]:
 
 
 def suggest_path() -> Path:
-    """Keep the numbered list beside month files so a later chat turn can reload the numbers."""
+    """Keep the sectioned list beside month files so a later chat turn can reload the sentences."""
     return monthly_staging_dir() / ".suggest.json"
 
 
@@ -79,121 +86,150 @@ def _split_month_tokens(tokens: list[str]) -> list[str]:
     return parts
 
 
-def _same_day(row: Any) -> bool:
-    """Drop a row whose first and last sighting are one date so a one-day task is not proposed as a standing rule."""
-    first = str(getattr(row, "first_seen", "") or "").strip()[:10]
-    last = str(getattr(row, "last_seen", "") or "").strip()[:10]
-    return bool(first) and first == last
-
-
-def _decision_row(row: Any) -> dict[str, Any]:
-    return {
-        "id": row.id,
-        "kind": row.kind,
-        "text": row.text,
-        "context": row.context,
-        "exceptions": row.exceptions,
-        "occurrence_n": row.occurrence_n,
-        "strength": row.strength,
-        "evidence": list(row.evidence),
-        "valid_to": row.valid_to,
-        "first_seen": row.first_seen,
-        "last_seen": row.last_seen,
-    }
-
-
-def _procedure_row(row: Any) -> dict[str, Any]:
-    return {
-        "id": row.id,
-        "trigger": row.trigger,
-        "problem": row.problem,
-        "solution": row.solution,
-        "insight": row.insight,
-        "occurrence_n": row.occurrence_n,
-        "strength": row.strength,
-        "weeks": list(row.weeks),
-        "evidence": list(row.evidence),
-        "first_seen": row.first_seen,
-        "last_seen": row.last_seen,
-    }
+def _tagged(schema: str, body: str) -> dict[str, str] | None:
+    """Keep a section only when it has prose, so an empty portrait cannot look like a suggestion."""
+    text = " ".join(str(body or "").split())
+    if not text:
+        return None
+    return {"schema": schema, "body": text}
 
 
 def compact_month(payload: Any) -> dict[str, Any]:
-    """Send story, rulings, and portrait text only so entity rosters cannot drown the suggest call.
+    """Send section bodies with a schema tag so the model knows what each sentence is.
 
-    Same-day rows stay out of this object. A one-day task would otherwise look as durable
-    as a preference that lasted the month.
+    Strength, story bullets, and entity rosters stay out. A same-day decision is still a body
+    the model can assign, because dropping it left August with almost nothing to cluster.
     """
+    sections: list[dict[str, str]] = []
     image = payload.user_image
-    return {
-        "month_key": payload.key,
-        "summary": [{"text": row.text, "weeks": list(row.weeks)} for row in payload.summary],
-        "key_decisions": [_decision_row(row) for row in payload.key_decisions if not _same_day(row)],
-        "key_procedures": [_procedure_row(row) for row in payload.key_procedures if not _same_day(row)],
-        "user_image": {
-            "goal_alignment": image.goal_alignment.text,
-            "decision_preference": image.decision_preference.text,
-            "behavior_pattern": image.behavior_pattern.text,
-        },
-    }
+    for row in image.cognition_change:
+        tagged = _tagged("cognition_change", row.text)
+        if tagged:
+            sections.append(tagged)
+    pattern = _tagged("behavior_pattern", image.behavior_pattern.text)
+    if pattern:
+        sections.append(pattern)
+    for row in payload.core_progress:
+        tagged = _tagged("core_progress", row.body)
+        if tagged:
+            sections.append(tagged)
+    for row in payload.key_decisions:
+        tagged = _tagged("key_decision", row.text)
+        if tagged:
+            sections.append(tagged)
+    for row in payload.key_procedures:
+        tagged = _tagged("key_procedure", row.solution or row.problem)
+        if tagged:
+            sections.append(tagged)
+    comparison = payload.comparison_with_last_month
+    for row in comparison.changed:
+        tagged = _tagged("comparison_with_last_month", row.text)
+        if tagged:
+            sections.append(tagged)
+    for row in comparison.unchanged:
+        tagged = _tagged("comparison_with_last_month", row.text)
+        if tagged:
+            sections.append(tagged)
+    suggestion = _tagged("comparison_with_last_month", comparison.suggestion)
+    if suggestion:
+        sections.append(suggestion)
+    return {"month_key": payload.key, "sections": sections}
 
 
-def _allowed_ids(months: list[dict[str, Any]]) -> set[str]:
-    allowed: set[str] = set()
-    for month in months:
-        for row in month.get("key_decisions") or []:
-            allowed.add(str(row.get("id") or ""))
-            allowed.update(str(item) for item in (row.get("evidence") or []))
-        for row in month.get("key_procedures") or []:
-            allowed.add(str(row.get("id") or ""))
-            allowed.update(str(item) for item in (row.get("evidence") or []))
-    allowed.discard("")
-    return allowed
+def _raw_items(args: Any) -> list[Any]:
+    """Turn a nested items array or one flat text/bucket object into the same list.
+
+    Some models wrap every body in items. MiniMax returned one flat object and
+    the array path treated that as no suggestions.
+    """
+    if isinstance(args, list):
+        return args
+    if not isinstance(args, dict):
+        return []
+    nested = args.get("items")
+    if isinstance(nested, list):
+        return nested
+    if str(args.get("text") or "").strip() and str(args.get("bucket") or "").strip():
+        return [args]
+    return []
 
 
-def _clean_items(raw: Any, allowed: set[str]) -> list[dict[str, Any]]:
-    """Keep only buckets and evidence ids the prompt contained, so chat cannot quote a made-up card."""
+def _clean_items(raw: Any, sections: list[str]) -> list[dict[str, Any]]:
+    """Keep a bucketed sentence, taking the section from the body when the model omits it.
+
+    The printed heading is the monthly section. Models that only fill text and bucket
+    still group under the body they were shown.
+    """
     if not isinstance(raw, list):
         return []
     items: list[dict[str, Any]] = []
-    for row in raw:
+    for index, row in enumerate(raw):
         if not isinstance(row, dict):
             continue
+        schema = str(row.get("schema") or "").strip()
+        if schema not in _SCHEMA_SET:
+            schema = sections[index] if index < len(sections) else ""
         bucket = str(row.get("bucket") or "").strip()
         text = " ".join(str(row.get("text") or "").split())
-        evidence = [str(item) for item in (row.get("evidence") or []) if str(item) in allowed]
-        if bucket not in _BUCKETS or not text or not evidence:
+        if schema not in _SCHEMA_SET or bucket not in _BUCKETS or not text:
             continue
-        items.append(
-            {
-                "n": len(items) + 1,
-                "bucket": bucket,
-                "text": text,
-                "evidence": evidence,
-                "why": " ".join(str(row.get("why") or "").split()),
-            }
-        )
+        items.append({"schema": schema, "text": text, "bucket": bucket})
     return items
 
 
+def _items_from_result(result: dict[str, Any], sections: list[str]) -> list[dict[str, Any]]:
+    """Read every tool call, nested or flat, so a later call does not erase an earlier one."""
+    raw: list[Any] = []
+    calls = result.get("tool_calls") or []
+    if isinstance(calls, list):
+        for call in calls:
+            args = call[1] if isinstance(call, (list, tuple)) and len(call) > 1 else call
+            raw.extend(_raw_items(args))
+    if not raw:
+        raw.extend(_raw_items(result.get("tool_args")))
+    return _clean_items(raw, sections)
+
+
 def _format_reply(record: dict[str, Any]) -> str:
+    """Print each monthly section on its own, with the bucket on the following line."""
     lines = ["## Monthly suggest"]
     missing = record.get("missing") or []
     if missing:
         lines.append("missing " + ", ".join(str(item) for item in missing))
+    grouped: dict[str, list[dict[str, Any]]] = {name: [] for name in _SCHEMAS}
     for item in record.get("items") or []:
-        evidence = ", ".join(item.get("evidence") or [])
-        why = f" — {item['why']}" if item.get("why") else ""
-        lines.append(f"{item['n']}. [{item['bucket']}] {item['text']}{why} ({evidence})")
-    if not record.get("items"):
+        grouped.setdefault(str(item.get("schema") or ""), []).append(item)
+    wrote = False
+    for name in _SCHEMAS:
+        rows = grouped.get(name) or []
+        if not rows:
+            continue
+        wrote = True
+        lines.append(f"### {name}")
+        for item in rows:
+            lines.append(f"- {item['text']}")
+            lines.append(f"  suggested to add to: [{item['bucket']}]")
+    if not wrote:
         lines.append("(no suggestions)")
     lines.append("")
     lines.append(GUIDE)
     return "\n".join(lines)
 
 
+def _bodies(months: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """One prompt per body, because one tool call returns one object and drops the rest."""
+    rows: list[dict[str, str]] = []
+    for month in months:
+        for row in month.get("sections") or []:
+            schema = str(row.get("schema") or "")
+            body = str(row.get("body") or "")
+            if schema in _SCHEMA_SET and body:
+                rows.append({"schema": schema, "body": body})
+    return rows
+
+
 def suggest_from_tokens(tokens: list[str], *, call_oneshot: CallOneshot | None = None) -> str:
-    """Reject a fifth month before any model call, then print the list and the conversation guide."""
+    """Reject a fifth month before any model call, then print one line per body."""
     keys = _split_month_tokens(tokens)
     if not keys:
         return "expected at least one YYYY-MM"
@@ -214,20 +250,28 @@ def suggest_from_tokens(tokens: list[str], *, call_oneshot: CallOneshot | None =
             missing.append(key)
     if not loaded:
         return "missing " + ", ".join(missing)
-    prompt = f"{_PREFIX}\n\n---\n{json.dumps(loaded, ensure_ascii=False)}"
     caller = call_oneshot or _default_oneshot
     schema = submit_month_suggest_schema()
-    result = caller(
-        prompt,
-        purpose="monthly-suggest",
-        force_tool_name=schema["name"],
-        tool_schema=schema,
-        max_tokens=SUGGEST_MAX_TOKENS,
-    )
-    if result.get("failed"):
+    items: list[dict[str, Any]] = []
+    failed = 0
+    for row in _bodies(loaded):
+        prompt = f"{_PREFIX}\n\nschema: {row['schema']}\nbody: {row['body']}"
+        result = caller(
+            prompt,
+            purpose="monthly-suggest",
+            force_tool_name=schema["name"],
+            tool_schema=schema,
+            max_tokens=SUGGEST_MAX_TOKENS,
+        )
+        if result.get("failed"):
+            failed += 1
+            continue
+        filled = _items_from_result(result, [row["schema"]])
+        if filled:
+            filled[0]["schema"] = row["schema"]
+            items.append(filled[0])
+    if not items and failed:
         return "suggest failed"
-    args = result.get("tool_args") if isinstance(result.get("tool_args"), dict) else {}
-    items = _clean_items(args.get("items"), _allowed_ids(loaded))
     record = {"months": [row["month_key"] for row in loaded], "missing": missing, "items": items}
     monthly_staging_dir().mkdir(parents=True, exist_ok=True)
     atomic_json_write(suggest_path(), record)

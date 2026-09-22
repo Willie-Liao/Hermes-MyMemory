@@ -233,32 +233,19 @@ def submit_month_synthesis_schema() -> dict[str, Any]:
 
 
 def submit_month_suggest_schema() -> dict[str, Any]:
-    """Force one tool so a suggest reply cannot be free prose with uncitable items.
+    """Force one flat fill-in per body so a model cannot stop after a single array element.
 
-    The chat turn after this list does the writes. This schema only names the bucket,
-    the sentence, the evidence ids, and why it belongs there.
+    The section name stays on the body the code sent. The model fills the sentence and the file.
     """
     return _schema(
         "submit_month_suggest",
-        "Assign each row with the prompt's bucket rule: repeated procedure to skill, "
-        "a multi-day preference about the user to USER.md, a workspace rule to HERMES.md, "
-        "a situation they will hit again to MEMORY.md. Cite only evidence ids from the prompt.",
+        "Fill text and bucket for this one body. "
+        "bucket is skill, USER.md, HERMES.md, or MEMORY.md.",
         {
-            "items": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "bucket": {"type": "string"},
-                        "text": {"type": "string"},
-                        "evidence": {"type": "array", "items": {"type": "string"}},
-                        "why": {"type": "string"},
-                    },
-                    "required": ["bucket", "text", "evidence", "why"],
-                },
-            }
+            "text": {"type": "string"},
+            "bucket": {"type": "string"},
         },
-        ["items"],
+        ["text", "bucket"],
     )
 
 
