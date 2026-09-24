@@ -38,7 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Literal, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import yaml
 
@@ -5695,39 +5695,6 @@ def _fold_index_anchors(surface_forms: list[str]) -> dict[str, str]:
     return result
 
 
-def _recall_bootstrap_map(state: dict[str, Any]) -> dict[str, str]:
-    raw = state.get("recall_bootstrap_sessions")
-    if not isinstance(raw, dict):
-        raw = {}
-        state["recall_bootstrap_sessions"] = raw
-    legacy = state.get("recall_injected_sessions")
-    if isinstance(legacy, dict):
-        for key, val in legacy.items():
-            if key not in raw and isinstance(val, str) and val not in ("", "done"):
-                raw[key] = val
-    return raw
-
-
-def _mark_bootstrap(session_id: str) -> None:
-    if not session_id:
-        return
-    state = _load_state()
-    _recall_bootstrap_map(state)[session_id] = hermes_local_today_str()
-    _save_state(state)
-
-
-def _recall_inject_decision(
-    session_id: str,
-    user_message: Any,
-) -> Literal["skip", "bootstrap"]:
-    del user_message
-    today = hermes_local_today_str()
-    state = _load_state()
-    if _recall_bootstrap_map(state).get(session_id) == today:
-        return "skip"
-    return "bootstrap"
-
-
 def _hot_memory_text() -> str:
     mem_dir = _hermes_home() / "memories"
     parts: list[str] = []
@@ -6016,7 +5983,9 @@ def on_pre_llm_call(
     """Re-enter digest before the next model call so user 13 can cancel the 12th-turn hold.
 
     Waiting only on ``on_agent_end`` would keep holding until assistant 12 exists;
-    inbound user 13 is already in sqlite at pre-LLM time.
+    inbound user 13 is already in sqlite at pre-LLM time. Bands return on every
+    non-cron call because Hermes fences prefetch per turn; a once-a-day skip
+    left later turns and compact without that index.
     """
     del is_first_turn, turn_id
     if in_worker_llm():
@@ -6030,21 +5999,13 @@ def on_pre_llm_call(
         return None
     if session_id:
         _maybe_run_digest(str(session_id), reason=BOOKMARK_TRIGGER_REASON)
-    decision = _recall_inject_decision(session_id, user_message)
-    if decision == "skip":
-        return None
     text = build_recall_injection_context(
         session_id=session_id,
         user_message=user_message,
     )
     if not text:
         return None
-    if decision == "bootstrap":
-        _mark_bootstrap(session_id)
-    _log(
-        f"recall injected session={session_id or '-'} decision={decision} "
-        "window=bands-a-c"
-    )
+    _log(f"recall injected session={session_id or '-'} window=bands-a-c")
     return {"context": text}
 
 

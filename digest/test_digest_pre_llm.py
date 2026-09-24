@@ -132,14 +132,17 @@ def test_future_valid_to_omitted_from_span_recall(tmp_path, monkeypatch):
     assert "Casey" in result["context"]
 
 
-def test_second_message_same_session_returns_none(tmp_path, monkeypatch):
+def test_second_prefetch_same_day_returns_bands(tmp_path, monkeypatch):
     digest = _load_digest()
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
     _write_daily(tmp_path, _today(), _block(block_id="mem-1", body="Casey canteen open.", valid_to="open"))
 
     first = _prefetch_ctx(digest, monkeypatch,user_message="hi", is_first_turn=True, session_id="s1")
+    second = _prefetch_ctx(digest, monkeypatch,user_message="hi again", is_first_turn=False, session_id="s1")
     assert first is not None
-    assert _prefetch_ctx(digest, monkeypatch,user_message="hi again", is_first_turn=False, session_id="s1") is None
+    assert second is not None
+    assert "mem-1" in first["context"]
+    assert "mem-1" in second["context"]
 
 
 def test_resumed_session_injects_when_not_first_turn(tmp_path, monkeypatch):
@@ -351,14 +354,15 @@ def test_injects_again_on_new_calendar_day(tmp_path, monkeypatch):
     _write_daily(tmp_path, _today(), _block(block_id="mem-1", body="Daily fact."))
 
     first = _prefetch_ctx(digest, monkeypatch,user_message="hi", is_first_turn=True, session_id="s1")
+    second = _prefetch_ctx(digest, monkeypatch,user_message="hi again", is_first_turn=False, session_id="s1")
     assert first is not None
-    assert _prefetch_ctx(digest, monkeypatch,user_message="hi again", is_first_turn=False, session_id="s1") is None
+    assert second is not None
+    assert "mem-1" in second["context"]
 
-    yesterday = _days_ago(1)
     state_path = tmp_path / "memories" / "staging" / ".digest-state.json"
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(
-        f'{{"recall_bootstrap_sessions": {{"s1": "{yesterday}"}}}}',
+        '{"recall_bootstrap_sessions": {"s1": "1999-01-01"}}',
         encoding="utf-8",
     )
 
@@ -381,7 +385,7 @@ def test_legacy_done_value_reinjects_today(tmp_path, monkeypatch):
     assert "mem-1" in result["context"]
 
 
-def test_recall_cue_does_not_reinject_same_day(tmp_path, monkeypatch):
+def test_recall_cue_still_includes_bands_same_day(tmp_path, monkeypatch):
     digest = _load_digest()
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
     _write_daily(
@@ -392,13 +396,15 @@ def test_recall_cue_does_not_reinject_same_day(tmp_path, monkeypatch):
 
     first = _prefetch_ctx(digest, monkeypatch,user_message="hi", is_first_turn=True, session_id="s1", turn_id="t1")
     assert first is not None
-    assert _prefetch_ctx(digest, monkeypatch,user_message="ok", is_first_turn=False, session_id="s1", turn_id="t2") is None
-    assert _prefetch_ctx(digest, monkeypatch,
+    later = _prefetch_ctx(digest, monkeypatch,user_message="ok", is_first_turn=False, session_id="s1", turn_id="t2")
+    cue = _prefetch_ctx(digest, monkeypatch,
         user_message="Casey 昨天说了什么？",
         is_first_turn=False,
         session_id="s1",
         turn_id="t3",
-    ) is None
+    )
+    assert later is not None and "mem-1" in later["context"]
+    assert cue is not None and "mem-1" in cue["context"]
 
 
 def test_build_recall_injection_context_matches_hook_tier1_body(tmp_path, monkeypatch):
@@ -555,3 +561,90 @@ def test_recall_index_by_day_includes_wrapup_phrase(tmp_path, monkeypatch):
     assert "NotGPT blocked; Xiaohongshu HTML cards shipped." in ctx
     assert secret_body not in ctx
     assert "SECRET_BODY" not in ctx
+
+
+def _memory_provider_context_block(text: str) -> str:
+    """JSON-escape provider text the way the Hermes summarizer fences memory_context."""
+    from agent.context_engine import sanitize_memory_context
+
+    serialized = json.dumps(sanitize_memory_context(text), ensure_ascii=False)
+    serialized = (
+        serialized.replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
+    )
+    return f"<memory-provider-context>\n{serialized}\n</memory-provider-context>"
+
+
+def test_on_pre_compress_returns_bands(tmp_path, monkeypatch):
+    digest = _load_digest()
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    _write_daily(tmp_path, _today(), _block(block_id="mem-probe-compact", body="Probe fact."))
+    provider = MyMemoryProvider()
+    text = provider.on_pre_compress([])
+    assert "mem-probe-compact" in text
+    first = _prefetch_ctx(digest, monkeypatch, user_message="hi", session_id="s1")
+    second = _prefetch_ctx(digest, monkeypatch, user_message="again", session_id="s1")
+    assert first is not None and second is not None
+    assert "mem-probe-compact" in second["context"]
+
+
+def test_bands_go_to_memory_provider_context_not_user_content(tmp_path, monkeypatch):
+    digest = _load_digest()
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    _write_daily(tmp_path, _today(), _block(block_id="mem-probe-compact", body="Probe fact."))
+    user_content = "hello"
+    bands = MyMemoryProvider().on_pre_compress([])
+    slot = _memory_provider_context_block(bands)
+    assert "mem-probe-compact" not in user_content
+    assert "<memory-context>" not in user_content
+    assert "mem-probe-compact" in slot
+    assert slot.startswith("<memory-provider-context>")
+
+
+def test_live_llm_sees_bands_in_both_hermes_slots(tmp_path, monkeypatch):
+    digest = _load_digest()
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    _write_daily(
+        tmp_path,
+        _today(),
+        _block(block_id="mem-probe-compact", body="Probe fact.")
+        + "\n\n## Day wrap-up\n- PROBE_TOKEN_8841\n",
+    )
+    second = _prefetch_ctx(digest, monkeypatch, user_message="again", session_id="s1")
+    assert second is not None and second["context"].strip()
+    from agent.memory_manager import build_memory_context_block
+
+    fence = build_memory_context_block(second["context"])
+    bands = MyMemoryProvider().on_pre_compress([])
+    assert bands.strip()
+    slot = _memory_provider_context_block(bands)
+    assert "<memory-context>" in fence and "mem-probe-compact" in fence and "PROBE_TOKEN_8841" in fence
+    assert "<memory-provider-context>" in slot and "mem-probe-compact" in slot and "PROBE_TOKEN_8841" in slot
+    from worker_llm import run_worker_llm_oneshot
+
+    capture = run_worker_llm_oneshot(
+        "Each block contains one PROBE_TOKEN value. "
+        "Call quote_mem_ids and put that full token in both fields.\n\n"
+        f"{fence}\n\n{slot}",
+        plugin="real-llm-test",
+        purpose="prefetch-compact-probe",
+        force_tool_name="quote_mem_ids",
+        tool_schema={
+            "name": "quote_mem_ids",
+            "description": "Quote the mem id found in each Hermes memory block.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "memory_context_id": {"type": "string"},
+                    "memory_provider_context_id": {"type": "string"},
+                },
+                "required": ["memory_context_id", "memory_provider_context_id"],
+            },
+        },
+        max_tokens=512,
+        temperature=0,
+    )
+    reply = str(capture.get("final_response") or "")
+    args = capture.get("tool_args") if isinstance(capture.get("tool_args"), dict) else {}
+    blob = " ".join([reply, *(str(v) for v in args.values())])
+    assert not capture.get("failed"), reply or capture
+    assert blob.count("PROBE_TOKEN_8841") >= 2, blob or capture

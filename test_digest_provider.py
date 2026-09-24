@@ -130,7 +130,8 @@ def test_prefetch_compose_no_prewrap(tmp_path, monkeypatch):
     assert "<memory-context>" not in first
     assert "USER.md" not in first
     second = p.prefetch("hello again", session_id="s-pre")
-    assert second == ""
+    assert "mem-1" in second
+    assert "<memory-context>" not in second
 
 
 def test_prefetch_keeps_weekly_when_digest_empty(tmp_path, monkeypatch):

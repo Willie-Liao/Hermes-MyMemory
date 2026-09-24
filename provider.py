@@ -208,6 +208,16 @@ class MyMemoryProvider(MemoryProvider):
             pass
         return out
 
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+        """Hand Bands A–D to Hermes compact as memory_context, not as a user turn.
+
+        The prefetch fence lives on api_content, so the stored transcript Hermes
+        passes here cannot be scraped for it. Returning the band string lets the
+        compressor place it in memory-provider-context.
+        """
+        del messages
+        return digest.build_recall_injection_context().strip()
+
     def sync_turn(
         self,
         user_content: str,
