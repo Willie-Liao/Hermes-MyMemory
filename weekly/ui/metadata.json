@@ -1,0 +1,6 @@
+{
+  "name": "Hermes Memory Manager",
+  "description": "A web-based human review and approval hub for managing weekly staging memory candidates, gated promotions, and action ledgers.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
