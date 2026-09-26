@@ -41,7 +41,8 @@ done < <(find . -type f -name '.env*' -print0 2>/dev/null || true)
 # Tests may embed fake keys in fixtures; scan production paths only.
 if grep -rE 'sk-[A-Za-z0-9]{10,}|MINIMAX_CN_API_KEY=[^$<]' \
   --include='*' \
-  --exclude='test_*.py' --exclude='*_test.py' --exclude-dir='tests' \
+  --exclude='test_*.py' --exclude='*_test.py' --exclude='publish-github*.sh' \
+  --exclude-dir='tests' \
   . 2>/dev/null | grep -v '.env.example' | grep -q .; then
   echo "error: suspected secret in snapshot tree; aborting" >&2
   exit 1

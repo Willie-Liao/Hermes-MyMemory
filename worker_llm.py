@@ -9,7 +9,9 @@ Forced tool-call workers (daily digest + weekly distill)
 ``run_worker_llm_tools`` with ``force_tool_name`` uses ``run_worker_llm_oneshot``
 so the HTTP ``tools`` array is only that function. Nested ``AIAgent`` still
 runs Hermes ``tool_describe``. Digest Phase-1 ``allowed_tool_names`` keeps the
-nested agent.
+nested agent only for OpenAI-format providers. Anthropic-format providers
+(MiniMax, Anthropic) call ``build_anthropic_kwargs`` directly so ``tool_choice``
+is not dropped by ``build_api_kwargs``.
 
 Also sets ``tool_choice`` to that function name on oneshot. Main chat agents never call
 this module — no effect on interactive tool catalogs.
@@ -41,6 +43,18 @@ _worker_llm_depth = 0
 _worker_llm_depth_lock = threading.Lock()
 # Gateway progressive disclosure — never the weekly/digest submit/patch payload.
 _PROGRESSIVE_DISCLOSURE_TOOLS = frozenset({"tool_search", "tool_describe", "tool_call"})
+# Providers whose nested AIAgent is forced onto Anthropic Messages. That
+# request builder drops tool_choice, so phase-1 allow-list calls bypass it.
+_ANTHROPIC_FORMAT_PROVIDERS = frozenset({"minimax-cn", "minimax", "anthropic"})
+_PHASE1_TOOL_NAMES = (
+    "submit_digest_blocks",
+    "patch_digest_blocks",
+    "skip_digest_worker",
+)
+_WRONG_PHASE1_TOOL_TEACH = (
+    "Call one of submit_digest_blocks, patch_digest_blocks, or "
+    "skip_digest_worker. Do not call any other tool."
+)
 
 
 @contextmanager
@@ -640,6 +654,331 @@ def run_worker_llm(
     return str(result.get("final_response") or "").strip()
 
 
+def _anthropic_format_worker(plugin: str, purpose: str) -> bool:
+    """True when this worker provider speaks Anthropic Messages.
+
+    Those nested agents build requests in ``build_api_kwargs``, which never
+    copies ``tool_choice``. Phase-1 would otherwise be free to answer in text.
+    """
+    runtime = _plugin_worker_runtime(plugin, purpose)
+    provider = str(runtime.get("provider") or "").strip().lower()
+    return provider in _ANTHROPIC_FORMAT_PROVIDERS
+
+
+def _build_phase1_anthropic_kwargs(
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    max_tokens: int,
+    base_url: str,
+) -> dict[str, Any]:
+    """Build an Anthropic body that requires one of the phase-1 tools.
+
+    Calling this from MyMemory, not from ``AIAgent``, is what puts
+    ``tool_choice='required'`` on the wire. ``build_api_kwargs`` drops it.
+    """
+    from agent.anthropic_adapter import build_anthropic_kwargs
+
+    return build_anthropic_kwargs(
+        model=model,
+        messages=messages,
+        tools=tools,
+        max_tokens=max_tokens,
+        reasoning_config=None,
+        tool_choice="required",
+        base_url=base_url or None,
+    )
+
+
+def _anthropic_messages_create(
+    kwargs: Mapping[str, Any],
+    *,
+    api_key: str,
+    base_url: str,
+) -> Any:
+    """POST one Anthropic Messages call. Tests replace this so Hermes stays unedited."""
+    from agent.anthropic_adapter import build_anthropic_client
+
+    client = build_anthropic_client(api_key, base_url=base_url or None)
+    return client.messages.create(**dict(kwargs))
+
+
+def _anthropic_tool_uses(response: Any) -> list[tuple[str, str, dict[str, Any]]]:
+    """Pull tool_use blocks off an Anthropic message. Text-only replies yield []."""
+    blocks = getattr(response, "content", None)
+    if blocks is None and isinstance(response, Mapping):
+        blocks = response.get("content")
+    found: list[tuple[str, str, dict[str, Any]]] = []
+    for block in blocks or []:
+        if isinstance(block, Mapping):
+            typ = block.get("type")
+            name = str(block.get("name") or "").strip()
+            raw_input = block.get("input")
+            call_id = str(block.get("id") or "").strip()
+        else:
+            typ = getattr(block, "type", None)
+            name = str(getattr(block, "name", "") or "").strip()
+            raw_input = getattr(block, "input", None)
+            call_id = str(getattr(block, "id", "") or "").strip()
+        if typ != "tool_use" or not name:
+            continue
+        args = dict(raw_input) if isinstance(raw_input, Mapping) else {}
+        found.append((call_id, name, args))
+    return found
+
+
+def _load_digest_tools() -> Any:
+    """Import digest tool handlers from either the plugin root or the digest package.
+
+    ``worker_llm`` is loaded with MyMemory on ``sys.path``. ``digest_tools``
+    is sometimes a top-level module (digest runner) and sometimes
+    ``digest.digest_tools`` (package import). Missing either one would skip
+    validation teach and accept a bad submit.
+    """
+    import importlib
+
+    last: Exception | None = None
+    for name in ("digest_tools", "digest.digest_tools"):
+        try:
+            return importlib.import_module(name)
+        except ImportError as exc:
+            last = exc
+    raise ImportError("digest_tools") from last
+
+
+def _phase1_handler_text(tool_name: str, args: Mapping[str, Any]) -> str:
+    """Run the digest submit/patch handler. Validation failures come back as teach text."""
+    handler = _load_digest_tools()._handler_for_tool(tool_name)
+    return str(handler(dict(args)) or "")
+
+
+def _phase1_handler_accepted(text: str) -> bool:
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(data, Mapping) and bool(data.get("ok"))
+
+
+def _append_phase1_tool_result(
+    messages: list[dict[str, Any]],
+    *,
+    call_id: str,
+    name: str,
+    args: Mapping[str, Any],
+    content: str,
+) -> None:
+    """Keep OpenAI-shaped history so ``build_anthropic_kwargs`` can convert the next turn."""
+    messages.append(
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(dict(args), ensure_ascii=False),
+                    },
+                }
+            ],
+        }
+    )
+    messages.append(
+        {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": content,
+        }
+    )
+
+
+def _run_anthropic_phase1_loop(
+    prompt: str,
+    *,
+    plugin: str,
+    purpose: str,
+    max_iterations: int,
+    enabled_toolsets: Sequence[str],
+    allowed_tool_names: Sequence[str],
+) -> dict[str, Any]:
+    """Phase-1 allow-list without AIAgent so Anthropic receives tool_choice required.
+
+    A nested agent would drop that field and could finish on plain text or
+    ``terminal``. Wrong names are not executed; the next call is taught the
+    three digest tools. Submit/patch validation teach stays on the existing
+    handlers.
+    """
+    started = time.perf_counter()
+
+    def _elapsed_ms() -> int:
+        return max(0, int((time.perf_counter() - started) * 1000))
+
+    def _fail(exc: BaseException) -> dict[str, Any]:
+        kind = _llm_issue_kind(exc)
+        rec: dict[str, Any] = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "plugin": plugin,
+            "purpose": purpose,
+            "model": "",
+            "config_model": "",
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.0,
+            "api_calls": 0,
+            "duration_ms": _elapsed_ms(),
+        }
+        if kind:
+            rec["issue"] = kind
+        record_worker_usage(rec)
+        return {
+            "final_response": str(exc),
+            "tool_name": None,
+            "tool_args": None,
+            "tool_calls": [],
+            "messages": [],
+            "failed": True,
+            "error": str(exc),
+        }
+
+    runtime = _plugin_worker_runtime(plugin, purpose)
+    model = str(runtime.get("model") or "").strip()
+    try:
+        api_key, base_url = _oneshot_credentials(runtime)
+        base_url, _used = resolve_worker_endpoint(base_url, "anthropic_messages")
+    except Exception as exc:
+        return _fail(exc)
+    tools = bind_worker_tools(list(enabled_toolsets), allowed_tool_names)
+    allowed = {str(n).strip() for n in allowed_tool_names if str(n).strip()}
+    messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+    tool_calls: list[tuple[str, dict[str, Any]]] = []
+    input_tokens = 0
+    output_tokens = 0
+    api_calls = 0
+    budget = max(1, int(max_iterations))
+    try:
+        for turn in range(budget):
+            kwargs = _build_phase1_anthropic_kwargs(
+                model=model,
+                messages=messages,
+                tools=tools,
+                max_tokens=8192,
+                base_url=base_url,
+            )
+            response = _anthropic_messages_create(
+                kwargs, api_key=api_key, base_url=base_url
+            )
+            api_calls += 1
+            usage = getattr(response, "usage", None)
+            input_tokens += _usage_int(usage, "input_tokens", "prompt_tokens")
+            output_tokens += _usage_int(usage, "output_tokens", "completion_tokens")
+            uses = _anthropic_tool_uses(response)
+            if not uses:
+                text = ""
+                content = getattr(response, "content", None) or []
+                for block in content:
+                    piece = (
+                        block.get("text")
+                        if isinstance(block, Mapping)
+                        else getattr(block, "text", None)
+                    )
+                    if piece:
+                        text += str(piece)
+                record_worker_usage(
+                    {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "plugin": plugin,
+                        "purpose": purpose,
+                        "model": model,
+                        "config_model": model,
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "cache_read_tokens": 0,
+                        "cache_write_tokens": 0,
+                        "reasoning_tokens": 0,
+                        "total_tokens": input_tokens + output_tokens,
+                        "cost_usd": 0.0,
+                        "api_calls": api_calls,
+                        "duration_ms": _elapsed_ms(),
+                    }
+                )
+                return {
+                    "final_response": text.strip(),
+                    "tool_name": None,
+                    "tool_args": None,
+                    "tool_calls": tool_calls,
+                    "messages": messages,
+                    "failed": False,
+                    "api_calls": api_calls,
+                    "duration_ms": _elapsed_ms(),
+                }
+            call_id, name, args = uses[0]
+            call_id = call_id or f"phase1-{turn}"
+            if name not in allowed or name not in _PHASE1_TOOL_NAMES:
+                if turn + 1 >= budget:
+                    break
+                messages.append(
+                    {"role": "user", "content": _WRONG_PHASE1_TOOL_TEACH}
+                )
+                continue
+            if name == "skip_digest_worker":
+                tool_calls.append((name, args))
+                break
+            teach = _phase1_handler_text(name, args)
+            tool_calls.append((name, args))
+            if _phase1_handler_accepted(teach):
+                break
+            if turn + 1 >= budget:
+                break
+            _append_phase1_tool_result(
+                messages,
+                call_id=call_id,
+                name=name,
+                args=args,
+                content=teach,
+            )
+    except Exception as exc:
+        return _fail(exc)
+    record_worker_usage(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "plugin": plugin,
+            "purpose": purpose,
+            "model": model,
+            "config_model": model,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+            "total_tokens": input_tokens + output_tokens,
+            "cost_usd": 0.0,
+            "api_calls": api_calls,
+            "duration_ms": _elapsed_ms(),
+        }
+    )
+    tool_name: str | None = None
+    tool_args: dict[str, Any] | None = None
+    if tool_calls:
+        tool_name, tool_args = tool_calls[-1]
+    return {
+        "final_response": "",
+        "tool_name": tool_name,
+        "tool_args": tool_args,
+        "tool_calls": tool_calls,
+        "messages": messages,
+        "failed": False,
+        "api_calls": api_calls,
+        "duration_ms": _elapsed_ms(),
+    }
+
+
 def run_worker_llm_tools(
     prompt: str,
     *,
@@ -656,10 +995,10 @@ def run_worker_llm_tools(
 
     When ``force_tool_name`` is set, this is one OpenAI-compatible completion
     with only that function schema — nested ``AIAgent`` would still run Hermes
-    ``tool_describe``. Digest Phase-1 ``allowed_tool_names`` keeps the nested agent.
-
-    When ``allowed_tool_names`` is set (Phase-1 type A), the agent is equipped
-    with exactly those tools and may choose among them within one turn.
+    ``tool_describe``. OpenAI-format Phase-1 ``allowed_tool_names`` keeps the
+    nested agent, because that transport already copies ``tool_choice``.
+    Anthropic-format providers skip the agent: ``build_api_kwargs`` would drop
+    ``tool_choice`` and the model could finish on text or ``terminal``.
     """
     overrides: dict[str, Any] = dict(request_overrides or {})
     force = str(force_tool_name or "").strip() or None
@@ -695,6 +1034,15 @@ def run_worker_llm_tools(
     if allowed and "tool_choice" not in overrides:
         # Require a tool call but do not force a single name (same-turn repair).
         overrides["tool_choice"] = "required"
+    if allowed and _anthropic_format_worker(plugin, purpose):
+        return _run_anthropic_phase1_loop(
+            prompt,
+            plugin=plugin,
+            purpose=purpose,
+            max_iterations=max_iterations,
+            enabled_toolsets=list(enabled_toolsets),
+            allowed_tool_names=allowed,
+        )
     captured: list[tuple[str, dict[str, Any]]] = []
 
     def _on_tool_start(_tool_call_id: str, name: str, args: Any) -> None:

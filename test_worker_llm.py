@@ -394,6 +394,176 @@ def test_run_worker_llm_tools_binds_forced_tool_only(tmp_path, monkeypatch):
     assert out["tool_name"] == "submit_fact_block"
 
 
+def _phase1_catalog():
+    return [
+        {
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object"}},
+        }
+        for name in (
+            "submit_digest_blocks",
+            "patch_digest_blocks",
+            "skip_digest_worker",
+        )
+    ]
+
+
+def _install_phase1_catalog(monkeypatch):
+    fake_model_tools = types.ModuleType("model_tools")
+
+    def fake_get_tool_definitions(**_k):
+        return _phase1_catalog()
+
+    fake_model_tools.get_tool_definitions = fake_get_tool_definitions
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+
+def test_openai_phase1_allowlist_still_uses_nested_agent(tmp_path, monkeypatch):
+    """OpenAI-format workers already copy tool_choice; do not leave that path."""
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-digest:\n      provider: xiaomi\n      model: mimo-v2.5\n",
+        encoding="utf-8",
+    )
+    seen: dict = {}
+
+    def fake_conv(*_a, **kwargs):
+        seen["conv"] = kwargs
+        return {"final_response": "", "messages": [], "failed": False}
+
+    monkeypatch.setattr(wl, "_run_worker_conversation", fake_conv)
+    monkeypatch.setattr(
+        wl,
+        "_run_anthropic_phase1_loop",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("OpenAI phase-1 must not use the Anthropic loop")
+        ),
+    )
+    wl.run_worker_llm_tools(
+        "prompt",
+        plugin="memory-digest",
+        purpose="digest-phase1",
+        enabled_toolsets=["memory_digest"],
+        allowed_tool_names=[
+            "submit_digest_blocks",
+            "patch_digest_blocks",
+            "skip_digest_worker",
+        ],
+    )
+    assert seen["conv"]["request_overrides"]["tool_choice"] == "required"
+    assert seen["conv"]["allowed_tool_names"] == [
+        "submit_digest_blocks",
+        "patch_digest_blocks",
+        "skip_digest_worker",
+    ]
+
+
+def test_anthropic_phase1_skips_nested_agent_and_retries_wrong_tool(
+    tmp_path, monkeypatch
+):
+    """MiniMax phase-1 must send tool_choice required and teach a non-digest name."""
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MINIMAX_CN_API_KEY", "test-key")
+    monkeypatch.setenv("MINIMAX_CN_BASE_URL", "https://example.test/anthropic")
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-digest:\n"
+        "      provider: minimax-cn\n      model: MiniMax-M2.5\n",
+        encoding="utf-8",
+    )
+    _install_phase1_catalog(monkeypatch)
+    seen: dict = {"builds": [], "handlers": []}
+
+    def boom(*_a, **_k):
+        raise AssertionError("AIAgent path must not run for Anthropic phase-1")
+
+    monkeypatch.setattr(wl, "_run_worker_conversation", boom)
+
+    fake_adapter = types.ModuleType("agent.anthropic_adapter")
+
+    def build_anthropic_kwargs(**kwargs):
+        seen["builds"].append(kwargs)
+        return {"model": kwargs["model"], "messages": list(kwargs["messages"])}
+
+    fake_adapter.build_anthropic_kwargs = build_anthropic_kwargs
+    monkeypatch.setitem(sys.modules, "agent", types.ModuleType("agent"))
+    monkeypatch.setitem(sys.modules, "agent.anthropic_adapter", fake_adapter)
+
+    class _Usage:
+        input_tokens = 3
+        output_tokens = 2
+
+    responses = [
+        types.SimpleNamespace(
+            content=[
+                types.SimpleNamespace(
+                    type="tool_use", id="t1", name="terminal", input={}
+                )
+            ],
+            usage=_Usage(),
+        ),
+        types.SimpleNamespace(
+            content=[
+                types.SimpleNamespace(
+                    type="tool_use",
+                    id="t2",
+                    name="submit_digest_blocks",
+                    input={"blocks": []},
+                )
+            ],
+            usage=_Usage(),
+        ),
+    ]
+
+    def fake_create(kwargs, *, api_key, base_url):
+        seen.setdefault("creates", []).append(
+            {"api_key": api_key, "base_url": base_url, "messages": kwargs["messages"]}
+        )
+        return responses.pop(0)
+
+    monkeypatch.setattr(wl, "_anthropic_messages_create", fake_create)
+
+    fake_digest_tools = types.ModuleType("digest_tools")
+
+    def _handler_for_tool(name):
+        def wrapped(args, **_k):
+            seen["handlers"].append(name)
+            return json.dumps({"ok": True})
+
+        return wrapped
+
+    fake_digest_tools._handler_for_tool = _handler_for_tool
+    monkeypatch.setitem(sys.modules, "digest_tools", fake_digest_tools)
+
+    out = wl.run_worker_llm_tools(
+        "prompt",
+        plugin="memory-digest",
+        purpose="digest-phase1",
+        max_iterations=3,
+        enabled_toolsets=["memory_digest"],
+        allowed_tool_names=[
+            "submit_digest_blocks",
+            "patch_digest_blocks",
+            "skip_digest_worker",
+        ],
+    )
+    assert seen["builds"][0]["tool_choice"] == "required"
+    assert seen["builds"][0]["tools"]
+    assert all(
+        (t.get("function") or {}).get("name")
+        in {"submit_digest_blocks", "patch_digest_blocks", "skip_digest_worker"}
+        for t in seen["builds"][0]["tools"]
+    )
+    teach = seen["creates"][1]["messages"][-1]["content"]
+    assert "submit_digest_blocks" in teach
+    assert "patch_digest_blocks" in teach
+    assert "skip_digest_worker" in teach
+    assert seen["handlers"] == ["submit_digest_blocks"]
+    assert out["tool_name"] == "submit_digest_blocks"
+    assert out["failed"] is False
+
+
 def test_run_worker_llm_text_path_does_not_rebind_tools(tmp_path, monkeypatch):
     wl = _load_worker_llm()
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -541,7 +711,7 @@ def test_extract_tool_calls_drops_tool_describe_keeps_submit():
     assert found == [
         (
             "submit_weekly_summary",
-            {"summary": [{"text": "Shipped wrap-up", "weekdays": ["Monday"]}]},
+            {"text": "Shipped wrap-up", "weekdays": ["Monday"]},
         )
     ]
 
