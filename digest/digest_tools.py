@@ -281,9 +281,13 @@ DECISION_LINK_TEACH = (
     "ruling must be the predicate for subject so `{kind}: {subject} {ruling}` "
     "is one clause; mirror transcript intensity and do not normalise to must "
     "(examples, not a closed list: intense must / must not; less intense "
-    "prefer / prefers; neutral locked / decided / chose / sets; etc.); do not "
-    "repeat subject at the start of ruling; do not make a third party the "
-    "agent of the ruling"
+    "prefer / prefers; neutral locked / decided / chose / sets; etc.); "
+    "identify who must act: own preference stays about the user (user prefers "
+    "tea); an expectation of the agent is user wants the agent to send the "
+    "report, or user wants the agent not to parrot the user's words; do not "
+    "write user must for an order to the agent; First subject after "
+    "Preference:/Decision: must be user/User; do not repeat subject at the "
+    "start of ruling; do not make a third party the agent of the ruling"
 )
 _DECISION_KIND_PREFIX_RE = re.compile(
     r"^(Preference|Decision):\s*",
@@ -840,6 +844,11 @@ def _procedure_props() -> dict[str, Any]:
 
 
 def _decision_props() -> dict[str, Any]:
+    """Schema text is the only ruling sample on the tool call itself.
+
+    An order to the assistant must say the user wants the agent to act.
+    A sample of user must makes that order look like the user's own duty.
+    """
     return {
         "kind": {
             "type": "string",
@@ -856,7 +865,13 @@ def _decision_props() -> dict[str, Any]:
             "clause. Mirror transcript intensity; do not normalise to must. "
             "Examples, not a closed list: intense must / must not; less intense "
             "prefer / prefers; neutral locked / decided / chose / sets; etc. "
-            "Do not repeat subject. Assembled Preference:/Decision: line <= 500 chars",
+            "Identify who must act. Own preference stays about the user "
+            "(user prefers tea). An expectation of the agent is user wants "
+            "the agent to send the report, or user wants the agent not to "
+            "parrot the user's words. Do not write user must for an order to "
+            "the agent. First subject after Preference:/Decision: must be "
+            "user/User. Do not repeat subject. Assembled Preference:/Decision: "
+            "line <= 500 chars",
             SLOT_MAX_LENGTH["ruling"],
         ),
         "confidence": _confidence_prop(),

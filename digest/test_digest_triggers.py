@@ -465,6 +465,23 @@ def test_append_policy_procedure_and_decision_are_event_driven():
     assert "decision_constraint: must/must-not/correction" not in policy
 
 
+def test_decision_wording_splits_own_preference_from_agent_expectation():
+    """Orders to the assistant name the agent; the subject stays user."""
+    digest = _load_digest()
+    tools = load_plugin_module("digest_tools.py", "memory_digest_expectation_tools")
+    ruling = tools._decision_props()["ruling"]["description"]
+    strings = [
+        digest.DIGEST_POLICY,
+        digest._worker_type_body_reminder("decision"),
+        ruling,
+        tools.DECISION_LINK_TEACH,
+    ]
+    for text in strings:
+        assert "wants the agent" in text
+        assert "First subject after Preference:/Decision: must be user/User" in text
+        assert "user must not X" not in text
+
+
 def test_append_policy_correction_uses_supersedes_not_related_delete():
     """Step 4: corrections use supersedes:+explicit; related: never deletes."""
     digest = _load_digest()
