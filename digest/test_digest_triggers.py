@@ -400,7 +400,9 @@ def test_event_first_worker_contracts_are_explicit(tmp_path, monkeypatch):
     assert "exactly three stages" in combined
     assert "procedure owns course obstacles and abstract solutions" in combined
     assert "raw tool logs" in combined
-    assert "decision owns user-only rulings/preferences for agent behavior" in combined
+    assert "user-only rulings and preferences" in policy
+    assert "Preference:/Decision:" in policy
+    assert "kind=Preference|Decision" in digest._worker_type_body_reminder("decision")
     assert "Narration:" in combined
     assert "role?" in combined or "role optional" in combined or "role only when clear" in combined
     assert "fact owns stable observations" in combined
@@ -994,3 +996,111 @@ def test_thirteenth_user_breaks_assistant_hold(tmp_path, monkeypatch):
     assert len(calls) == 1
     assert calls[0]["user_count"] == 12
     assert "batch_hold_until" not in _read_state(tmp_path)["sessions"]["s1"]
+
+
+def _alias_user_md(tmp_path: Path, monkeypatch, text: str = "Name: Ada Lovelace\n"):
+    digest = _load_digest()
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    memories = tmp_path / "memories"
+    memories.mkdir(parents=True, exist_ok=True)
+    (memories / "USER.md").write_text(text, encoding="utf-8")
+    return digest, memories / ".decision-user-aliases.json"
+
+
+def test_user_alias_scan_skips_oneshot_when_hash_matches(tmp_path, monkeypatch):
+    digest, cache_path = _alias_user_md(tmp_path, monkeypatch)
+    text = (tmp_path / "memories" / "USER.md").read_text(encoding="utf-8")
+    cache_path.write_text(
+        json.dumps(
+            {"user_md_sha256": digest._content_hash(text), "aliases": ["Willie"]}
+        ),
+        encoding="utf-8",
+    )
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("oneshot must not run when the hash matches")
+
+    subjects = digest._decision_user_subjects(oneshot=boom)
+    assert subjects == frozenset({"user", "willie"})
+
+
+def test_user_alias_scan_runs_without_hash_or_saved_list(tmp_path, monkeypatch):
+    digest, cache_path = _alias_user_md(tmp_path, monkeypatch)
+    text = (tmp_path / "memories" / "USER.md").read_text(encoding="utf-8")
+    calls = {"n": 0}
+
+    def fake(*_args, **_kwargs):
+        calls["n"] += 1
+        return {"failed": False, "tool_args": {"aliases": ["Ada"]}}
+
+    digest._decision_user_subjects(oneshot=fake)
+    assert calls["n"] == 1
+    cache_path.unlink()
+
+    cache_path.write_text(json.dumps({"aliases": ["Ada"]}), encoding="utf-8")
+    digest._decision_user_subjects(oneshot=fake)
+    assert calls["n"] == 2
+
+    cache_path.write_text(
+        json.dumps({"user_md_sha256": digest._content_hash(text)}),
+        encoding="utf-8",
+    )
+    digest._decision_user_subjects(oneshot=fake)
+    assert calls["n"] == 3
+
+    cache_path.write_text(
+        json.dumps({"user_md_sha256": "0" * 64, "aliases": ["Ada"]}),
+        encoding="utf-8",
+    )
+    digest._decision_user_subjects(oneshot=fake)
+    assert calls["n"] == 4
+
+
+def test_user_alias_scan_null_means_user_only(tmp_path, monkeypatch):
+    digest, cache_path = _alias_user_md(tmp_path, monkeypatch)
+
+    def fake(*_args, **_kwargs):
+        return {"failed": False, "tool_args": {"aliases": None}}
+
+    subjects = digest._decision_user_subjects(oneshot=fake)
+    assert subjects == frozenset({"user"})
+    saved = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert saved["aliases"] is None
+    assert saved["user_md_sha256"] == digest._content_hash(
+        (tmp_path / "memories" / "USER.md").read_text(encoding="utf-8")
+    )
+
+
+def test_user_alias_scan_failure_does_not_cache(tmp_path, monkeypatch):
+    digest, cache_path = _alias_user_md(tmp_path, monkeypatch)
+
+    def fake(*_args, **_kwargs):
+        return {"failed": True, "tool_args": None}
+
+    subjects = digest._decision_user_subjects(oneshot=fake)
+    assert subjects == frozenset({"user"})
+    assert not cache_path.exists()
+
+
+def test_decision_reminder_lists_alias_or_user_only(tmp_path, monkeypatch):
+    digest, cache_path = _alias_user_md(tmp_path, monkeypatch)
+
+    def named(*_args, **_kwargs):
+        return {"failed": False, "tool_args": {"aliases": ["Willie"]}}
+
+    digest._decision_user_subjects(oneshot=named)
+    named_reminder = digest._worker_type_body_reminder("decision")
+    assert "Willie" in named_reminder
+    assert "kind=Preference|Decision" in named_reminder
+    assert "etc." in named_reminder
+
+    cache_path.unlink()
+
+    def empty(*_args, **_kwargs):
+        return {"failed": False, "tool_args": {"aliases": None}}
+
+    digest._decision_user_subjects(oneshot=empty)
+    bare = digest._worker_type_body_reminder("decision")
+    assert "subject=`user`" in bare
+    assert "Willie" not in bare
+    assert "kind=Preference|Decision" in bare

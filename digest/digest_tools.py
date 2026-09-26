@@ -273,16 +273,17 @@ _REGISTERED = False
 
 DECISION_OWNERSHIP_TEACH = (
     "decision bodies must start with Preference:/Decision: whose first subject "
-    "token is user/User (plus aliases from USER.md); third-party traits belong to "
-    "fact (Narration: + involves cast); only the user's ruling/preference for "
-    "agent behavior is decision"
+    "token is user/User, or an alias the decision slot reminder named; "
+    "third-party traits belong to fact (Narration: + involves cast); only the "
+    "user's ruling/preference for agent behavior is decision"
 )
 DECISION_LINK_TEACH = (
     "ruling must be the predicate for subject so `{kind}: {subject} {ruling}` "
-    "is one clause (e.g. Decision: user must not auto-drop events); do not "
+    "is one clause; mirror transcript intensity and do not normalise to must "
+    "(examples, not a closed list: intense must / must not; less intense "
+    "prefer / prefers; neutral locked / decided / chose / sets; etc.); do not "
     "repeat subject at the start of ruling; do not make a third party the "
-    "agent of the ruling; look in the transcript for the user's must / "
-    "must-not / standing prefs for agent behavior"
+    "agent of the ruling"
 )
 _DECISION_KIND_PREFIX_RE = re.compile(
     r"^(Preference|Decision):\s*",
@@ -846,14 +847,16 @@ def _decision_props() -> dict[str, Any]:
             "description": "Body prefix kind: Preference|Decision",
         },
         "subject": _slot_string(
-            "Grammatical subject; must be user/User (or USER.md aliases). "
-            "Scan the transcript for the user's must/must-not/standing prefs.",
+            "Grammatical subject; user/User, or an alias the decision slot "
+            "reminder named. If that reminder names none, use user.",
             SLOT_MAX_LENGTH["subject"],
         ),
         "ruling": _slot_string(
             "Predicate for subject so `{kind}: {subject} {ruling}` is one "
-            "clause (e.g. must not auto-drop events). Do not repeat subject. "
-            "Assembled Preference:/Decision: line <= 500 chars",
+            "clause. Mirror transcript intensity; do not normalise to must. "
+            "Examples, not a closed list: intense must / must not; less intense "
+            "prefer / prefers; neutral locked / decided / chose / sets; etc. "
+            "Do not repeat subject. Assembled Preference:/Decision: line <= 500 chars",
             SLOT_MAX_LENGTH["ruling"],
         ),
         "confidence": _confidence_prop(),

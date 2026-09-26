@@ -38,7 +38,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import yaml
 
@@ -205,34 +205,157 @@ _DECISION_CONSTRAINT_CUE_RE = re.compile(
 )
 _DECISION_USER_SUBJECTS_BASE = frozenset({"user"})
 _DECISION_USER_SUBJECTS = _DECISION_USER_SUBJECTS_BASE
+# Original-case tokens from the last resolve, so the phase-1 reminder can
+# name Willie rather than the casefolded allow-list.
+_decision_alias_display: tuple[str, ...] = ()
+_ALIAS_CACHE_FILENAME = ".decision-user-aliases.json"
 _NARRATION_PREFIX = "Narration:"
 _FACTUAL_PREFIX = "Factual:"
 _DECISION_OWNERSHIP_TEACH = digest_tools.DECISION_OWNERSHIP_TEACH
 _FACT_NARRATION_TEACH = digest_tools.FACT_NARRATION_TEACH
 
 
-def _decision_user_subjects() -> frozenset[str]:
-    """Allowlisted decision subjects: user + tokens derived from USER.md."""
-    subjects = set(_DECISION_USER_SUBJECTS_BASE)
+def _decision_user_subjects(
+    oneshot: Callable[..., dict[str, Any]] | None = None,
+) -> frozenset[str]:
+    """Resolve subjects before the phase-1 prompt, not after the model emits.
+
+    A name/heading regex handed aliases to the validator too late, so the
+    model only ever wrote ``user``. Reuse a saved list while USER.md's hash
+    matches; a missing hash or missing ``aliases`` key scans again. A
+    256-token cap fills the whole completion before ``submit_user_aliases``
+    is emitted, so the scan returns user-only and writes nothing.
+    """
+    global _decision_alias_display
+    base = frozenset(_DECISION_USER_SUBJECTS_BASE)
+
+    def _apply(display: tuple[str, ...]) -> frozenset[str]:
+        global _decision_alias_display
+        _decision_alias_display = display
+        folded = {token.casefold() for token in display if token.casefold() != "user"}
+        return base | folded
+
+    user_path = _hermes_home() / "memories" / "USER.md"
+    if not user_path.is_file():
+        return _apply(())
     try:
-        user_path = _hermes_home() / "memories" / "USER.md"
-        if user_path.is_file():
-            text_u = user_path.read_text(encoding="utf-8")
-            for match in re.finditer(
-                r"(?im)^(?:#+\s*)?(?:name|preferred name|aka|alias)\s*[:：]\s*(.+)$",
-                text_u,
-            ):
-                raw = match.group(1).strip()
-                for part in re.split(r"[,/|，、]+", raw):
-                    token = part.strip().split()[0] if part.strip() else ""
-                    if token:
-                        subjects.add(token.casefold())
-            for match in re.finditer(r"(?m)^#\s+(\S+)", text_u):
-                subjects.add(match.group(1).casefold())
-                break
+        text_u = user_path.read_text(encoding="utf-8")
     except OSError:
-        pass
-    return frozenset(subjects)
+        return _apply(())
+    current_hash = _content_hash(text_u)
+    cache_path = user_path.parent / _ALIAS_CACHE_FILENAME
+    caller = oneshot or run_worker_llm_oneshot
+
+    with _digest_lock:
+        cached: tuple[str, ...] | None = None
+        cache_hit = False
+        if cache_path.is_file():
+            try:
+                data = json.loads(cache_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                data = None
+            if (
+                isinstance(data, dict)
+                and str(data.get("user_md_sha256") or "") == current_hash
+                and "aliases" in data
+            ):
+                cache_hit = True
+                raw_saved = data.get("aliases")
+                if raw_saved is None:
+                    cached = ()
+                elif isinstance(raw_saved, list):
+                    cached = tuple(
+                        str(token).strip()
+                        for token in raw_saved
+                        if str(token).strip() and str(token).strip().casefold() != "user"
+                    )
+                else:
+                    cache_hit = False
+        if cache_hit and cached is not None:
+            return _apply(cached)
+
+        try:
+            capture = caller(
+                (
+                    "Find personal name aliases the user goes by, for the "
+                    "grammatical subject of a preference line. Return short "
+                    "name tokens only: given name, English name, or nickname. "
+                    "Do not return roles, schools, section titles, or the word "
+                    "user. If no personal alias is stated, set aliases to null.\n\n"
+                    "USER.md:\n"
+                    f"{text_u}"
+                ),
+                plugin="memory-digest",
+                purpose="user-alias-scan",
+                force_tool_name="submit_user_aliases",
+                tool_schema={
+                    "name": "submit_user_aliases",
+                    "description": (
+                        "Names the user goes by, or null when USER.md states none."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "aliases": {
+                                "anyOf": [
+                                    {"type": "array", "items": {"type": "string"}},
+                                    {"type": "null"},
+                                ]
+                            }
+                        },
+                        "required": ["aliases"],
+                        "additionalProperties": False,
+                    },
+                },
+                max_tokens=1024,
+            )
+        except Exception:
+            return _apply(())
+        if not isinstance(capture, dict) or capture.get("failed"):
+            return _apply(())
+        tool_args = capture.get("tool_args")
+        if not isinstance(tool_args, dict) or "aliases" not in tool_args:
+            return _apply(())
+        raw_aliases = tool_args.get("aliases")
+        if raw_aliases is None or raw_aliases == []:
+            display: tuple[str, ...] = ()
+        elif isinstance(raw_aliases, list):
+            cleaned: list[str] = []
+            for item in raw_aliases:
+                token = str(item).strip()
+                if not token or token.casefold() == "user" or token in cleaned:
+                    continue
+                cleaned.append(token)
+                if len(cleaned) >= 8:
+                    break
+            display = tuple(cleaned)
+        else:
+            return _apply(())
+        payload = {
+            "user_md_sha256": current_hash,
+            "aliases": list(display) if display else None,
+        }
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(cache_path.parent), suffix=".tmp", prefix=".alias_"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle)
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp_name, cache_path)
+            except Exception:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
+        except OSError:
+            return _apply(display)
+        return _apply(display)
 
 MAX_INVOLVES = 5
 MAX_RELATED = 10
@@ -346,7 +469,7 @@ Types: fact | procedure | decision | event. Never type: entity or hypothesis (en
 - event: user-driven causal chain and the user-request skeleton with exactly three stages — Beginning, Course, Outcome. Each of beginning, course, and outcome is one concise sentence (not a paragraph). Own the user goal, important phases, and current result/status; do not duplicate detailed facts, preferences, speculation, or tool logs. Required: entity; predicate snake_case user intent (e.g. user_requested_*) — not a tool-step name; participants MUST include {{entity: User, role: requester}} and {{entity: Assistant, role: executor}} (≤5 total; role optional on secondary; confidence: medium if any role missing); valid_from + valid_to (open if ongoing); no file paths / message ids / byte sizes (→ sources:); no 【过程性参考】.
 - fact: stable, observable observations; do not contain agent process or user preference. Two peer forms: Factual (kind=Factual + content; involves optional/single) or Narration (kind=Narration + content + involves cast `{{entity: Name, role?: optional}}`, role only when clear). Prefer one Narration card over N cast shards for the same story.
 - procedure: what the user asked the agent to do, the obstacle encountered, and the concrete output produced. Capture the task scope (user request), the problem (obstacle), and the deliverable (file, config, message, code). Not raw tool logs; not object/API documentation.
-- decision: user-only rulings and preferences for agent behavior (must/must-not), including decision_constraint: user feedback on that procedure, corrections, and standing prefs. Scan the transcript for the user's must / must-not / standing prefs and emit them as subject=user plus a predicate ruling so Preference:/Decision: {{subject}} {{ruling}} is one clause. First subject after Preference:/Decision: must be user/User (plus USER.md aliases). Third-party traits/living/likes → fact (`Narration:` / kind=Narration), even when the user reported them. Do not duplicate the full procedure or event summary. Corrections use supersedes: + confidence: explicit. `decision_constraint` is accepted only as a legacy input alias and is normalized to canonical `decision`.
+- decision: user-only rulings and preferences for agent behavior. Mirror the transcript's intensity; do not normalise the ruling to must. Examples, not a closed list: intense must / must not (write forbids / banned as must not); less intense prefer / prefers; neutral locked / decided / chose / sets; etc. Use another verb when it fits the session history's intensity better. Samples: "I don't want X" → user must not X; "I prefer Y over Z" → user prefers Y over Z; "We agreed the rule is W" → user locked the rule W; "I decided X" → user decided X. Including decision_constraint: user feedback on that procedure, corrections, and standing prefs. Emit subject plus a predicate ruling so Preference:/Decision: {{subject}} {{ruling}} is one clause. First subject after Preference:/Decision: must be user/User. Use only user unless the decision slot reminder names aliases. Third-party traits/living/likes → fact (`Narration:` / kind=Narration), even when the user reported them. Do not duplicate the full procedure or event summary. Corrections use supersedes: + confidence: explicit. `decision_constraint` is accepted only as a legacy input alias and is normalized to canonical `decision`.
 - Legacy input alias detail: decision_constraint: user feedback on that procedure; it is never emitted as the canonical output type.
 - Episode-first: one outcome event per completed user request (not one per tool step). Grade/scrape snapshot → fact; multi-file deliverable arc → one event.
 - entity: required on fact and event (English canonical). entity_aliases: optional original-language surfaces; omit when identical to entity. involves: optional on non-event only (max {MAX_INVOLVES}; omit primary; entity collection with optional role). Do NOT use involves on event — use participants instead.
@@ -2209,12 +2332,6 @@ def _staging_output_contract(daily_path: Path) -> str:
         "`{entity, role?}` (role optional) for a multi-person/multi-facet story.\n"
         "- procedure owns course obstacles and abstract solutions, not raw tool logs or the event outcome.\n"
         "- Procedure slots: obstacle, solution (code renders Obstacle:/Solution:); keep raw tool logs in sources only.\n"
-        "- decision owns user-only rulings/preferences for agent behavior (first subject user/User + USER.md aliases), "
-        "not third-party traits and not the full procedure or event summary. "
-        "Look in the transcript for the user's must / must-not / standing prefs; skip if the user made no ruling.\n"
-        "- Decision slots: kind=Preference|Decision, subject=user (USER.md aliases ok), "
-        "ruling=predicate for that subject (e.g. must not auto-drop events); "
-        "assembled `{kind}: {subject} {ruling}` is one clause.\n"
         "- Each worker result is a temporary worker result envelope for the organizer; it is not a persistent memory type.\n"
         "- Every block needs frontmatter keys: id, type, confidence, status, sources.\n"
         f"- New blocks: set importance: integer {IMPORTANCE_WRITE_MIN}–{IMPORTANCE_MAX} "
@@ -3818,13 +3935,19 @@ def _worker_type_body_reminder(worker_type: str) -> str:
             "(code renders Obstacle:/Solution:).\n"
         )
     if assigned == "decision":
+        _decision_user_subjects()
+        names = ", ".join(_decision_alias_display)
+        subject = f"`user` or {names}" if names else "`user`"
         return (
-            "Slot reminder: kind=Preference|Decision, subject=user "
-            "(or USER.md aliases), ruling=predicate for that subject "
-            "(must/must-not/standing pref; do not repeat subject). "
-            "Look in the transcript for the user's rulings. "
-            "Third-party traits → fact "
-            "with kind=Narration + involves cast, not decision.\n"
+            f"Slot reminder: kind=Preference|Decision, subject={subject}, "
+            "ruling=predicate that mirrors the transcript intensity; do not "
+            "normalise to must. Examples, not a closed list: intense must / "
+            "must not (write forbids / banned as must not); less intense "
+            "prefer / prefers; neutral locked / decided / chose / sets; etc. "
+            "Use another verb when it fits the session history's intensity "
+            "better. Do not repeat subject. Look in the transcript for the "
+            "user's rulings. Third-party traits → fact with kind=Narration "
+            "+ involves cast, not decision.\n"
         )
     if assigned == "fact":
         return (
