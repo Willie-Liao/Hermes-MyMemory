@@ -66,3 +66,33 @@ def test_band_d_month_summaries_when_month_file_exists(staging):
 
     n = len(tiktoken.get_encoding("o200k_base").encode(out))
     assert n <= _BUDGET, n
+
+
+def test_band_a_keeps_full_daily_wrapup(staging):
+    day = staging / "daily" / "2026-08-18.md"
+    day.write_text(
+        "---\n"
+        "id: mem-2026-08-18-event-BAND-A-FULL\n"
+        "type: event\n"
+        "entity: Memory Digest\n"
+        "confidence: high\n"
+        "status: candidate\n"
+        "sources: [session s-fake]\n"
+        "predicate: band_a_wrap\n"
+        "---\n"
+        "Beginning: one; Course: two; Outcome: three.\n"
+        "\n## Day wrap-up\n"
+        "- First wrap bullet is long enough that a 120-character cut would drop the second bullet entirely from prefetch.\n"
+        "- SECOND_BULLET_MUST_REMAIN\n",
+        encoding="utf-8",
+    )
+    text = render_bands(staging, today=date(2026, 8, 18))
+    band_a = text.split("## Memory / entity index", 1)[0]
+    assert "SECOND_BULLET_MUST_REMAIN" in band_a
+    assert "First wrap bullet is long enough" in band_a
+    assert "…" not in band_a
+    assert "blk ::" in band_a
+    for line in band_a.splitlines():
+        if "SECOND_BULLET_MUST_REMAIN" in line or "First wrap bullet" in line:
+            assert line.startswith("- ")
+            assert not line.startswith(" ")

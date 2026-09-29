@@ -61,10 +61,14 @@ def time_band_paint(root: Path, today: date) -> dict[str, float]:
             continue
         nblk = sum(1 for r in store.records if r.path == path)
         wrap = _wrapup_for_path(path)
-        wrap_one = " ".join(wrap.split())
-        if len(wrap_one) > 120:
-            wrap_one = wrap_one[:119].rstrip() + "…"
-        a_lines.append(f"- {d.isoformat()} {iso_week(d)} {nblk}blk :: {wrap_one}")
+        a_lines.append(f"- {d.isoformat()} {iso_week(d)} {nblk}blk ::")
+        if wrap == "(no wrap-up)":
+            a_lines.append("(no wrap-up)")
+        else:
+            for bullet in wrap.splitlines():
+                line = bullet.strip()
+                if line:
+                    a_lines.append(line if line.startswith("-") else f"- {line}")
     band_a_ms = _ms(t0)
 
     t0 = time.perf_counter()

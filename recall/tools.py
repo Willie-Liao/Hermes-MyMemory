@@ -822,10 +822,11 @@ def render_bands(
     today: date | None = None,
     hot_text: str = "",
 ) -> str:
-    """Byte-stable A–D prefix so the model can pick a week/month ISO window without a daily dump.
+    """Keep each day's full wrap-up; a 120-character stub dropped later bullets.
 
     Band C is four weeks of summary bullets plus ranges; entity names only on the older three
     so the newest week does not duplicate Band B. Band D is four month summaries with ranges.
+    The day header still ends with ``blk ::`` so an empty staging tree returns no injection.
     """
     root = staging_root(staging)
     store = BlockIndex(root)
@@ -841,10 +842,14 @@ def render_bands(
         day_files.append(path)
         nblk = sum(1 for r in store.records if r.path == path)
         wrap = _wrapup_for_path(path)
-        wrap_one = " ".join(wrap.split())
-        if len(wrap_one) > 120:
-            wrap_one = wrap_one[:119].rstrip() + "…"
-        a_lines.append(f"- {d.isoformat()} {iso_week(d)} {nblk}blk :: {wrap_one}")
+        a_lines.append(f"- {d.isoformat()} {iso_week(d)} {nblk}blk ::")
+        if wrap == "(no wrap-up)":
+            a_lines.append("(no wrap-up)")
+        else:
+            for bullet in wrap.splitlines():
+                line = bullet.strip()
+                if line:
+                    a_lines.append(line if line.startswith("-") else f"- {line}")
 
     idx = load_entity_index(root)
     window = {d.isoformat() for d in band_a_days}
