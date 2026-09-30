@@ -683,6 +683,29 @@ def test_extract_tool_calls_flat_shape_and_broken_arguments_string():
     assert found == [("submit_tighten_fact", {"kind": "Factual", "content": "x"})]
 
 
+def test_truncated_submit_keeps_finished_key_rows():
+    wl = _load_worker_llm()
+    raw = (
+        '{"key_decisions": [{"id": "mem-a", "why_it_matters": "still matters", "evidence": ["mem-a"]}], '
+        '"key_procedures": [{"id": "mem-b", "insight": "check first", "evidence": ["mem-b"]}], '
+        '"summary": [{"text": "cut'
+    )
+    result = {
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"function": {"name": "submit_month_synthesis", "arguments": raw}}
+                ],
+            }
+        ]
+    }
+    found = wl.extract_tool_calls_from_result(result)
+    assert found[0][0] == "submit_month_synthesis"
+    assert found[0][1]["key_decisions"][0]["id"] == "mem-a"
+    assert found[0][1]["key_procedures"][0]["id"] == "mem-b"
+
+
 def test_extract_tool_calls_drops_tool_describe_keeps_submit():
     """Gateway disclosure hops must not become worker1_summary's recorded tool."""
     wl = _load_worker_llm()

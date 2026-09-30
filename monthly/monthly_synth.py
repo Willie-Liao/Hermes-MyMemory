@@ -6,7 +6,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 _monthly = Path(__file__).resolve().parent
 _mymemory = _monthly.parent
@@ -52,11 +52,7 @@ from monthly_slice import (  # noqa: E402
     mechanical_facts,
     week_key_for,
 )
-from monthly_tools import (  # noqa: E402
-    merge_field_patch,
-    patch_month_synthesis_schema,
-    submit_month_synthesis_schema,
-)
+from monthly_tools import submit_month_synthesis_schema  # noqa: E402
 
 CallOneshot = Callable[..., dict[str, Any]]
 MAX_ATTEMPTS = 3
@@ -577,6 +573,17 @@ def payload_from_synthesis(
     )
 
 
+def _tool_has_key_rows(args: Mapping[str, Any] | None) -> bool:
+    """A reduce attempt counts only when key rows arrived, so a summary-only reply cannot hide an empty Band D."""
+    if not isinstance(args, dict):
+        return False
+    for key in ("key_decisions", "key_procedures"):
+        rows = args.get(key)
+        if isinstance(rows, list) and rows:
+            return True
+    return False
+
+
 def synthesize_month(
     month_key: str,
     note_records: list[dict[str, Any]],
@@ -585,18 +592,21 @@ def synthesize_month(
     carry: str = "",
     facts: MechanicalFacts | None = None,
 ) -> tuple[MonthlyPayload, dict[str, Any]]:
-    """Write every narrative field in one call, from notes rather than from raw blocks."""
+    """Keep a submit payload that names key rows, including a later attempt that has no summary.
+
+    Switching to a patch tool dropped a full submit, and the month file then copied story seeds.
+    """
     facts = facts or mechanical_facts(month_key)
     notes: list[dict[str, Any]] = []
     for record in note_records:
         notes.extend(item for item in (record.get("items") or []) if isinstance(item, dict))
     prompt = build_reduce_prompt(month_key, notes, facts, carry)
     caller = call_oneshot or _default_oneshot
+    schema = submit_month_synthesis_schema()
     previous: dict[str, Any] | None = None
     usage: dict[str, Any] = {}
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        submit = attempt == 1
-        schema = submit_month_synthesis_schema() if submit else patch_month_synthesis_schema()
+    excerpt = ""
+    for _attempt in range(1, MAX_ATTEMPTS + 1):
         result = caller(
             prompt,
             purpose="monthly-reduce",
@@ -607,16 +617,13 @@ def synthesize_month(
         usage = result
         if result.get("failed"):
             continue
-        name = str(result.get("tool_name") or "")
         args = result.get("tool_args") if isinstance(result.get("tool_args"), dict) else {}
-        if submit:
+        if _tool_has_key_rows(args):
             previous = args
-        else:
-            if name == submit_month_synthesis_schema()["name"]:
-                continue
-            previous = merge_field_patch(previous or {}, args)
-        if isinstance(previous, dict) and previous.get("summary") is not None:
             break
+        text = str(result.get("final_response") or "").strip()
+        if text:
+            excerpt = text[:240]
     args = dict(previous or {})
     args["_notes"] = notes
     stamp = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -625,7 +632,7 @@ def synthesize_month(
         args,
         facts,
         carry=carry,
-        model=str(usage.get("model") or "mimo-v2.5"),
+        model=str(usage.get("model") or "MiniMax-M2.5"),
         map_calls=len(note_records),
         reduce_tokens=int(usage.get("input_tokens") or 0),
         generated_at=stamp,
@@ -637,4 +644,6 @@ def synthesize_month(
         "prompt_tokens_est": count_tokens(prompt),
         "failed": bool(usage.get("failed")),
     }
+    if not _tool_has_key_rows(previous):
+        usage_out["final_response"] = excerpt
     return payload, usage_out

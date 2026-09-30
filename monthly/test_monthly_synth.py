@@ -194,6 +194,41 @@ def test_synthesize_month_forced_tool(monkeypatch):
     assert usage["input_tokens"] == 50
 
 
+def test_later_submit_without_summary_keeps_key_rows():
+    facts = mechanical_facts("2026-06")
+    real = next(b for b in facts.all_dpe if b.type == "decision")
+    calls = {"n": 0}
+
+    def call(prompt, **kwargs):
+        calls["n"] += 1
+        assert kwargs.get("force_tool_name") == "submit_month_synthesis"
+        if calls["n"] == 1:
+            return {"failed": False, "tool_name": "submit_month_synthesis", "tool_args": {}, "input_tokens": 10}
+        return {
+            "failed": False,
+            "tool_name": "submit_month_synthesis",
+            "tool_args": {
+                "key_decisions": [
+                    {"id": real.id, "why_it_matters": "still changes the next time", "evidence": [real.id]}
+                ],
+            },
+            "input_tokens": 50,
+            "output_tokens": 20,
+            "model": "mimo-v2.5",
+        }
+
+    payload, usage = synthesize_month(
+        "2026-06",
+        [],
+        call_oneshot=call,
+        carry="",
+        facts=facts,
+    )
+    assert calls["n"] == 2
+    assert payload.key_decisions[0].id == real.id
+    assert usage["input_tokens"] == 50
+
+
 def test_payload_from_synthesis_passes_bilingual_aliases():
     facts = mechanical_facts("2026-08")
     patched = [

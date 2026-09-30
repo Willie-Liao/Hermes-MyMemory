@@ -295,6 +295,46 @@ def _sync_llm_health(record: Mapping[str, Any]) -> None:
         )
 
 
+def _emit_langfuse_usage(record: dict[str, Any]) -> None:
+    """Copy a worker oneshot into Langfuse; the agent hook never sees this HTTP call.
+
+    Without this, monthly-reduce token counts stay on the local ledger and never become a trace.
+    """
+    try:
+        from langfuse import Langfuse
+    except Exception:
+        return
+    public = (os.environ.get("HERMES_LANGFUSE_PUBLIC_KEY") or os.environ.get("LANGFUSE_PUBLIC_KEY") or "").strip()
+    secret = (os.environ.get("HERMES_LANGFUSE_SECRET_KEY") or os.environ.get("LANGFUSE_SECRET_KEY") or "").strip()
+    if not public.startswith("pk-lf-") or not secret.startswith("sk-lf-"):
+        return
+    base = (
+        os.environ.get("HERMES_LANGFUSE_BASE_URL")
+        or os.environ.get("LANGFUSE_BASE_URL")
+        or "http://localhost:3000"
+    ).strip()
+    try:
+        input_tokens = int(record.get("input_tokens") or 0)
+        output_tokens = int(record.get("output_tokens") or 0)
+        total = int(record.get("total_tokens") or (input_tokens + output_tokens))
+        client = Langfuse(public_key=public, secret_key=secret, base_url=base)
+        obs = client.start_observation(
+            name=str(record.get("purpose") or "worker-llm"),
+            as_type="generation",
+            model=str(record.get("model") or "") or None,
+            metadata={
+                "plugin": record.get("plugin"),
+                "purpose": record.get("purpose"),
+                "duration_ms": int(record.get("duration_ms") or 0),
+            },
+            usage_details={"input": input_tokens, "output": output_tokens, "total": total},
+        )
+        obs.end()
+        client.flush()
+    except Exception:
+        return
+
+
 def record_worker_usage(record: dict[str, Any]) -> None:
     """Append one JSONL usage record and refresh llm-health. Fail-open — never raise to callers.
 
@@ -308,6 +348,7 @@ def record_worker_usage(record: dict[str, Any]) -> None:
         _sync_llm_health(record)
     except Exception:
         pass  # fail-open
+    _emit_langfuse_usage(record)
 
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.I)
@@ -413,6 +454,51 @@ def _loads_json_object(raw: Any) -> dict[str, Any] | None:
     return parsed[-1]
 
 
+def _array_objects(text: str, start: int) -> list[dict[str, Any]]:
+    """Read finished objects from an array that the model cut off before the closing bracket.
+
+    A truncated submit still holds complete key rows; dropping the whole payload leaves Band D empty.
+    """
+    if start < 0 or start >= len(text) or text[start] != "[":
+        return []
+    objs: list[dict[str, Any]] = []
+    i = start + 1
+    n = len(text)
+    while i < n:
+        while i < n and text[i] in " \n\t\r,":
+            i += 1
+        if i >= n or text[i] == "]":
+            break
+        if text[i] != "{":
+            break
+        slices = _json_object_slices(text[i:])
+        if not slices:
+            break
+        obj = _parse_json_mapping(slices[0])
+        if obj is None:
+            break
+        objs.append(obj)
+        i += len(slices[0])
+    return objs
+
+
+def _salvage_truncated_tool_args(raw: str) -> dict[str, Any]:
+    """Keep key rows when MiniMax stops inside the submit JSON before the object closes."""
+    out: dict[str, Any] = {}
+    for key in ("key_decisions", "key_procedures"):
+        marker = f'"{key}"'
+        idx = raw.find(marker)
+        if idx < 0:
+            continue
+        bracket = raw.find("[", idx)
+        if bracket < 0:
+            continue
+        rows = _array_objects(raw, bracket)
+        if rows:
+            out[key] = rows
+    return out
+
+
 def _pair_from_tool_call(
     tc: Mapping[str, Any],
     default_tool_name: str | None,
@@ -430,6 +516,13 @@ def _pair_from_tool_call(
             raw_args = tc.get(key)
             break
     args = _loads_json_object(raw_args) or {}
+    if isinstance(raw_args, str) and not (
+        isinstance(args.get("key_decisions"), list) and args.get("key_decisions")
+        or isinstance(args.get("key_procedures"), list) and args.get("key_procedures")
+    ):
+        salvaged = _salvage_truncated_tool_args(raw_args)
+        if salvaged:
+            args = {**args, **salvaged}
     if not name:
         return None
     return (name, args)
@@ -1487,6 +1580,7 @@ def run_worker_llm_oneshot(
             captured["api_calls"] = 1
             captured["failed"] = False
             captured["duration_ms"] = _elapsed_ms()
+            captured["model"] = model or config_model
             return captured
     return _fail_record(last_exc, model)
 
