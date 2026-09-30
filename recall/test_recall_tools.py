@@ -472,7 +472,7 @@ def test_embed_real_peak_keeps_two(staging, monkeypatch):
 
 
 def test_guidance_mode_monthly_preference_before_procedure(staging, monkeypatch):
-    """A 0.973 gate drops topic overlap, so this stub must clear the gate or the channel never appears."""
+    """The monthly-guidance gate is 0.92, so this stub must clear it or the channel never appears."""
 
     def _stub_encode(texts):
         query = texts[0] if texts else ""
