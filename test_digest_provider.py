@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -20,7 +22,10 @@ if str(_PLUGINS) not in sys.path:
 if str(_AGENT) not in sys.path:
     sys.path.insert(0, str(_AGENT))
 
-from MyMemory.provider import MyMemoryProvider, reset_bootstrap_for_tests
+from MyMemory.digest.slash import handle_digest
+from MyMemory.monthly.monthly_actions import handle_monthly
+from MyMemory.provider import MyMemoryProvider, _slash_off_loop, reset_bootstrap_for_tests
+from MyMemory.weekly.slash import handle_weekly
 from MyMemory.digest import digest
 
 
@@ -62,11 +67,74 @@ def test_plugin_manager_discover_registers_digest_and_weekly_slash(monkeypatch):
     monkeypatch.setattr(plugins_mod, "get_plugin_manager", lambda: mgr)
     mgr.discover_and_load()
     cmds = mgr._plugin_commands
-    assert cmds["digest"]["handler"].__name__ == "handle_digest"
-    assert cmds["weekly"]["handler"].__name__ == "handle_weekly"
-    assert cmds["monthly"]["handler"].__name__ == "handle_monthly"
+    digest_handler = cmds["digest"]["handler"]
+    weekly_handler = cmds["weekly"]["handler"]
+    monthly_handler = cmds["monthly"]["handler"]
+    assert digest_handler.__name__ == "handle_digest"
+    assert weekly_handler.__name__ == "handle_weekly"
+    assert monthly_handler.__name__ == "handle_monthly"
+    assert asyncio.iscoroutinefunction(digest_handler)
+    assert asyncio.iscoroutinefunction(weekly_handler)
+    assert asyncio.iscoroutinefunction(monthly_handler)
+    assert asyncio.run(digest_handler("help")) == handle_digest("help")
+    assert asyncio.run(weekly_handler("help")) == handle_weekly("help")
+    assert asyncio.run(monthly_handler("help")) == handle_monthly("help")
     assert "digest" in cmds
     assert "weekly" in cmds
+
+
+@pytest.mark.skipif(
+    not (_AGENT / "hermes_cli" / "plugins.py").exists(),
+    reason="hermes-agent not vendored",
+)
+def test_registered_monthly_handler_runs_off_calling_thread(monkeypatch):
+    """The object stored for /monthly must run handle_monthly off the gateway thread.
+
+    Directory plugins load as hermes_plugins.*, so patching MyMemory.monthly
+    does not reach the closure. Track asyncio.to_thread, which both copies share.
+    """
+    from hermes_cli import plugins as plugins_mod
+
+    caller = threading.get_ident()
+    seen: dict[str, object] = {}
+    real_to_thread = asyncio.to_thread
+
+    async def tracking(func, /, *args, **kwargs):
+        def _mark(*a, **k):
+            seen["thread"] = threading.get_ident()
+            return func(*a, **k)
+
+        seen["func"] = func
+        return await real_to_thread(_mark, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", tracking)
+    monkeypatch.setenv("HERMES_HOME", str(_HERMES_HOME))
+    mgr = plugins_mod.PluginManager()
+    monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
+    monkeypatch.setattr(plugins_mod, "get_plugin_manager", lambda: mgr)
+    mgr.discover_and_load()
+    handler = mgr._plugin_commands["monthly"]["handler"]
+    assert asyncio.iscoroutinefunction(handler)
+    assert asyncio.run(handler("help")) == handle_monthly("help")
+    assert seen["func"] is handler.__wrapped__
+    assert seen["thread"] != caller
+
+
+def test_slash_off_loop_runs_handler_off_calling_thread():
+    """A registered slash coroutine must leave the gateway thread free for heartbeats."""
+    caller = threading.get_ident()
+    seen: dict[str, int] = {}
+
+    def handler(raw_args: str) -> str:
+        seen["thread"] = threading.get_ident()
+        return f"saw {raw_args}"
+
+    wrapped = _slash_off_loop(handler)
+    assert asyncio.iscoroutinefunction(wrapped)
+    assert wrapped.__name__ == "handler"
+    assert asyncio.run(wrapped("help")) == "saw help"
+    assert seen["thread"] != caller
+    assert not asyncio.iscoroutine(handler("help"))
 
 
 def test_name_and_available():

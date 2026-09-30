@@ -7,10 +7,13 @@ inject path Hermes wraps as ``<memory-context>``.
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
 import os
 import sys
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -408,13 +411,29 @@ class MyMemoryProvider(MemoryProvider):
             embed_cache.stop_embed_cache_clock_thread()
 
 
+def _slash_off_loop(handler: Callable[[str], str]) -> Callable[[str], Awaitable[str]]:
+    """Keep a sync slash handler off the gateway loop so a long MiniMax call cannot miss heartbeats.
+
+    The gateway awaits a coroutine and otherwise runs the handler on the loop.
+    A string return holds that loop until the watchdog exits 75. CLI and tools
+    keep calling the unwrapped function and still receive a string.
+    """
+
+    @functools.wraps(handler)
+    async def _run(raw_args: str) -> str:
+        return await asyncio.to_thread(handler, raw_args)
+
+    return _run
+
+
 def _register_slash_commands() -> None:
     """Put /digest, /weekly, and /monthly on PluginManager; exclusive load never calls register_command.
 
     The memory loader's fake context has no register_command. Without this,
     those names never enter _plugin_commands and chat treats them as unknown.
     Fail-open so a missing hermes_cli cannot block provider init. Never
-    rediscover with force=True (that wipes the command table).
+    rediscover with force=True (that wipes the command table). Handlers are
+    coroutines so a long slash run yields the gateway loop.
     """
     try:
         from hermes_cli.plugins import (
@@ -434,7 +453,7 @@ def _register_slash_commands() -> None:
         ctx = PluginContext(manifest, mgr)
         ctx.register_command(
             "digest",
-            digest_slash.handle_digest,
+            _slash_off_loop(digest_slash.handle_digest),
             description=(
                 "Force a digest run, manage bookmark, or estimate/run history backfill"
             ),
@@ -442,7 +461,7 @@ def _register_slash_commands() -> None:
         )
         ctx.register_command(
             "weekly",
-            weekly_slash.handle_weekly,
+            _slash_off_loop(weekly_slash.handle_weekly),
             description="Weekly memory: ui / update / close / reopen",
             args_hint="[ui|update [week]|close [week]|reopen [week]|help]",
         )
@@ -450,7 +469,7 @@ def _register_slash_commands() -> None:
 
         ctx.register_command(
             "monthly",
-            handle_monthly,
+            _slash_off_loop(handle_monthly),
             description="Monthly guidance: update / show",
             args_hint="[update [YYYY-MM]|show [YYYY-MM]|help]",
         )

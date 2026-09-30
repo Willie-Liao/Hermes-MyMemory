@@ -9,7 +9,7 @@ initialize.
 from __future__ import annotations
 
 from .prefetch_timeout import apply_external_prefetch_timeout
-from .provider import MyMemoryProvider
+from .provider import MyMemoryProvider, _slash_off_loop
 
 
 def register(ctx) -> None:
@@ -19,6 +19,7 @@ def register(ctx) -> None:
     memory loader's collector has no register_command. hasattr so one
     register() serves both loaders without dual recall hooks.
     Re-apply prefetch join budget here so a Hermes upgrade cannot restore 8s.
+    Handlers are coroutines so a long slash run yields the gateway loop.
     """
     apply_external_prefetch_timeout()
     if hasattr(ctx, "register_command"):
@@ -27,7 +28,7 @@ def register(ctx) -> None:
 
         ctx.register_command(
             "digest",
-            digest_slash.handle_digest,
+            _slash_off_loop(digest_slash.handle_digest),
             description=(
                 "Force a digest run, manage bookmark, or estimate/run history backfill"
             ),
@@ -35,7 +36,7 @@ def register(ctx) -> None:
         )
         ctx.register_command(
             "weekly",
-            weekly_slash.handle_weekly,
+            _slash_off_loop(weekly_slash.handle_weekly),
             description="Weekly memory: ui / update / close / reopen",
             args_hint="[ui|update [week]|close [week]|reopen [week]|help]",
         )
@@ -43,7 +44,7 @@ def register(ctx) -> None:
 
         ctx.register_command(
             "monthly",
-            handle_monthly,
+            _slash_off_loop(handle_monthly),
             description="Monthly guidance: update / show",
             args_hint="[update [YYYY-MM]|show [YYYY-MM]|help]",
         )
