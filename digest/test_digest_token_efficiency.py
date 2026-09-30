@@ -970,6 +970,48 @@ def test_render_worker_yaml_quotes_at_session_and_default_sources():
     assert parsed2["sources"] == ["session bench-x"]
 
 
+def test_bare_colon_entity_is_quoted_on_read_and_rewrite():
+    """An unquoted colon in a top-level scalar is a nested mapping and kills digest."""
+    import yaml
+
+    digest = _load("digest")
+    text = (
+        "---\n"
+        "id: mem-1\n"
+        "type: fact\n"
+        "entity: MEDIA: platform feature\n"
+        "status: candidate\n"
+        "---\n"
+        "Factual: note\n"
+    )
+    _line_no, fm, _body = digest._frontmatter_blocks(text)[0]
+    assert 'entity: "MEDIA: platform feature"' in fm
+    parsed = yaml.safe_load(fm)
+    assert parsed["entity"] == "MEDIA: platform feature"
+    nested = (
+        "---\n"
+        "id: mem-2\n"
+        "type: event\n"
+        "entity: Topic\n"
+        "participants:\n"
+        "  - {entity: MEDIA: platform feature, role: requester}\n"
+        "---\n"
+        "Beginning: a\n"
+    )
+    nested_fm = digest._frontmatter_blocks(nested)[0][1]
+    assert "{entity: MEDIA: platform feature, role: requester}" in nested_fm
+    rendered = digest._render_digest_block(
+        {"id": "mem-1", "type": "fact", "entity": "MEDIA: platform feature"},
+        "Factual: note",
+    )
+    assert 'entity: "MEDIA: platform feature"' in rendered
+    plain = digest._render_digest_block(
+        {"id": "mem-2", "type": "fact", "entity": "Topic"},
+        "Factual: note",
+    )
+    assert "entity: Topic\n" in plain
+
+
 def _sample_digest_blocks_payload() -> dict:
     return {
         "blocks": [

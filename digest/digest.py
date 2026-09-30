@@ -1209,7 +1209,11 @@ def _format_entity_collection_lines(key: str, items: Any) -> list[str]:
 
 
 def _render_digest_block(parsed: dict[str, Any], body: str) -> str:
-    """Keep entity_aliases in list form after entity so a rewrite cannot drop the original-language surface."""
+    """Keep entity_aliases in list form, and quote scalars that contain a colon.
+
+    A rewrite that writes ``entity: MEDIA: platform feature`` is illegal YAML.
+    ``_yaml_scalar`` is what stops that line from killing the next digest pass.
+    """
     lines = ["---"]
     seen: set[str] = set()
     for key in _FRONTMATTER_KEY_ORDER:
@@ -1220,10 +1224,8 @@ def _render_digest_block(parsed: dict[str, Any], body: str) -> str:
             lines.append(f"{key}: {_format_sources(parsed[key])}")
         elif key in {"participants", "involves"}:
             lines.extend(_format_entity_collection_lines(key, parsed[key]))
-        elif key in CLOCK_FRONTMATTER_KEYS:
-            lines.append(f"{key}: {digest_tools._yaml_scalar(parsed[key])}")
         else:
-            lines.append(f"{key}: {parsed[key]}")
+            lines.append(f"{key}: {digest_tools._yaml_scalar(parsed[key])}")
     for key, value in parsed.items():
         if key in seen:
             continue
@@ -1231,10 +1233,8 @@ def _render_digest_block(parsed: dict[str, Any], body: str) -> str:
             lines.append(f"{key}: {_format_sources(value)}")
         elif key in {"participants", "involves"}:
             lines.extend(_format_entity_collection_lines(key, value))
-        elif key in CLOCK_FRONTMATTER_KEYS:
-            lines.append(f"{key}: {digest_tools._yaml_scalar(value)}")
         else:
-            lines.append(f"{key}: {value}")
+            lines.append(f"{key}: {digest_tools._yaml_scalar(value)}")
     lines.extend(["---", body])
     return "\n".join(lines)
 
@@ -1431,6 +1431,11 @@ def _normalize_digest_content(
 
 
 def _frontmatter_blocks(content: str) -> list[tuple[int, str, str]]:
+    """Split daily fences, quoting a bare ``key: text: more`` so YAML stays a scalar.
+
+    ``entity: MEDIA: platform feature`` is a nested mapping and kills digest.
+    Indented lines stay untouched so ``{entity: Name, role: requester}`` is not rewritten.
+    """
     fences, _phrase = split_daily_wrapup(content)
     lines = fences.splitlines()
     blocks: list[tuple[int, str, str]] = []
@@ -1445,7 +1450,22 @@ def _frontmatter_blocks(content: str) -> list[tuple[int, str, str]]:
         idx += 1
         frontmatter: list[str] = []
         while idx < len(lines) and lines[idx].strip() != "---":
-            frontmatter.append(lines[idx])
+            raw_line = lines[idx]
+            line = raw_line
+            if raw_line and not raw_line[0].isspace():
+                key, sep, value = raw_line.partition(": ")
+                stripped = value.strip()
+                if (
+                    sep
+                    and key
+                    and " " not in key
+                    and ":" not in key
+                    and stripped
+                    and stripped[0] not in "\"'[{|"
+                    and ":" in stripped
+                ):
+                    line = f"{key}: {json.dumps(stripped, ensure_ascii=False)}"
+            frontmatter.append(line)
             idx += 1
         if idx >= len(lines):
             blocks.append((start_line, "\n".join(frontmatter), ""))
