@@ -23,6 +23,7 @@ from monthly_schema import (  # noqa: E402
     CAP_PROGRESS,
     CAP_RISKS,
     CAP_SUMMARY,
+    NOTE_WORD_CAP,
     REDUCE_MAX_TOKENS,
     SOLUTION_CHAR_CAP,
     MonthlyBehaviorPattern,
@@ -60,10 +61,16 @@ from monthly_tools import (  # noqa: E402
 CallOneshot = Callable[..., dict[str, Any]]
 MAX_ATTEMPTS = 3
 REDUCE_PREFIX = (
-    "Synthesize a monthly user portrait from notes, weekly story seeds, and mechanical D/P groups. "
-    "Cite only ids listed. Do not copy Beginning/Course/Outcome/Obstacle. "
+    "Same-rule paraphrase ranks above every singleton. "
+    "Same topic is not the same rule. "
+    "After repeats, only a sentence that would still change the next time. "
+    "A finished one-day act is not a key row. "
+    "Importance does not outrank a repeat. "
+    f"Return at most {CAP_DECISIONS} key_decisions and {CAP_PROCEDURES} key_procedures. "
+    "Each row uses one representative id. Put the other same-rule mem-ids in evidence. "
+    f"why_it_matters and insight are required and at most {NOTE_WORD_CAP} words. "
+    "Cite only ids from the card lines. Do not copy Beginning/Course/Outcome/Obstacle. "
     "summary must be an array of one-line stories (text + weeks); never glue two seeds into one string. "
-    "key_decisions.id and key_procedures.id must be ids from mechanical dp_groups. "
     "Do not invent obstacles, exceptions, or ids."
 )
 
@@ -117,29 +124,58 @@ def _solution_clause(block) -> str:
     return text[:SOLUTION_CHAR_CAP]
 
 
+def _card_dump_line(row: dict[str, Any]) -> str:
+    """One line per card so the reduce call cannot spend tokens on indented group JSON."""
+    kind = str(row.get("kind") or row.get("type") or "")
+    day = str(row.get("date") or row.get("first_seen") or "")
+    if row.get("type") == "procedure":
+        body = str(row.get("solution") or row.get("problem") or "")
+    else:
+        body = str(row.get("text") or "")
+    body = " ".join(body.split())
+    return f"{row.get('id')} | {kind} | {day} | {body}"
+
+
+def _cap_words(text: str) -> str:
+    """Keep a mandatory note inside NOTE_WORD_CAP so a key row stays one glance."""
+    return " ".join(str(text or "").split()[:NOTE_WORD_CAP])
+
+
+def _same_type_evidence(representative: str, raw: tuple[str, ...], type_ids: set[str]) -> tuple[str, ...]:
+    """Keep the representative and same-type dump ids; a procedure cite on a decision row is dropped."""
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for item in (representative, *raw):
+        if item in seen or item not in type_ids:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return tuple(ordered)
+
+
 def build_reduce_prompt(
     month_key: str,
     notes: list[dict[str, Any]],
     facts: MechanicalFacts,
     carry: str,
 ) -> str:
+    cards = "\n".join(_card_dump_line(row) for row in facts.dp_groups)
     payload = {
         "month_key": month_key,
         "notes": notes,
-        "mechanical": facts.rendered(),
-        "story_seeds": list(facts.story_seeds),
-        "weekly_summaries": list(facts.weekly_summaries),
-        "cross_week_candidates": list(facts.cross_week_candidates),
-        "dp_groups": [
-            {k: v for k, v in row.items() if k != "text" or row.get("type") == "decision"}
-            for row in facts.dp_groups
-        ],
+        "metrics": {
+            "decisions": facts.metrics.decisions,
+            "procedures": facts.metrics.procedures,
+            "events": facts.metrics.events,
+        },
+        "story_seeds": [{"text": row.get("text"), "weeks": list(row.get("weeks") or ())} for row in facts.story_seeds],
         "carry_card": carry,
-        "decision_ids": [b.id for b in facts.all_dpe if b.type == "decision"],
-        "procedure_ids": [b.id for b in facts.all_dpe if b.type == "procedure"],
         "supersedes_pairs": list(facts.supersedes_pairs),
     }
-    return f"{REDUCE_PREFIX}\n\n---\n{json.dumps(payload, ensure_ascii=False, default=str)}"
+    return (
+        f"{REDUCE_PREFIX}\n\nCards:\n{cards}\n\n---\n"
+        f"{json.dumps(payload, ensure_ascii=False, default=str)}"
+    )
 
 
 def allowed_ids_from_facts(facts: MechanicalFacts, notes: list[dict[str, Any]]) -> set[str]:
@@ -256,7 +292,10 @@ def payload_from_synthesis(
     reduce_tokens: int,
     generated_at: str,
 ) -> MonthlyPayload:
-    """Bind synthesis args onto mechanical facts, including bilingual aliases, so monthly YAML cannot drop original-language surfaces."""
+    """Bind synthesis args onto mechanical facts so a blank or cross-type key row cannot land in the month file.
+
+    Bilingual aliases stay on the entity roster. Key order is the model's order.
+    """
     from monthly_slice import calendar_range
 
     allowed = allowed_ids_from_facts(facts, [])
@@ -314,6 +353,8 @@ def payload_from_synthesis(
 
     decisions: list[MonthlyDecision] = []
     groups_by_id = {str(g["id"]): g for g in facts.dp_groups}
+    decision_ids = {gid for gid, group in groups_by_id.items() if group.get("type") == "decision"}
+    procedure_ids = {gid for gid, group in groups_by_id.items() if group.get("type") == "procedure"}
     llm_decisions = [row for row in (args.get("key_decisions") or []) if isinstance(row, dict)]
     for row in llm_decisions:
         mem_id = str(row.get("id") or "")
@@ -322,6 +363,7 @@ def payload_from_synthesis(
         if group is None or group.get("type") != "decision":
             if block is None or block.type != "decision":
                 continue
+            decision_ids.add(mem_id)
             group = {
                 "id": mem_id,
                 "kind": _lead_kind(block.clause),
@@ -338,21 +380,16 @@ def payload_from_synthesis(
                 "context": "",
                 "exceptions": "",
             }
-        evidence = _drop_unsourced(_as_ids(row.get("evidence")), allowed) or tuple(group.get("evidence") or (mem_id,))
-        why = str(row.get("why_it_matters") or "")
-        if why.strip() and not evidence:
-            why = ""
-        group = {**group, "evidence": evidence}
+        why = _cap_words(str(row.get("why_it_matters") or ""))
+        if not why:
+            continue
+        evidence = _same_type_evidence(mem_id, _as_ids(row.get("evidence")), decision_ids)
+        if not evidence:
+            continue
+        group = {**group, "evidence": evidence, "occurrence_n": len(evidence)}
         decisions.append(_group_to_decision(group, why))
         if len(decisions) >= CAP_DECISIONS:
             break
-    if not decisions:
-        for group in facts.dp_groups:
-            if group.get("type") != "decision":
-                continue
-            decisions.append(_group_to_decision(group, ""))
-            if len(decisions) >= CAP_DECISIONS:
-                break
 
     procedures: list[MonthlyProcedure] = []
     llm_procs = [row for row in (args.get("key_procedures") or []) if isinstance(row, dict)]
@@ -363,6 +400,7 @@ def payload_from_synthesis(
         if group is None or group.get("type") != "procedure":
             if block is None or block.type != "procedure":
                 continue
+            procedure_ids.add(mem_id)
             group = {
                 "id": mem_id,
                 "problem": str(row.get("problem") or ""),
@@ -377,22 +415,17 @@ def payload_from_synthesis(
                 "last_seen": block.valid_from,
                 "strength": 0.0,
             }
-        evidence = _drop_unsourced(_as_ids(row.get("evidence")), allowed) or tuple(group.get("evidence") or (mem_id,))
-        insight = str(row.get("insight") or "")
-        if insight.strip() and not evidence:
-            insight = ""
+        insight = _cap_words(str(row.get("insight") or ""))
+        if not insight:
+            continue
+        evidence = _same_type_evidence(mem_id, _as_ids(row.get("evidence")), procedure_ids)
+        if not evidence:
+            continue
         problem = str(group.get("problem") or "")
-        group = {**group, "evidence": evidence}
+        group = {**group, "evidence": evidence, "occurrence_n": len(evidence)}
         procedures.append(_group_to_procedure(group, insight, problem))
         if len(procedures) >= CAP_PROCEDURES:
             break
-    if not procedures:
-        for group in facts.dp_groups:
-            if group.get("type") != "procedure":
-                continue
-            procedures.append(_group_to_procedure(group, "", str(group.get("problem") or "")))
-            if len(procedures) >= CAP_PROCEDURES:
-                break
 
     cross: list[MonthlyCrossWeekItem] = []
     for row in args.get("cross_week_items") or []:

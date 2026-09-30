@@ -28,6 +28,7 @@ from monthly_schema import (  # noqa: E402
     MonthlyEvidenceText,
     MonthlyFocus,
     MonthlyGenerator,
+    NOTE_WORD_CAP,
     MonthlyMetrics,
     MonthlyPayload,
     MonthlyProcedure,
@@ -86,6 +87,17 @@ def dump_yaml(payload: MonthlyPayload) -> str:
     data = payload_to_dict(payload)
     ordered = {key: data[key] for key in _KEY_ORDER}
     return yaml.safe_dump(ordered, sort_keys=False, allow_unicode=True)
+
+
+def _stored_note(value: Any) -> str:
+    """Drop a blank key note on load so an older month file can still open.
+
+    New rows are written only after the binder has a short why or insight.
+    """
+    words = str(value or "").split()
+    if not words:
+        return ""
+    return " ".join(words[:NOTE_WORD_CAP])
 
 
 def _tuple(value: Any) -> tuple:
@@ -216,7 +228,7 @@ def payload_from_dict(obj: dict[str, Any]) -> MonthlyPayload:
                 id=str(row.get("id") or ""),
                 kind=str(row.get("kind") or "decision"),
                 text=str(row.get("text") or ""),
-                why_it_matters=str(row.get("why_it_matters") or ""),
+                why_it_matters=_stored_note(row.get("why_it_matters")),
                 context=str(row.get("context") or ""),
                 exceptions=str(row.get("exceptions") or ""),
                 date=str(row.get("date") or ""),
@@ -230,7 +242,7 @@ def payload_from_dict(obj: dict[str, Any]) -> MonthlyPayload:
                 strength=float(row.get("strength") or 0.0),
             )
             for row in obj.get("key_decisions") or []
-            if isinstance(row, dict)
+            if isinstance(row, dict) and _stored_note(row.get("why_it_matters"))
         ),
         key_procedures=tuple(
             MonthlyProcedure(
@@ -239,7 +251,7 @@ def payload_from_dict(obj: dict[str, Any]) -> MonthlyPayload:
                 problem=str(row.get("problem") or ""),
                 obstacles=_tuple(row.get("obstacles")),
                 solution=str(row.get("solution") or ""),
-                insight=str(row.get("insight") or ""),
+                insight=_stored_note(row.get("insight")),
                 entity_keys=_tuple(row.get("entity_keys")),
                 weeks=_tuple(row.get("weeks")),
                 evidence=_tuple(row.get("evidence")),
@@ -249,7 +261,7 @@ def payload_from_dict(obj: dict[str, Any]) -> MonthlyPayload:
                 strength=float(row.get("strength") or 0.0),
             )
             for row in obj.get("key_procedures") or []
-            if isinstance(row, dict)
+            if isinstance(row, dict) and _stored_note(row.get("insight"))
         ),
         cross_week_items=tuple(
             MonthlyCrossWeekItem(

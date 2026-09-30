@@ -75,6 +75,39 @@ def submit_month_synthesis_schema() -> dict[str, Any]:
         "Synthesize the month from notes and mechanical facts. Cite only ids you were given. "
         "summary is one-line bullets (text + weeks); never one paragraph.",
         {
+            "key_decisions": {
+                "type": "array",
+                "description": "Same-rule repeats first, then standing rules. At most 12. Fill this before summary.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "why_it_matters": {
+                            "type": "string",
+                            "description": "Required. At most 40 words. Why this rule would still change the next time.",
+                        },
+                        "evidence": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["id", "why_it_matters", "evidence"],
+                },
+            },
+            "key_procedures": {
+                "type": "array",
+                "description": "Same-rule repeats first. A finished one-day act is not a key row. At most 8.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "problem": {"type": "string"},
+                        "insight": {
+                            "type": "string",
+                            "description": "Required. At most 40 words. Why this procedure would still change the next time.",
+                        },
+                        "evidence": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["id", "insight", "evidence"],
+                },
+            },
             "summary": {
                 "type": "array",
                 "items": {
@@ -130,29 +163,6 @@ def submit_month_synthesis_schema() -> dict[str, Any]:
                         "state": {"type": "string"},
                         "weeks": {"type": "array", "items": {"type": "string"}},
                         "entity_keys": {"type": "array", "items": {"type": "string"}},
-                        "evidence": {"type": "array", "items": {"type": "string"}},
-                    },
-                },
-            },
-            "key_decisions": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "why_it_matters": {"type": "string"},
-                        "evidence": {"type": "array", "items": {"type": "string"}},
-                    },
-                },
-            },
-            "key_procedures": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string"},
-                        "problem": {"type": "string"},
-                        "insight": {"type": "string"},
                         "evidence": {"type": "array", "items": {"type": "string"}},
                     },
                 },

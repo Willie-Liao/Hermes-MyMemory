@@ -106,6 +106,52 @@ def test_cognition_change_requires_supersedes_pair():
     assert payload.user_image.cognition_change == ()
 
 
+def test_reduce_prompt_is_same_rule_lines_and_blank_why_is_dropped():
+    facts = mechanical_facts("2026-08")
+    prompt = build_reduce_prompt("2026-08", [], facts, carry="")
+    assert "Same-rule" in prompt
+    assert '"dp_groups"' not in prompt
+    assert "\n    \"id\"" not in prompt
+    assert " | " in prompt
+    real = next(b for b in facts.all_dpe if b.type == "decision")
+    proc = next(b for b in facts.all_dpe if b.type == "procedure")
+    blank = payload_from_synthesis(
+        "2026-08",
+        {"summary": "x", "key_decisions": [{"id": real.id, "why_it_matters": "", "evidence": [real.id]}]},
+        facts,
+        carry="",
+        model="mimo-v2.5",
+        map_calls=1,
+        reduce_tokens=1,
+        generated_at="2026-09-01T08:00:00+08:00",
+    )
+    assert all(row.id != real.id for row in blank.key_decisions)
+    long_why = " ".join(f"w{i}" for i in range(50))
+    capped = payload_from_synthesis(
+        "2026-08",
+        {
+            "summary": "x",
+            "key_decisions": [
+                {
+                    "id": real.id,
+                    "why_it_matters": long_why,
+                    "evidence": [real.id, proc.id, "mem-not-in-dump"],
+                }
+            ],
+        },
+        facts,
+        carry="",
+        model="mimo-v2.5",
+        map_calls=1,
+        reduce_tokens=1,
+        generated_at="2026-09-01T08:00:00+08:00",
+    )
+    kept = next(row for row in capped.key_decisions if row.id == real.id)
+    assert len(kept.why_it_matters.split()) == 40
+    assert proc.id not in kept.evidence
+    assert "mem-not-in-dump" not in kept.evidence
+
+
 def test_august_reduce_prompt_under_4000():
     facts = mechanical_facts("2026-08")
     notes = [

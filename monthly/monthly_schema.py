@@ -19,7 +19,7 @@ CAP_FOCUS = 5
 CAP_NOTE_ITEMS = 6
 NOTE_WORD_CAP = 40
 MAP_BATCH_TOKENS = 8000
-REDUCE_MAX_TOKENS = 4096
+REDUCE_MAX_TOKENS = 8192
 SOLUTION_CHAR_CAP = 200
 CARRY_CARD_TOKEN_CAP = 600
 
@@ -33,6 +33,15 @@ def _require_evidence(text: str, evidence: tuple[str, ...], label: str) -> None:
     """Refuse a synthesized body with no cites so recall cannot quote an unchecked claim."""
     if str(text or "").strip() and not evidence:
         raise ValueError(f"{label} body requires evidence")
+
+
+def _require_concise_note(text: str, label: str) -> None:
+    """A key row with a blank or essay-length note cannot be defended as a standing rule."""
+    words = str(text or "").split()
+    if not words:
+        raise ValueError(f"{label} is required")
+    if len(words) > NOTE_WORD_CAP:
+        raise ValueError(f"{label} exceeds {NOTE_WORD_CAP} words")
 
 
 @dataclass(frozen=True)
@@ -171,6 +180,7 @@ class MonthlyDecision:
     strength: float = 0.0
 
     def __post_init__(self) -> None:
+        _require_concise_note(self.why_it_matters, "why_it_matters")
         _require_evidence(self.why_it_matters, self.evidence, "key_decisions")
 
     def lookup_text(self) -> str:
@@ -207,7 +217,8 @@ class MonthlyProcedure:
     strength: float = 0.0
 
     def __post_init__(self) -> None:
-        _require_evidence(self.problem, self.evidence, "key_procedures")
+        _require_concise_note(self.insight, "insight")
+        _require_evidence(self.problem or self.insight, self.evidence, "key_procedures")
 
     def lookup_text(self) -> str:
         """Join trigger/problem/obstacles/solution so a paraphrased task can hit the case."""

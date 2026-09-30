@@ -224,7 +224,7 @@ def test_batch_composition_deterministic_and_carry_under_budget():
     assert count_tokens(carry_card("2026-05")) <= CARRY_CARD_TOKEN_CAP
 
 
-def test_repeated_procedures_cluster_and_preference_uses_linked_event(monkeypatch, tmp_path):
+def test_each_card_is_its_own_group_and_preference_uses_linked_event(monkeypatch, tmp_path):
     from datetime import date
 
     from monthly_slice import mechanical_facts
@@ -263,6 +263,16 @@ def test_repeated_procedures_cluster_and_preference_uses_linked_event(monkeypatc
         },
         "Preference: user prefers concise review summaries. Exception: do not shorten explicit user quotes.",
     )
+    pref_other = (
+        date(2026, 8, 12),
+        {
+            "id": "mem-2026-08-12-decision-FFFFFFF",
+            "type": "decision",
+            "entity": "letterhead",
+            "status": "candidate",
+        },
+        "Preference: user wants letterhead only for external letters.",
+    )
     ev = (
         date(2026, 8, 5),
         {
@@ -286,7 +296,7 @@ def test_repeated_procedures_cluster_and_preference_uses_linked_event(monkeypatc
     )
     monkeypatch.setattr(
         "monthly_slice.load_all_blocks",
-        lambda: [proc_a, proc_b, pref, ev, singleton],
+        lambda: [proc_a, proc_b, pref, pref_other, ev, singleton],
     )
     weekly = tmp_path / "weekly"
     weekly.mkdir()
@@ -313,26 +323,19 @@ def test_repeated_procedures_cluster_and_preference_uses_linked_event(monkeypatc
 
     facts = mechanical_facts("2026-08")
     procs = [g for g in facts.dp_groups if g["type"] == "procedure"]
-    pair = next(g for g in procs if g["occurrence_n"] == 2)
-    single = next(g for g in procs if g["occurrence_n"] == 1)
-    assert pair["occurrence_n"] == 2
-    assert len(pair["evidence"]) == 2
-    assert len(pair["obstacles"]) == 1
-    from datetime import date as date_cls
-
-    from recall.strength import strength_value
-
-    solo = strength_value(
-        recall_n=1,
-        first_seen=pair["first_seen"],
-        importance=3,
-        now=date_cls.fromisoformat(pair["last_seen"]),
-    )
-    assert pair["strength"] > solo
+    assert len(procs) == 3
+    assert all(g["occurrence_n"] == 1 and g["evidence"] == (g["id"],) for g in procs)
+    assert all(len(g["obstacles"]) <= 1 for g in procs)
     prefs = [g for g in facts.dp_groups if g.get("kind") == "preference"]
-    assert prefs
-    assert "weekly review summaries" in prefs[0]["context"]
-    assert "do not shorten" in prefs[0]["exceptions"]
+    assert len(prefs) == 2
+    assert all(g["occurrence_n"] == 1 and len(g["obstacles"]) == 0 for g in prefs)
+    assert {g["evidence"] for g in prefs} == {
+        ("mem-2026-08-05-decision-CCCCCCC",),
+        ("mem-2026-08-12-decision-FFFFFFF",),
+    }
+    linked = next(g for g in prefs if g["id"] == "mem-2026-08-05-decision-CCCCCCC")
+    assert "weekly review summaries" in linked["context"]
+    assert "do not shorten" in linked["exceptions"]
     assert any(c["weeks"] == ["2026-W34", "2026-W35"] or set(c["weeks"]) == {"2026-W34", "2026-W35"} for c in facts.cross_week_candidates)
     leftover = [s for s in facts.story_seeds if s["source"] == "weekly-summary"]
     assert any("smoothie" in s["text"] for s in leftover)

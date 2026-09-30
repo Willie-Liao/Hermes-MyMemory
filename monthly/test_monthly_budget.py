@@ -98,7 +98,7 @@ def test_month_band_and_expand(tmp_path, monkeypatch):
                 why_it_matters="scannable",
                 context="when writing weekly review summaries",
                 exceptions="do not shorten explicit user quotes",
-                evidence=("mem-2026-08-05-decision-PREF",),
+                evidence=("mem-2026-08-05-decision-PREF", "mem-2026-08-12-decision-MATE"),
                 strength=1.2,
             ),
         ),
@@ -107,8 +107,12 @@ def test_month_band_and_expand(tmp_path, monkeypatch):
                 id="mem-2026-08-05-procedure-CRON",
                 trigger="user asked to draft a reminder cron",
                 problem="wrong cadence",
-                obstacles=("scheduled cron triggered at the wrong cadence",),
+                obstacles=(
+                    "scheduled cron triggered at the wrong cadence",
+                    "the reminder also fired on a holiday",
+                ),
                 solution="treat the trigger as ad-hoc until confirmed",
+                insight="confirm the next due date before arming the cron",
                 evidence=("mem-2026-08-05-procedure-CRON",),
                 strength=0.9,
             ),
@@ -127,10 +131,9 @@ def test_month_band_and_expand(tmp_path, monkeypatch):
     assert "### 2026-08  2026-08-01..2026-08-31" in band
     assert "- Shipped weekly review retries (2026-W33)" in band
     assert "- Qixi card from drafting to sharing (2026-W34, 2026-W35)" in band
-    assert "when writing weekly review summaries" in band
-    assert "mem-2026-08-05-decision-PREF" in band
-    assert "user asked to draft a reminder cron" in band
-    assert "wrong cadence" in band
+    assert "- preference mem-2026-08-05-decision-PREF — user prefers concise review summaries evidence: mem-2026-08-12-decision-MATE" in band
+    assert "- procedure mem-2026-08-05-procedure-CRON — wrong cadence — treat the trigger as ad-hoc until confirmed" in band
+    assert "; " not in band
     assert "2026-08  2026-08-01..2026-08-31:" not in band
     walked = expand_from_block("mem-2026-08-12-event-9625547B667B")
     assert walked["ok"] is True

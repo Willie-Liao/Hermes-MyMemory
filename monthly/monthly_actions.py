@@ -225,7 +225,16 @@ def format_guidance_hits(hits: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _extra_evidence(row) -> str:
+    """Append same-rule mates on the row line so Band D does not open a second indented block."""
+    mates = [item for item in row.evidence if item and item != row.id]
+    if not mates:
+        return ""
+    return " evidence: " + ", ".join(mates)
+
+
 def _paint_payload(payload) -> list[str]:
+    """One short line per key row so prefetch cannot glue a month of obstacles onto one mem-id."""
     start = str(payload.range.start or "").strip()[:10]
     end = str(payload.range.end or "").strip()[:10]
     lines = [f"### {payload.key}  {start}..{end}".rstrip()]
@@ -235,14 +244,10 @@ def _paint_payload(payload) -> list[str]:
         lines.append(f"- {row.text}{suffix}")
     superseded = {sid for row in payload.key_decisions for sid in row.supersedes}
     decisions = [row for row in payload.key_decisions if _is_active_decision(row, superseded)]
-    decisions.sort(key=lambda r: (-float(r.strength), r.id))
     for row in decisions[:_BAND_DECISIONS]:
-        extra = f" except {row.exceptions}" if row.exceptions else ""
-        lines.append(f"- preference {row.id}  {row.context or '-'} — {row.text}{extra}")
-    procs = sorted(payload.key_procedures, key=lambda r: (-float(r.strength), r.id))
-    for row in procs[:_BAND_PROCEDURES]:
-        obs = "; ".join(row.obstacles) if row.obstacles else "-"
-        lines.append(f"- procedure {row.id}  {row.trigger or '-'} — {obs} — {row.solution}")
+        lines.append(f"- preference {row.id} — {row.text}{_extra_evidence(row)}")
+    for row in payload.key_procedures[:_BAND_PROCEDURES]:
+        lines.append(f"- procedure {row.id} — {row.problem} — {row.solution}{_extra_evidence(row)}")
     return lines
 
 

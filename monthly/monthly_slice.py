@@ -16,12 +16,14 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Iterable
 
-_mymemory = Path(__file__).resolve().parent.parent
+_here = Path(__file__).resolve().parent
+_mymemory = _here.parent
 _weekly = _mymemory / "weekly"
-for path in (_mymemory, _weekly, Path(__file__).resolve().parent):
+for path in (_mymemory, _weekly, _here):
     text = str(path)
-    if text not in sys.path:
-        sys.path.insert(0, text)
+    while text in sys.path:
+        sys.path.remove(text)
+    sys.path.insert(0, text)
 
 from monthly_schema import (  # noqa: E402
     CARRY_CARD_TOKEN_CAP,
@@ -403,13 +405,6 @@ def _kind_from_clause(clause: str) -> str:
     return "decision"
 
 
-def _importance_int(block: SliceBlock) -> int:
-    try:
-        return int(str(block.importance or "3").strip() or 3)
-    except ValueError:
-        return 3
-
-
 def _obstacle_clause(clause: str) -> str:
     text = clause_body(clause)
     if "Obstacle:" not in text:
@@ -452,17 +447,6 @@ def _week_start(week_key: str) -> date | None:
         return None
 
 
-def _block_to_cluster_card(block: SliceBlock) -> dict[str, Any]:
-    return {
-        "event_id": block.id,
-        "date": block.day,
-        "entity": block.entity,
-        "predicate": block.type,
-        "body": clause_body(block.clause),
-        "snippet": clause_body(block.clause)[:180],
-    }
-
-
 def _inverse_event_text(
     target_ids: set[str],
     events: Iterable[SliceBlock],
@@ -481,46 +465,20 @@ def _cluster_same_type(
     group_type: str,
     kind: str,
 ) -> list[dict[str, Any]]:
-    """Group repeated same-type D/P cards; P=1 so a singleton still becomes a month row."""
+    """One group per card so a loose centroid cannot join a month of same-type sentences into one obstacle list.
+
+    Same-rule repeats are chosen later by the reduce call. Strength stays on the live-recall path.
+    """
     if not blocks:
         return []
-    cards = [_block_to_cluster_card(b) for b in blocks]
-    by_id = {b.id: b for b in blocks}
-    clusters = _score_event_clusters(cards, min_distinct_periods=1)
     out: list[dict[str, Any]] = []
-    from recall.strength import strength_value
-
-    for members in clusters:
-        member_blocks = [by_id[m["event_id"]] for m in members if m["event_id"] in by_id]
-        if not member_blocks:
-            continue
-        superseded = {sid for b in member_blocks for sid in b.supersedes}
-        live = [b for b in member_blocks if b.id not in superseded] or member_blocks
-        live.sort(key=lambda b: (b.day, b.id), reverse=True)
-        rep = live[0]
-        evidence = tuple(b.id for b in sorted(member_blocks, key=lambda b: (b.day, b.id)))
-        first = min(b.day for b in member_blocks).isoformat()
-        last = max(b.day for b in member_blocks).isoformat()
-        n = len(evidence)
-        importance = max(_importance_int(b) for b in member_blocks)
-        strength = strength_value(
-            recall_n=n,
-            first_seen=first,
-            importance=importance,
-            now=max(b.day for b in member_blocks),
-        )
-        linked_ids = {b.id for b in member_blocks}
-        inverse = _inverse_event_text(linked_ids, events)
-        fallback = rep.entity or (rep.entity_key)
+    for rep in sorted(blocks, key=lambda b: (b.day, b.id)):
+        day = rep.day.isoformat()
+        inverse = _inverse_event_text({rep.id}, events)
+        fallback = rep.entity or rep.entity_key
         context = inverse or fallback
-        weeks = tuple(sorted({b.week_key for b in member_blocks}))
-        obstacles = tuple(
-            dict.fromkeys(text for b in member_blocks if (text := _obstacle_clause(b.clause)))
-        )
-        exceptions = next(
-            (text for b in member_blocks if (text := _exception_clause(b.clause))),
-            "",
-        )
+        obstacle = _obstacle_clause(rep.clause)
+        obstacles = (obstacle,) if obstacle else ()
         row: dict[str, Any] = {
             "type": group_type,
             "kind": kind,
@@ -531,17 +489,17 @@ def _cluster_same_type(
             "obstacles": obstacles,
             "context": context if group_type == "decision" else "",
             "trigger": context if group_type == "procedure" else "",
-            "exceptions": exceptions,
-            "entity_keys": tuple(dict.fromkeys(b.entity_key for b in member_blocks if b.entity_key)),
-            "supersedes": tuple(dict.fromkeys(sid for b in member_blocks for sid in b.supersedes)),
-            "evidence": evidence,
-            "occurrence_n": n,
-            "first_seen": first,
-            "last_seen": last,
-            "strength": strength,
+            "exceptions": _exception_clause(rep.clause),
+            "entity_keys": (rep.entity_key,) if rep.entity_key else (),
+            "supersedes": tuple(rep.supersedes),
+            "evidence": (rep.id,),
+            "occurrence_n": 1,
+            "first_seen": day,
+            "last_seen": day,
+            "strength": 0.0,
             "date": rep.valid_from,
             "valid_to": rep.valid_to,
-            "weeks": weeks,
+            "weeks": (rep.week_key,) if rep.week_key else (),
         }
         if group_type == "decision":
             text = clause_body(rep.clause)
@@ -557,7 +515,6 @@ def _cluster_same_type(
             row["solution"] = text
             row["text"] = ""
         out.append(row)
-    out.sort(key=lambda r: (-float(r["strength"]), r["last_seen"], r["id"]))
     return out
 
 
