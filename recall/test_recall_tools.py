@@ -471,7 +471,15 @@ def test_embed_real_peak_keeps_two(staging, monkeypatch):
     assert text.count("rank=") == 2
 
 
-def test_guidance_mode_monthly_preference_before_procedure(staging):
+def test_guidance_mode_monthly_preference_before_procedure(staging, monkeypatch):
+    """A 0.973 gate drops topic overlap, so this stub must clear the gate or the channel never appears."""
+
+    def _stub_encode(texts):
+        query = texts[0] if texts else ""
+        score = 0.98 if "review summaries" in query else 0.1
+        return [[1.0, 0.0], _vec_for_cosine(score)]
+
+    monkeypatch.setattr("recall.embed._encode_texts", _stub_encode)
     monthly = staging / "monthly" / "2026-08.md"
     monthly.write_text(
         monthly.read_text(encoding="utf-8")
@@ -479,6 +487,7 @@ def test_guidance_mode_monthly_preference_before_procedure(staging):
         + "  - id: mem-2026-08-05-decision-PREF\n"
         + "    kind: preference\n"
         + "    text: user prefers concise review summaries\n"
+        + "    why_it_matters: still changes the next weekly review\n"
         + "    context: when writing weekly review summaries\n"
         + "    exceptions: do not shorten quotes\n"
         + "    evidence: [mem-2026-08-05-decision-PREF]\n"
@@ -489,6 +498,7 @@ def test_guidance_mode_monthly_preference_before_procedure(staging):
         + "    problem: reviews too long\n"
         + "    obstacles: [reviews too long]\n"
         + "    solution: keep bullets under forty words\n"
+        + "    insight: the next review still needs the short form\n"
         + "    evidence: [mem-2026-08-05-procedure-SUMM]\n"
         + "    strength: 9.0\n",
         encoding="utf-8",

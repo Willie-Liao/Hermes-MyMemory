@@ -29,7 +29,7 @@ from monthly_synth import synthesize_month  # noqa: E402
 from monthly_writer import load_month, write_month, loads  # noqa: E402
 
 _MONTH_KEY_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
-_GUIDANCE_GATE = 0.30
+_GUIDANCE_GATE = 0.973
 _BAND_DECISIONS = 4
 _BAND_PROCEDURES = 3
 _BAND_SUMMARY = 8
@@ -135,7 +135,10 @@ def _lexical_sim(query: str, candidate: str) -> float:
 
 
 def _guidance_sim(query: str, candidate: str) -> float:
-    """Lexical overlap first; GTE cosine only if lexical misses the 0.30 gate."""
+    """Lexical overlap first; GTE cosine only if lexical misses the 0.973 gate.
+
+    A looser gate admits topic-shaped queries. Guidance should keep a near-duplicate task match.
+    """
     lexical = _lexical_sim(query, candidate)
     if lexical >= _GUIDANCE_GATE:
         return lexical
@@ -158,7 +161,7 @@ def rank_monthly_guidance(
 ) -> list[dict[str, Any]]:
     """Rank active monthly D/P for a task-shaped query so prefetch does not scan daily events first.
 
-    Strength may reorder inside the admitted set; it cannot rescue a row below the 0.30 gate.
+    Strength may reorder inside the admitted set; it cannot rescue a row below the 0.973 gate.
     """
     q = str(query or "").strip()
     if not q:
