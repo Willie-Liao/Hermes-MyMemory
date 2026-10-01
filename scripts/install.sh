@@ -83,7 +83,8 @@ mkdir -p "$DEST" "$HERMES_HOME/agent-hooks"
 
 RSYNC_EXCLUDES=(
   --exclude '.git/'
-  --exclude '/scripts/'
+  # Local GitNexus index. Copying it into the plugin fills a small test disk.
+  --exclude '.gitnexus/'
   --exclude 'Install MyMemory.command'
   --exclude '__pycache__/'
   --exclude '.pytest_cache/'
@@ -92,6 +93,7 @@ RSYNC_EXCLUDES=(
   --exclude '.vite/'
   --exclude '*.pyc'
   --exclude '.DS_Store'
+  --exclude '._*'
   --exclude '.env'
   --exclude '.env.*'
   --exclude '!.env.example'
@@ -112,29 +114,68 @@ echo "hermes CLI: $HERMES_BIN"
 echo ""
 
 rsync -a "${RSYNC_EXCLUDES[@]}" "$PACK_ROOT/" "$DEST/"
+# AppleDouble sidecars match *.py and are not UTF-8, so source scans fail after a Mac pack.
+find "$DEST" -name '._*' -delete
 echo "installed: plugins/MyMemory"
 
 resolve_runtime_python() {
+  # Channel 4 and the installer YAML merge must use the interpreter Hermes
+  # actually runs. A fresh official install keeps that under ~/.hermes/tools
+  # and leaves /usr/bin/python3 without pip, so falling through to it aborts.
   if [[ -n "${HERMES_PYTHON:-}" && -x "${HERMES_PYTHON}" ]]; then
     echo "${HERMES_PYTHON}"
     return 0
   fi
   local candidate
   for candidate in \
+    "${HERMES_HOME}/hermes-agent/venv/bin/python" \
+    "${HERMES_HOME}/hermes-agent/venv/bin/python3" \
     "${HERMES_HOME}/hermes-agent/.venv/bin/python" \
+    "${HERMES_HOME}/hermes-agent/.venv/bin/python3" \
     "${HERMES_HOME}/.venv/bin/python" \
     "/usr/local/lib/hermes-agent/venv/bin/python" \
-    "/usr/local/lib/hermes-agent/.venv/bin/python"
+    "/usr/local/lib/hermes-agent/venv/bin/python3" \
+    "/usr/local/lib/hermes-agent/.venv/bin/python" \
+    "/usr/local/lib/hermes-agent/.venv/bin/python3"
   do
     if [[ -x "$candidate" ]]; then
       echo "$candidate"
       return 0
     fi
   done
+  local tools_py
+  tools_py="$(ls -1d "${HERMES_HOME}"/tools/python-*/bin/python3 2>/dev/null | tail -n 1 || true)"
+  if [[ -n "$tools_py" && -x "$tools_py" ]]; then
+    echo "$tools_py"
+    return 0
+  fi
   if command -v python3 >/dev/null 2>&1; then
     command -v python3
     return 0
   fi
+  return 1
+}
+
+install_python_packages() {
+  # Standalone Hermes pythons often have no pip module. uv is what the
+  # official installer already used to build that interpreter.
+  local py="$1"
+  shift
+  if "$py" -m pip --version >/dev/null 2>&1; then
+    "$py" -m pip install --quiet "$@"
+    return
+  fi
+  local uv_bin=""
+  if command -v uv >/dev/null 2>&1; then
+    uv_bin="$(command -v uv)"
+  elif [[ -x "${HOME}/.local/bin/uv" ]]; then
+    uv_bin="${HOME}/.local/bin/uv"
+  fi
+  if [[ -n "$uv_bin" ]]; then
+    "$uv_bin" pip install --python "$py" "$@"
+    return
+  fi
+  echo "error: ${py} has no pip and uv is not installed" >&2
   return 1
 }
 
@@ -183,11 +224,16 @@ ensure_gte_int8() {
 echo ""
 echo "Channel 4 runtime (onnxruntime, tokenizers, numpy)…"
 if RUNTIME_PY="$(resolve_runtime_python)"; then
+  export HERMES_PYTHON="$RUNTIME_PY"
   if [[ "${MYMEMORY_SKIP_GTE:-}" != "1" ]]; then
-    if ! "${RUNTIME_PY}" -c "import onnxruntime, tokenizers, numpy" >/dev/null 2>&1; then
-      echo "Installing onnxruntime tokenizers numpy into ${RUNTIME_PY}"
-      "${RUNTIME_PY}" -m pip install --quiet onnxruntime tokenizers numpy
+    # openai: worker oneshot imports it lazily. ruamel.yaml: Hermes hermes_yaml imports it.
+    py_pkgs=(onnxruntime tokenizers numpy pyyaml openai ruamel.yaml)
+    if [[ "$SKIP_TESTS" != true ]]; then
+      # recall/test_layer_compression.py imports tiktoken at collection time.
+      py_pkgs+=(pytest tiktoken)
     fi
+    echo "Installing ${py_pkgs[*]} into ${RUNTIME_PY}"
+    install_python_packages "$RUNTIME_PY" "${py_pkgs[@]}"
     echo "ok: ${RUNTIME_PY} can import onnxruntime, tokenizers, numpy"
   else
     echo "note: skipping onnxruntime install (MYMEMORY_SKIP_GTE=1)"
@@ -366,8 +412,43 @@ PY
     chat_lc="$(echo "$chat_provider" | tr '[:upper:]' '[:lower:]')"
     w_lc="$(echo "$w_provider" | tr '[:upper:]' '[:lower:]')"
     if [[ "$w_lc" != "$chat_lc" && -z "$w_url" ]]; then
-      echo "error: base URL is required when the worker provider differs from chat" >&2
-      return 1
+      # The documented non-TTY command sets provider and model only. A fresh
+      # Hermes chat provider is not MiniMax, so the pin still needs a base URL.
+      local url_env
+      if [[ "$w_lc" == "kimi-coding" ]]; then
+        url_env="KIMI_BASE_URL"
+      else
+        url_env="$(echo "$w_provider" | tr '[:lower:]-' '[:upper:]_')_BASE_URL"
+      fi
+      if [[ -n "${!url_env:-}" ]]; then
+        w_url="${!url_env}"
+      elif [[ -f "$HERMES_HOME/.env" ]]; then
+        w_url="$("$py" - "$HERMES_HOME/.env" "$url_env" <<'PY'
+"""Read one base-URL assignment from .env. Print nothing when it is absent."""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+path, key = Path(sys.argv[1]), sys.argv[2]
+for raw in path.read_text(encoding="utf-8").splitlines():
+    line = raw.strip()
+    if line.startswith("export "):
+        line = line[7:].strip()
+    if line.startswith(f"{key}="):
+        print(line.split("=", 1)[1].strip().strip("\"'"))
+        break
+PY
+)"
+      fi
+      if [[ -z "$w_url" && "$w_lc" == "minimax-cn" ]]; then
+        w_url="https://api.minimax.chat/v1"
+      fi
+      if [[ -z "$w_url" ]]; then
+        echo "error: base URL is required when the worker provider differs from chat" >&2
+        return 1
+      fi
+      echo "Worker base URL: ${w_url}"
     fi
   fi
 

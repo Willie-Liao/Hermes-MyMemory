@@ -119,6 +119,10 @@ def _write_daily_block(hermes_home: Path, *, day: str, mem_id: str, body: str, s
 
 
 def test_patch_daily_block_status_omitted_body_preserves_body(tmp_path):
+    """Omitting body must keep the staging text and quote a colon-bearing timestamp.
+
+    An unquoted ``2026-07-16T12:00:00`` is illegal YAML and breaks the next digest pass.
+    """
     ms = _load_memory_staging()
     mem_id = "mem-2026-06-16-preserve-body"
     path = _write_daily_block(
@@ -136,11 +140,16 @@ def test_patch_daily_block_status_omitted_body_preserves_body(tmp_path):
     assert ok is True
     text = path.read_text(encoding="utf-8")
     assert "status: rejected" in text
-    assert "discarded_at: '2026-07-16T12:00:00'" in text or "discarded_at: 2026-07-16T12:00:00" in text
+    assert 'discarded_at: "2026-07-16T12:00:00"' in text
     assert "original staging body" in text
 
 
 def test_patch_daily_block_status_with_body_replaces_body(tmp_path):
+    """A body rewrite must drop the old text and quote the colon-bearing updated_at.
+
+    The same unquoted timestamp that a status-only patch must not emit would
+    also make this rewritten block fail to parse.
+    """
     ms = _load_memory_staging()
     mem_id = "mem-2026-06-16-edit-body"
     path = _write_daily_block(
@@ -161,7 +170,7 @@ def test_patch_daily_block_status_with_body_replaces_body(tmp_path):
     assert "status: candidate" in text
     assert "edited staging body" in text
     assert "original staging body" not in text
-    assert "updated_at: '2026-07-16T12:00:00'" in text or "updated_at: 2026-07-16T12:00:00" in text
+    assert 'updated_at: "2026-07-16T12:00:00"' in text
 
 
 def test_patch_daily_block_status_with_body_leaves_other_blocks(tmp_path):

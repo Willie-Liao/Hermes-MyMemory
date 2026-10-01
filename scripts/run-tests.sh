@@ -17,7 +17,8 @@ resolve_agent_root() {
   local candidate
   for candidate in \
     "${HERMES_HOME}/hermes-agent" \
-    "${HOME}/.hermes/hermes-agent"
+    "${HOME}/.hermes/hermes-agent" \
+    "/usr/local/lib/hermes-agent"
   do
     if [[ -f "${candidate}/agent/memory_provider.py" ]]; then
       echo "$candidate"
@@ -55,11 +56,41 @@ export PYTHONPATH="${AGENT_ROOT}:${PLUGIN}/..:${PYTHONPATH:-}"
 export HERMES_DIGEST_LIVE_LLM=0
 export REAL_LLM_TEST=0
 export PLAN_LOOP_LIVE_LLM=0
+# A git Hermes checkout finishes a source update when pytest imports hermes_cli.
+# That rewrites .hermes/bin/hermes to a pytest temp interpreter and the suite exits 1.
+export HERMES_DISABLE_LAZY_INSTALLS=1
+
+LAUNCHER_DIR="${HERMES_HOME}/hermes-agent/.hermes/bin"
+LAUNCHER_BAK="${LAUNCHER_DIR}.mymemory-pytest-bak"
+restore_launchers() {
+  if [[ -d "$LAUNCHER_BAK" ]]; then
+    cp -a "${LAUNCHER_BAK}/." "$LAUNCHER_DIR/"
+    rm -rf "$LAUNCHER_BAK"
+  fi
+}
+if [[ -d "$LAUNCHER_DIR" ]]; then
+  rm -rf "$LAUNCHER_BAK"
+  mkdir -p "$LAUNCHER_BAK"
+  cp -a "${LAUNCHER_DIR}/." "$LAUNCHER_BAK/"
+  trap restore_launchers EXIT
+fi
+
+# /tmp is often a small tmpfs. Pytest basetemp then hits ENOSPC and the
+# installer reports a failed plugin before the suite has actually run.
+TEST_TMP="${MYMEMORY_TEST_TMPDIR:-${HOME}/.cache/mymemory-pytest}"
+rm -rf "$TEST_TMP"
+mkdir -p "$TEST_TMP"
+export TMPDIR="$TEST_TMP"
 
 cd "$PLUGIN"
 echo "pytest python: $PY"
 echo "agent root: $AGENT_ROOT"
+# test_live_llm_sees_bands_in_both_hermes_slots calls the worker model and does not
+# honor REAL_LLM_TEST=0. The other tests in that file stay in the install run.
+# test_eval_prefetch_fallback_band_c_weekday_ladder reads the workstation Mem_Eval
+# tree beside HERMES_HOME, which a cloud install does not have.
 "$PY" -m pytest \
   --ignore=digest/test_digest_live_typed_prompt.py \
   --ignore=digest/test_digest_live_merge_slots.py \
+  -k 'not test_live_llm_sees_bands_in_both_hermes_slots and not test_eval_prefetch_fallback_band_c_weekday_ladder' \
   -q --tb=line

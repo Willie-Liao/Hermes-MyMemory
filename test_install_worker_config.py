@@ -133,3 +133,49 @@ def test_custom_worker_env_upserts_key_only(tmp_path: Path):
     assert data["model"]["default"] == "kimi-k2.6"
     assert data["plugins"]["entries"]["MyMemory"]["digest"]["model"] == "MiniMax-M2.5"
     assert data["plugins"]["entries"]["MyMemory"]["weekly"]["weekly_brief_weixin"] == "keep-me@im.wechat"
+
+
+def test_minimax_worker_without_base_url_uses_public_default(tmp_path: Path):
+    """A non-TTY MiniMax pin with no base URL must still finish.
+
+    The documented cloud command sets provider and model only. A fresh Hermes
+    chat provider is not minimax-cn, and aborting there blocks install.sh.
+    """
+    home = tmp_path / "hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        textwrap.dedent(
+            """\
+            model:
+              default: anthropic/claude-opus-4.6
+              provider: auto
+              base_url: https://openrouter.ai/api/v1
+            """
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "bin").mkdir(exist_ok=True)
+    hermes = _stub_hermes(tmp_path / "bin")
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    env["HERMES_BIN"] = str(hermes)
+    env["MYMEMORY_SKIP_GTE"] = "1"
+    env["MYMEMORY_WORKER_PROVIDER"] = "minimax-cn"
+    env["MYMEMORY_WORKER_MODEL"] = "MiniMax-M2.5"
+    env.pop("MYMEMORY_WORKER_BASE_URL", None)
+    proc = subprocess.run(
+        ["bash", str(INSTALL_SH), "--skip-tests"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        input="",
+    )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 0, combined
+    data = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert data["model"]["default"] == "anthropic/claude-opus-4.6"
+    digest = data["plugins"]["entries"]["MyMemory"]["digest"]
+    assert digest["provider"] == "minimax-cn"
+    assert digest["model"] == "MiniMax-M2.5"
+    assert digest["base_url"] == "https://api.minimax.chat/v1"

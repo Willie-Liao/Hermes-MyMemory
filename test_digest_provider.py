@@ -261,6 +261,10 @@ def _fresh_plugin_manager(monkeypatch):
     reason="hermes-agent not vendored",
 )
 def test_initialize_registers_digest_and_weekly_slash(monkeypatch):
+    """Slash registration must store the off-loop wrapper, not the raw sync handler.
+
+    A raw handler on the gateway loop blocks heartbeats for the whole MiniMax call.
+    """
     from hermes_cli.plugins import get_plugin_commands
     from MyMemory.digest import slash as digest_slash
     from MyMemory.weekly import slash as weekly_slash
@@ -271,11 +275,17 @@ def test_initialize_registers_digest_and_weekly_slash(monkeypatch):
     p = MyMemoryProvider()
     p.initialize("s1", hermes_home=str(_HERMES_HOME), platform="cli")
     cmds = get_plugin_commands()
-    assert cmds["digest"]["handler"] is digest_slash.handle_digest
-    assert cmds["weekly"]["handler"] is weekly_slash.handle_weekly
+    digest_handler = cmds["digest"]["handler"]
+    weekly_handler = cmds["weekly"]["handler"]
+    assert asyncio.iscoroutinefunction(digest_handler)
+    assert asyncio.iscoroutinefunction(weekly_handler)
+    assert digest_handler.__wrapped__ is digest_slash.handle_digest
+    assert weekly_handler.__wrapped__ is weekly_slash.handle_weekly
     from MyMemory.monthly.monthly_actions import handle_monthly
 
-    assert cmds["monthly"]["handler"] is handle_monthly
+    monthly_handler = cmds["monthly"]["handler"]
+    assert asyncio.iscoroutinefunction(monthly_handler)
+    assert monthly_handler.__wrapped__ is handle_monthly
 
 
 @pytest.mark.skipif(
@@ -283,6 +293,11 @@ def test_initialize_registers_digest_and_weekly_slash(monkeypatch):
     reason="hermes-agent not vendored",
 )
 def test_initialize_registers_slash_in_skip_write_context(monkeypatch):
+    """Cron skip-write init must still register the off-loop slash wrappers.
+
+    A context that skips memory writes used to look unregistered; chat then
+    treated /digest as an unknown command.
+    """
     from hermes_cli.plugins import get_plugin_commands
     from MyMemory.digest import slash as digest_slash
     from MyMemory.weekly import slash as weekly_slash
@@ -297,11 +312,17 @@ def test_initialize_registers_slash_in_skip_write_context(monkeypatch):
         agent_context="cron",
     )
     cmds = get_plugin_commands()
-    assert cmds["digest"]["handler"] is digest_slash.handle_digest
-    assert cmds["weekly"]["handler"] is weekly_slash.handle_weekly
+    digest_handler = cmds["digest"]["handler"]
+    weekly_handler = cmds["weekly"]["handler"]
+    assert asyncio.iscoroutinefunction(digest_handler)
+    assert asyncio.iscoroutinefunction(weekly_handler)
+    assert digest_handler.__wrapped__ is digest_slash.handle_digest
+    assert weekly_handler.__wrapped__ is weekly_slash.handle_weekly
     from MyMemory.monthly.monthly_actions import handle_monthly
 
-    assert cmds["monthly"]["handler"] is handle_monthly
+    monthly_handler = cmds["monthly"]["handler"]
+    assert asyncio.iscoroutinefunction(monthly_handler)
+    assert monthly_handler.__wrapped__ is handle_monthly
 
 
 def test_initialize_starts_clock_weekly_retention_once(monkeypatch):
