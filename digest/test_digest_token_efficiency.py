@@ -1240,3 +1240,119 @@ def test_phase2_gate_records_sep29_procedure_pair(tmp_path, monkeypatch, capsys)
     captured = capsys.readouterr()
     assert "sep29 pair rho=" in captured.out
     sys.stderr.write(captured.out)
+
+
+def _phase2_two_facts():
+    return [
+        {
+            "id": "mem-fact-apple",
+            "type": "fact",
+            "entity": "Topic",
+            "confidence": "high",
+            "importance": 3,
+            "status": "candidate",
+            "sources": ["session s1"],
+            "body": "Apple related note.",
+        },
+        {
+            "id": "mem-fact-banana",
+            "type": "fact",
+            "entity": "Topic",
+            "confidence": "high",
+            "importance": 3,
+            "status": "candidate",
+            "sources": ["session s1"],
+            "body": "Banana related note.",
+        },
+    ]
+
+
+def _stub_phase2_minilm(digest):
+    class _StubMiniLM:
+        def encode(self, texts, normalize_embeddings=True):
+            del texts, normalize_embeddings
+            return [[1.0, 0.0, 0.0, 0.0], [0.2, 0.9, 0.0, 0.0]]
+
+    digest._PHASE2_MINILM = _StubMiniLM()
+    digest._PHASE2_EMBED_CACHE = {}
+
+
+def test_phase2_empty_ops_records_no_merge(tmp_path, monkeypatch):
+    """An empty successful tool list must be readable later as a keep, not a crash.
+
+    Without reason "no merge" the gate row stops at Pearson/MI and a dead call
+    looks the same.
+    """
+    digest = _load("digest")
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    _stub_phase2_minilm(digest)
+
+    def empty_tool(prompt, platform, *, purpose, force_tool_name):
+        del prompt, platform, purpose
+        return {
+            "tool_name": force_tool_name,
+            "tool_args": {"operations": []},
+        }
+
+    monkeypatch.setattr(digest, "_invoke_digest_worker_tool", empty_tool)
+    proposer = digest.make_llm_proposer("cli", session_id="s1", run_id="empty")
+    proposer([], _phase2_two_facts(), errors=(), attempt=1)
+    state = json.loads(
+        (tmp_path / "memories" / "staging" / ".digest-state.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    llm = state["phase2_gate"][-1]["llm"]
+    assert llm["operations"] == []
+    assert llm["reason"] == "no merge"
+    assert llm["failed"] is False
+
+    def merge_tool(prompt, platform, *, purpose, force_tool_name):
+        del prompt, platform, purpose
+        return {
+            "tool_name": force_tool_name,
+            "tool_args": {
+                "operations": [
+                    {
+                        "operation": "drop",
+                        "id": "mem-fact-apple",
+                    }
+                ]
+            },
+        }
+
+    monkeypatch.setattr(digest, "_invoke_digest_worker_tool", merge_tool)
+    digest._PHASE2_EMBED_CACHE = {}
+    keeper = digest.make_llm_proposer("cli", session_id="s1", run_id="kept")
+    keeper([], _phase2_two_facts(), errors=(), attempt=1)
+    state = json.loads(
+        (tmp_path / "memories" / "staging" / ".digest-state.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    kept = state["phase2_gate"][-1]["llm"]
+    assert kept["operations"]
+    assert "reason" not in kept
+
+    def boom(prompt, platform, *, purpose, force_tool_name):
+        del prompt, platform, purpose, force_tool_name
+        raise RuntimeError("socket reset")
+
+    monkeypatch.setattr(digest, "_invoke_digest_worker_tool", boom)
+    digest._PHASE2_EMBED_CACHE = {}
+    failing = digest.make_llm_proposer("cli", session_id="s1", run_id="boom")
+    try:
+        failing([], _phase2_two_facts(), errors=(), attempt=1)
+    except RuntimeError as exc:
+        assert "socket reset" in str(exc)
+    else:
+        raise AssertionError("tool failure must surface")
+    state = json.loads(
+        (tmp_path / "memories" / "staging" / ".digest-state.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    failed = state["phase2_gate"][-1]["llm"]
+    assert failed["failed"] is True
+    assert failed["reason"] == "tool error"
+    assert "socket reset" in failed["error"]
