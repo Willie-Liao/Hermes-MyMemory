@@ -31,13 +31,16 @@ candidate pairs**. `pairs[k] = [i, j]` means compare `cards[i]` with
 `cards[j]`; emit operations using `cards[i].id` / `cards[j].id`.
 If that section is absent, compare every same-type pair. For each compared
 pair ask: does one block EXTEND the other, or RESTATE it? Consolidate only
-then.
+then. Two same-type cards extend each other when they overlap on one record and each also
+carries an aspect the other omits. The merge nest keeps every aspect.
 
 An extension is any of:
 - A follow-up or addition — same episode, later stage. "asked the contact about
   Topic X" then "the contact agreed to do Topic X on date D".
-- B specification — same record, more concrete. "Person P is a teacher" then
-  "Person P teaches subject S at school Q".
+- B specification — same record, more concrete, including when each card adds an aspect of
+  that record the other does not. Union those aspects into the one nest. "Person P is a
+  teacher" then "Person P teaches subject S at school Q". A procedure that names the lock
+  file and a procedure that names the restart order are still one lock-recovery record.
 - C evolution or progress — same episode, advanced. "component failed to load at
   T1" then "component self-recovered by T2".
 
@@ -101,7 +104,10 @@ Rules for the array:
 
 ## Past-day contradiction (retrieval-grounded update)
 
-Do not merge complementary facts or historical evolution. A later card that
+Do not merge facts that only complement each other across days, and do not merge a later
+card that contradicts an older one. This section does not keep apart same-day same-type
+cards that share one record and add aspects; those are B, or A/C when one stage follows
+the other. A later card that
 *contradicts* an older same-type/same-entity card retrieved in the same recall
 set may emit a metadata-only `update` on the older id:
 
@@ -114,8 +120,9 @@ exactly one eligible older target exists:
 
 - `rejected_reason`: `rejected by user's correction`
 
-Never change the old body. Never merge/drop/supersede across days. Leave
-complementary or evolving facts alone.
+Never change the old body. Never merge/drop/supersede across days. Leave cross-day
+complementary or evolving facts alone. Same-day aspect overlap of one record is B, not
+this section.
 """
 
 FEW_SHOT_BANK = """## Worked examples
@@ -138,7 +145,10 @@ Call submit_operations with operations: [the object below].
 
 Existing (procedure, importance 4): Obstacle/Solution about clearing a stale lock.
 New (procedure, importance 4): same lock recovery with clearer steps.
-Why B: same recovery procedure; merge meaning into procedure nest.
+Why B: same recovery procedure. Clearer steps are B, and so are extra aspects split
+across the two cards (one names the lock file, the other names the restart). The
+procedure nest unions those aspects. Tool arguments are
+{"operations":[ the object below ]}, never a bare obstacle/solution object.
 
 {"operation":"merge","survivor_id":"<id-with-file-list>","absorbed_ids":["<shorter>"],
  "reason":"B specification: same lock recovery; survivor has clearer clear-then-restart steps",
