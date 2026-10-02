@@ -272,20 +272,22 @@ def _merge_nest_object_schema(worker_type: str) -> dict[str, Any]:
 _REGISTERED = False
 
 DECISION_OWNERSHIP_TEACH = (
-    "decision bodies must start with Preference:/Decision: whose first subject "
-    "token is user/User, or an alias the decision slot reminder named; "
-    "third-party traits belong to fact (Narration: + involves cast); only the "
-    "user's ruling/preference for agent behavior is decision"
+    "decision is a standing rule finished in this card; recalled alone it still "
+    "changes a later, different request. Preference is the user's own taste. "
+    "Decision is a constraint on the agent. The ruling names no deliverable of "
+    "this sitting. decision bodies must start with Preference:/Decision: whose "
+    "first subject token is user/User, or an alias the decision slot reminder "
+    "named; third-party traits belong to fact (Narration: + involves cast)"
 )
 DECISION_LINK_TEACH = (
-    "ruling must be the predicate for subject so `{kind}: {subject} {ruling}` "
-    "is one clause; mirror transcript intensity and do not normalise to must "
-    "(examples, not a closed list: intense must / must not; less intense "
-    "prefer / prefers; neutral locked / decided / chose / sets; etc.); "
-    "identify who must act: own preference stays about the user (user prefers "
-    "tea); an expectation of the agent is user wants the agent to send the "
-    "report, or user wants the agent not to parrot the user's words; do not "
-    "write user must for an order to the agent; First subject after "
+    "decision: a standing rule that is finished in this card. Recalled with no "
+    "procedure and no event beside it, it still changes a later, different "
+    "request. Preference is the user's own taste. Decision is a constraint on "
+    "the agent. The ruling names no deliverable of this sitting (no file, page "
+    "count, one-off layout, or add this change to that note). Those details "
+    "stay in the procedure solution. A decision that only restates that "
+    "solution is not a decision. ruling must be the predicate for subject so "
+    "`{kind}: {subject} {ruling}` is one clause; First subject after "
     "Preference:/Decision: must be user/User; do not repeat subject at the "
     "start of ruling; do not make a third party the agent of the ruling"
 )
@@ -846,8 +848,8 @@ def _procedure_props() -> dict[str, Any]:
 def _decision_props() -> dict[str, Any]:
     """Schema text is the only ruling sample on the tool call itself.
 
-    An order to the assistant must say the user wants the agent to act.
-    A sample of user must makes that order look like the user's own duty.
+    A one-sitting deliverable in this description gets stored as a decision
+    and later recalled with no procedure beside it.
     """
     return {
         "kind": {
@@ -865,11 +867,10 @@ def _decision_props() -> dict[str, Any]:
             "clause. Mirror transcript intensity; do not normalise to must. "
             "Examples, not a closed list: intense must / must not; less intense "
             "prefer / prefers; neutral locked / decided / chose / sets; etc. "
-            "Identify who must act. Own preference stays about the user "
-            "(user prefers tea). An expectation of the agent is user wants "
-            "the agent to send the report, or user wants the agent not to "
-            "parrot the user's words. Do not write user must for an order to "
-            "the agent. First subject after Preference:/Decision: must be "
+            "A standing rule finished in this card. Recalled alone it still "
+            "changes a later, different request. The ruling names no deliverable "
+            "of this sitting (no file, page count, one-off layout). Those details "
+            "stay in the procedure solution. First subject after Preference:/Decision: must be "
             "user/User. Do not repeat subject. Assembled Preference:/Decision: "
             "line <= 500 chars",
             SLOT_MAX_LENGTH["ruling"],

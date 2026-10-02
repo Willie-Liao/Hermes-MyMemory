@@ -400,7 +400,7 @@ def test_event_first_worker_contracts_are_explicit(tmp_path, monkeypatch):
     assert "exactly three stages" in combined
     assert "procedure owns course obstacles and abstract solutions" in combined
     assert "raw tool logs" in combined
-    assert "user-only rulings and preferences" in policy
+    assert "standing rule" in policy
     assert "Preference:/Decision:" in policy
     assert "kind=Preference|Decision" in digest._worker_type_body_reminder("decision")
     assert "Narration:" in combined
@@ -460,13 +460,13 @@ def test_append_policy_procedure_and_decision_are_event_driven():
     assert "not object/API documentation" in policy
     assert "decision_constraint: user feedback on that procedure" in policy
     assert "First subject after Preference:/Decision: must be user/User" in policy
-    assert "standing prefs" in policy or "agent behavior" in policy
+    assert "standing rule" in policy
     assert "procedure: how-to" not in policy
     assert "decision_constraint: must/must-not/correction" not in policy
 
 
 def test_decision_wording_splits_own_preference_from_agent_expectation():
-    """Orders to the assistant name the agent; the subject stays user."""
+    """A decision is a standing rule; this sitting's deliverable stays a procedure."""
     digest = _load_digest()
     tools = load_plugin_module("digest_tools.py", "memory_digest_expectation_tools")
     ruling = tools._decision_props()["ruling"]["description"]
@@ -475,11 +475,17 @@ def test_decision_wording_splits_own_preference_from_agent_expectation():
         digest._worker_type_body_reminder("decision"),
         ruling,
         tools.DECISION_LINK_TEACH,
+        tools.DECISION_OWNERSHIP_TEACH,
     ]
     for text in strings:
-        assert "wants the agent" in text
+        assert "standing rule" in text
+        assert "send the report" not in text
+    for text in (
+        digest.DIGEST_POLICY,
+        digest._worker_type_body_reminder("decision"),
+        tools.DECISION_LINK_TEACH,
+    ):
         assert "First subject after Preference:/Decision: must be user/User" in text
-        assert "user must not X" not in text
 
 
 def test_append_policy_correction_uses_supersedes_not_related_delete():
@@ -1109,7 +1115,7 @@ def test_decision_reminder_lists_alias_or_user_only(tmp_path, monkeypatch):
     named_reminder = digest._worker_type_body_reminder("decision")
     assert "Willie" in named_reminder
     assert "kind=Preference|Decision" in named_reminder
-    assert "etc." in named_reminder
+    assert "standing rule" in named_reminder
 
     cache_path.unlink()
 

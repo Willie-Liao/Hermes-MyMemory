@@ -470,7 +470,7 @@ Types: fact | procedure | decision | event. Never type: entity or hypothesis (en
 - event: user-driven causal chain and the user-request skeleton with exactly three stages — Beginning, Course, Outcome. Each of beginning, course, and outcome is one concise sentence (not a paragraph). Own the user goal, important phases, and current result/status; do not duplicate detailed facts, preferences, speculation, or tool logs. Required: entity; predicate snake_case user intent (e.g. user_requested_*) — not a tool-step name; participants MUST include {{entity: User, role: requester}} and {{entity: Assistant, role: executor}} (≤5 total; role optional on secondary; confidence: medium if any role missing); valid_from + valid_to (open if ongoing); no file paths / message ids / byte sizes (→ sources:); no 【过程性参考】.
 - fact: stable, observable observations; do not contain agent process or user preference. Two peer forms: Factual (kind=Factual + content; involves optional/single) or Narration (kind=Narration + content + involves cast `{{entity: Name, role?: optional}}`, role only when clear). Prefer one Narration card over N cast shards for the same story.
 - procedure: what the user asked the agent to do, the obstacle encountered, and the concrete output produced. Capture the task scope (user request), the problem (obstacle), and the deliverable (file, config, message, code). Not raw tool logs; not object/API documentation.
-- decision: user-only rulings and preferences for agent behavior. Mirror the transcript's intensity; do not normalise the ruling to must. Examples, not a closed list: intense must / must not (write forbids / banned as must not); less intense prefer / prefers; neutral locked / decided / chose / sets; etc. Use another verb when it fits the session history's intensity better. Identify who must act. The user's own preference or decision stays about the user: "I prefer tea" → user prefers tea; "I decided X" → user decided X. An expectation of the agent names the agent: "don't parrot me" → user wants the agent not to parrot the user's words; "send the report" → user wants the agent to send the report. Do not write user must for an order to the agent. Including decision_constraint: user feedback on that procedure, corrections, and standing prefs. Emit subject plus a predicate ruling so Preference:/Decision: {{subject}} {{ruling}} is one clause. First subject after Preference:/Decision: must be user/User. Use only user unless the decision slot reminder names aliases. Third-party traits/living/likes → fact (`Narration:` / kind=Narration), even when the user reported them. Do not duplicate the full procedure or event summary. Corrections use supersedes: + confidence: explicit. `decision_constraint` is accepted only as a legacy input alias and is normalized to canonical `decision`.
+- decision: a standing rule that is finished in this card. Recalled with no procedure and no event beside it, it still changes a later, different request. Preference is the user's own taste. Decision is a constraint on the agent. The ruling names no deliverable of this sitting (no file, page count, one-off layout, or "add this change to that note"). Those details stay in the procedure solution. A decision that only restates that solution is not a decision. Mirror the transcript's intensity; do not normalise the ruling to must. Emit subject plus a predicate ruling so Preference:/Decision: {{subject}} {{ruling}} is one clause. First subject after Preference:/Decision: must be user/User. Use only user unless the decision slot reminder names aliases. Third-party traits/living/likes → fact (`Narration:` / kind=Narration), even when the user reported them. Do not duplicate the full procedure or event summary. Corrections use supersedes: + confidence: explicit. `decision_constraint` is accepted only as a legacy input alias and is normalized to canonical `decision`.
 - Legacy input alias detail: decision_constraint: user feedback on that procedure; it is never emitted as the canonical output type.
 - Episode-first: one outcome event per completed user request (not one per tool step). Grade/scrape snapshot → fact; multi-file deliverable arc → one event.
 - entity: required on fact and event (English canonical). entity_aliases: optional original-language surfaces; omit when identical to entity. involves: optional on non-event only (max {MAX_INVOLVES}; omit primary; entity collection with optional role). Do NOT use involves on event — use participants instead.
@@ -4227,20 +4227,17 @@ def _worker_type_body_reminder(worker_type: str) -> str:
         names = ", ".join(_decision_alias_display)
         subject = f"`user` or {names}" if names else "`user`"
         return (
-            f"Slot reminder: kind=Preference|Decision, subject={subject}, "
-            "ruling=predicate that mirrors the transcript intensity; do not "
-            "normalise to must. Examples, not a closed list: intense must / "
-            "must not (write forbids / banned as must not); less intense "
-            "prefer / prefers; neutral locked / decided / chose / sets; etc. "
-            "Use another verb when it fits the session history's intensity "
-            "better. Identify who must act. Own preference stays about the "
-            "user (user prefers tea). An expectation of the agent is "
-            "user wants the agent to send the report, or user wants the "
-            "agent not to parrot the user's words. Do not write user must "
-            "for an order to the agent. Do not repeat subject. First subject "
-            "after Preference:/Decision: must be user/User. Look in the "
-            "transcript for the user's rulings. Third-party traits → fact "
-            "with kind=Narration + involves cast, not decision.\n"
+            f"Slot reminder: kind=Preference|Decision, subject={subject}. "
+            "decision: a standing rule that is finished in this card. Recalled "
+            "with no procedure and no event beside it, it still changes a later, "
+            "different request. Preference is the user's own taste. Decision is "
+            "a constraint on the agent. The ruling names no deliverable of this "
+            "sitting (no file, page count, one-off layout, or \"add this change "
+            "to that note\"). Those details stay in the procedure solution. A "
+            "decision that only restates that solution is not a decision. "
+            "Do not repeat subject. First subject after Preference:/Decision: "
+            "must be user/User. Third-party traits → fact with kind=Narration "
+            "+ involves cast, not decision.\n"
         )
     if assigned == "fact":
         return (
