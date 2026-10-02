@@ -1156,8 +1156,16 @@ def test_phase2_gate_records_sep29_procedure_pair(tmp_path, monkeypatch, capsys)
     """A two-card board always keeps the sole pair, so the threshold is never applied.
 
     These two leave-notice procedures need a third procedure or the gate cannot
-    show whether 0.06 would have dropped them.
+    show whether 0.06 would have dropped them. The installer venv does not ship
+    sentence_transformers; a missing embedder is recorded as full_board, which
+    is not this filter decision.
     """
+    try:
+        import sentence_transformers  # noqa: F401
+    except ImportError:
+        import pytest
+
+        pytest.skip("sentence_transformers is not installed in this interpreter")
     digest = _load("digest")
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(digest, "_PHASE2_EMBED_CACHE", {})

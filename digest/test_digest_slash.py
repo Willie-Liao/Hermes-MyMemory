@@ -240,3 +240,44 @@ def test_history_help_lists_presets(monkeypatch):
     out = slash.handle_digest("help")
     assert "history" in out
     assert "1d" in out
+
+
+def test_async_slash_handler_sees_bound_session_then_clears():
+    """A desktop /digest call binds the chat id; a later call must not keep it.
+
+    The installer collects this file. The handler reads the context variable
+    the same way resolve_session does, including when a loop is already running
+    and the await moves to a helper thread.
+    """
+    import asyncio
+
+    agent = Path(__file__).resolve().parents[3] / "hermes-agent"
+    if str(agent) not in sys.path:
+        sys.path.insert(0, str(agent))
+    from gateway.session_context import (
+        clear_session_vars,
+        get_session_env,
+        set_session_vars,
+    )
+    from hermes_cli.plugins import resolve_plugin_command_result
+
+    async def read_id():
+        return get_session_env("HERMES_SESSION_ID")
+
+    tokens = set_session_vars(session_key="sess-key", session_id="sess-key")
+    try:
+        assert resolve_plugin_command_result(read_id()) == "sess-key"
+    finally:
+        clear_session_vars(tokens)
+    assert get_session_env("HERMES_SESSION_ID") == ""
+
+    tokens = set_session_vars(session_key="sess-key", session_id="sess-key")
+    try:
+
+        async def inside_loop():
+            return resolve_plugin_command_result(read_id())
+
+        assert asyncio.run(inside_loop()) == "sess-key"
+    finally:
+        clear_session_vars(tokens)
+    assert get_session_env("HERMES_SESSION_ID") == ""
