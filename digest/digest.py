@@ -3471,6 +3471,110 @@ def _fallback_proposal(
     return digest_operations.build_update_operations(existing_blocks, new_blocks)
 
 
+def _phase2_gate_record(
+    outcome: str,
+    reason: str,
+    entered: list[str],
+    filtered_out: list[str],
+    pairs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """One Pearson/MI gate row, stamped with `at` so a later llm patch can find it.
+
+    Without a stable `at`, the tool result would have to append a second
+    history entry and the filter numbers would split from the model's ops.
+    """
+    return {
+        "at": datetime.now(timezone.utc).isoformat(),
+        "outcome": outcome,
+        "reason": reason,
+        "threshold": PHASE2_MI_THRESHOLD,
+        "entered_llm": list(entered),
+        "filtered_out": list(filtered_out),
+        "pairs": list(pairs),
+    }
+
+
+def _remember_phase2_gate(record: dict[str, Any]) -> str | None:
+    """Append one gate pass and return its `at`, or None if the save failed.
+
+    A failed save must not change the prompt, and must not hand back an `at`
+    the llm patch would miss.
+    """
+    entered = record.get("entered_llm") or []
+    filtered = record.get("filtered_out") or []
+    pairs = record.get("pairs") or []
+    _log(
+        "phase2 Pearson/MI gate "
+        f"outcome={record.get('outcome')} entered={len(entered)} "
+        f"filtered_out={len(filtered)} pairs={len(pairs)} "
+        f"threshold={record.get('threshold')}"
+    )
+    try:
+        with _digest_lock:
+            state = _load_state()
+            history = state.get("phase2_gate")
+            if not isinstance(history, list):
+                history = []
+            history.append(record)
+            state["phase2_gate"] = history[-PHASE2_GATE_HISTORY_CAP:]
+            _save_state(state)
+    except Exception:
+        return None
+    at = str(record.get("at") or "").strip()
+    return at or None
+
+
+def _patch_phase2_gate_llm(at: str | None, llm: dict[str, Any]) -> None:
+    """Write `llm` onto the gate row saved at `at` instead of a second history entry.
+
+    Skip-LLM and attempt ≥2 pass `at` None because the model was not called
+    against a new gate row. A missing row is left alone so a late patch cannot
+    invent a gate the filter never wrote.
+    """
+    stamp = str(at or "").strip()
+    if not stamp:
+        return
+    try:
+        with _digest_lock:
+            state = _load_state()
+            history = state.get("phase2_gate")
+            if not isinstance(history, list):
+                return
+            for row in reversed(history):
+                if isinstance(row, dict) and row.get("at") == stamp:
+                    row["llm"] = dict(llm)
+                    _save_state(state)
+                    return
+    except Exception:
+        return
+
+
+def _phase2_llm_record(
+    tool_name: str,
+    operations: list[Any],
+    *,
+    failed: bool = False,
+    error: str = "",
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Shape the phase2_gate.llm object next to operations.
+
+    `reason` is only "no merge" or "tool error". Omitting it keeps a
+    successful non-empty op list from looking like a keep-separate.
+    """
+    payload: dict[str, Any] = {
+        "tool_name": tool_name,
+        "failed": failed,
+        "error": error,
+        "operations": [
+            dict(op) if isinstance(op, Mapping) else op for op in operations
+        ],
+    }
+    if reason:
+        payload["reason"] = reason
+    return payload
+
+
 def _phase2_prompt_and_tool(
     existing_blocks: list[dict[str, Any]],
     new_blocks: list[dict[str, Any]],
@@ -3479,14 +3583,16 @@ def _phase2_prompt_and_tool(
     attempt: int,
     previous_ops: list[dict[str, Any]],
     max_attempts: int,
-) -> tuple[str, str, str]:
+) -> tuple[str, str, str, str | None]:
     """Record whether Pearson/MI filtered the board or fell open to every card.
 
     Without that digest-state row a RAM fail-open and a real filter look the
     same, and the 0.06 threshold cannot be checked later. Skip MiniLM only on
     ≤2GiB boxes or <256MiB available so a 3.5GiB VPS can still filter;
     embed/math failure fail-opens to the full board. Attempt ≥2 still shrinks
-    to foul-touched cards only and does not write a gate record.
+    to foul-touched cards only and does not write a gate record. The fourth
+    return is that row's `at`, or None when no row was saved or the model
+    will not be called (skip_llm).
     """
     global _PHASE2_MINILM
     mode = "submit" if attempt == 1 or not previous_ops else "patch"
@@ -3510,49 +3616,7 @@ def _phase2_prompt_and_tool(
         for b in list(existing_blocks) + list(new_blocks)
         if str(b.get("id") or "").strip()
     ]
-
-    def _phase2_gate_record(
-        outcome: str,
-        reason: str,
-        entered: list[str],
-        filtered_out: list[str],
-        pairs: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        return {
-            "at": datetime.now(timezone.utc).isoformat(),
-            "outcome": outcome,
-            "reason": reason,
-            "threshold": PHASE2_MI_THRESHOLD,
-            "entered_llm": list(entered),
-            "filtered_out": list(filtered_out),
-            "pairs": list(pairs),
-        }
-
-    def _remember_phase2_gate(record: dict[str, Any]) -> None:
-        """Keep one gate pass in digest state so 0.06 can be checked later.
-
-        A failed save must not change the prompt this call returns.
-        """
-        entered = record.get("entered_llm") or []
-        filtered = record.get("filtered_out") or []
-        pairs = record.get("pairs") or []
-        _log(
-            "phase2 Pearson/MI gate "
-            f"outcome={record.get('outcome')} entered={len(entered)} "
-            f"filtered_out={len(filtered)} pairs={len(pairs)} "
-            f"threshold={record.get('threshold')}"
-        )
-        try:
-            with _digest_lock:
-                state = _load_state()
-                history = state.get("phase2_gate")
-                if not isinstance(history, list):
-                    history = []
-                history.append(record)
-                state["phase2_gate"] = history[-PHASE2_GATE_HISTORY_CAP:]
-                _save_state(state)
-        except Exception:
-            return
+    gate_at: str | None = None
 
     if attempt >= 2 and previous_ops:
         closure = digest_dedup_prompt.foul_touched_block_ids(
@@ -3794,7 +3858,7 @@ def _phase2_prompt_and_tool(
                         pair_list,
                     )
                 )
-                return ("", force_name, "skip")
+                return ("", force_name, "skip", None)
             keep_ids = {a for a, _b in kept} | {b for _a, b in kept}
             prompt_existing = [
                 b
@@ -3805,7 +3869,7 @@ def _phase2_prompt_and_tool(
                 b for b in new_blocks if str(b.get("id") or "") in keep_ids
             ]
             candidate_pairs = kept
-            _remember_phase2_gate(
+            gate_at = _remember_phase2_gate(
                 _phase2_gate_record(
                     "filtered",
                     "",
@@ -3818,7 +3882,7 @@ def _phase2_prompt_and_tool(
             _log(
                 f"phase2 Pearson/MI gate failed; full-board prompt: {exc}"
             )
-            _remember_phase2_gate(
+            gate_at = _remember_phase2_gate(
                 _phase2_gate_record(
                     "full_board",
                     str(exc),
@@ -3840,7 +3904,7 @@ def _phase2_prompt_and_tool(
     )
     if teach:
         prompt = f"{prompt}\n\n{teach}"
-    return prompt, force_name, mode
+    return prompt, force_name, mode, gate_at
 
 
 def make_llm_proposer(
@@ -3855,7 +3919,9 @@ def make_llm_proposer(
 
     Skip-mode from the Pearson/MI gate returns no ops without an LLM call so
     empty-candidate boards do not burn tokens, while prepare_operations still
-    runs decay and validation.
+    runs decay and validation. A successful empty operations list is stamped
+    onto that gate row as reason "no merge" so a later read can tell a keep
+    from a call that never returned.
 
     Preferred I/O: forced ``submit_operations`` (attempt 1) then
     ``patch_operations`` (attempts 2–5) via ``run_worker_llm_tools``. Text
@@ -3880,8 +3946,9 @@ def make_llm_proposer(
     ) -> list[Any]:
         nonlocal previous_ops
         proposed: list[Any] | None = None
+        llm_reason: str | None = None
         try:
-            prompt, force_name, mode = _phase2_prompt_and_tool(
+            prompt, force_name, mode, gate_at = _phase2_prompt_and_tool(
                 existing_blocks,
                 new_blocks,
                 errors=errors,
@@ -3937,6 +4004,13 @@ def make_llm_proposer(
                         for op in tool_args["operations"]
                     ]
                     previous_ops = [dict(op) for op in proposed if isinstance(op, Mapping)]
+                    llm_reason = "no merge" if not proposed else None
+                    _patch_phase2_gate_llm(
+                        gate_at,
+                        _phase2_llm_record(
+                            tool_name, proposed, reason=llm_reason
+                        ),
+                    )
                 elif tool_name == "patch_operations" and isinstance(tool_args, dict):
                     merged = digest_tools.merge_operations_patch(
                         previous_ops, tool_args
@@ -3947,6 +4021,13 @@ def make_llm_proposer(
                     previous_ops = [
                         dict(op) for op in proposed if isinstance(op, Mapping)
                     ]
+                    llm_reason = "no merge" if not proposed else None
+                    _patch_phase2_gate_llm(
+                        gate_at,
+                        _phase2_llm_record(
+                            tool_name, proposed, reason=llm_reason
+                        ),
+                    )
                 else:
                     # Text fallback (tests stub _invoke_digest_llm + stub_dedup).
                     reply = caller(prompt)
@@ -3987,12 +4068,13 @@ def make_llm_proposer(
         finalized = digest_operations.finalize_operations(existing_blocks, proposed)
         merges = sum(1 for op in finalized if op.operation == "merge")
         drops = sum(1 for op in finalized if op.operation == "drop")
+        reason_bit = f" reason={llm_reason}" if llm_reason else ""
         _log(
             f"digest dedup proposer session={session_id} run={run_id} "
             f"attempt={attempt} mode={mode} invocations={stats['invocations']} "
             f"prompt_tokens~={stats['prompt_chars'] // 4} "
             f"latency_ms={stats['latency_ms']:.0f} "
-            f"merges={merges} drops={drops}"
+            f"merges={merges} drops={drops}{reason_bit}"
         )
         return finalized
 
@@ -4009,7 +4091,8 @@ def make_oneshot_proposer(
     """Phase-2 oneshot proposer: same teach/patch as Hermes, no AIAgent.
 
     Skip-mode from the Pearson/MI gate returns no ops without an LLM call so
-    empty-candidate boards still reach prepare_operations decay.
+    empty-candidate boards still reach prepare_operations decay. A successful
+    empty operations list is stamped on that gate row as reason "no merge".
     """
     caller = invoke_tool or _invoke_digest_oneshot_tool
     previous_ops: list[dict[str, Any]] = []
@@ -4022,7 +4105,7 @@ def make_oneshot_proposer(
         attempt: int = 1,
     ) -> list[Any]:
         nonlocal previous_ops
-        prompt, force_name, mode = _phase2_prompt_and_tool(
+        prompt, force_name, mode, gate_at = _phase2_prompt_and_tool(
             existing_blocks,
             new_blocks,
             errors=errors,
@@ -4044,6 +4127,7 @@ def make_oneshot_proposer(
             )
         tool_name, tool_args = digest_tools.parse_tool_args_from_result(capture)
         proposed: list[Any] | None = None
+        llm_reason: str | None = None
         if (
             tool_name == "submit_operations"
             and isinstance(tool_args, dict)
@@ -4054,17 +4138,28 @@ def make_oneshot_proposer(
                 for op in tool_args["operations"]
             ]
             previous_ops = [dict(op) for op in proposed if isinstance(op, Mapping)]
+            llm_reason = "no merge" if not proposed else None
+            _patch_phase2_gate_llm(
+                gate_at,
+                _phase2_llm_record(tool_name, proposed, reason=llm_reason),
+            )
         elif tool_name == "patch_operations" and isinstance(tool_args, dict):
             merged = digest_tools.merge_operations_patch(previous_ops, tool_args)
             proposed = [
                 dict(op) if isinstance(op, Mapping) else op for op in merged
             ]
             previous_ops = [dict(op) for op in proposed if isinstance(op, Mapping)]
+            llm_reason = "no merge" if not proposed else None
+            _patch_phase2_gate_llm(
+                gate_at,
+                _phase2_llm_record(tool_name, proposed, reason=llm_reason),
+            )
         if proposed is None:
             raise ValueError("oneshot returned no operations")
+        reason_bit = f" reason={llm_reason}" if llm_reason else ""
         _log(
             f"digest oneshot proposer session={session_id} run={run_id} "
-            f"attempt={attempt} mode={mode} ops={len(proposed)}"
+            f"attempt={attempt} mode={mode} ops={len(proposed)}{reason_bit}"
         )
         return digest_operations.finalize_operations(existing_blocks, proposed)
 
