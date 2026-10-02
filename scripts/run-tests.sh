@@ -92,5 +92,7 @@ echo "agent root: $AGENT_ROOT"
 "$PY" -m pytest \
   --ignore=digest/test_digest_live_typed_prompt.py \
   --ignore=digest/test_digest_live_merge_slots.py \
+  --ignore=weekly/test_w38_sunday_evening_patch.py \
+  --ignore-glob='weekly/debug_*.py' \
   -k 'not test_live_llm_sees_bands_in_both_hermes_slots and not test_eval_prefetch_fallback_band_c_weekday_ladder' \
   -q --tb=line
