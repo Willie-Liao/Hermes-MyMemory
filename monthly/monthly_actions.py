@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import sys
+import time
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ from monthly_slice import (  # noqa: E402
 from monthly_state import month_file_path  # noqa: E402
 from monthly_synth import synthesize_month  # noqa: E402
 from monthly_writer import load_month, write_month, loads  # noqa: E402
+from worker_llm import format_token_line, sum_usage_after, usage_ledger_offset  # noqa: E402
 
 _MONTH_KEY_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 _GUIDANCE_GATE = 0.92
@@ -268,6 +270,17 @@ def month_band(limit: int = 8, staging: Path | None = None) -> str:
     return "## Month summaries\n" + "\n".join(lines)
 
 
+def _slash_usage_line(result: dict, offset: int, started: float) -> str:
+    """Attach the same token line digest and weekly print after a model run."""
+    usage = result.get("usage") if isinstance(result.get("usage"), dict) else None
+    if usage is None:
+        usage = sum_usage_after(offset)
+    seconds = result.get("seconds")
+    if seconds is None:
+        seconds = time.monotonic() - started
+    return format_token_line(usage, float(seconds))
+
+
 def handle_monthly(raw_args: str) -> str:
     """Slash/CLI dispatcher for update, show, and suggest — monthly has no UI lifecycle.
 
@@ -282,15 +295,23 @@ def handle_monthly(raw_args: str) -> str:
     if cmd == "suggest":
         from monthly_suggest import suggest_from_tokens
 
-        return suggest_from_tokens(tokens[1:])
+        offset = usage_ledger_offset()
+        started = time.monotonic()
+        text = suggest_from_tokens(tokens[1:])
+        return text + "\n" + _slash_usage_line({}, offset, started)
     if cmd == "update":
         key = parse_month_key(rest) if rest else date.today().strftime("%Y-%m")
         if rest and key is None:
             return f"bad month {rest!r}; expected YYYY-MM"
+        offset = usage_ledger_offset()
+        started = time.monotonic()
         result = generate_month(key, reason="slash", force_refresh=True)
         if result.get("outcome") == "bad_month":
             return f"bad month {rest!r}; expected YYYY-MM"
-        return f"updated {result.get('month')} ({result.get('outcome')})"
+        return (
+            f"updated {result.get('month')} ({result.get('outcome')})\n"
+            + _slash_usage_line(result, offset, started)
+        )
     if cmd == "show":
         key = parse_month_key(rest) if rest else date.today().strftime("%Y-%m")
         if rest and key is None:

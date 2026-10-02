@@ -900,6 +900,21 @@ def _seconds_since(ts: datetime | None) -> float:
     return (now - ts).total_seconds()
 
 
+def _message_local_day(msg: Mapping[str, Any]) -> date | None:
+    """Civil date of a transcript row so slash scopes do not mix yesterday into today.
+
+    A bookmark tail that still holds last night's turns would rewrite today's file
+    with another day's sitting.
+    """
+    stamp = _iso_from_message_ts(msg.get("timestamp"))
+    if not stamp:
+        return None
+    parsed = _parse_frontmatter_clock(stamp)
+    if parsed is None:
+        return None
+    return parsed.astimezone().date()
+
+
 def _fetch_messages(session_id: str, after_id: int = 0) -> list[dict[str, Any]]:
     """Load chat rows for digest without treating compaction summaries as user turns.
 
@@ -5439,6 +5454,9 @@ def _run_digest_pipeline(
     assistant_count: int = 0,
     batch_start_id: int | None = None,
     user_hashes: list[str] | None = None,
+    rewrite: bool = False,
+    move_bookmark: bool = True,
+    wrapup: bool = False,
 ) -> str:
     """Phase-1 extract → persist → bookmark, recording user hashes so clones skip.
 
@@ -5447,7 +5465,13 @@ def _run_digest_pipeline(
     the helper card and still bookmarks so extract cannot stall.
     Passes ``daily_path.stem`` into Phase-1 so leftover persist and minted
     ids stay on that board date when wall-clock today has already rolled.
+    ``rewrite`` clears today's fences before persist so /digest --all replaces
+    the board. ``wrapup`` is the past-date slash path; the 23:55 clock stays
+    the only automatic wrap-up.
     """
+    if rewrite:
+        _rewrite_daily_file(daily_path, "")
+    bookmark_id = batch_end_id if move_bookmark else None
     try:
         phase1 = run_phase1_digest_blocks(
             session_id,
@@ -5477,7 +5501,7 @@ def _run_digest_pipeline(
             f"reason={reason}"
         )
         _finalize_digest_success(
-            session_key, batch_end_id, session_id=session_id, user_hashes=user_hashes
+            session_key, bookmark_id, session_id=session_id, user_hashes=user_hashes
         )
         return "skip"
 
@@ -5528,8 +5552,10 @@ def _run_digest_pipeline(
         )
 
     _finalize_digest_success(
-        session_key, batch_end_id, session_id=session_id, user_hashes=user_hashes
+        session_key, bookmark_id, session_id=session_id, user_hashes=user_hashes
     )
+    if wrapup:
+        run_day_wrapup(daily_path)
     _log(
         f"digest pipeline appended session={session_id} "
         f"run={run_id} reason={reason} prior_cards={prior_count}"
@@ -5580,6 +5606,9 @@ def _run_digest_pipeline_entry(
     assistant_count: int = 0,
     batch_start_id: int | None = None,
     user_hashes: list[str] | None = None,
+    rewrite: bool = False,
+    move_bookmark: bool = True,
+    wrapup: bool = False,
 ) -> str:
     """Run the digest pipeline. Returns appended/skip/failed."""
     _digest_worker_active.active = True
@@ -5597,6 +5626,9 @@ def _run_digest_pipeline_entry(
             assistant_count=assistant_count,
             batch_start_id=batch_start_id,
             user_hashes=user_hashes,
+            rewrite=rewrite,
+            move_bookmark=move_bookmark,
+            wrapup=wrapup,
         )
     finally:
         _digest_worker_active.active = False
@@ -5613,6 +5645,7 @@ def _maybe_run_digest(
     force: bool = False,
     sync: bool = False,
     date_str: str | None = None,
+    scope: str | None = None,
 ) -> dict[str, Any]:
     """Decide digest: skip already-extracted windows, hold for the 12th reply, then launch.
 
@@ -5646,7 +5679,19 @@ def _maybe_run_digest(
             _log(f"recover stale in-flight digest ({reason}) session={session_id}")
 
         after_id = int(entry.get("last_digest_message_id") or 0)
+        if scope in {"all", "date"}:
+            after_id = 0
         messages = _fetch_messages(session_id, after_id=after_id)
+        if scope:
+            if scope == "date":
+                target_day = date.fromisoformat(str(date_str))
+            else:
+                target_day = hermes_local_today()
+            messages = [
+                msg
+                for msg in messages
+                if _message_local_day(msg) == target_day
+            ]
         user_count, assistant_count = _role_counts(messages)
         pending_users = user_count
         if not messages:
@@ -5784,7 +5829,7 @@ def _maybe_run_digest(
             known_count * DIGEST_REPLAY_HIT_DENOMINATOR
             >= len(user_hashes) * DIGEST_REPLAY_HIT_NUMERATOR
         )
-        if window_hit or hash_hit:
+        if scope not in {"all", "date"} and (window_hit or hash_hit):
             _log(
                 f"skip digest (already_extracted) session={session_id} "
                 f"range={batch_start_id}-{batch_end_id} "
@@ -5839,6 +5884,9 @@ def _maybe_run_digest(
             assistant_count=assistant_count,
             batch_start_id=batch_start_id,
             user_hashes=user_hashes,
+            rewrite=scope in {"all", "date"},
+            move_bookmark=scope != "date",
+            wrapup=False,
         )
         return {"outcome": outcome, **base}
 

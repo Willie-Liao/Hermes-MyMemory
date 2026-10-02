@@ -2,7 +2,9 @@
 
 Subcommands (single flat ``/digest`` command, parsed from ``raw_args``):
 
-    /digest                      force a synchronous digest run now
+    /digest --all                rewrite today's blocks from the full transcript
+    /digest --batch              digest today's messages after the bookmark
+    /digest YYYY-MM-DD           rewrite a past day, including the wrap-up
     /digest status               bookmark + undigested counts + in-flight + log
     /digest bookmark show        current bookmark id
     /digest bookmark set <id>    set bookmark to an absolute message id
@@ -18,8 +20,10 @@ Every handler returns plain text and never raises.
 from __future__ import annotations
 
 import importlib.util
+import re
 import shlex
 import sys
+from datetime import date
 from pathlib import Path
 
 _mymemory = Path(__file__).resolve().parent.parent
@@ -31,6 +35,7 @@ if str(_plugins_root) not in sys.path:
     sys.path.insert(0, str(_plugins_root))
 
 from memory_staging import resolve_session
+from worker_llm import format_token_line
 
 
 def _active_session() -> tuple[str, str] | None:
@@ -81,19 +86,54 @@ def handle_digest(raw_args: str, *, history_sync: bool = False) -> str:
         return _history(tokens[1:], history_sync=history_sync)
     if sub in ("help", "?"):
         return _help()
+    if _DATE_RE.match(sub):
+        return _past_day(sub)
+    if sub in ("--all", "--batch"):
+        if len(tokens) != 1:
+            return _run_usage()
+        return _force_run(sub[2:])
     if sub and not sub.startswith("-"):
         return f"Unknown /digest subcommand: {sub}\n\n{_help()}"
 
-    return _force_run(raw_args)
+    return _run_usage()
 
 
-def _force_run(raw_args: str) -> str:
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _run_usage() -> str:
+    """Bare /digest and mixed flags must not start a run the user did not name."""
+    return (
+        "Usage:\n"
+        "  /digest --all\n"
+        "  /digest --batch\n"
+        "  /digest YYYY-MM-DD\n"
+    )
+
+
+def _past_day(day_text: str) -> str:
+    """Rewrite one past civil day, including wrap-up, without moving today's bookmark."""
+    try:
+        day = date.fromisoformat(day_text)
+    except ValueError:
+        return _run_usage()
+    if day >= digest.hermes_local_today():
+        return f"/digest {day_text}: past civil date only.\n\n{_run_usage()}"
+    return _force_run("date", date_str=day_text)
+
+
+def _force_run(scope: str, date_str: str | None = None) -> str:
     resolved = _active_session()
     if resolved is None:
         return _no_session()
     session_key, _session_id = resolved
 
-    result = digest_run.request_digest(session_key, reason="slash_force")
+    result = digest_run.request_digest(
+        session_key,
+        reason="slash_force",
+        scope=scope,
+        date_str=date_str,
+    )
     outcome = result.get("outcome")
     sid = result.get("session_id", session_key)
 
@@ -110,7 +150,11 @@ def _force_run(raw_args: str) -> str:
     counts = ""
     if result.get("user") is not None:
         counts = f" [window: {result.get('user')} user / {result.get('assistant')} assistant]"
-    return f"/digest ({sid}): {line}{counts}"
+    if scope == "date" and result.get("path") and outcome in {"appended", "skip"}:
+        digest.run_day_wrapup(result["path"])
+    usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+    token_line = format_token_line(usage, float(result.get("seconds") or 0))
+    return f"/digest ({sid}): {line}{counts}\n{token_line}"
 
 
 def _status(raw_args: str) -> str:
@@ -234,7 +278,9 @@ def _history(args: list[str], *, history_sync: bool) -> str:
 def _help() -> str:
     return (
         "/digest commands:\n"
-        "  /digest                      force a digest run now\n"
+        "  /digest --all                rewrite today from the full transcript\n"
+        "  /digest --batch              digest today's messages after the bookmark\n"
+        "  /digest YYYY-MM-DD           rewrite a past day, including wrap-up\n"
         "  /digest status               bookmark, undigested counts, in-flight\n"
         "  /digest bookmark show        current bookmark id\n"
         "  /digest bookmark set <id>    set bookmark to a message id\n"

@@ -30,6 +30,10 @@ from pathlib import Path
 _section_dir = str(Path(__file__).resolve().parent)
 if _section_dir not in sys.path:
     sys.path.insert(0, _section_dir)
+_mymemory_dir = str(Path(__file__).resolve().parent.parent)
+if _mymemory_dir not in sys.path:
+    sys.path.insert(0, _mymemory_dir)
+from worker_llm import format_token_line, sum_usage_after, usage_ledger_offset
 
 try:  # package import (normal plugin load)
     from . import weekly as weekly_mod
@@ -110,8 +114,21 @@ def _brief_from_update_result(result: dict) -> str:
     return "\n".join(lines)
 
 
+def _usage_line(result: dict, offset: int, started: float) -> str:
+    """Print the run's token totals when the weekly update called a model."""
+    usage = result.get("usage") if isinstance(result.get("usage"), dict) else None
+    if usage is None:
+        usage = sum_usage_after(offset)
+    seconds = result.get("seconds")
+    if seconds is None:
+        seconds = time.monotonic() - started
+    return format_token_line(usage, float(seconds))
+
+
 def _update(args: list[str]) -> str:
     week_key = _week_arg(args)
+    offset = usage_ledger_offset()
+    started = time.monotonic()
     result = weekly_actions.update_week(week_key, reason="update")
     outcome = result.get("outcome")
 
@@ -122,8 +139,6 @@ def _update(args: list[str]) -> str:
             f"/weekly update: The newsroom is quiet — no daily digests for "
             f"{result.get('week')} yet. Chat with Hermes first, then update again."
         )
-    if outcome == "failed":
-        return f"/weekly update: generation failed for {result.get('week')} (validation/API)."
     if outcome == "generated":
         brief = _brief_from_update_result(result)
         # Slash update = user opted into staging review tools → unlock.
@@ -140,8 +155,16 @@ def _update(args: list[str]) -> str:
             f"{result.get('sources')} daily file(s) -> {result.get('path')}"
         )
         if brief:
-            return f"{brief}\n\n{footer}"
-        return footer
+            body = f"{brief}\n\n{footer}"
+        else:
+            body = footer
+        return body + "\n" + _usage_line(result, offset, started)
+    if outcome == "failed":
+        return (
+            f"/weekly update: generation failed for {result.get('week')} (validation/API)."
+            + "\n"
+            + _usage_line(result, offset, started)
+        )
     return f"/weekly update: unexpected outcome {outcome!r}."
 
 

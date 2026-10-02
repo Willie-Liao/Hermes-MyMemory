@@ -14,6 +14,7 @@ import json
 import sqlite3
 import sys
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -55,9 +56,31 @@ def request_digest(
     reason: str = "slash_force",
     force: bool = True,
     sync: bool = True,
+    scope: str | None = None,
+    date_str: str | None = None,
 ) -> dict[str, Any]:
-    """Run a digest now. Defaults to a forced, synchronous run for slash use."""
-    return digest._maybe_run_digest(session_key, reason, force=force, sync=sync)
+    """Run a digest now. Defaults to a forced, synchronous run for slash use.
+
+    ``scope`` is the slash choice: today's full board, today's bookmark tail,
+    or one past civil date. The returned usage is that run's ledger delta.
+    """
+    from worker_llm import sum_usage_after, usage_ledger_offset
+
+    offset = usage_ledger_offset()
+    started = time.monotonic()
+    result = digest._maybe_run_digest(
+        session_key,
+        reason,
+        force=force,
+        sync=sync,
+        date_str=date_str,
+        scope=scope,
+    )
+    usage = sum_usage_after(offset)
+    result = dict(result)
+    result["usage"] = usage
+    result["seconds"] = max(0.0, time.monotonic() - started)
+    return result
 
 
 def get_digest_status(session_key: str, session_id: str) -> dict[str, Any]:

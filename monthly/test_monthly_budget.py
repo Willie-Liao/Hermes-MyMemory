@@ -173,9 +173,18 @@ def test_handle_monthly_help_update_show(tmp_path, monkeypatch):
     assert "bad month" in handle_monthly("update 2026-13")
     monkeypatch.setattr(
         "monthly_actions.generate_month",
-        lambda key, **_: {"outcome": "ok", "month": key},
+        lambda key, **_: {
+            "outcome": "ok",
+            "month": key,
+            "usage": {"input_tokens": 9, "output_tokens": 2},
+            "seconds": 1.2,
+        },
     )
-    assert "updated 2026-08" in handle_monthly("update 2026-08")
+    updated = handle_monthly("update 2026-08")
+    assert "updated 2026-08" in updated
+    assert "input_tokens=9" in updated
+    assert "output_tokens=2" in updated
+    assert "seconds=" in updated
     write_month(
         MonthlyPayload(
             key="2026-08",

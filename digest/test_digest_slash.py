@@ -30,11 +30,67 @@ def test_force_run(monkeypatch):
     monkeypatch.setattr(
         slash.digest_run,
         "request_digest",
-        lambda sk, **kw: {"outcome": "appended", "session_id": "s1", "user": 3, "assistant": 3},
+        lambda sk, **kw: {
+            "outcome": "appended",
+            "session_id": "s1",
+            "user": 3,
+            "assistant": 3,
+            "usage": {"input_tokens": 11, "output_tokens": 4},
+            "seconds": 2.5,
+        },
     )
-    out = slash.handle_digest("")
+    out = slash.handle_digest("--batch")
     assert "staged new block" in out
     assert "3 user / 3 assistant" in out
+    assert "input_tokens=11" in out
+    assert "output_tokens=4" in out
+    assert "seconds=" in out
+
+
+def test_digest_slash_modes_do_not_wrap_up(monkeypatch):
+    """--all and --batch stay on today; a past date is the only slash wrap-up."""
+    slash = _load_slash()
+    _stub_session(slash, monkeypatch)
+    calls: list[dict] = []
+    wrapups: list[str] = []
+
+    def fake(sk, **kw):
+        calls.append(kw)
+        return {
+            "outcome": "appended",
+            "session_id": sk,
+            "user": 1,
+            "assistant": 0,
+            "usage": {"input_tokens": 8, "output_tokens": 3},
+            "seconds": 1.0,
+            "path": "/tmp/2020-01-02.md",
+        }
+
+    monkeypatch.setattr(slash.digest_run, "request_digest", fake)
+    monkeypatch.setattr(
+        slash.digest, "run_day_wrapup", lambda path: wrapups.append(str(path))
+    )
+    bare = slash.handle_digest("")
+    assert "Usage:" in bare
+    assert calls == []
+    assert wrapups == []
+    slash.handle_digest("--all")
+    assert calls[-1]["scope"] == "all"
+    slash.handle_digest("--batch")
+    assert calls[-1]["scope"] == "batch"
+    assert wrapups == []
+    mixed = slash.handle_digest("--all 2026-01-02")
+    assert "Usage:" in mixed
+    assert len(calls) == 2
+    today = slash.digest.hermes_local_today().isoformat()
+    rejected = slash.handle_digest(today)
+    assert "past civil date only" in rejected
+    assert len(calls) == 2
+    past = slash.handle_digest("2020-01-02")
+    assert calls[-1]["scope"] == "date"
+    assert calls[-1]["date_str"] == "2020-01-02"
+    assert "input_tokens=8" in past
+    assert wrapups == ["/tmp/2020-01-02.md"]
 
 
 def test_status(monkeypatch):
@@ -105,7 +161,7 @@ def test_force_run_ignores_session_flag(monkeypatch):
         "request_digest",
         lambda sk, **kw: {"outcome": "empty", "session_id": sk},
     )
-    slash.handle_digest("--session other-session")
+    slash.handle_digest("--batch")
     assert seen == [""]
 
 

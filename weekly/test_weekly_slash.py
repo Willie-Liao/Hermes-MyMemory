@@ -89,6 +89,8 @@ def test_update_pastes_brief_not_distill(tmp_path, monkeypatch):
             "week": week_key,
             "sources": 3,
             "path": str(week_path),
+            "usage": {"input_tokens": 6, "output_tokens": 1},
+            "seconds": 0.4,
         }
 
     monkeypatch.setattr(s.weekly_actions, "update_week", fake_update)
@@ -100,6 +102,9 @@ def test_update_pastes_brief_not_distill(tmp_path, monkeypatch):
     assert "Distill body" not in out
     assert "refer to [" not in out.lower()
     assert "2026-W24" in out  # short path/week footer ok
+    assert "input_tokens=6" in out
+    assert "output_tokens=1" in out
+    assert "seconds=" in out
 
 
 def test_update_sets_staging_unlocked(tmp_path, monkeypatch):

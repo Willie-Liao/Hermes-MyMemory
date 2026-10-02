@@ -96,6 +96,53 @@ def _ledger_path() -> Path:
     return _hermes_home() / "metrics" / "llm-usage.jsonl"
 
 
+def usage_ledger_offset() -> int:
+    """Byte offset before a slash run so later lines are that run's model calls.
+
+    Summing the whole ledger would bill earlier digests to this reply.
+    """
+    try:
+        return _ledger_path().stat().st_size
+    except OSError:
+        return 0
+
+
+def sum_usage_after(offset: int) -> dict[str, int]:
+    """Sum input and output tokens appended after ``offset``.
+
+    A slash reply that omits this total hides whether the run called the model.
+    """
+    path = _ledger_path()
+    totals = {"input_tokens": 0, "output_tokens": 0}
+    try:
+        with path.open(encoding="utf-8") as fh:
+            fh.seek(max(0, int(offset)))
+            if offset:
+                fh.readline()
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                totals["input_tokens"] += int(rec.get("input_tokens") or 0)
+                totals["output_tokens"] += int(rec.get("output_tokens") or 0)
+    except OSError:
+        return totals
+    return totals
+
+
+def format_token_line(usage: Mapping[str, Any], seconds: float) -> str:
+    """One reply line so digest, weekly, and monthly runs report the same three numbers."""
+    return (
+        f"input_tokens={int(usage.get('input_tokens') or 0)} "
+        f"output_tokens={int(usage.get('output_tokens') or 0)} "
+        f"seconds={max(0.0, float(seconds)):.1f}"
+    )
+
+
 def _runtime_from_mapping(bag: Mapping[str, Any] | None) -> dict[str, str]:
     """Copy lane/entry/chat endpoint fields so workers are not a hardcoded provider table.
 
