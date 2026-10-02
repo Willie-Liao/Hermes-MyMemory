@@ -146,6 +146,35 @@ def _with_llm_issue(payload: dict[str, Any]) -> dict[str, Any]:
     return {**payload, **extra}
 
 
+def _recover_stale_reorganise_state(state: dict[str, Any], job_key: str) -> dict[str, Any]:
+    """If the weekly-reorganise job was left in_flight but its thread is dead,
+    clear the flag so the UI spinner does not stick after a crashed daemon.
+
+    The caller already holds ``digest._digest_lock`` and passes back the same
+    dict it is about to act on, so the mutation is observed by the caller
+    without a second load/save round-trip.
+    """
+    job = state.get(job_key)
+    if not isinstance(job, dict) or not bool(job.get("in_flight")):
+        return state
+    job_date = str(job.get("date") or "").strip()
+    if not job_date:
+        # No date hint -> cannot check a specific thread name; bail safely.
+        return state
+    target_name = f"weekly-reorganise-{job_date}"
+    alive = any(
+        t.name == target_name and t.is_alive() for t in threading.enumerate()
+    )
+    if alive:
+        return state
+    state[job_key] = {
+        "in_flight": False,
+        "date": job_date,
+        "last_outcome": "stale_cleared_on_boot",
+    }
+    return state
+
+
 def request_weekly_reorganise(
     *,
     date_str: str | None = None,
@@ -180,6 +209,8 @@ def request_weekly_reorganise(
 
     with digest._digest_lock:
         state = digest._load_state()
+        state = _recover_stale_reorganise_state(state, job_key)
+        digest._save_state(state)
         job = state.get(job_key) if isinstance(state.get(job_key), dict) else {}
         in_flight = bool(job.get("in_flight"))
         last_outcome = str(job.get("last_outcome") or "").strip()
@@ -198,6 +229,19 @@ def request_weekly_reorganise(
             })
 
     if not daily_path.exists():
+        # Daily file missing — if a previous run left in_flight=True on disk,
+        # clear it so the UI does not show a permanently stuck spinner.
+        with digest._digest_lock:
+            state = digest._load_state()
+            state = _recover_stale_reorganise_state(state, job_key)
+            job = state.get(job_key) if isinstance(state.get(job_key), dict) else {}
+            if bool(job.get("in_flight")):
+                state[job_key] = {
+                    "in_flight": False,
+                    "date": target_date,
+                    "last_outcome": "missing_daily_cleared",
+                }
+                digest._save_state(state)
         return {"outcome": "missing", "path": str(daily_path), "date": target_date}
 
     if wait:
@@ -210,6 +254,7 @@ def request_weekly_reorganise(
     )
     with digest._digest_lock:
         state = digest._load_state()
+        state = _recover_stale_reorganise_state(state, job_key)
         job = state.get(job_key) if isinstance(state.get(job_key), dict) else {}
         if bool(job.get("in_flight")) and worker_alive:
             return {
@@ -233,7 +278,11 @@ def request_weekly_reorganise(
         try:
             result = digest.run_manual_phase2(daily_path, date_str=target_date)
             outcome = str(result.get("outcome") or "failed")
-        except Exception:  # noqa: BLE001
+        except BaseException:  # noqa: BLE001
+            # BaseException covers Exception + SystemExit/KeyboardInterrupt so the
+            # finally below always runs and clears the in_flight flag, except when
+            # the OS itself kills the process (SIGKILL/OOM) — that case is handled
+            # by _recover_stale_reorganise_state() on the next state load.
             outcome = "failed"
         finally:
             with digest._digest_lock:

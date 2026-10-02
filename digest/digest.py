@@ -148,6 +148,7 @@ IN_FLIGHT_STALE_SECONDS = 600
 # Phase-2 Pearson/MI prefilter (ES-Mem eqs 1–2). Lazy MiniLM; in-memory only.
 PHASE2_MINILM_MODEL = "all-MiniLM-L6-v2"
 PHASE2_MI_THRESHOLD = 0.06  # Absolute MI threshold (relaxed from 0.10)
+PHASE2_GATE_HISTORY_CAP = 20
 # Skip MiniLM on tiny boxes only. 768MiB available used to fail-open the 3.5GiB
 # Aliyun host under load even though total RAM is enough for all-MiniLM-L6-v2.
 PHASE2_MINILM_SKIP_TOTAL = 2 * 1024 * 1024 * 1024
@@ -3479,12 +3480,13 @@ def _phase2_prompt_and_tool(
     previous_ops: list[dict[str, Any]],
     max_attempts: int,
 ) -> tuple[str, str, str]:
-    """Build Phase-2 submit/patch prompt after a local Pearson/MI pair filter.
+    """Record whether Pearson/MI filtered the board or fell open to every card.
 
-    Without a same-type MI gate every daily card would enter the LLM context.
-    Skip MiniLM only on ≤2GiB boxes or <256MiB available so a 3.5GiB VPS can
-    still filter; embed/math failure fail-opens to the full board. Attempt ≥2
-    still shrinks to foul-touched cards only.
+    Without that digest-state row a RAM fail-open and a real filter look the
+    same, and the 0.06 threshold cannot be checked later. Skip MiniLM only on
+    ≤2GiB boxes or <256MiB available so a 3.5GiB VPS can still filter;
+    embed/math failure fail-opens to the full board. Attempt ≥2 still shrinks
+    to foul-touched cards only and does not write a gate record.
     """
     global _PHASE2_MINILM
     mode = "submit" if attempt == 1 or not previous_ops else "patch"
@@ -3503,6 +3505,55 @@ def _phase2_prompt_and_tool(
     pending_ids: list[str] | None = None
     previous_for_prompt: list[dict[str, Any]] | None = None
     candidate_pairs: list[tuple[str, str]] | None = None
+    gate_board_ids = [
+        str(b.get("id")).strip()
+        for b in list(existing_blocks) + list(new_blocks)
+        if str(b.get("id") or "").strip()
+    ]
+
+    def _phase2_gate_record(
+        outcome: str,
+        reason: str,
+        entered: list[str],
+        filtered_out: list[str],
+        pairs: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return {
+            "at": datetime.now(timezone.utc).isoformat(),
+            "outcome": outcome,
+            "reason": reason,
+            "threshold": PHASE2_MI_THRESHOLD,
+            "entered_llm": list(entered),
+            "filtered_out": list(filtered_out),
+            "pairs": list(pairs),
+        }
+
+    def _remember_phase2_gate(record: dict[str, Any]) -> None:
+        """Keep one gate pass in digest state so 0.06 can be checked later.
+
+        A failed save must not change the prompt this call returns.
+        """
+        entered = record.get("entered_llm") or []
+        filtered = record.get("filtered_out") or []
+        pairs = record.get("pairs") or []
+        _log(
+            "phase2 Pearson/MI gate "
+            f"outcome={record.get('outcome')} entered={len(entered)} "
+            f"filtered_out={len(filtered)} pairs={len(pairs)} "
+            f"threshold={record.get('threshold')}"
+        )
+        try:
+            with _digest_lock:
+                state = _load_state()
+                history = state.get("phase2_gate")
+                if not isinstance(history, list):
+                    history = []
+                history.append(record)
+                state["phase2_gate"] = history[-PHASE2_GATE_HISTORY_CAP:]
+                _save_state(state)
+        except Exception:
+            return
+
     if attempt >= 2 and previous_ops:
         closure = digest_dedup_prompt.foul_touched_block_ids(
             errors, previous_ops, existing_blocks, new_blocks
@@ -3634,6 +3685,11 @@ def _phase2_prompt_and_tool(
                 return pairs
 
             kept: list[tuple[str, str]] = []
+            pair_rows: dict[tuple[str, str], dict[str, Any]] = {}
+
+            def _canon_pair(left: str, right: str) -> tuple[str, str]:
+                return (left, right) if left < right else (right, left)
+
             for kind in digest_dedup_prompt.BLOCK_TYPE_ORDER:
                 cards = [
                     str(b.get("id"))
@@ -3642,7 +3698,7 @@ def _phase2_prompt_and_tool(
                 ]
                 if len(cards) < 2:
                     continue
-                scores: list[tuple[str, str, float]] = []
+                scores: list[tuple[str, str, float, float]] = []
                 for i, left in enumerate(cards):
                     for right in cards[i + 1 :]:
                         x = by_id[left][1]
@@ -3663,13 +3719,40 @@ def _phase2_prompt_and_tool(
                         rho = max(-1.0, min(1.0, rho))
                         rho2 = min(rho * rho, 1.0 - 1e-12)
                         mi = -0.5 * math.log(1.0 - rho2)
-                        scores.append((left, right, mi))
+                        scores.append((left, right, rho, mi))
                 if len(scores) == 1:
-                    kept.append((scores[0][0], scores[0][1]))
+                    left, right, rho, mi = scores[0]
+                    kept.append((left, right))
+                    pair_rows[_canon_pair(left, right)] = {
+                        "left": left,
+                        "right": right,
+                        "rho": rho,
+                        "mi": mi,
+                        "kept": True,
+                        "reason": "sole_pair",
+                    }
                     continue
-                for left, right, mi in scores:
+                for left, right, rho, mi in scores:
+                    canon = _canon_pair(left, right)
                     if mi > PHASE2_MI_THRESHOLD:
                         kept.append((left, right))
+                        pair_rows[canon] = {
+                            "left": left,
+                            "right": right,
+                            "rho": rho,
+                            "mi": mi,
+                            "kept": True,
+                            "reason": "mi",
+                        }
+                    else:
+                        pair_rows[canon] = {
+                            "left": left,
+                            "right": right,
+                            "rho": rho,
+                            "mi": mi,
+                            "kept": False,
+                            "reason": "below",
+                        }
             # Entity-based fallback: same entity + same type → always candidate
             entity_pairs = _same_entity_same_type_pairs(grouped, by_id)
             kept_set = {pair if pair[0] < pair[1] else (pair[1], pair[0])
@@ -3679,9 +3762,37 @@ def _phase2_prompt_and_tool(
                 if canonical not in kept_set:
                     kept.append(canonical)
                     kept_set.add(canonical)
+                row = pair_rows.get(canonical)
+                if row is None:
+                    pair_rows[canonical] = {
+                        "left": canonical[0],
+                        "right": canonical[1],
+                        "rho": None,
+                        "mi": None,
+                        "kept": True,
+                        "reason": "entity",
+                    }
+                elif not row["kept"]:
+                    row["kept"] = True
+                    row["reason"] = "entity"
+            board_ids = [
+                str(b.get("id"))
+                for b in board
+                if str(b.get("id") or "").strip()
+            ]
+            pair_list = [pair_rows[key] for key in sorted(pair_rows)]
             if not kept:
                 _log(
                     "phase2 Pearson/MI gate: no candidate pairs; skip LLM"
+                )
+                _remember_phase2_gate(
+                    _phase2_gate_record(
+                        "skip_llm",
+                        "",
+                        [],
+                        board_ids,
+                        pair_list,
+                    )
                 )
                 return ("", force_name, "skip")
             keep_ids = {a for a, _b in kept} | {b for _a, b in kept}
@@ -3694,9 +3805,27 @@ def _phase2_prompt_and_tool(
                 b for b in new_blocks if str(b.get("id") or "") in keep_ids
             ]
             candidate_pairs = kept
+            _remember_phase2_gate(
+                _phase2_gate_record(
+                    "filtered",
+                    "",
+                    sorted(keep_ids),
+                    [i for i in board_ids if i not in keep_ids],
+                    pair_list,
+                )
+            )
         except Exception as exc:
             _log(
                 f"phase2 Pearson/MI gate failed; full-board prompt: {exc}"
+            )
+            _remember_phase2_gate(
+                _phase2_gate_record(
+                    "full_board",
+                    str(exc),
+                    gate_board_ids,
+                    [],
+                    [],
+                )
             )
             candidate_pairs = None
     prompt = digest_dedup_prompt.build_proposer_prompt(

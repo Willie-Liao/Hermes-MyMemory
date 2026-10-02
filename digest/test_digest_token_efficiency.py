@@ -1150,3 +1150,93 @@ def test_merge_digest_blocks_patch_full_replace_and_index():
     assert patched["blocks"][1]["kind"] == "Decision"
     assert patched["blocks"][0]["temp_id"] == "tmp-e1"
     assert patched["blocks"][1]["subject"] == "user"
+
+
+def test_phase2_gate_records_sep29_procedure_pair(tmp_path, monkeypatch, capsys):
+    """A two-card board always keeps the sole pair, so the threshold is never applied.
+
+    These two leave-notice procedures need a third procedure or the gate cannot
+    show whether 0.06 would have dropped them.
+    """
+    digest = _load("digest")
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(digest, "_PHASE2_EMBED_CACHE", {})
+    monkeypatch.setattr(digest, "_PHASE2_MINILM", None)
+    leave_ics = {
+        "id": "mem-2026-09-29-procedure-4AC1328A5C86",
+        "type": "procedure",
+        "body": (
+            "Obstacle: User needed to track daily student leave names and "
+            "generate English notices for group chat posting; Solution: "
+            "Created ask-leave-notice skill with add/list/remove/generate "
+            "commands and ICS integration"
+        ),
+    }
+    leave_daily = {
+        "id": "mem-2026-09-29-procedure-2A932B035C35",
+        "type": "procedure",
+        "body": (
+            "Obstacle: user needs to track daily student leave names and "
+            "generate notices; Solution: create skill with: add name+sick/"
+            "personal to daily file; \"generate notice\" outputs consolidated "
+            "notice in specified format; auto-delete files older than the day "
+            "before yesterday (keep today+yesterday only)"
+        ),
+    }
+    bread = {
+        "id": "mem-2026-09-29-procedure-bread",
+        "type": "procedure",
+        "entity": "",
+        "body": (
+            "Obstacle: bake bread; Solution: heat oven to 180C and knead "
+            "dough for ten minutes"
+        ),
+    }
+    digest._phase2_prompt_and_tool(
+        [],
+        [leave_ics, leave_daily, bread],
+        errors=(),
+        attempt=1,
+        previous_ops=[],
+        max_attempts=2,
+    )
+    state_path = tmp_path / "memories" / "staging" / ".digest-state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    record = state["phase2_gate"][-1]
+    assert record["outcome"] == "filtered"
+    assert record["threshold"] == digest.PHASE2_MI_THRESHOLD
+    named = {
+        leave_ics["id"],
+        leave_daily["id"],
+    }
+    row = next(
+        pair
+        for pair in record["pairs"]
+        if {pair["left"], pair["right"]} == named
+    )
+    assert isinstance(row["rho"], float)
+    assert isinstance(row["mi"], float)
+    entered = set(record["entered_llm"])
+    filtered = set(record["filtered_out"])
+    for block_id in named:
+        other_kept = any(
+            pair["kept"] and block_id in {pair["left"], pair["right"]}
+            for pair in record["pairs"]
+        )
+        if other_kept:
+            assert block_id in entered
+            assert block_id not in filtered
+        else:
+            assert block_id in filtered
+            assert block_id not in entered
+    if row["kept"]:
+        assert named <= entered
+    log_text = (tmp_path / "logs" / "memory-digest.log").read_text(encoding="utf-8")
+    assert "phase2 Pearson/MI gate outcome=filtered" in log_text
+    print(
+        f"sep29 pair rho={row['rho']:.6f} mi={row['mi']:.6f} "
+        f"kept={row['kept']} reason={row['reason']}"
+    )
+    captured = capsys.readouterr()
+    assert "sep29 pair rho=" in captured.out
+    sys.stderr.write(captured.out)
