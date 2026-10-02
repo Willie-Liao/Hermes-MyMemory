@@ -77,27 +77,41 @@ def submit_month_synthesis_schema() -> dict[str, Any]:
         {
             "key_decisions": {
                 "type": "array",
-                "description": "Same-rule repeats first, then standing rules. At most 12. Fill this before summary.",
+                "description": (
+                    "Standing rules synthesized from the month's decision cards, "
+                    "chosen after reading story_seeds. At most 12. text is the "
+                    "month's synthesis, not one daily clause. Do not set id."
+                ),
                 "items": {
                     "type": "object",
                     "properties": {
-                        "id": {"type": "string"},
+                        "text": {
+                            "type": "string",
+                            "description": "Synthesis of the cited decision cards.",
+                        },
                         "why_it_matters": {
                             "type": "string",
                             "description": "Required. At most 40 words. Why this rule would still change the next time.",
                         },
                         "evidence": {"type": "array", "items": {"type": "string"}},
                     },
-                    "required": ["id", "why_it_matters", "evidence"],
+                    "required": ["text", "why_it_matters", "evidence"],
                 },
             },
             "key_procedures": {
                 "type": "array",
-                "description": "Same-rule repeats first. A finished one-day act is not a key row. At most 8.",
+                "description": (
+                    "Reusable cases synthesized from the month's procedure cards. "
+                    "A finished one-day act is not a key row. At most 8. solution "
+                    "is the month's synthesis. Do not set id."
+                ),
                 "items": {
                     "type": "object",
                     "properties": {
-                        "id": {"type": "string"},
+                        "solution": {
+                            "type": "string",
+                            "description": "Synthesis of the cited procedure cards.",
+                        },
                         "problem": {"type": "string"},
                         "insight": {
                             "type": "string",
@@ -105,7 +119,7 @@ def submit_month_synthesis_schema() -> dict[str, Any]:
                         },
                         "evidence": {"type": "array", "items": {"type": "string"}},
                     },
-                    "required": ["id", "insight", "evidence"],
+                    "required": ["solution", "insight", "evidence"],
                 },
             },
             "summary": {

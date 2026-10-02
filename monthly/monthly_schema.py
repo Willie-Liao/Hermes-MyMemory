@@ -157,7 +157,7 @@ class MonthlyProgress:
 
 @dataclass(frozen=True)
 class MonthlyDecision:
-    """Keep the ruling verbatim so an LLM rewording cannot silently change a must-not.
+    """Hold the month's synthesized ruling so guidance does not retrieve one sitting's clause.
 
     Context and exceptions exist so recall can match *when* the preference applies
     instead of retrieving a standing rule for every chat turn.

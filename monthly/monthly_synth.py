@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from datetime import datetime, timezone
@@ -63,11 +64,20 @@ REDUCE_PREFIX = (
     "A finished one-day act is not a key row. "
     "Importance does not outrank a repeat. "
     f"Return at most {CAP_DECISIONS} key_decisions and {CAP_PROCEDURES} key_procedures. "
-    "Each row uses one representative id. Put the other same-rule mem-ids in evidence. "
+    "When choosing key_decisions and key_procedures, read story_seeds first. A card line "
+    "that only carries out one story seed is that sitting's procedure or a finished act, "
+    "even if the line repeats inside that story. A key decision or key procedure is a "
+    "rule that still changes a later month after that story is over. "
+    "If a card's only job is to carry out one story_seed, leave it out of "
+    "key_decisions and key_procedures. "
+    "Write key_decisions.text and key_procedures.solution as a synthesis of the same-type "
+    "cards you cite, not a paste of one clause. Put every daily card you drew on in "
+    "evidence. Do not set id. Code mints mem-YYYY-MM-key-decision-{hash} or "
+    "mem-YYYY-MM-key-procedure-{hash} from the sorted evidence ids. Do not invent daily ids. "
     f"why_it_matters and insight are required and at most {NOTE_WORD_CAP} words. "
     "Cite only ids from the card lines. Do not copy Beginning/Course/Outcome/Obstacle. "
     "summary must be an array of one-line stories (text + weeks); never glue two seeds into one string. "
-    "Do not invent obstacles, exceptions, or ids."
+    "Do not invent obstacles or exceptions."
 )
 
 
@@ -230,16 +240,44 @@ def _summary_from_synthesis(args: dict[str, Any], facts: MechanicalFacts) -> tup
     return tuple(items)
 
 
-def _group_to_decision(group: dict[str, Any], why: str) -> MonthlyDecision:
-    text = str(group.get("text") or "")
+def _mint_month_key_id(month_key: str, kind: str, evidence: tuple[str, ...]) -> str:
+    """Mint one month id from the cited daily cards so a re-reduce does not fork the row.
+
+    Hashing the sorted evidence ids keeps the same synthesis addressable after
+    the daily clauses are no longer copied into the key row.
+    """
+    digest = hashlib.sha256("\n".join(sorted(evidence)).encode("utf-8")).hexdigest()[:12]
+    label = "key-decision" if kind == "decision" else "key-procedure"
+    return f"mem-{month_key}-{label}-{digest}"
+
+
+def _cited_card_ids(raw: tuple[str, ...], card_ids: set[str]) -> tuple[str, ...] | None:
+    """Drop the row unless every cite is a card line of this type.
+
+    Stripping an off-board id would still let a one-day act ride along inside a standing rule.
+    """
+    if not raw or any(item not in card_ids for item in raw):
+        return None
+    return tuple(dict.fromkeys(raw))
+
+
+def _group_to_decision(
+    group: dict[str, Any],
+    why: str,
+    *,
+    text: str,
+    minted_id: str,
+) -> MonthlyDecision:
+    """Store the month's synthesized ruling so guidance does not retrieve one sitting's clause."""
+    cleaned = text.strip()
     for prefix in ("Decision:", "Preference:"):
-        if text.startswith(prefix):
-            text = text[len(prefix) :].strip()
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix) :].strip()
             break
     return MonthlyDecision(
-        id=str(group["id"]),
+        id=minted_id,
         kind=str(group.get("kind") or "decision"),
-        text=text,
+        text=cleaned,
         why_it_matters=why,
         context=str(group.get("context") or ""),
         exceptions=str(group.get("exceptions") or ""),
@@ -255,17 +293,25 @@ def _group_to_decision(group: dict[str, Any], why: str) -> MonthlyDecision:
     )
 
 
-def _group_to_procedure(group: dict[str, Any], insight: str, problem: str) -> MonthlyProcedure:
-    solution = str(group.get("solution") or "")
-    if len(solution) > SOLUTION_CHAR_CAP:
-        solution = solution[:SOLUTION_CHAR_CAP]
+def _group_to_procedure(
+    group: dict[str, Any],
+    insight: str,
+    problem: str,
+    *,
+    solution: str,
+    minted_id: str,
+) -> MonthlyProcedure:
+    """Store the month's synthesized solution so a key procedure is not one day's clause."""
+    cleaned = solution.strip()
+    if len(cleaned) > SOLUTION_CHAR_CAP:
+        cleaned = cleaned[:SOLUTION_CHAR_CAP]
     obstacles = tuple(group.get("obstacles") or ())
     return MonthlyProcedure(
-        id=str(group["id"]),
+        id=minted_id,
         trigger=str(group.get("trigger") or ""),
         problem=problem or str(group.get("problem") or (obstacles[0] if obstacles else "")),
         obstacles=obstacles,
-        solution=solution,
+        solution=cleaned,
         insight=insight,
         entity_keys=tuple(group.get("entity_keys") or ()),
         weeks=tuple(group.get("weeks") or ()),
@@ -348,78 +394,85 @@ def payload_from_synthesis(
             break
 
     decisions: list[MonthlyDecision] = []
-    groups_by_id = {str(g["id"]): g for g in facts.dp_groups}
-    decision_ids = {gid for gid, group in groups_by_id.items() if group.get("type") == "decision"}
-    procedure_ids = {gid for gid, group in groups_by_id.items() if group.get("type") == "procedure"}
+    decision_ids = {b.id for b in facts.all_dpe if b.type == "decision"}
+    procedure_ids = {b.id for b in facts.all_dpe if b.type == "procedure"}
     llm_decisions = [row for row in (args.get("key_decisions") or []) if isinstance(row, dict)]
     for row in llm_decisions:
-        mem_id = str(row.get("id") or "")
-        group = groups_by_id.get(mem_id)
-        block = facts.blocks_by_id.get(mem_id)
-        if group is None or group.get("type") != "decision":
-            if block is None or block.type != "decision":
-                continue
-            decision_ids.add(mem_id)
-            group = {
-                "id": mem_id,
-                "kind": _lead_kind(block.clause),
-                "text": _verbatim_clause(block) if _verbatim_clause(block) else block.clause,
-                "date": block.valid_from,
-                "valid_to": block.valid_to,
-                "entity_keys": (block.entity_key,) if block.entity_key else (),
-                "supersedes": block.supersedes,
-                "evidence": (mem_id,),
-                "occurrence_n": 1,
-                "first_seen": block.valid_from,
-                "last_seen": block.valid_from,
-                "strength": 0.0,
-                "context": "",
-                "exceptions": "",
-            }
         why = _cap_words(str(row.get("why_it_matters") or ""))
-        if not why:
+        text = " ".join(str(row.get("text") or "").split())
+        if not why or not text:
             continue
-        evidence = _same_type_evidence(mem_id, _as_ids(row.get("evidence")), decision_ids)
+        evidence = _cited_card_ids(_as_ids(row.get("evidence")), decision_ids)
         if not evidence:
             continue
-        group = {**group, "evidence": evidence, "occurrence_n": len(evidence)}
-        decisions.append(_group_to_decision(group, why))
+        cited = [facts.blocks_by_id[i] for i in evidence if i in facts.blocks_by_id]
+        dates = [b.valid_from for b in cited if b.valid_from]
+        group = {
+            "kind": str(row.get("kind") or (_lead_kind(cited[0].clause) if cited else "decision")),
+            "context": str(row.get("context") or ""),
+            "exceptions": str(row.get("exceptions") or ""),
+            "date": dates[0] if dates else "",
+            "valid_to": str(row.get("valid_to") or (cited[-1].valid_to if cited else "")),
+            "entity_keys": tuple(
+                dict.fromkeys(b.entity_key for b in cited if b.entity_key)
+            ),
+            "supersedes": tuple(
+                dict.fromkeys(sid for b in cited for sid in (b.supersedes or ()))
+            ),
+            "evidence": evidence,
+            "occurrence_n": len(evidence),
+            "first_seen": min(dates) if dates else "",
+            "last_seen": max(dates) if dates else "",
+            "strength": float(row.get("strength") or 0.0),
+        }
+        decisions.append(
+            _group_to_decision(
+                group,
+                why,
+                text=text,
+                minted_id=_mint_month_key_id(month_key, "decision", evidence),
+            )
+        )
         if len(decisions) >= CAP_DECISIONS:
             break
 
     procedures: list[MonthlyProcedure] = []
     llm_procs = [row for row in (args.get("key_procedures") or []) if isinstance(row, dict)]
     for row in llm_procs:
-        mem_id = str(row.get("id") or "")
-        group = groups_by_id.get(mem_id)
-        block = facts.blocks_by_id.get(mem_id)
-        if group is None or group.get("type") != "procedure":
-            if block is None or block.type != "procedure":
-                continue
-            procedure_ids.add(mem_id)
-            group = {
-                "id": mem_id,
-                "problem": str(row.get("problem") or ""),
-                "solution": _solution_clause(block),
-                "obstacles": (),
-                "trigger": "",
-                "entity_keys": (block.entity_key,) if block.entity_key else (),
-                "weeks": (week_key_for(block.day),),
-                "evidence": (mem_id,),
-                "occurrence_n": 1,
-                "first_seen": block.valid_from,
-                "last_seen": block.valid_from,
-                "strength": 0.0,
-            }
         insight = _cap_words(str(row.get("insight") or ""))
-        if not insight:
+        solution = " ".join(str(row.get("solution") or "").split())
+        if not insight or not solution:
             continue
-        evidence = _same_type_evidence(mem_id, _as_ids(row.get("evidence")), procedure_ids)
+        evidence = _cited_card_ids(_as_ids(row.get("evidence")), procedure_ids)
         if not evidence:
             continue
-        problem = str(group.get("problem") or "")
-        group = {**group, "evidence": evidence, "occurrence_n": len(evidence)}
-        procedures.append(_group_to_procedure(group, insight, problem))
+        cited = [facts.blocks_by_id[i] for i in evidence if i in facts.blocks_by_id]
+        dates = [b.valid_from for b in cited if b.valid_from]
+        weeks = tuple(
+            dict.fromkeys(week_key_for(b.day) for b in cited if b.day)
+        )
+        group = {
+            "trigger": str(row.get("trigger") or ""),
+            "obstacles": tuple(row.get("obstacles") or ()),
+            "entity_keys": tuple(
+                dict.fromkeys(b.entity_key for b in cited if b.entity_key)
+            ),
+            "weeks": weeks,
+            "evidence": evidence,
+            "occurrence_n": len(evidence),
+            "first_seen": min(dates) if dates else "",
+            "last_seen": max(dates) if dates else "",
+            "strength": float(row.get("strength") or 0.0),
+        }
+        procedures.append(
+            _group_to_procedure(
+                group,
+                insight,
+                str(row.get("problem") or ""),
+                solution=solution,
+                minted_id=_mint_month_key_id(month_key, "procedure", evidence),
+            )
+        )
         if len(procedures) >= CAP_PROCEDURES:
             break
 
