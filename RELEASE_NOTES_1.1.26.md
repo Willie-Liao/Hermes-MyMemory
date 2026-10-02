@@ -9,6 +9,11 @@ Snapshot from AGENT commit at tag **v1.1.26**.
 - Monthly synthesis: standing decisions vs one-sitting procedures; nest split aspects (pattern B).
 - Installer/run-tests: drop dated W38 harness; ignore live-LLM and Mem_Eval-only tests.
 
+### Recall expand (refresh)
+
+- **Expand inlines direct `related:` neighbors** on the opened card so one `recall_memory` read can show obstacle/procedure bodies without a second hop; PPR lines for non-direct hops stay id-only.
+- **`channel=id` expand** dedupes seeds so the opened card’s body is not expanded twice.
+
 ### Commits in this snapshot (since 1.1.25)
 
 - Digest Phase-2 gate persistence and empty/tool-error gate reasons

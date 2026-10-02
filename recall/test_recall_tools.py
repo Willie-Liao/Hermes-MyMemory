@@ -171,13 +171,25 @@ def test_expand_ppr_order_and_depth_clamp(staging):
     text = expand_memory(SEED, depth=5, staging=staging)
     assert "depth=2" in text
     assert "Beginning:" not in text
+    assert "overlap check" not in text
     assert HOP1 in text and HOP2 in text
+    assert "Obstacle: merge slots drifted" in text
+    assert "Obstacle: extra commas in digest output" in text
+    assert "type: procedure" in text
     pos1 = text.find(HOP1)
     pos2 = text.find(HOP2)
     pos_o = text.find(OVERLAP)
     assert pos1 != -1 and pos2 != -1
     if pos_o != -1:
         assert min(pos1, pos2) < pos_o
+
+
+def test_handle_tool_id_expands_opened_card_once(staging):
+    text = handle_tool("recall_memory", {"query": SEED}, staging=staging)
+    assert text.count("## Memory / expand") == 1
+    assert "Obstacle: merge slots drifted" in text
+    assert "Obstacle: extra commas in digest output" in text
+    assert "Beginning: semicolon digest bug returned" in text
 
 
 def test_handle_tool_recall_then_expand(staging):

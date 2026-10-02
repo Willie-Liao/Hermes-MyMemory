@@ -750,7 +750,10 @@ def expand_memory(
     staging: Path | None = None,
     index: BlockIndex | None = None,
 ) -> str:
-    """Walk ≤2 hops then rank with PPR; never emit a causal sentence."""
+    """Inline a direct related neighbor's body so that card can be read without another recall.
+
+    A two-hop or entity-overlap line stays an id. The opened card's own body is not repeated here.
+    """
     depth = min(int(depth or 0), MAX_DEPTH)
     root = staging_root(staging)
     store = index or BlockIndex(root)
@@ -804,6 +807,19 @@ def expand_memory(
         lines.append(
             f"- π={pi_map.get(item, 0):.2f}  {item}  {day} {week}  {why}".rstrip()
         )
+        if hit is None or item == seed_id:
+            continue
+        forward = (adj.get(seed_id) or {}).get(item)
+        backward = (adj.get(item) or {}).get(seed_id)
+        if not (
+            (forward and forward[1] == "related")
+            or (backward and backward[1] == "related")
+        ):
+            continue
+        lines.append(f"  type: {hit.item_type}")
+        body = (hit.body or "").strip()
+        if body:
+            lines.append(f"  {body}")
     return "\n".join(lines)
 
 
@@ -1089,19 +1105,31 @@ def _recall_then_expand(
     """Recall first, then expand listed seeds so hops do not depend on rank-1 or a second LLM tool.
 
     Entity channel pins the newest member first (June plugin), so expanding only that seed
-    misses the August semicolon hops still listed further down.
+    misses the August semicolon hops still listed further down. A channel=id chunk expands
+    only the opened card: its related: ids already have bodies on that expand.
     """
     chunks = []
+    expand_seeds: list[str] = []
+    seen_seeds: set[str] = set()
     for q in _script_queries(query):
-        chunks.append(
-            recall_memory(
-                q,
-                k=k,
-                staging=staging,
-                time_from=time_from,
-                time_to=time_to,
-            )
+        chunk = recall_memory(
+            q,
+            k=k,
+            staging=staging,
+            time_from=time_from,
+            time_to=time_to,
         )
+        chunks.append(chunk)
+        if "channel=id" in chunk:
+            opened = re.search(r"(?m)^id: (\S+)", chunk)
+            picked = [opened.group(1)] if opened else []
+        else:
+            picked = _ordered_ids(chunk)
+        for seed in picked:
+            if seed in seen_seeds:
+                continue
+            seen_seeds.add(seed)
+            expand_seeds.append(seed)
     found = "\n\n".join(chunks)
     q0 = str(query or "").strip()
     asked = _MEM_ID_RE.findall(q0)
@@ -1110,7 +1138,7 @@ def _recall_then_expand(
         return found
     if all("channel=miss" in c for c in chunks):
         return found
-    ids = _ordered_ids(found)
+    ids = expand_seeds
     if not ids:
         return found
     walked = []
