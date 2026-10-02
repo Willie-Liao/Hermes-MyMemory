@@ -3920,8 +3920,8 @@ def make_llm_proposer(
     Skip-mode from the Pearson/MI gate returns no ops without an LLM call so
     empty-candidate boards do not burn tokens, while prepare_operations still
     runs decay and validation. A successful empty operations list is stamped
-    onto that gate row as reason "no merge" so a later read can tell a keep
-    from a call that never returned.
+    onto that gate row as reason "no merge", and a tool exception as "tool
+    error", so a later read can tell a keep from a call that died.
 
     Preferred I/O: forced ``submit_operations`` (attempt 1) then
     ``patch_operations`` (attempts 2–5) via ``run_worker_llm_tools``. Text
@@ -4039,6 +4039,22 @@ def make_llm_proposer(
                 stats["prompt_chars"] += len(prompt)
                 stats["latency_ms"] += (time.monotonic() - started) * 1000
             except Exception as exc:
+                llm_reason = "tool error"
+                _patch_phase2_gate_llm(
+                    gate_at,
+                    _phase2_llm_record(
+                        force_name,
+                        [],
+                        failed=True,
+                        error=str(exc),
+                        reason=llm_reason,
+                    ),
+                )
+                _log(
+                    f"digest dedup proposer session={session_id} run={run_id} "
+                    f"attempt={attempt} mode={mode} reason={llm_reason} "
+                    f"error={exc}"
+                )
                 if attempt < max_attempts:
                     raise
                 return _fallback_proposal(
@@ -4092,7 +4108,8 @@ def make_oneshot_proposer(
 
     Skip-mode from the Pearson/MI gate returns no ops without an LLM call so
     empty-candidate boards still reach prepare_operations decay. A successful
-    empty operations list is stamped on that gate row as reason "no merge".
+    empty operations list is stamped on that gate row as reason "no merge",
+    and a failed tool call as reason "tool error".
     """
     caller = invoke_tool or _invoke_digest_oneshot_tool
     previous_ops: list[dict[str, Any]] = []
@@ -4115,47 +4132,69 @@ def make_oneshot_proposer(
         )
         if mode == "skip":
             return []
-        capture = caller(
-            prompt,
-            "cli",
-            purpose=f"digest-dedup-{mode}",
-            force_tool_name=force_name,
-        )
-        if capture.get("failed"):
-            raise ValueError(
-                str(capture.get("final_response") or capture.get("error") or "oneshot failed")
-            )
-        tool_name, tool_args = digest_tools.parse_tool_args_from_result(capture)
         proposed: list[Any] | None = None
         llm_reason: str | None = None
-        if (
-            tool_name == "submit_operations"
-            and isinstance(tool_args, dict)
-            and isinstance(tool_args.get("operations"), list)
-        ):
-            proposed = [
-                dict(op) if isinstance(op, Mapping) else op
-                for op in tool_args["operations"]
-            ]
-            previous_ops = [dict(op) for op in proposed if isinstance(op, Mapping)]
-            llm_reason = "no merge" if not proposed else None
+        try:
+            capture = caller(
+                prompt,
+                "cli",
+                purpose=f"digest-dedup-{mode}",
+                force_tool_name=force_name,
+            )
+            if capture.get("failed"):
+                raise ValueError(
+                    str(
+                        capture.get("final_response")
+                        or capture.get("error")
+                        or "oneshot failed"
+                    )
+                )
+            tool_name, tool_args = digest_tools.parse_tool_args_from_result(capture)
+            if (
+                tool_name == "submit_operations"
+                and isinstance(tool_args, dict)
+                and isinstance(tool_args.get("operations"), list)
+            ):
+                proposed = [
+                    dict(op) if isinstance(op, Mapping) else op
+                    for op in tool_args["operations"]
+                ]
+                previous_ops = [dict(op) for op in proposed if isinstance(op, Mapping)]
+                llm_reason = "no merge" if not proposed else None
+                _patch_phase2_gate_llm(
+                    gate_at,
+                    _phase2_llm_record(tool_name, proposed, reason=llm_reason),
+                )
+            elif tool_name == "patch_operations" and isinstance(tool_args, dict):
+                merged = digest_tools.merge_operations_patch(previous_ops, tool_args)
+                proposed = [
+                    dict(op) if isinstance(op, Mapping) else op for op in merged
+                ]
+                previous_ops = [dict(op) for op in proposed if isinstance(op, Mapping)]
+                llm_reason = "no merge" if not proposed else None
+                _patch_phase2_gate_llm(
+                    gate_at,
+                    _phase2_llm_record(tool_name, proposed, reason=llm_reason),
+                )
+            if proposed is None:
+                raise ValueError("oneshot returned no operations")
+        except Exception as exc:
+            llm_reason = "tool error"
             _patch_phase2_gate_llm(
                 gate_at,
-                _phase2_llm_record(tool_name, proposed, reason=llm_reason),
+                _phase2_llm_record(
+                    force_name,
+                    [],
+                    failed=True,
+                    error=str(exc),
+                    reason=llm_reason,
+                ),
             )
-        elif tool_name == "patch_operations" and isinstance(tool_args, dict):
-            merged = digest_tools.merge_operations_patch(previous_ops, tool_args)
-            proposed = [
-                dict(op) if isinstance(op, Mapping) else op for op in merged
-            ]
-            previous_ops = [dict(op) for op in proposed if isinstance(op, Mapping)]
-            llm_reason = "no merge" if not proposed else None
-            _patch_phase2_gate_llm(
-                gate_at,
-                _phase2_llm_record(tool_name, proposed, reason=llm_reason),
+            _log(
+                f"digest oneshot proposer session={session_id} run={run_id} "
+                f"attempt={attempt} mode={mode} reason={llm_reason} error={exc}"
             )
-        if proposed is None:
-            raise ValueError("oneshot returned no operations")
+            raise
         reason_bit = f" reason={llm_reason}" if llm_reason else ""
         _log(
             f"digest oneshot proposer session={session_id} run={run_id} "
