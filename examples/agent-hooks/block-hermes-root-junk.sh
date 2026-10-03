@@ -87,7 +87,7 @@ case "$rel" in
   memories/staging/*|memories/staging|memories/*|memories)
     block "Only plugin/UI/digest pipelines may write under memories/"
     ;;
-  config.yaml|SOUL.md|agent-hooks/*|plugins/*|skills/*|scripts/*)
+  config.yaml|SOUL.md|HERMES.md|agent-hooks/*|plugins/*|skills/*|scripts/*)
     allow
     ;;
 esac
