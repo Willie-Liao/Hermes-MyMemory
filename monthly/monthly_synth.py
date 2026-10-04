@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -48,12 +49,18 @@ from monthly_schema import (  # noqa: E402
 )
 from monthly_slice import (  # noqa: E402
     MechanicalFacts,
+    calendar_range,
     clause_body,
     count_tokens,
     mechanical_facts,
+    previous_month_key,
     week_key_for,
 )
-from monthly_tools import submit_month_synthesis_schema  # noqa: E402
+from monthly_tools import (  # noqa: E402
+    merge_field_patch,
+    patch_month_synthesis_schema,
+    submit_month_synthesis_schema,
+)
 
 CallOneshot = Callable[..., dict[str, Any]]
 MAX_ATTEMPTS = 3
@@ -77,7 +84,12 @@ REDUCE_PREFIX = (
     f"why_it_matters and insight are required and at most {NOTE_WORD_CAP} words. "
     "Cite only ids from the card lines. Do not copy Beginning/Course/Outcome/Obstacle. "
     "summary must be an array of one-line stories (text + weeks); never glue two seeds into one string. "
-    "Do not invent obstacles or exceptions."
+    "Do not invent obstacles or exceptions. "
+    "user_image.goal_alignment, user_image.decision_preference, and user_image.behavior_pattern "
+    "each need a non-empty text judgment about the user and evidence ids from the card lines. "
+    "core_progress, problems_and_risks, and next_month_focus each need at least one row that is "
+    "a judgment about the user, with evidence ids from the card lines. "
+    "An empty string or an empty array is a failure, not a filled section."
 )
 
 
@@ -142,11 +154,6 @@ def _card_dump_line(row: dict[str, Any]) -> str:
     return f"{row.get('id')} | {kind} | {day} | {body}"
 
 
-def _cap_words(text: str) -> str:
-    """Keep a mandatory note inside NOTE_WORD_CAP so a key row stays one glance."""
-    return " ".join(str(text or "").split()[:NOTE_WORD_CAP])
-
-
 def _same_type_evidence(representative: str, raw: tuple[str, ...], type_ids: set[str]) -> tuple[str, ...]:
     """Keep the representative and same-type dump ids; a procedure cite on a decision row is dropped."""
     ordered: list[str] = []
@@ -157,6 +164,29 @@ def _same_type_evidence(representative: str, raw: tuple[str, ...], type_ids: set
         seen.add(item)
         ordered.append(item)
     return tuple(ordered)
+
+
+def _cognition_case_line(month_key: str, facts: MechanicalFacts) -> str:
+    """Tell this call whether cognition is code-filled or must be a real sentence.
+
+    The static prefix cannot know if last month exists. Without this line the model
+    sends an empty string and the month file stays unwritten.
+    """
+    if not _previous_has_judgment(month_key):
+        return (
+            "No previous month judgment. Leave cognition_change and comparison_with_last_month empty. "
+            "Code writes no information from last month."
+        )
+    if facts.supersedes_pairs:
+        return (
+            "Previous month has a judgment. Write cognition_change as one of supersedes_pairs "
+            "with text, from, to, date, and evidence. Do not send an empty string and do not send "
+            "the phrase no information from last month."
+        )
+    return (
+        "Previous month has a judgment. Write cognition_change as text plus evidence only. "
+        "Do not send an empty string and do not send the phrase no information from last month."
+    )
 
 
 def build_reduce_prompt(
@@ -179,7 +209,7 @@ def build_reduce_prompt(
         "supersedes_pairs": list(facts.supersedes_pairs),
     }
     return (
-        f"{REDUCE_PREFIX}\n\nCards:\n{cards}\n\n---\n"
+        f"{REDUCE_PREFIX}\n{_cognition_case_line(month_key, facts)}\n\nCards:\n{cards}\n\n---\n"
         f"{json.dumps(payload, ensure_ascii=False, default=str)}"
     )
 
@@ -333,6 +363,7 @@ def payload_from_synthesis(
     map_calls: int,
     reduce_tokens: int,
     generated_at: str,
+    comparison_exempt: bool = False,
 ) -> MonthlyPayload:
     """Bind synthesis args onto mechanical facts so a blank or cross-type key row cannot land in the month file.
 
@@ -350,27 +381,47 @@ def payload_from_synthesis(
 
     img_raw = args.get("user_image") if isinstance(args.get("user_image"), dict) else {}
     cognition: list[MonthlyCognitionChange] = []
-    pair_set = set(facts.supersedes_pairs)
-    for row in img_raw.get("cognition_change") or []:
-        if not isinstance(row, dict):
-            continue
-        frm = str(row.get("from") or "")
-        to = str(row.get("to") or "")
-        if (frm, to) not in pair_set:
-            continue
-        text = str(row.get("text") or "")
-        if not text.strip():
-            continue
-        evidence = _drop_unsourced(_as_ids(row.get("evidence")), allowed) or (to,)
-        cognition.append(
-            MonthlyCognitionChange(
-                text=str(row.get("text") or ""),
-                from_id=frm,
-                to=to,
-                date=str(row.get("date") or (facts.blocks_by_id[to].valid_from if to in facts.blocks_by_id else "")),
-                evidence=evidence,
+    cognition_empty_reason = ""
+    if comparison_exempt:
+        cognition_empty_reason = _NO_LAST_MONTH
+    else:
+        pair_set = set(facts.supersedes_pairs)
+        for row in img_raw.get("cognition_change") or []:
+            if not isinstance(row, dict):
+                continue
+            text = str(row.get("text") or "").strip()
+            if not text or text == _NO_LAST_MONTH:
+                continue
+            frm = str(row.get("from") or "")
+            to = str(row.get("to") or "")
+            evidence = _drop_unsourced(_as_ids(row.get("evidence")), allowed)
+            if pair_set:
+                if (frm, to) not in pair_set:
+                    continue
+                evidence = evidence or ((to,) if to in allowed else ())
+                if not evidence:
+                    continue
+                cognition.append(
+                    MonthlyCognitionChange(
+                        text=text,
+                        from_id=frm,
+                        to=to,
+                        date=str(row.get("date") or (facts.blocks_by_id[to].valid_from if to in facts.blocks_by_id else "")),
+                        evidence=evidence,
+                    )
+                )
+                continue
+            if frm or to or not evidence:
+                continue
+            cognition.append(
+                MonthlyCognitionChange(
+                    text=text,
+                    from_id="",
+                    to="",
+                    date=str(row.get("date") or ""),
+                    evidence=evidence,
+                )
             )
-        )
 
     progress: list[MonthlyProgress] = []
     for row in args.get("core_progress") or []:
@@ -398,10 +449,11 @@ def payload_from_synthesis(
     procedure_ids = {b.id for b in facts.all_dpe if b.type == "procedure"}
     llm_decisions = [row for row in (args.get("key_decisions") or []) if isinstance(row, dict)]
     for row in llm_decisions:
-        why = _cap_words(str(row.get("why_it_matters") or ""))
+        why_words = str(row.get("why_it_matters") or "").split()
         text = " ".join(str(row.get("text") or "").split())
-        if not why or not text:
+        if not why_words or len(why_words) > NOTE_WORD_CAP or not text:
             continue
+        why = " ".join(why_words)
         evidence = _cited_card_ids(_as_ids(row.get("evidence")), decision_ids)
         if not evidence:
             continue
@@ -439,10 +491,11 @@ def payload_from_synthesis(
     procedures: list[MonthlyProcedure] = []
     llm_procs = [row for row in (args.get("key_procedures") or []) if isinstance(row, dict)]
     for row in llm_procs:
-        insight = _cap_words(str(row.get("insight") or ""))
+        insight_words = str(row.get("insight") or "").split()
         solution = " ".join(str(row.get("solution") or "").split())
-        if not insight or not solution:
+        if not insight_words or len(insight_words) > NOTE_WORD_CAP or not solution:
             continue
+        insight = " ".join(insight_words)
         evidence = _cited_card_ids(_as_ids(row.get("evidence")), procedure_ids)
         if not evidence:
             continue
@@ -519,8 +572,8 @@ def payload_from_synthesis(
 
     cmp_raw = args.get("comparison_with_last_month") if isinstance(args.get("comparison_with_last_month"), dict) else {}
     empty_reason = ""
-    if not carry.strip():
-        empty_reason = "no previous month file"
+    if comparison_exempt or not carry.strip():
+        empty_reason = "no information from last month"
         comparison = MonthlyComparison(empty_reason=empty_reason)
     else:
         def _changes(key: str) -> tuple[MonthlyComparisonChange, ...]:
@@ -576,6 +629,7 @@ def payload_from_synthesis(
     user_image = MonthlyUserImage(
         goal_alignment=_evidence_text(img_raw.get("goal_alignment"), allowed),
         cognition_change=tuple(cognition),
+        cognition_empty_reason=cognition_empty_reason,
         decision_preference=MonthlyDecisionPreference(
             text=pref_text,
             counts=dict(facts.decision_kind_counts),
@@ -626,15 +680,289 @@ def payload_from_synthesis(
     )
 
 
-def _tool_has_key_rows(args: Mapping[str, Any] | None) -> bool:
-    """A reduce attempt counts only when key rows arrived, so a summary-only reply cannot hide an empty Band D."""
-    if not isinstance(args, dict):
-        return False
-    for key in ("key_decisions", "key_procedures"):
+_LIST_FIELDS = ("evidence", "obstacles", "weeks", "entity_keys", "depends_on")
+_TEXT_FIELDS = (
+    "text",
+    "body",
+    "title",
+    "why_it_matters",
+    "context",
+    "exceptions",
+    "trigger",
+    "problem",
+    "solution",
+    "insight",
+    "content",
+    "suggestion",
+    "target",
+    "level",
+    "priority",
+    "state",
+)
+_NO_LAST_MONTH = "no information from last month"
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
+def _normalize_node(node: Any, fixes: list[str], path: str) -> Any:
+    """Collapse whitespace and wrap a lone evidence string so shape never needs a model retry."""
+    if isinstance(node, list):
+        return [_normalize_node(item, fixes, path) for item in node]
+    if not isinstance(node, dict):
+        return node
+    out: dict[str, Any] = {}
+    for key, value in node.items():
+        here = f"{path}.{key}" if path else key
+        if key in _LIST_FIELDS and isinstance(value, str):
+            fixes.append(f"{here} string -> list")
+            out[key] = _string_list(value)
+            continue
+        if key in _TEXT_FIELDS and isinstance(value, str):
+            collapsed = " ".join(value.split())
+            if collapsed != value:
+                fixes.append(f"{here} whitespace")
+            out[key] = collapsed
+            continue
+        out[key] = _normalize_node(value, fixes, here)
+    return out
+
+
+def normalize_synthesis_args(
+    args: Mapping[str, Any], facts: MechanicalFacts
+) -> tuple[dict[str, Any], list[str]]:
+    """Fill mechanical counts the model is not asked to invent."""
+    fixes: list[str] = []
+    normalized = _normalize_node(dict(args), fixes, "")
+    image = normalized.get("user_image")
+    if not isinstance(image, dict):
+        image = {}
+        normalized["user_image"] = image
+    pref = image.get("decision_preference")
+    if isinstance(pref, dict) and "counts" not in pref:
+        pref["counts"] = dict(facts.decision_kind_counts)
+        fixes.append("decision_preference.counts filled from mechanical facts")
+    behavior = image.get("behavior_pattern")
+    if isinstance(behavior, dict) and "metrics" not in behavior:
+        behavior["metrics"] = dict(facts.behavior)
+        fixes.append("behavior_pattern.metrics filled from mechanical facts")
+    return normalized, fixes
+
+
+def _words(text: Any) -> list[str]:
+    return str(text or "").split()
+
+
+def _missing_text(value: Any) -> bool:
+    return not str(value or "").strip()
+
+
+def _bad_evidence(value: Any, allowed: set[str]) -> bool:
+    ids = _string_list(value)
+    return not ids or any(item not in allowed for item in ids)
+
+
+def _row_gaps(label: str, row: Mapping[str, Any], fields: tuple[str, ...], allowed: set[str]) -> list[str]:
+    gaps: list[str] = []
+    for field in fields:
+        if field in ("evidence",):
+            continue
+        if field in ("obstacles", "weeks", "entity_keys", "depends_on"):
+            if not _string_list(row.get(field)):
+                gaps.append(f"{label}.{field} is empty")
+            continue
+        if field in ("why_it_matters", "insight"):
+            words = _words(row.get(field))
+            if not words:
+                gaps.append(f"{label}.{field} is empty")
+            elif len(words) > NOTE_WORD_CAP:
+                gaps.append(f"{label}.{field} exceeds {NOTE_WORD_CAP} words")
+            continue
+        if _missing_text(row.get(field)):
+            gaps.append(f"{label}.{field} is empty")
+    if _bad_evidence(row.get("evidence"), allowed):
+        gaps.append(f"{label}.evidence is missing or not a given card id")
+    return gaps
+
+
+def judgment_gaps(
+    args: Mapping[str, Any],
+    facts: MechanicalFacts,
+    *,
+    comparison_exempt: bool,
+) -> list[str]:
+    """Name every required section that still lacks a user judgment.
+
+    An empty list is the only signal that the month file may be written.
+    """
+    allowed = allowed_ids_from_facts(facts, list(args.get("_notes") or []))
+    decision_ids = {block.id for block in facts.all_dpe if block.type == "decision"}
+    procedure_ids = {block.id for block in facts.all_dpe if block.type == "procedure"}
+    gaps: list[str] = []
+    image = args.get("user_image") if isinstance(args.get("user_image"), dict) else {}
+    for key in ("goal_alignment", "decision_preference", "behavior_pattern"):
+        row = image.get(key) if isinstance(image.get(key), dict) else {}
+        if _missing_text(row.get("text")):
+            gaps.append(f"user_image.{key}.text is empty")
+        if _bad_evidence(row.get("evidence"), allowed):
+            gaps.append(f"user_image.{key}.evidence is missing or not a given card id")
+    changes = image.get("cognition_change") if isinstance(image.get("cognition_change"), list) else []
+    if not comparison_exempt:
+        if facts.supersedes_pairs:
+            if not changes:
+                gaps.append("user_image.cognition_change is empty")
+            else:
+                pair_set = set(facts.supersedes_pairs)
+                ok = False
+                for index, row in enumerate(changes):
+                    if not isinstance(row, dict):
+                        gaps.append(f"user_image.cognition_change[{index}] is not an object")
+                        continue
+                    if str(row.get("text") or "").strip() == _NO_LAST_MONTH:
+                        gaps.append(f"user_image.cognition_change[{index}] is the placeholder phrase")
+                        continue
+                    pair = (str(row.get("from") or ""), str(row.get("to") or ""))
+                    if pair not in pair_set:
+                        gaps.append(f"user_image.cognition_change[{index}] is not a supersedes pair")
+                        continue
+                    if _missing_text(row.get("text")) or _missing_text(row.get("date")):
+                        gaps.append(f"user_image.cognition_change[{index}] text or date is empty")
+                        continue
+                    if _bad_evidence(row.get("evidence"), allowed):
+                        gaps.append(f"user_image.cognition_change[{index}].evidence is missing")
+                        continue
+                    ok = True
+                if not ok:
+                    gaps.append("user_image.cognition_change has no valid row")
+        elif not changes:
+            gaps.append("user_image.cognition_change is empty")
+        else:
+            ok = False
+            for index, row in enumerate(changes):
+                if not isinstance(row, dict):
+                    gaps.append(f"user_image.cognition_change[{index}] is not an object")
+                    continue
+                if str(row.get("from") or "").strip() or str(row.get("to") or "").strip():
+                    gaps.append(f"user_image.cognition_change[{index}] must omit from and to")
+                    continue
+                text = str(row.get("text") or "").strip()
+                if not text:
+                    gaps.append(f"user_image.cognition_change[{index}] text is empty")
+                    continue
+                if text == _NO_LAST_MONTH:
+                    gaps.append(f"user_image.cognition_change[{index}] is the placeholder phrase")
+                    continue
+                if _bad_evidence(row.get("evidence"), allowed):
+                    gaps.append(f"user_image.cognition_change[{index}].evidence is missing")
+                    continue
+                ok = True
+            if not ok:
+                gaps.append("user_image.cognition_change has no valid row")
+    for key, fields, id_set in (
+        (
+            "core_progress",
+            ("title", "body", "state", "weeks", "entity_keys"),
+            allowed,
+        ),
+        (
+            "key_decisions",
+            ("text", "why_it_matters", "context", "exceptions"),
+            decision_ids,
+        ),
+        (
+            "key_procedures",
+            ("trigger", "problem", "obstacles", "solution", "insight"),
+            procedure_ids,
+        ),
+        ("problems_and_risks", ("content", "level", "suggestion"), allowed),
+    ):
         rows = args.get(key)
-        if isinstance(rows, list) and rows:
-            return True
-    return False
+        if not isinstance(rows, list) or not rows:
+            gaps.append(f"{key} is empty")
+            continue
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                gaps.append(f"{key}[{index}] is not an object")
+                continue
+            gaps.extend(_row_gaps(f"{key}[{index}]", row, fields, id_set))
+    focus = args.get("next_month_focus")
+    if not isinstance(focus, list) or not focus:
+        gaps.append("next_month_focus is empty")
+    else:
+        for index, row in enumerate(focus):
+            if not isinstance(row, dict):
+                gaps.append(f"next_month_focus[{index}] is not an object")
+                continue
+            for field in ("content", "target", "priority"):
+                if _missing_text(row.get(field)):
+                    gaps.append(f"next_month_focus[{index}].{field} is empty")
+            if "depends_on" not in row:
+                gaps.append(f"next_month_focus[{index}].depends_on is missing")
+    if not comparison_exempt:
+        cmp_raw = args.get("comparison_with_last_month")
+        rows: list[Any] = []
+        if isinstance(cmp_raw, dict):
+            rows = list(cmp_raw.get("changed") or []) + list(cmp_raw.get("unchanged") or [])
+        valid = False
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if not _missing_text(row.get("text")) and not _bad_evidence(row.get("evidence"), allowed):
+                valid = True
+                break
+        if not valid:
+            gaps.append("comparison_with_last_month needs a changed or unchanged row")
+    return gaps
+
+
+def _section_keys(gaps: list[str]) -> list[str]:
+    found: list[str] = []
+    for line in gaps:
+        head = line.split()[0].split(".", 1)[0].split("[", 1)[0].strip()
+        if head and head not in found:
+            found.append(head)
+    return found
+
+
+def _previous_has_judgment(month_key: str) -> bool:
+    """True when last month already holds one of the six judgment sections.
+
+    cognition_empty_reason is the code placeholder for a missing prior month.
+    Counting it would force the next month to invent a change.
+    """
+    from monthly_writer import load_month
+
+    start, _end = calendar_range(month_key)
+    try:
+        payload = load_month(previous_month_key(start))
+    except (FileNotFoundError, OSError, ValueError):
+        return False
+    image = payload.user_image
+    texts = (
+        image.goal_alignment.text,
+        image.decision_preference.text,
+        image.behavior_pattern.text,
+    )
+    real_cognition = [
+        row
+        for row in image.cognition_change
+        if str(row.text or "").strip() and str(row.text).strip() != _NO_LAST_MONTH
+    ]
+    if any(str(text or "").strip() for text in texts) or real_cognition:
+        return True
+    return bool(
+        payload.core_progress
+        or payload.key_decisions
+        or payload.key_procedures
+        or payload.problems_and_risks
+        or payload.next_month_focus
+    )
 
 
 def synthesize_month(
@@ -645,9 +973,10 @@ def synthesize_month(
     carry: str = "",
     facts: MechanicalFacts | None = None,
 ) -> tuple[MonthlyPayload, dict[str, Any]]:
-    """Keep a submit payload that names key rows, including a later attempt that has no summary.
+    """Submit the month once, then patch only sections that still lack a judgment.
 
-    Switching to a patch tool dropped a full submit, and the month file then copied story seeds.
+    A second full submit dropped the first payload. Format mistakes are fixed here
+    so they never spend another model call.
     """
     facts = facts or mechanical_facts(month_key)
     notes: list[dict[str, Any]] = []
@@ -655,48 +984,141 @@ def synthesize_month(
         notes.extend(item for item in (record.get("items") or []) if isinstance(item, dict))
     prompt = build_reduce_prompt(month_key, notes, facts, carry)
     caller = call_oneshot or _default_oneshot
-    schema = submit_month_synthesis_schema()
-    previous: dict[str, Any] | None = None
-    usage: dict[str, Any] = {}
-    excerpt = ""
-    for _attempt in range(1, MAX_ATTEMPTS + 1):
+    comparison_exempt = not _previous_has_judgment(month_key)
+    merged: dict[str, Any] = {}
+    gaps = ["user_image is empty"]
+    attempts: list[dict[str, Any]] = []
+    last_model = "MiniMax-M2.5"
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        if attempt == 1:
+            schema = submit_month_synthesis_schema()
+            call_prompt = prompt
+            reason = ""
+        else:
+            sections = _section_keys(gaps)
+            schema = patch_month_synthesis_schema(sections)
+            teaching = "Fix only these gaps:\n" + "\n".join(f"- {line}" for line in gaps)
+            call_prompt = (
+                f"{prompt}\n\nPrevious JSON:\n"
+                f"{json.dumps(merged, ensure_ascii=False)}\n\n{teaching}"
+            )
+            reason = teaching
+        started = time.perf_counter()
         result = caller(
-            prompt,
+            call_prompt,
             purpose="monthly-reduce",
             force_tool_name=schema["name"],
             tool_schema=schema,
             max_tokens=REDUCE_MAX_TOKENS,
         )
-        usage = result
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        last_model = str(result.get("model") or last_model)
+        input_tokens = int(result.get("input_tokens") or 0)
+        output_tokens = int(result.get("output_tokens") or 0)
         if result.get("failed"):
+            attempts.append(
+                {
+                    "n": attempt,
+                    "tool": schema["name"],
+                    "purpose": "monthly-reduce",
+                    "reason": reason or "transport failed",
+                    "format_fixes": [],
+                    "failed": list(gaps),
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": input_tokens + output_tokens,
+                    "duration_ms": duration_ms,
+                }
+            )
             continue
-        args = result.get("tool_args") if isinstance(result.get("tool_args"), dict) else {}
-        if _tool_has_key_rows(args):
-            previous = args
+        incoming = result.get("tool_args") if isinstance(result.get("tool_args"), dict) else {}
+        if attempt == 1:
+            merged = dict(incoming)
+        elif str(result.get("tool_name") or "") == submit_month_synthesis_schema()["name"]:
+            attempts.append(
+                {
+                    "n": attempt,
+                    "tool": schema["name"],
+                    "purpose": "monthly-reduce",
+                    "reason": reason,
+                    "format_fixes": [],
+                    "failed": list(gaps),
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": input_tokens + output_tokens,
+                    "duration_ms": duration_ms,
+                }
+            )
+            continue
+        else:
+            merged = merge_field_patch(merged, incoming)
+        merged, format_fixes = normalize_synthesis_args(merged, facts)
+        if comparison_exempt:
+            merged["comparison_with_last_month"] = {
+                "unchanged": [],
+                "changed": [],
+                "suggestion": "",
+                "empty_reason": _NO_LAST_MONTH,
+            }
+            format_fixes.append("comparison_with_last_month empty_reason set by code")
+            image = merged.get("user_image") if isinstance(merged.get("user_image"), dict) else {}
+            image = dict(image)
+            image["cognition_change"] = []
+            image["cognition_empty_reason"] = _NO_LAST_MONTH
+            merged["user_image"] = image
+            format_fixes.append("cognition_change empty_reason set by code")
+        gaps = judgment_gaps(merged, facts, comparison_exempt=comparison_exempt)
+        attempts.append(
+            {
+                "n": attempt,
+                "tool": schema["name"],
+                "purpose": "monthly-reduce",
+                "reason": reason,
+                "format_fixes": format_fixes,
+                "failed": list(gaps),
+                "retired": [],
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+                "duration_ms": duration_ms,
+            }
+        )
+        if not gaps:
             break
-        text = str(result.get("final_response") or "").strip()
-        if text:
-            excerpt = text[:240]
-    args = dict(previous or {})
-    args["_notes"] = notes
+    for index in range(1, len(attempts)):
+        before = set(_section_keys(list(attempts[index - 1].get("failed") or [])))
+        after = set(_section_keys(list(attempts[index].get("failed") or [])))
+        retired = []
+        for section in sorted(before - after):
+            sent = sum(
+                1
+                for prior in attempts[:index]
+                if section in _section_keys(list(prior.get("failed") or []))
+            )
+            retired.append(f"{section} (attempt {attempts[index]['n']}, sent back {sent})")
+        attempts[index]["retired"] = retired
+    merged["_notes"] = notes
     stamp = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     payload = payload_from_synthesis(
         month_key,
-        args,
+        merged,
         facts,
         carry=carry,
-        model=str(usage.get("model") or "MiniMax-M2.5"),
+        model=last_model,
         map_calls=len(note_records),
-        reduce_tokens=int(usage.get("input_tokens") or 0),
+        reduce_tokens=sum(int(row["input_tokens"]) for row in attempts),
         generated_at=stamp,
+        comparison_exempt=comparison_exempt,
     )
     usage_out = {
-        "input_tokens": int(usage.get("input_tokens") or 0),
-        "output_tokens": int(usage.get("output_tokens") or 0),
-        "cache_read_tokens": int(usage.get("cache_read_tokens") or 0),
+        "input_tokens": sum(int(row["input_tokens"]) for row in attempts),
+        "output_tokens": sum(int(row["output_tokens"]) for row in attempts),
+        "total_tokens": sum(int(row["total_tokens"]) for row in attempts),
+        "cache_read_tokens": 0,
         "prompt_tokens_est": count_tokens(prompt),
-        "failed": bool(usage.get("failed")),
+        "failed": bool(gaps),
+        "valid": not gaps,
+        "model": last_model,
+        "attempts": attempts,
     }
-    if not _tool_has_key_rows(previous):
-        usage_out["final_response"] = excerpt
     return payload, usage_out

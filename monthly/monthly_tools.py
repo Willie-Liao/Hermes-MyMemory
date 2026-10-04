@@ -58,22 +58,38 @@ def patch_month_note_schema() -> dict[str, Any]:
     )
 
 
+def _judgment_string(description: str) -> dict[str, Any]:
+    """Reject a blank string in the tool schema so "" cannot pose as a filled judgment."""
+    return {
+        "type": "string",
+        "minLength": 1,
+        "description": f"{description} An empty string is not a judgment.",
+    }
+
+
 def _evidence_text_props() -> dict[str, Any]:
     return {
         "type": "object",
         "properties": {
-            "text": {"type": "string"},
-            "evidence": {"type": "array", "items": {"type": "string"}},
+            "text": _judgment_string("Judgment about the user."),
+            "evidence": {"type": "array", "items": {"type": "string"}, "minItems": 1},
         },
+        "required": ["text", "evidence"],
     }
 
 
 def submit_month_synthesis_schema() -> dict[str, Any]:
-    """One reduce call writes every narrative field; mechanical facts stay out of this tool."""
+    """One reduce call writes every narrative field; mechanical facts stay out of this tool.
+
+    The worker returns JSON tool arguments. YAML is rendered later by dump_yaml.
+    """
     return _schema(
         "submit_month_synthesis",
-        "Synthesize the month from notes and mechanical facts. Cite only ids you were given. "
-        "summary is one-line bullets (text + weeks); never one paragraph.",
+        "Synthesize the month as JSON tool arguments, not a YAML document. "
+        "Cite only ids you were given. "
+        "summary is one-line bullets (text + weeks); never one paragraph. "
+        "user_image, core_progress, key_decisions, key_procedures, "
+        "problems_and_risks, and next_month_focus must each contain a judgment about the user.",
         {
             "key_decisions": {
                 "type": "array",
@@ -85,17 +101,15 @@ def submit_month_synthesis_schema() -> dict[str, Any]:
                 "items": {
                     "type": "object",
                     "properties": {
-                        "text": {
-                            "type": "string",
-                            "description": "Synthesis of the cited decision cards.",
-                        },
-                        "why_it_matters": {
-                            "type": "string",
-                            "description": "Required. At most 40 words. Why this rule would still change the next time.",
-                        },
+                        "text": _judgment_string("Synthesis of the cited decision cards."),
+                        "why_it_matters": _judgment_string(
+                            "Required. At most 40 words. Why this rule would still change the next time."
+                        ),
+                        "context": _judgment_string("Where this rule applies."),
+                        "exceptions": _judgment_string("When this rule does not apply."),
                         "evidence": {"type": "array", "items": {"type": "string"}},
                     },
-                    "required": ["text", "why_it_matters", "evidence"],
+                    "required": ["text", "why_it_matters", "context", "exceptions", "evidence"],
                 },
             },
             "key_procedures": {
@@ -108,18 +122,16 @@ def submit_month_synthesis_schema() -> dict[str, Any]:
                 "items": {
                     "type": "object",
                     "properties": {
-                        "solution": {
-                            "type": "string",
-                            "description": "Synthesis of the cited procedure cards.",
-                        },
-                        "problem": {"type": "string"},
-                        "insight": {
-                            "type": "string",
-                            "description": "Required. At most 40 words. Why this procedure would still change the next time.",
-                        },
+                        "trigger": _judgment_string("What starts this procedure."),
+                        "problem": _judgment_string("The problem this procedure addresses."),
+                        "obstacles": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                        "solution": _judgment_string("Synthesis of the cited procedure cards."),
+                        "insight": _judgment_string(
+                            "Required. At most 40 words. Why this procedure would still change the next time."
+                        ),
                         "evidence": {"type": "array", "items": {"type": "string"}},
                     },
-                    "required": ["solution", "insight", "evidence"],
+                    "required": ["trigger", "problem", "obstacles", "solution", "insight", "evidence"],
                 },
             },
             "summary": {
@@ -142,43 +154,48 @@ def submit_month_synthesis_schema() -> dict[str, Any]:
                         "items": {
                             "type": "object",
                             "properties": {
-                                "text": {"type": "string"},
+                                "text": _judgment_string("How the user's understanding changed."),
                                 "from": {"type": "string"},
                                 "to": {"type": "string"},
                                 "date": {"type": "string"},
-                                "evidence": {"type": "array", "items": {"type": "string"}},
+                                "evidence": {"type": "array", "items": {"type": "string"}, "minItems": 1},
                             },
                         },
                     },
                     "decision_preference": {
                         "type": "object",
                         "properties": {
-                            "text": {"type": "string"},
-                            "evidence": {"type": "array", "items": {"type": "string"}},
+                            "text": _judgment_string("Judgment about the user."),
+                            "evidence": {"type": "array", "items": {"type": "string"}, "minItems": 1},
                         },
+                        "required": ["text", "evidence"],
                     },
                     "behavior_pattern": {
                         "type": "object",
                         "properties": {
-                            "text": {"type": "string"},
-                            "evidence": {"type": "array", "items": {"type": "string"}},
+                            "text": _judgment_string("Judgment about the user."),
+                            "evidence": {"type": "array", "items": {"type": "string"}, "minItems": 1},
                         },
+                        "required": ["text", "evidence"],
                     },
                 },
+                "required": ["goal_alignment", "decision_preference", "behavior_pattern"],
             },
             "core_progress": {
                 "type": "array",
+                "minItems": 1,
                 "items": {
                     "type": "object",
                     "properties": {
                         "id": {"type": "string"},
-                        "title": {"type": "string"},
-                        "body": {"type": "string"},
-                        "state": {"type": "string"},
+                        "title": _judgment_string("Short name of the progress."),
+                        "body": _judgment_string("Judgment about how the user moved this forward."),
+                        "state": _judgment_string("Where this progress stands."),
                         "weeks": {"type": "array", "items": {"type": "string"}},
                         "entity_keys": {"type": "array", "items": {"type": "string"}},
                         "evidence": {"type": "array", "items": {"type": "string"}},
                     },
+                    "required": ["title", "body", "state", "weeks", "entity_keys", "evidence"],
                 },
             },
             "cross_week_items": {
@@ -200,14 +217,16 @@ def submit_month_synthesis_schema() -> dict[str, Any]:
             },
             "problems_and_risks": {
                 "type": "array",
+                "minItems": 1,
                 "items": {
                     "type": "object",
                     "properties": {
-                        "content": {"type": "string"},
-                        "level": {"type": "string"},
-                        "suggestion": {"type": "string"},
+                        "content": _judgment_string("The risk for the user."),
+                        "level": _judgment_string("How serious the risk is."),
+                        "suggestion": _judgment_string("What the user should do about it."),
                         "evidence": {"type": "array", "items": {"type": "string"}},
                     },
+                    "required": ["content", "level", "suggestion", "evidence"],
                 },
             },
             "comparison_with_last_month": {
@@ -240,19 +259,28 @@ def submit_month_synthesis_schema() -> dict[str, Any]:
             },
             "next_month_focus": {
                 "type": "array",
+                "minItems": 1,
                 "items": {
                     "type": "object",
                     "properties": {
                         "id": {"type": "string"},
-                        "content": {"type": "string"},
-                        "target": {"type": "string"},
-                        "priority": {"type": "string"},
+                        "content": _judgment_string("What the user should carry forward."),
+                        "target": _judgment_string("When or where this focus lands."),
+                        "priority": _judgment_string("How soon this focus matters."),
                         "depends_on": {"type": "array", "items": {"type": "string"}},
                     },
+                    "required": ["content", "target", "priority", "depends_on"],
                 },
             },
         },
-        ["summary"],
+        [
+            "user_image",
+            "core_progress",
+            "key_decisions",
+            "key_procedures",
+            "problems_and_risks",
+            "next_month_focus",
+        ],
     )
 
 
@@ -273,9 +301,19 @@ def submit_month_suggest_schema() -> dict[str, Any]:
     )
 
 
-def patch_month_synthesis_schema() -> dict[str, Any]:
-    schema = submit_month_synthesis_schema()
-    schema["name"] = "patch_month_synthesis"
-    schema["description"] = "Patch ONLY changed fields on previous submit_month_synthesis args."
-    schema["parameters"].pop("required", None)
+def patch_month_synthesis_schema(keys: list[str] | None = None) -> dict[str, Any]:
+    """Expose only the sections that failed so a retry cannot replace the whole month.
+
+    A full clone of submit_month_synthesis dropped the first payload and the file
+    then copied story seeds. keys are top-level JSON names, not dotted fields.
+    """
+    full = submit_month_synthesis_schema()
+    wanted = [key for key in (keys or []) if key in full["parameters"]["properties"]]
+    props = {key: full["parameters"]["properties"][key] for key in wanted}
+    schema = _schema(
+        "patch_month_synthesis",
+        "Return JSON for only these failed sections. Do not repeat sections that already passed.",
+        props,
+        wanted,
+    )
     return schema

@@ -12,6 +12,79 @@ from monthly_synth import (
 from monthly_slice import count_tokens
 
 
+def _filled_args(facts) -> dict:
+    """One valid JSON submit so a unit test does not trip the section retry."""
+    decision = next(block for block in facts.all_dpe if block.type == "decision")
+    procedure = next(block for block in facts.all_dpe if block.type == "procedure")
+    week = facts.weeks[0] if facts.weeks else "2026-W25"
+    image = {
+        "goal_alignment": {"text": "Willie kept one standing goal.", "evidence": [decision.id]},
+        "decision_preference": {"text": "Willie prefers one next action.", "evidence": [decision.id]},
+        "behavior_pattern": {"text": "Willie batches the work on school days.", "evidence": [decision.id]},
+        "cognition_change": [],
+    }
+    if facts.supersedes_pairs:
+        prior, current = facts.supersedes_pairs[0]
+        image["cognition_change"] = [
+            {
+                "text": "A later claim replaced the earlier one.",
+                "from": prior,
+                "to": current,
+                "date": "2026-06-16",
+                "evidence": [current],
+            }
+        ]
+    return {
+        "summary": "June start",
+        "user_image": image,
+        "core_progress": [
+            {
+                "title": "Standing goal",
+                "body": "Willie moved that goal forward.",
+                "state": "advanced",
+                "weeks": [week],
+                "entity_keys": [decision.entity_key or "user"],
+                "evidence": [decision.id],
+            }
+        ],
+        "key_decisions": [
+            {
+                "text": "June goal stays a standing rule",
+                "why_it_matters": "still changes the next time",
+                "context": "Month planning.",
+                "exceptions": "A one-day reminder does not count.",
+                "evidence": [decision.id],
+            }
+        ],
+        "key_procedures": [
+            {
+                "trigger": "Willie asks to repeat the step.",
+                "problem": "The step was written only once.",
+                "obstacles": ["The first note was incomplete."],
+                "solution": "Reuse the cited procedure.",
+                "insight": "The case still changes the next time.",
+                "evidence": [procedure.id],
+            }
+        ],
+        "problems_and_risks": [
+            {
+                "content": "Willie may skip the follow-up.",
+                "level": "medium",
+                "suggestion": "Keep the procedure next to the decision.",
+                "evidence": [decision.id],
+            }
+        ],
+        "next_month_focus": [
+            {
+                "content": "Carry the rule forward.",
+                "target": "2026-07",
+                "priority": "medium",
+                "depends_on": [decision.id],
+            }
+        ],
+    }
+
+
 def test_reduce_drops_invented_ids_and_keeps_verbatim():
     facts = mechanical_facts("2026-08")
     real_decision = next(b for b in facts.all_dpe if b.type == "decision")
@@ -120,6 +193,11 @@ def test_reduce_prompt_is_same_rule_lines_and_blank_why_is_dropped():
     assert '"dp_groups"' not in prompt
     assert "\n    \"id\"" not in prompt
     assert " | " in prompt
+    assert "user_image.goal_alignment" in prompt
+    assert "core_progress" in prompt
+    assert "problems_and_risks" in prompt
+    assert "next_month_focus" in prompt
+    assert "No previous month judgment" in prompt
     real = next(b for b in facts.all_dpe if b.type == "decision")
     proc = next(b for b in facts.all_dpe if b.type == "procedure")
     blank = payload_from_synthesis(
@@ -170,24 +248,18 @@ def test_august_reduce_prompt_under_4000():
 def test_synthesize_month_forced_tool(monkeypatch):
     facts = mechanical_facts("2026-06")
     real = next(b for b in facts.all_dpe if b.type == "decision")
+    calls = {"n": 0}
 
     def call(prompt, **kwargs):
+        calls["n"] += 1
+        assert kwargs.get("force_tool_name") == "submit_month_synthesis"
         return {
             "failed": False,
             "tool_name": kwargs.get("force_tool_name"),
-            "tool_args": {
-                "summary": "June start",
-                "key_decisions": [
-                    {
-                        "text": "June goal stays a standing rule",
-                        "why_it_matters": "goal",
-                        "evidence": [real.id],
-                    }
-                ],
-            },
+            "tool_args": _filled_args(facts),
             "input_tokens": 50,
             "output_tokens": 20,
-            "model": "mimo-v2.5",
+            "model": "MiniMax-M2.5",
         }
 
     payload, usage = synthesize_month(
@@ -197,39 +269,45 @@ def test_synthesize_month_forced_tool(monkeypatch):
         carry="",
         facts=facts,
     )
+    assert calls["n"] == 1
     assert payload.summary[0].text == "June start"
     assert payload.key_decisions[0].id == _mint_month_key_id(
         "2026-06", "decision", (real.id,)
     )
     assert payload.key_decisions[0].text == "June goal stays a standing rule"
+    assert usage["valid"] is True
     assert usage["input_tokens"] == 50
 
 
-def test_later_submit_without_summary_keeps_key_rows():
+def test_failed_section_is_patched_not_resubmitted():
     facts = mechanical_facts("2026-06")
     real = next(b for b in facts.all_dpe if b.type == "decision")
     calls = {"n": 0}
 
     def call(prompt, **kwargs):
         calls["n"] += 1
-        assert kwargs.get("force_tool_name") == "submit_month_synthesis"
+        name = kwargs.get("force_tool_name")
         if calls["n"] == 1:
-            return {"failed": False, "tool_name": "submit_month_synthesis", "tool_args": {}, "input_tokens": 10}
+            assert name == "submit_month_synthesis"
+            return {
+                "failed": False,
+                "tool_name": name,
+                "tool_args": {"summary": "June start"},
+                "input_tokens": 10,
+                "output_tokens": 1,
+                "model": "MiniMax-M2.5",
+            }
+        assert name == "patch_month_synthesis"
+        props = set(kwargs["tool_schema"]["parameters"]["properties"])
+        assert "summary" not in props
+        assert "key_decisions" in props
         return {
             "failed": False,
-            "tool_name": "submit_month_synthesis",
-            "tool_args": {
-                "key_decisions": [
-                    {
-                        "text": "June goal stays a standing rule",
-                        "why_it_matters": "still changes the next time",
-                        "evidence": [real.id],
-                    }
-                ],
-            },
+            "tool_name": name,
+            "tool_args": _filled_args(facts),
             "input_tokens": 50,
             "output_tokens": 20,
-            "model": "mimo-v2.5",
+            "model": "MiniMax-M2.5",
         }
 
     payload, usage = synthesize_month(
@@ -241,7 +319,158 @@ def test_later_submit_without_summary_keeps_key_rows():
     )
     assert calls["n"] == 2
     assert payload.key_decisions[0].id.startswith("mem-2026-06-key-decision-")
-    assert usage["input_tokens"] == 50
+    assert usage["input_tokens"] == 60
+    assert usage["valid"] is True
+    assert usage["attempts"][1]["retired"]
+    assert real.id
+
+
+def test_evidence_string_does_not_call_the_model_again():
+    facts = mechanical_facts("2026-06")
+    calls = {"n": 0}
+
+    def call(prompt, **kwargs):
+        calls["n"] += 1
+        args = _filled_args(facts)
+        args["key_decisions"][0]["evidence"] = args["key_decisions"][0]["evidence"][0]
+        return {
+            "failed": False,
+            "tool_name": "submit_month_synthesis",
+            "tool_args": args,
+            "input_tokens": 5,
+            "output_tokens": 1,
+            "model": "MiniMax-M2.5",
+        }
+
+    _payload, usage = synthesize_month("2026-06", [], call_oneshot=call, carry="", facts=facts)
+    assert calls["n"] == 1
+    assert any("string -> list" in fix for fix in usage["attempts"][0]["format_fixes"])
+    assert usage["valid"] is True
+
+
+def test_incomplete_month_is_not_written(tmp_path, monkeypatch):
+    from monthly_actions import generate_month
+    from monthly_state import month_file_path
+
+    def call(prompt, **kwargs):
+        if kwargs.get("force_tool_name") == "submit_month_note":
+            return {
+                "failed": False,
+                "tool_name": "submit_month_note",
+                "tool_args": {"items": []},
+                "input_tokens": 1,
+                "output_tokens": 1,
+            }
+        return {
+            "failed": False,
+            "tool_name": kwargs.get("force_tool_name"),
+            "tool_args": {},
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "model": "MiniMax-M2.5",
+        }
+
+    result = generate_month("2026-06", call_oneshot=call, force_refresh=True)
+    assert result["outcome"] == "incomplete"
+    assert not month_file_path("2026-06").is_file()
+    assert result["usage"]["valid"] is False
+
+
+def test_blank_goal_alignment_text_is_a_gap():
+    from monthly_synth import judgment_gaps
+
+    facts = mechanical_facts("2026-06")
+    args = _filled_args(facts)
+    args["user_image"]["goal_alignment"]["text"] = ""
+    gaps = judgment_gaps(args, facts, comparison_exempt=True)
+    assert any("goal_alignment.text is empty" in gap for gap in gaps)
+
+
+def test_no_previous_month_sets_cognition_reason():
+    facts = mechanical_facts("2026-06")
+
+    def call(prompt, **kwargs):
+        return {
+            "failed": False,
+            "tool_name": "submit_month_synthesis",
+            "tool_args": _filled_args(facts),
+            "input_tokens": 5,
+            "output_tokens": 1,
+            "model": "MiniMax-M2.5",
+        }
+
+    payload, usage = synthesize_month("2026-06", [], call_oneshot=call, carry="", facts=facts)
+    assert payload.user_image.cognition_change == ()
+    assert payload.user_image.cognition_empty_reason == "no information from last month"
+    assert usage["valid"] is True
+    assert not any("cognition_change" in line for line in usage["attempts"][0]["failed"])
+    assert any("cognition_change empty_reason" in fix for fix in usage["attempts"][0]["format_fixes"])
+
+
+def test_previous_month_blank_cognition_is_not_written(tmp_path, monkeypatch):
+    from monthly_actions import generate_month
+    from monthly_schema import MonthlyEvidenceText, MonthlyPayload, MonthlyRange, MonthlyUserImage
+    from monthly_state import month_file_path
+    from monthly_writer import write_month
+
+    write_month(
+        MonthlyPayload(
+            key="2026-05",
+            range=MonthlyRange(start="2026-05-01", end="2026-05-31"),
+            user_image=MonthlyUserImage(
+                goal_alignment=MonthlyEvidenceText(
+                    text="May already held a goal.",
+                    evidence=("mem-2026-05-decision-a",),
+                )
+            ),
+        )
+    )
+    facts = mechanical_facts("2026-06")
+    args = _filled_args(facts)
+    args["user_image"]["cognition_change"] = []
+
+    def call(prompt, **kwargs):
+        if kwargs.get("force_tool_name") == "submit_month_note":
+            return {
+                "failed": False,
+                "tool_name": "submit_month_note",
+                "tool_args": {"items": []},
+                "input_tokens": 1,
+                "output_tokens": 1,
+            }
+        return {
+            "failed": False,
+            "tool_name": kwargs.get("force_tool_name"),
+            "tool_args": args,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "model": "MiniMax-M2.5",
+        }
+
+    result = generate_month("2026-06", call_oneshot=call, force_refresh=True)
+    assert result["outcome"] == "incomplete"
+    assert not month_file_path("2026-06").is_file()
+    failed = " ".join(result["usage"]["attempts"][-1]["failed"])
+    assert "cognition_change" in failed
+
+
+def test_sentinel_cognition_phrase_is_a_gap():
+    from monthly_synth import judgment_gaps
+
+    facts = mechanical_facts("2026-06")
+    args = _filled_args(facts)
+    prior, current = facts.supersedes_pairs[0]
+    args["user_image"]["cognition_change"] = [
+        {
+            "text": "no information from last month",
+            "from": prior,
+            "to": current,
+            "date": "2026-06-16",
+            "evidence": [current],
+        }
+    ]
+    gaps = judgment_gaps(args, facts, comparison_exempt=False)
+    assert any("placeholder phrase" in gap for gap in gaps)
 
 
 def test_payload_from_synthesis_passes_bilingual_aliases():

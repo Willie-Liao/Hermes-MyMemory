@@ -683,6 +683,34 @@ def test_extract_tool_calls_flat_shape_and_broken_arguments_string():
     assert found == [("submit_tighten_fact", {"kind": "Factual", "content": "x"})]
 
 
+def test_month_submit_keeps_outer_object_not_last_nested_field():
+    """A nested text/evidence field must not replace the month the model submitted."""
+    wl = _load_worker_llm()
+    raw = (
+        '{"user_image": {"goal_alignment": {"text": "keep briefs short", '
+        '"evidence": ["mem-b"]}}, '
+        '"key_decisions": [{"text": "short briefs", "why_it_matters": "next time", '
+        '"context": "briefs", "exceptions": "none", "evidence": ["mem-b"]}], '
+        '"next_month_focus": [{"content": "keep the index", "target": "July", '
+        '"priority": "high", "depends_on": []}]}'
+    )
+    result = {
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"function": {"name": "submit_month_synthesis", "arguments": raw}}
+                ],
+            }
+        ]
+    }
+    found = wl.extract_tool_calls_from_result(result)
+    assert found[0][0] == "submit_month_synthesis"
+    assert "user_image" in found[0][1]
+    assert found[0][1]["user_image"]["goal_alignment"]["text"] == "keep briefs short"
+    assert found[0][1]["key_decisions"][0]["text"] == "short briefs"
+
+
 def test_truncated_submit_keeps_finished_key_rows():
     wl = _load_worker_llm()
     raw = (
@@ -734,7 +762,7 @@ def test_extract_tool_calls_drops_tool_describe_keeps_submit():
     assert found == [
         (
             "submit_weekly_summary",
-            {"text": "Shipped wrap-up", "weekdays": ["Monday"]},
+            {"summary": [{"text": "Shipped wrap-up", "weekdays": ["Monday"]}]},
         )
     ]
 

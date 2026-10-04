@@ -413,7 +413,11 @@ def _strip_think_blocks(text: str) -> str:
 
 
 def _json_object_slices(text: str) -> list[str]:
-    """Left-to-right top-level `{...}` slices so the last payload can beat CoT JSON."""
+    """Keep each top-level `{...}` so a nested field cannot replace the tool payload.
+
+    The last slice is the payload that follows any earlier CoT object. Stepping
+    back inside the object made the month's final `{text, evidence}` the winner.
+    """
     slices: list[str] = []
     i = 0
     n = len(text)
@@ -448,7 +452,7 @@ def _json_object_slices(text: str) -> list[str]:
         if end is None:
             break
         slices.append(text[start : end + 1])
-        i = start + 1
+        i = end + 1
     return slices
 
 
@@ -1403,12 +1407,43 @@ def _usage_int(usage: Any, *names: str) -> int:
     return 0
 
 
+def _reasoning_text(message: Any, raw_content: str) -> str:
+    """Keep the model's own reasoning beside the tool call so a failed field can be explained.
+
+    Tool arguments stay parsed from the text after the think block. Without this
+    split, the only record of a retry is the gap name, not why the model left it blank.
+    """
+    parts: list[str] = []
+    for attr in ("reasoning_content", "reasoning"):
+        value = getattr(message, attr, None)
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+    dump = getattr(message, "model_dump", None)
+    if callable(dump):
+        try:
+            bag = dump()
+        except Exception:
+            bag = {}
+        if isinstance(bag, dict):
+            for key in ("reasoning_content", "reasoning"):
+                value = bag.get(key)
+                if isinstance(value, str) and value.strip() and value.strip() not in parts:
+                    parts.append(value.strip())
+    for match in _THINK_RE.finditer(raw_content):
+        body = match.group(0)
+        inner = re.sub(r"^<(thinking|think)>|</(thinking|think)>$", "", body, flags=re.I).strip()
+        if inner and inner not in parts:
+            parts.append(inner)
+    return "\n\n".join(parts)
+
+
 def _capture_from_oneshot_message(
     message: Any,
     *,
     force_tool_name: str | None,
 ) -> dict[str, Any]:
-    content = _strip_think_blocks(str(getattr(message, "content", None) or ""))
+    raw_content = str(getattr(message, "content", None) or "")
+    content = _strip_think_blocks(raw_content)
     raw_calls = getattr(message, "tool_calls", None) or []
     packed: list[dict[str, Any]] = []
     for tc in raw_calls:
@@ -1437,6 +1472,7 @@ def _capture_from_oneshot_message(
         tool_name, tool_args = tool_calls[-1]
     return {
         "final_response": content.strip(),
+        "reasoning_text": _reasoning_text(message, raw_content),
         "tool_name": tool_name,
         "tool_args": tool_args,
         "tool_calls": tool_calls,

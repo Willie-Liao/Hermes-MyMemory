@@ -199,6 +199,7 @@ def payload_from_dict(obj: dict[str, Any]) -> MonthlyPayload:
         user_image=MonthlyUserImage(
             goal_alignment=_evidence_text(img.get("goal_alignment")),
             cognition_change=tuple(cognition),
+            cognition_empty_reason=str(img.get("cognition_empty_reason") or ""),
             decision_preference=MonthlyDecisionPreference(
                 text=str(pref.get("text") or ""),
                 counts=dict(pref.get("counts") or {}),

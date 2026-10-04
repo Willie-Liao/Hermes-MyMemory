@@ -57,7 +57,11 @@ def generate_month(
     call_oneshot=None,
     force_refresh: bool = False,
 ) -> dict[str, Any]:
-    """Run map-reduce for one calendar month and persist YYYY-MM.md."""
+    """Run map-reduce for one calendar month and persist YYYY-MM.md only when judgments are filled.
+
+    An incomplete reduce used to write empty key lists. Leaving the previous file
+    in place keeps a failed retry from erasing a month.
+    """
     del reason
     key = parse_month_key(month_key)
     if key is None:
@@ -78,6 +82,15 @@ def generate_month(
         carry=carry,
         facts=facts,
     )
+    if not usage.get("valid"):
+        return {
+            "outcome": "incomplete",
+            "month": key,
+            "path": "",
+            "map_calls": sum(0 if n.get("cache_hit") else 1 for n in notes),
+            "usage": usage,
+            "payload": payload.to_dict(),
+        }
     path = write_month(payload)
     return {
         "outcome": "ok",

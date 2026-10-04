@@ -7,6 +7,7 @@ from monthly_schema import (
     MonthlyProgress,
     MonthlyRange,
     MonthlySummaryItem,
+    MonthlyUserImage,
     payload_to_dict,
 )
 from monthly_writer import dump_yaml, load_month, loads, write_month
@@ -50,6 +51,31 @@ def test_write_month_uses_month_status_and_round_trips(tmp_path, monkeypatch):
     from monthly_writer import dumps
 
     assert '"month_key"' in dumps(loaded)
+
+
+def test_cognition_empty_reason_round_trips(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    payload = _payload()
+    payload = MonthlyPayload(
+        key=payload.key,
+        weeks=payload.weeks,
+        range=payload.range,
+        summary=payload.summary,
+        core_progress=payload.core_progress,
+        user_image=MonthlyUserImage(cognition_empty_reason="no information from last month"),
+    )
+    write_month(payload)
+    loaded = load_month("2026-08")
+    assert loaded.user_image.cognition_empty_reason == "no information from last month"
+    assert loaded.user_image.cognition_change == ()
+
+
+def test_month_file_without_cognition_reason_still_loads():
+    dumped = dump_yaml(_payload())
+    legacy = "\n".join(line for line in dumped.splitlines() if "cognition_empty_reason" not in line) + "\n"
+    restored = loads(legacy)
+    assert restored.user_image.cognition_empty_reason == ""
+    assert restored.user_image.cognition_change == ()
 
 
 def test_write_month_atomic_on_serializer_failure(tmp_path, monkeypatch):

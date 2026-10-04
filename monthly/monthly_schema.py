@@ -74,7 +74,11 @@ class MonthlyEvidenceText:
 
 @dataclass(frozen=True)
 class MonthlyCognitionChange:
-    """Anchor belief change on a supersedes pair so the model cannot invent a reversal."""
+    """Anchor a belief change on a cited sentence so an empty string cannot stand in for one.
+
+    from and to are both required when the row names a supersedes pair, and both
+    omitted when the previous month has a judgment but no pair.
+    """
 
     text: str
     from_id: str
@@ -84,7 +88,9 @@ class MonthlyCognitionChange:
 
     def __post_init__(self) -> None:
         _require_evidence(self.text, self.evidence, "cognition_change")
-        if self.text.strip() and (not self.from_id or not self.to):
+        has_from = bool(str(self.from_id or "").strip())
+        has_to = bool(str(self.to or "").strip())
+        if has_from != has_to:
             raise ValueError("cognition_change requires from and to ids")
 
 
@@ -118,6 +124,7 @@ class MonthlyUserImage:
 
     goal_alignment: MonthlyEvidenceText = field(default_factory=MonthlyEvidenceText)
     cognition_change: tuple[MonthlyCognitionChange, ...] = ()
+    cognition_empty_reason: str = ""
     decision_preference: MonthlyDecisionPreference = field(
         default_factory=MonthlyDecisionPreference
     )
@@ -456,6 +463,7 @@ def payload_to_dict(payload: MonthlyPayload) -> dict[str, Any]:
                 }
                 for row in img.cognition_change
             ],
+            "cognition_empty_reason": img.cognition_empty_reason,
             "decision_preference": {
                 "text": img.decision_preference.text,
                 "counts": dict(img.decision_preference.counts),
