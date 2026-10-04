@@ -92,14 +92,16 @@ def submit_month_synthesis_schema() -> dict[str, Any]:
         "objects inside these tool arguments. A sentence in thinking does not count. "
         "key_decisions.evidence is decision ids only. key_procedures.evidence is procedure ids only. "
         "Notes mix both kinds in one list. Keep only -decision- ids on a decision row "
-        "and only -procedure- ids on a procedure row. One leftover id of the other kind fails the row.",
+        "and only -procedure- ids on a procedure row. One leftover id of the other kind fails the row. "
+        "comparison_with_last_month.summary is one summary of this month's user_image "
+        "against last month's user_image lines. Leave unchanged and changed empty.",
         {
             "user_image": {
                 "type": "object",
                 "description": (
-                    "Three objects in these tool arguments: goal_alignment, "
+                    "Three objects in these tool arguments, never null: goal_alignment, "
                     "decision_preference, and behavior_pattern. Each is text plus evidence. "
-                    "A sentence in thinking does not count."
+                    "A sentence in thinking does not count. Write these before the comparison summary."
                 ),
                 "properties": {
                     "goal_alignment": _evidence_text_props(),
@@ -263,31 +265,20 @@ def submit_month_synthesis_schema() -> dict[str, Any]:
             },
             "comparison_with_last_month": {
                 "type": "object",
+                "description": (
+                    "One summary of this month's user_image against last month's "
+                    "user_image lines on the carry card."
+                ),
                 "properties": {
-                    "unchanged": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "text": {"type": "string"},
-                                "evidence": {"type": "array", "items": {"type": "string"}},
-                            },
-                        },
+                    "summary": {
+                        "type": "string",
+                        "description": (
+                            "How goal alignment, decision preference, behavior pattern, "
+                            "and cognition changed from last month's user image to this one."
+                        ),
                     },
-                    "changed": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "text": {"type": "string"},
-                                "from": {"type": "string"},
-                                "to": {"type": "string"},
-                                "evidence": {"type": "array", "items": {"type": "string"}},
-                            },
-                        },
-                    },
-                    "suggestion": {"type": "string"},
                 },
+                "required": ["summary"],
             },
             "next_month_focus": {
                 "type": "array",
@@ -311,6 +302,7 @@ def submit_month_synthesis_schema() -> dict[str, Any]:
             "key_decisions",
             "key_procedures",
             "problems_and_risks",
+            "comparison_with_last_month",
             "next_month_focus",
         ],
     )

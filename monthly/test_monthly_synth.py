@@ -82,6 +82,9 @@ def _filled_args(facts) -> dict:
                 "depends_on": [decision.id],
             }
         ],
+        "comparison_with_last_month": {
+            "summary": "The standing goal held and the preference got sharper.",
+        },
     }
 
 
@@ -538,6 +541,44 @@ def test_sentinel_cognition_phrase_is_a_gap():
     ]
     gaps = judgment_gaps(args, facts, comparison_exempt=False)
     assert any("placeholder phrase" in gap for gap in gaps)
+
+
+def test_reduce_prompt_compares_last_month_user_image():
+    from monthly_schema import MonthlyEvidenceText, MonthlyPayload, MonthlyRange, MonthlySummaryItem, MonthlyUserImage
+    from monthly_slice import carry_card
+    from monthly_writer import write_month
+
+    write_month(
+        MonthlyPayload(
+            key="2026-07",
+            range=MonthlyRange(start="2026-07-01", end="2026-07-31"),
+            summary=(MonthlySummaryItem(text="July story", weeks=()),),
+            user_image=MonthlyUserImage(
+                goal_alignment=MonthlyEvidenceText(
+                    text="Keep the July goal.",
+                    evidence=("mem-2026-07-10-decision-a",),
+                ),
+            ),
+        )
+    )
+    facts = mechanical_facts("2026-08")
+    prompt = build_reduce_prompt("2026-08", [], facts, carry_card("2026-07"))
+    assert "Keep the July goal." in prompt
+    assert "comparison_with_last_month.summary" in prompt
+    assert "needs a changed or unchanged row" not in prompt
+
+
+def test_comparison_summary_gap_follows_the_sentence():
+    from monthly_synth import judgment_gaps
+
+    facts = mechanical_facts("2026-08")
+    empty = _filled_args(facts)
+    empty["comparison_with_last_month"] = {"summary": ""}
+    gaps = judgment_gaps(empty, facts, comparison_exempt=False)
+    assert any("comparison_with_last_month.summary is empty" in gap for gap in gaps)
+    gaps = judgment_gaps(_filled_args(facts), facts, comparison_exempt=False)
+    assert not any("comparison_with_last_month.summary" in gap for gap in gaps)
+    assert not any("changed or unchanged" in gap for gap in gaps)
 
 
 def test_payload_from_synthesis_passes_bilingual_aliases():

@@ -183,20 +183,37 @@ def _cognition_case_line(month_key: str, facts: MechanicalFacts) -> str:
     The static prefix cannot know if last month exists. Without this line the model
     sends an empty string and the month file stays unwritten.
     """
+    portrait_first = (
+        "In this tool call, user_image.goal_alignment, user_image.decision_preference, and "
+        "user_image.behavior_pattern must each be an object with non-empty text and card ids. "
+        "null fails the month. Write those three objects before comparison_with_last_month.summary."
+    )
+    summary_rule = (
+        "Then write comparison_with_last_month.summary as one summary of how those three objects "
+        "differ from last month's user_image lines on the carry card. Leave unchanged and changed empty."
+    )
     if not _previous_has_judgment(month_key):
         return (
-            "No previous month judgment. Leave cognition_change and comparison_with_last_month empty. "
-            "Code writes no information from last month."
+            "No previous month judgment. Leave cognition_change and comparison_with_last_month.summary empty. "
+            "Code writes no information from last month. "
+            + portrait_first
         )
     if facts.supersedes_pairs:
+        listed = "; ".join(f"from={prior} to={current}" for prior, current in facts.supersedes_pairs)
         return (
-            "Previous month has a judgment. Write cognition_change as one of supersedes_pairs "
-            "with text, from, to, date, and evidence. Do not send an empty string and do not send "
-            "the phrase no information from last month."
+            portrait_first
+            + " Previous month has a judgment. cognition_change must be a non-empty array. "
+            "Copy one pair exactly, from and to unchanged, and put that to id in evidence: "
+            + listed
+            + ". Do not invent a pair. Do not send an empty string and do not send the phrase "
+            "no information from last month. "
+            + summary_rule
         )
     return (
-        "Previous month has a judgment. Write cognition_change as text plus evidence only. "
-        "Do not send an empty string and do not send the phrase no information from last month."
+        portrait_first
+        + " Previous month has a judgment. Write cognition_change as text plus evidence only. "
+        "Do not send an empty string and do not send the phrase no information from last month. "
+        + summary_rule
     )
 
 
@@ -609,6 +626,7 @@ def payload_from_synthesis(
             unchanged=_changes("unchanged"),
             changed=_changes("changed"),
             suggestion=str(cmp_raw.get("suggestion") or ""),
+            summary=" ".join(str(cmp_raw.get("summary") or "").split()),
         )
 
     focus: list[MonthlyFocus] = []
@@ -752,6 +770,7 @@ def normalize_synthesis_args(
 
     Map notes put decision and procedure ids in one evidence array. One leftover
     foreign id fails the whole key row even when a same-type id is already there.
+    A core_progress or problems row with one unknown id fails the same way.
     """
     fixes: list[str] = []
     normalized = _normalize_node(dict(args), fixes, "")
@@ -782,6 +801,20 @@ def normalize_synthesis_args(
                 continue
             row["evidence"] = kept
             fixes.append(f"{key}[{index}].evidence dropped ids that are not {key} card ids")
+    allowed = allowed_ids_from_facts(facts, [])
+    for key in ("core_progress", "problems_and_risks"):
+        rows = normalized.get(key)
+        if not isinstance(rows, list):
+            continue
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            ids = _string_list(row.get("evidence"))
+            kept = [item for item in ids if item in allowed]
+            if not kept or len(kept) == len(ids):
+                continue
+            row["evidence"] = kept
+            fixes.append(f"{key}[{index}].evidence dropped ids that are not card ids")
     return normalized, fixes
 
 
@@ -985,18 +1018,11 @@ def judgment_gaps(
                 gaps.append(f"next_month_focus[{index}].depends_on is missing")
     if not comparison_exempt:
         cmp_raw = args.get("comparison_with_last_month")
-        rows: list[Any] = []
+        summary = ""
         if isinstance(cmp_raw, dict):
-            rows = list(cmp_raw.get("changed") or []) + list(cmp_raw.get("unchanged") or [])
-        valid = False
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            if not _missing_text(row.get("text")) and not _bad_evidence(row.get("evidence"), allowed):
-                valid = True
-                break
-        if not valid:
-            gaps.append("comparison_with_last_month needs a changed or unchanged row")
+            summary = " ".join(str(cmp_raw.get("summary") or "").split())
+        if not summary or summary == _NO_LAST_MONTH:
+            gaps.append("comparison_with_last_month.summary is empty")
     return gaps
 
 
@@ -1137,6 +1163,7 @@ def synthesize_month(
                 "unchanged": [],
                 "changed": [],
                 "suggestion": "",
+                "summary": "",
                 "empty_reason": _NO_LAST_MONTH,
             }
             format_fixes.append("comparison_with_last_month empty_reason set by code")

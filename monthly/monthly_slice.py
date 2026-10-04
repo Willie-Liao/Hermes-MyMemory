@@ -870,8 +870,35 @@ def mechanical_facts(month_key: str) -> MechanicalFacts:
     )
 
 
+_NO_LAST_MONTH = "no information from last month"
+
+
+def _portrait_lines(payload) -> list[str]:
+    """Last month's user-image sentences, without evidence ids the next month cannot cite."""
+    image = payload.user_image
+    lines: list[str] = []
+    labeled = (
+        ("user_image.goal_alignment", image.goal_alignment.text),
+        ("user_image.decision_preference", image.decision_preference.text),
+        ("user_image.behavior_pattern", image.behavior_pattern.text),
+    )
+    for label, text in labeled:
+        cleaned = " ".join(str(text or "").split())
+        if cleaned and cleaned != _NO_LAST_MONTH:
+            lines.append(f"{label}: {cleaned}")
+    for row in image.cognition_change:
+        cleaned = " ".join(str(row.text or "").split())
+        if cleaned and cleaned != _NO_LAST_MONTH:
+            lines.append(f"user_image.cognition_change: {cleaned}")
+    return lines
+
+
 def carry_card(previous_month_key: str) -> str:
-    """Compact last-month residue so comparison cannot reread the previous file's bodies."""
+    """Give the reduce last month's portrait first so comparison cannot reread whole bodies.
+
+    Summary, current state, and unfinished names stay for the rest of the reduce.
+    Over the token cap, those three lists are trimmed and the portrait lines stay.
+    """
     from monthly_writer import load_month
 
     try:
@@ -885,69 +912,16 @@ def carry_card(previous_month_key: str) -> str:
         item.name for item in payload.cross_week_items if item.current_status != "completed"
     ]
     summary_bits = [row.text for row in payload.summary]
-    text = "\n".join(
-        [
-            f"previous_month: {payload.key}",
-            f"summary: {summary_bits}",
-            f"current_state: {current_state}",
-            f"unfinished: {unfinished}",
-        ]
-    )
-    if count_tokens(text) > CARRY_CARD_TOKEN_CAP:
-        text = text[: CARRY_CARD_TOKEN_CAP * 4]
-    return text
+    portrait = [f"previous_month: {payload.key}", *_portrait_lines(payload)]
+    rest = [
+        f"summary: {summary_bits}",
+        f"current_state: {current_state}",
+        f"unfinished: {unfinished}",
+    ]
+    while rest and count_tokens("\n".join([*portrait, *rest])) > CARRY_CARD_TOKEN_CAP:
+        rest.pop()
+    return "\n".join([*portrait, *rest])
 
 
 def slice_corpus_tokens(month_key: str) -> int:
     return sum(row.tokens for row in week_slices(month_key))
-
-
-def canonical_source_fingerprint(month_key: str) -> str:
-    """Hash semantic D/P + weekly story fields so recall stamps cannot retrigger a month generate."""
-    import json
-
-    start, end = calendar_range(month_key)
-    parts: list[str] = []
-    for day, fm, body in load_all_blocks():
-        if day < start or day > end:
-            continue
-        kind = str(fm.get("type") or "").strip().casefold()
-        if kind not in {"decision", "procedure"}:
-            continue
-        parts.append(
-            "|".join(
-                (
-                    str(fm.get("id") or ""),
-                    kind,
-                    clause_body(str(body or "")),
-                    str(fm.get("related") or ""),
-                    str(fm.get("supersedes") or ""),
-                )
-            )
-        )
-    folder = weekly_dir()
-    if folder.is_dir():
-        for path in sorted(folder.glob("*.md")):
-            try:
-                obj = load_sidecar(path)
-            except (OSError, ValueError, FileNotFoundError):
-                continue
-            if not isinstance(obj, dict):
-                continue
-            week = str(obj.get("week_key") or path.stem)
-            week_start = _week_start(week)
-            belongs = str(obj.get("belongs_to") or "")
-            overlap = belongs == month_key
-            if week_start is not None:
-                week_end = week_start + timedelta(days=6)
-                overlap = overlap or (week_start <= end and week_end >= start)
-            if not overlap:
-                continue
-            parts.append(week)
-            parts.append(json.dumps(obj.get("summary"), ensure_ascii=False, sort_keys=True, default=str))
-            parts.append(
-                json.dumps(obj.get("cross-day-thread"), ensure_ascii=False, sort_keys=True, default=str)
-            )
-    if not parts:
-        return ""
-    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()

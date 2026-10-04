@@ -133,6 +133,9 @@ def compact_month(payload: Any) -> dict[str, Any]:
     suggestion = _tagged("comparison_with_last_month", comparison.suggestion)
     if suggestion:
         sections.append(suggestion)
+    summary = _tagged("comparison_with_last_month", comparison.summary)
+    if summary:
+        sections.append(summary)
     return {"month_key": payload.key, "sections": sections}
 
 

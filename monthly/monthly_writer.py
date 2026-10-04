@@ -293,6 +293,7 @@ def payload_from_dict(obj: dict[str, Any]) -> MonthlyPayload:
             unchanged=changes("unchanged"),
             changed=changes("changed"),
             suggestion=str(cmp_raw.get("suggestion") or ""),
+            summary=str(cmp_raw.get("summary") or ""),
             empty_reason=str(cmp_raw.get("empty_reason") or ""),
         ),
         next_month_focus=tuple(

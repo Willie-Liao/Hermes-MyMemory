@@ -224,6 +224,30 @@ def test_batch_composition_deterministic_and_carry_under_budget():
     assert count_tokens(carry_card("2026-05")) <= CARRY_CARD_TOKEN_CAP
 
 
+def test_carry_card_puts_user_image_before_summary():
+    from monthly_schema import MonthlyEvidenceText, MonthlyPayload, MonthlyRange, MonthlySummaryItem, MonthlyUserImage
+    from monthly_slice import carry_card
+    from monthly_writer import write_month
+
+    write_month(
+        MonthlyPayload(
+            key="2026-07",
+            range=MonthlyRange(start="2026-07-01", end="2026-07-31"),
+            summary=(MonthlySummaryItem(text="July story", weeks=()),),
+            user_image=MonthlyUserImage(
+                goal_alignment=MonthlyEvidenceText(
+                    text="Keep the July goal.",
+                    evidence=("mem-2026-07-10-decision-a",),
+                ),
+            ),
+        )
+    )
+    card = carry_card("2026-07")
+    assert "user_image.goal_alignment: Keep the July goal." in card
+    assert card.index("user_image.goal_alignment") < card.index("summary:")
+    assert "mem-2026-07-10-decision-a" not in card
+
+
 def test_each_card_is_its_own_group_and_preference_uses_linked_event(monkeypatch, tmp_path):
     from datetime import date
 

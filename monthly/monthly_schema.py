@@ -286,11 +286,16 @@ class MonthlyComparisonChange:
 
 @dataclass(frozen=True)
 class MonthlyComparison:
-    """Carry last-month contrast in one place so two month files are not concatenated."""
+    """Carry last-month contrast in one place so two month files are not concatenated.
+
+    summary is the portrait delta. unchanged, changed, and suggestion stay so
+    older month files still load.
+    """
 
     unchanged: tuple[MonthlyComparisonChange, ...] = ()
     changed: tuple[MonthlyComparisonChange, ...] = ()
     suggestion: str = ""
+    summary: str = ""
     empty_reason: str = ""
 
 
@@ -568,6 +573,7 @@ def payload_to_dict(payload: MonthlyPayload) -> dict[str, Any]:
                 for row in payload.comparison_with_last_month.changed
             ],
             "suggestion": payload.comparison_with_last_month.suggestion,
+            "summary": payload.comparison_with_last_month.summary,
             "empty_reason": payload.comparison_with_last_month.empty_reason,
         },
         "next_month_focus": [

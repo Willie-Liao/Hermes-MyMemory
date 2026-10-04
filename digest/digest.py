@@ -798,13 +798,31 @@ def stop_digest_clock_thread() -> None:
     _clock_wake.set()
 
 
+def _next_monthly_write_at(local: datetime) -> datetime | None:
+    """00:05 on the 1st, 10th, or 20th, kept off the phase-2 grid.
+
+    A phase-2 tick at 00:05 would set past_tick and run leftover or phase 2.
+    """
+    try:
+        monthly_dir = _mymemory / "monthly"
+        if str(monthly_dir) not in sys.path:
+            sys.path.insert(0, str(monthly_dir))
+        import monthly_clock as _monthly_clock
+
+        return _monthly_clock.next_write_at(local)
+    except Exception as exc:
+        _log(f"monthly wake skipped: {exc}")
+        return None
+
+
 def _digest_clock_loop() -> None:
-    """Sleep until next_clock_at or the earliest batch_hold_until.
+    """Sleep until next_clock_at, the next monthly 00:05, or the earliest batch hold.
 
     A civil-only wait would miss the 10-minute assistant hold after the 12th
     user turn. Fire the slept-for civil tick as ``now`` so a wake a few minutes
     past midnight still leftover-extracts that 23:55 civil day instead of
-    skipping until 08:00.
+    skipping until 08:00. A monthly 00:05 wake passes wall time so next_clock_at
+    stays on the phase-2 grid.
     """
     global _clock_thread
     while not _clock_stop.is_set():
@@ -822,6 +840,9 @@ def _digest_clock_loop() -> None:
                     state["next_clock_at"] = stored.isoformat()
                     _save_state(state)
             delay = max(0.0, (stored - local).total_seconds())
+            monthly_at = _next_monthly_write_at(local)
+            if monthly_at is not None:
+                delay = min(delay, max(0.0, (monthly_at - local).total_seconds()))
             now_utc = datetime.now(timezone.utc)
             with _digest_lock:
                 state = _load_state()
@@ -838,7 +859,10 @@ def _digest_clock_loop() -> None:
                     if until.tzinfo is None:
                         until = until.replace(tzinfo=timezone.utc)
                     delay = min(delay, max(0.0, (until - now_utc).total_seconds()))
-            _log(f"digest clock waiting until {stored.isoformat()}")
+            wake_at = stored
+            if monthly_at is not None and monthly_at < stored:
+                wake_at = monthly_at
+            _log(f"digest clock waiting until {wake_at.isoformat()}")
             _clock_wake.clear()
             _clock_wake.wait(delay)
             if _clock_stop.is_set():
@@ -867,6 +891,8 @@ def _digest_clock_loop() -> None:
             local = datetime.now(zone)
             if local >= stored:
                 maybe_run_digest_clock(now=stored, sync=True)
+            elif monthly_at is not None and local >= monthly_at:
+                maybe_run_digest_clock(now=local, sync=True)
         except Exception as exc:
             _log(f"digest clock died: {exc}")
             with _digest_lock:
