@@ -88,65 +88,19 @@ def submit_month_synthesis_schema() -> dict[str, Any]:
         "Synthesize the month as JSON tool arguments, not a YAML document. "
         "Cite only ids you were given. "
         "summary is one-line bullets (text + weeks); never one paragraph. "
-        "user_image, core_progress, key_decisions, key_procedures, "
-        "problems_and_risks, and next_month_focus must each contain a judgment about the user.",
+        "user_image.goal_alignment, decision_preference, and behavior_pattern must be "
+        "objects inside these tool arguments. A sentence in thinking does not count. "
+        "key_decisions.evidence is decision ids only. key_procedures.evidence is procedure ids only. "
+        "Notes mix both kinds in one list. Keep only -decision- ids on a decision row "
+        "and only -procedure- ids on a procedure row. One leftover id of the other kind fails the row.",
         {
-            "key_decisions": {
-                "type": "array",
-                "description": (
-                    "Standing rules synthesized from the month's decision cards, "
-                    "chosen after reading story_seeds. At most 12. text is the "
-                    "month's synthesis, not one daily clause. Do not set id."
-                ),
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "text": _judgment_string("Synthesis of the cited decision cards."),
-                        "why_it_matters": _judgment_string(
-                            "Required. At most 40 words. Why this rule would still change the next time."
-                        ),
-                        "context": _judgment_string("Where this rule applies."),
-                        "exceptions": _judgment_string("When this rule does not apply."),
-                        "evidence": {"type": "array", "items": {"type": "string"}},
-                    },
-                    "required": ["text", "why_it_matters", "context", "exceptions", "evidence"],
-                },
-            },
-            "key_procedures": {
-                "type": "array",
-                "description": (
-                    "Reusable cases synthesized from the month's procedure cards. "
-                    "A finished one-day act is not a key row. At most 8. solution "
-                    "is the month's synthesis. Do not set id."
-                ),
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "trigger": _judgment_string("What starts this procedure."),
-                        "problem": _judgment_string("The problem this procedure addresses."),
-                        "obstacles": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-                        "solution": _judgment_string("Synthesis of the cited procedure cards."),
-                        "insight": _judgment_string(
-                            "Required. At most 40 words. Why this procedure would still change the next time."
-                        ),
-                        "evidence": {"type": "array", "items": {"type": "string"}},
-                    },
-                    "required": ["trigger", "problem", "obstacles", "solution", "insight", "evidence"],
-                },
-            },
-            "summary": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string"},
-                        "weeks": {"type": "array", "items": {"type": "string"}},
-                    },
-                    "required": ["text"],
-                },
-            },
             "user_image": {
                 "type": "object",
+                "description": (
+                    "Three objects in these tool arguments: goal_alignment, "
+                    "decision_preference, and behavior_pattern. Each is text plus evidence. "
+                    "A sentence in thinking does not count."
+                ),
                 "properties": {
                     "goal_alignment": _evidence_text_props(),
                     "cognition_change": {
@@ -181,6 +135,76 @@ def submit_month_synthesis_schema() -> dict[str, Any]:
                 },
                 "required": ["goal_alignment", "decision_preference", "behavior_pattern"],
             },
+            "key_decisions": {
+                "type": "array",
+                "description": (
+                    "Standing rules synthesized from the month's decision cards, "
+                    "chosen after reading story_seeds. At most 12. text is the "
+                    "month's synthesis, not one daily clause. Do not set id."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "text": _judgment_string("Synthesis of the cited decision cards."),
+                        "why_it_matters": _judgment_string(
+                            "Required. At most 40 words. Why this rule would still change the next time."
+                        ),
+                        "context": _judgment_string("Where this rule applies."),
+                        "exceptions": _judgment_string("When this rule does not apply."),
+                        "evidence": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "description": (
+                                "Decision card ids copied from a card line. "
+                                "Each id must contain -decision-. A procedure id or a changed date fails this row."
+                            ),
+                        },
+                    },
+                    "required": ["text", "why_it_matters", "context", "exceptions", "evidence"],
+                },
+            },
+            "key_procedures": {
+                "type": "array",
+                "description": (
+                    "Reusable cases synthesized from the month's procedure cards. "
+                    "A finished one-day act is not a key row. At most 8. solution "
+                    "is the month's synthesis. Do not set id."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "trigger": _judgment_string("What starts this procedure."),
+                        "problem": _judgment_string("The problem this procedure addresses."),
+                        "obstacles": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                        "solution": _judgment_string("Synthesis of the cited procedure cards."),
+                        "insight": _judgment_string(
+                            "Required. At most 40 words. Why this procedure would still change the next time."
+                        ),
+                        "evidence": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "description": (
+                                "Procedure card ids copied from a card line. "
+                                "Each id must contain -procedure-. A decision id or a changed date fails this row."
+                            ),
+                        },
+                    },
+                    "required": ["trigger", "problem", "obstacles", "solution", "insight", "evidence"],
+                },
+            },
+            "summary": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "weeks": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["text"],
+                },
+            },
             "core_progress": {
                 "type": "array",
                 "minItems": 1,
@@ -193,7 +217,11 @@ def submit_month_synthesis_schema() -> dict[str, Any]:
                         "state": _judgment_string("Where this progress stands."),
                         "weeks": {"type": "array", "items": {"type": "string"}},
                         "entity_keys": {"type": "array", "items": {"type": "string"}},
-                        "evidence": {"type": "array", "items": {"type": "string"}},
+                        "evidence": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Card-line ids only. Do not change the date inside an id.",
+                        },
                     },
                     "required": ["title", "body", "state", "weeks", "entity_keys", "evidence"],
                 },
@@ -224,7 +252,11 @@ def submit_month_synthesis_schema() -> dict[str, Any]:
                         "content": _judgment_string("The risk for the user."),
                         "level": _judgment_string("How serious the risk is."),
                         "suggestion": _judgment_string("What the user should do about it."),
-                        "evidence": {"type": "array", "items": {"type": "string"}},
+                        "evidence": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Card-line ids only. Do not change the date inside an id.",
+                        },
                     },
                     "required": ["content", "level", "suggestion", "evidence"],
                 },

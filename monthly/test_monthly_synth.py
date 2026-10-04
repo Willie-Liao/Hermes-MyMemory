@@ -185,6 +185,14 @@ def test_cognition_change_requires_supersedes_pair():
 
 
 def test_reduce_prompt_is_same_rule_lines_and_blank_why_is_dropped():
+    """A mixed-type cite used to pass the prompt and come back as 'not a given card id'.
+
+    The first reduce call has to see the type rule and the portrait objects in the
+    tool arguments, and a later patch has to be told which procedure id sat on a
+    decision row.
+    """
+    from monthly_synth import judgment_gaps, normalize_synthesis_args
+
     facts = mechanical_facts("2026-08")
     prompt = build_reduce_prompt("2026-08", [], facts, carry="")
     assert "story_seeds" in prompt
@@ -194,12 +202,71 @@ def test_reduce_prompt_is_same_rule_lines_and_blank_why_is_dropped():
     assert "\n    \"id\"" not in prompt
     assert " | " in prompt
     assert "user_image.goal_alignment" in prompt
+    assert "Inside the tool arguments, user_image.goal_alignment" in prompt
+    assert "key_decisions.evidence may contain only decision ids." in prompt
+    assert "key_procedures.evidence may contain only procedure ids." in prompt
+    assert "One id of the other type fails that row." in prompt
+    assert "Do not change the date inside an id." in prompt
+    assert "must contain -decision-" in prompt
+    assert "Notes mix both kinds in one evidence list." in prompt
+    assert "Put every daily card you drew on in evidence." not in prompt
     assert "core_progress" in prompt
     assert "problems_and_risks" in prompt
     assert "next_month_focus" in prompt
     assert "No previous month judgment" in prompt
     real = next(b for b in facts.all_dpe if b.type == "decision")
     proc = next(b for b in facts.all_dpe if b.type == "procedure")
+    mixed = judgment_gaps(
+        {
+            "key_decisions": [
+                {
+                    "text": "standing rule",
+                    "why_it_matters": "still changes the next month",
+                    "context": "digest",
+                    "exceptions": "none",
+                    "evidence": [proc.id],
+                }
+            ]
+        },
+        facts,
+        comparison_exempt=True,
+    )
+    assert f"key_decisions[0].evidence cites procedure id {proc.id}" in mixed
+    cleaned, fixes = normalize_synthesis_args(
+        {
+            "key_decisions": [
+                {
+                    "text": "standing rule",
+                    "why_it_matters": "still changes the next month",
+                    "context": "digest",
+                    "exceptions": "none",
+                    "evidence": [real.id, proc.id],
+                }
+            ]
+        },
+        facts,
+    )
+    assert cleaned["key_decisions"][0]["evidence"] == [real.id]
+    assert any("key_decisions[0].evidence dropped" in line for line in fixes)
+    invented_id = "mem-2026-08-07-procedure-NOTACARD"
+    invented = judgment_gaps(
+        {
+            "problems_and_risks": [
+                {
+                    "content": "a risk",
+                    "level": "high",
+                    "suggestion": "drop the rewritten id",
+                    "evidence": [invented_id],
+                }
+            ]
+        },
+        facts,
+        comparison_exempt=True,
+    )
+    assert (
+        f"problems_and_risks[0].evidence cites {invented_id}, which is not a given card id"
+        in invented
+    )
     blank = payload_from_synthesis(
         "2026-08",
         {"summary": "x", "key_decisions": [{"id": real.id, "why_it_matters": "", "evidence": [real.id]}]},

@@ -78,15 +78,26 @@ REDUCE_PREFIX = (
     "If a card's only job is to carry out one story_seed, leave it out of "
     "key_decisions and key_procedures. "
     "Write key_decisions.text and key_procedures.solution as a synthesis of the same-type "
-    "cards you cite, not a paste of one clause. Put every daily card you drew on in "
-    "evidence. Do not set id. Code mints mem-YYYY-MM-key-decision-{hash} or "
+    "cards you cite, not a paste of one clause. "
+    "key_decisions.evidence may contain only decision ids. "
+    "key_procedures.evidence may contain only procedure ids. "
+    "One id of the other type fails that row. "
+    "Copy each evidence id from a card line. Do not change the date inside an id. "
+    "A key_decisions evidence id must contain -decision-. "
+    "A key_procedures evidence id must contain -procedure-. "
+    "Notes mix both kinds in one evidence list. Do not copy a note list onto a key row. "
+    "From that list, keep only the ids that contain -decision- on a key_decisions row, "
+    "and only the ids that contain -procedure- on a key_procedures row. "
+    "One leftover id of the other kind fails the whole row. "
+    "Do not set id. Code mints mem-YYYY-MM-key-decision-{hash} or "
     "mem-YYYY-MM-key-procedure-{hash} from the sorted evidence ids. Do not invent daily ids. "
     f"why_it_matters and insight are required and at most {NOTE_WORD_CAP} words. "
     "Cite only ids from the card lines. Do not copy Beginning/Course/Outcome/Obstacle. "
     "summary must be an array of one-line stories (text + weeks); never glue two seeds into one string. "
     "Do not invent obstacles or exceptions. "
-    "user_image.goal_alignment, user_image.decision_preference, and user_image.behavior_pattern "
-    "each need a non-empty text judgment about the user and evidence ids from the card lines. "
+    "Inside the tool arguments, user_image.goal_alignment, user_image.decision_preference, "
+    "and user_image.behavior_pattern must each be an object with non-empty text and card ids. "
+    "A sentence in thinking does not count. "
     "core_progress, problems_and_risks, and next_month_focus each need at least one row that is "
     "a judgment about the user, with evidence ids from the card lines. "
     "An empty string or an empty array is a failure, not a filled section."
@@ -737,7 +748,11 @@ def _normalize_node(node: Any, fixes: list[str], path: str) -> Any:
 def normalize_synthesis_args(
     args: Mapping[str, Any], facts: MechanicalFacts
 ) -> tuple[dict[str, Any], list[str]]:
-    """Fill mechanical counts the model is not asked to invent."""
+    """Drop a foreign id that rode in on a mixed note list before the gap check.
+
+    Map notes put decision and procedure ids in one evidence array. One leftover
+    foreign id fails the whole key row even when a same-type id is already there.
+    """
     fixes: list[str] = []
     normalized = _normalize_node(dict(args), fixes, "")
     image = normalized.get("user_image")
@@ -752,6 +767,21 @@ def normalize_synthesis_args(
     if isinstance(behavior, dict) and "metrics" not in behavior:
         behavior["metrics"] = dict(facts.behavior)
         fixes.append("behavior_pattern.metrics filled from mechanical facts")
+    decision_ids = {block.id for block in facts.all_dpe if block.type == "decision"}
+    procedure_ids = {block.id for block in facts.all_dpe if block.type == "procedure"}
+    for key, keep in (("key_decisions", decision_ids), ("key_procedures", procedure_ids)):
+        rows = normalized.get(key)
+        if not isinstance(rows, list):
+            continue
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            ids = _string_list(row.get("evidence"))
+            kept = [item for item in ids if item in keep]
+            if not kept or len(kept) == len(ids):
+                continue
+            row["evidence"] = kept
+            fixes.append(f"{key}[{index}].evidence dropped ids that are not {key} card ids")
     return normalized, fixes
 
 
@@ -768,7 +798,19 @@ def _bad_evidence(value: Any, allowed: set[str]) -> bool:
     return not ids or any(item not in allowed for item in ids)
 
 
-def _row_gaps(label: str, row: Mapping[str, Any], fields: tuple[str, ...], allowed: set[str]) -> list[str]:
+def _row_gaps(
+    label: str,
+    row: Mapping[str, Any],
+    fields: tuple[str, ...],
+    allowed: set[str],
+    foreign: set[str] | None = None,
+    foreign_kind: str = "",
+) -> list[str]:
+    """Name the bad id so the next try can drop that string instead of resending the row.
+
+    A wrong type and a date the model rewrote both used to come back as the same
+    unnamed line, so the patch kept the id that was not on a card line.
+    """
     gaps: list[str] = []
     for field in fields:
         if field in ("evidence",):
@@ -787,7 +829,20 @@ def _row_gaps(label: str, row: Mapping[str, Any], fields: tuple[str, ...], allow
         if _missing_text(row.get(field)):
             gaps.append(f"{label}.{field} is empty")
     if _bad_evidence(row.get("evidence"), allowed):
-        gaps.append(f"{label}.evidence is missing or not a given card id")
+        cited = next(
+            (item for item in _string_list(row.get("evidence")) if foreign and item in foreign),
+            "",
+        )
+        missing = next(
+            (item for item in _string_list(row.get("evidence")) if item not in allowed),
+            "",
+        )
+        if cited and foreign_kind:
+            gaps.append(f"{label}.evidence cites {foreign_kind} id {cited}")
+        elif missing:
+            gaps.append(f"{label}.evidence cites {missing}, which is not a given card id")
+        else:
+            gaps.append(f"{label}.evidence is missing or not a given card id")
     return gaps
 
 
@@ -811,7 +866,16 @@ def judgment_gaps(
         if _missing_text(row.get("text")):
             gaps.append(f"user_image.{key}.text is empty")
         if _bad_evidence(row.get("evidence"), allowed):
-            gaps.append(f"user_image.{key}.evidence is missing or not a given card id")
+            missing = next(
+                (item for item in _string_list(row.get("evidence")) if item not in allowed),
+                "",
+            )
+            if missing:
+                gaps.append(
+                    f"user_image.{key}.evidence cites {missing}, which is not a given card id"
+                )
+            else:
+                gaps.append(f"user_image.{key}.evidence is missing or not a given card id")
     changes = image.get("cognition_change") if isinstance(image.get("cognition_change"), list) else []
     if not comparison_exempt:
         if facts.supersedes_pairs:
@@ -864,23 +928,29 @@ def judgment_gaps(
                 ok = True
             if not ok:
                 gaps.append("user_image.cognition_change has no valid row")
-    for key, fields, id_set in (
+    for key, fields, id_set, foreign, foreign_kind in (
         (
             "core_progress",
             ("title", "body", "state", "weeks", "entity_keys"),
             allowed,
+            set(),
+            "",
         ),
         (
             "key_decisions",
             ("text", "why_it_matters", "context", "exceptions"),
             decision_ids,
+            procedure_ids,
+            "procedure",
         ),
         (
             "key_procedures",
             ("trigger", "problem", "obstacles", "solution", "insight"),
             procedure_ids,
+            decision_ids,
+            "decision",
         ),
-        ("problems_and_risks", ("content", "level", "suggestion"), allowed),
+        ("problems_and_risks", ("content", "level", "suggestion"), allowed, set(), ""),
     ):
         rows = args.get(key)
         if not isinstance(rows, list) or not rows:
@@ -890,7 +960,16 @@ def judgment_gaps(
             if not isinstance(row, dict):
                 gaps.append(f"{key}[{index}] is not an object")
                 continue
-            gaps.extend(_row_gaps(f"{key}[{index}]", row, fields, id_set))
+            gaps.extend(
+                _row_gaps(
+                    f"{key}[{index}]",
+                    row,
+                    fields,
+                    id_set,
+                    foreign,
+                    foreign_kind,
+                )
+            )
     focus = args.get("next_month_focus")
     if not isinstance(focus, list) or not focus:
         gaps.append("next_month_focus is empty")

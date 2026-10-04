@@ -30,18 +30,26 @@ resolve_agent_root() {
   return 1
 }
 
+pytest_python_ok() {
+  local py="$1"
+  [[ -n "$py" && -x "$py" ]] || return 1
+  "$py" -c "import pytest; import ruamel.yaml" >/dev/null 2>&1
+}
+
 resolve_pytest_python() {
-  if [[ -n "${HERMES_PYTHON:-}" && -x "${HERMES_PYTHON}" ]]; then
-    if "${HERMES_PYTHON}" -c "import pytest" >/dev/null 2>&1; then
-      echo "${HERMES_PYTHON}"
+  local candidates=()
+  [[ -n "${HERMES_PYTHON:-}" ]] && candidates+=("${HERMES_PYTHON}")
+  local home="${HERMES_HOME:-$HOME/.hermes}"
+  [[ -x "${home}/hermes-agent/.venv/bin/python" ]] && candidates+=("${home}/hermes-agent/.venv/bin/python")
+  command -v python3 >/dev/null 2>&1 && candidates+=("$(command -v python3)")
+  local py
+  for py in "${candidates[@]}"; do
+    if pytest_python_ok "$py"; then
+      echo "$py"
       return 0
     fi
-  fi
-  if command -v python3 >/dev/null 2>&1 && python3 -c "import pytest" >/dev/null 2>&1; then
-    command -v python3
-    return 0
-  fi
-  echo "error: python3 with pytest not found" >&2
+  done
+  echo "error: need python with pytest and ruamel.yaml (pip install pytest 'ruamel.yaml')" >&2
   return 1
 }
 
