@@ -42,6 +42,20 @@ INDEX_TYPES = {"fact", "procedure", "decision", "event", "decision_constraint"}
 TIME_WIDEN_STAGES = (0, 3, 7)
 TIME_HIT_FLOOR = 3
 
+BAND_FIDELITY_RULE = (
+    "Date fidelity: real memory ids follow the format "
+    "`mem-YYYY-MM-DD-<type>-<4-byte-hash>` (date + type + hash). "
+    "When the user's question is about a specific date or timeframe "
+    "(e.g. 'when did X happen?', 'last August'), only state the exact day "
+    "when the matching `mem-YYYY-MM-DD-...` id is visible in this context. "
+    "When the date is incidental (e.g. 'what did you help me with in "
+    "August?'), it is fine to answer with the approximate period "
+    "(month/season) you can read from the visible mem id or wrap-up text. "
+    "If you cannot find the date and the question needs precision, respond "
+    "in the user's language: 'I remember this was around {period}, but the "
+    "exact day needs verification — should I look it up?'"
+)
+
 
 def _plugin_subpath(name: str) -> Path:
     """Keep monthly/weekly imports on the plugin path so recall does not depend on Hermes cwd."""
@@ -995,7 +1009,7 @@ def render_bands(
     text = "\n\n".join(parts).rstrip() + "\n"
     if "blk ::" not in text:
         return ""
-    return text
+    return text + BAND_FIDELITY_RULE
 
 
 TOOL_SCHEMAS = [
