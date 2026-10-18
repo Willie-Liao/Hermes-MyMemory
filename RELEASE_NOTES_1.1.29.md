@@ -15,3 +15,4 @@
 
 - `/weekly update` returns the write status and token totals. The Chronicle brief stays in the week file instead of being pasted into chat.
 - The weekly token line keeps the finished ledger row at a newline offset, so a one-call update no longer prints zero tokens.
+- `/weekly update`, `close`, and `reopen` omit the week file path. Weixin was sending that `.md` path as a document attachment.
