@@ -5672,8 +5672,13 @@ def _maybe_run_digest(
     sync: bool = False,
     date_str: str | None = None,
     scope: str | None = None,
+    rewrite: bool | None = None,
 ) -> dict[str, Any]:
     """Decide digest: skip already-extracted windows, hold for the 12th reply, then launch.
+
+    ``rewrite=False`` lets a later session on the same slash day append. Hook
+    and clock callers leave it unset so ``--all`` / a past date still replace
+    the board.
 
     Crash/compaction must not extract the same turns twice. Auto runs wait for
     ``BATCH_USER_MESSAGES`` user turns, then take only those turns plus assistant
@@ -5896,6 +5901,8 @@ def _maybe_run_digest(
         "user": user_count,
         "assistant": assistant_count,
     }
+    do_rewrite = scope in {"all", "date"} if rewrite is None else rewrite
+    move_bookmark = scope != "date"
 
     if sync:
         outcome = _run_digest_worker(
@@ -5910,8 +5917,8 @@ def _maybe_run_digest(
             assistant_count=assistant_count,
             batch_start_id=batch_start_id,
             user_hashes=user_hashes,
-            rewrite=scope in {"all", "date"},
-            move_bookmark=scope != "date",
+            rewrite=do_rewrite,
+            move_bookmark=move_bookmark,
             wrapup=False,
         )
         return {"outcome": outcome, **base}
@@ -5932,6 +5939,8 @@ def _maybe_run_digest(
             "assistant_count": assistant_count,
             "batch_start_id": batch_start_id,
             "user_hashes": user_hashes,
+            "rewrite": do_rewrite,
+            "move_bookmark": move_bookmark,
         },
         name=f"memory-digest-{session_id[:8]}",
         daemon=True,

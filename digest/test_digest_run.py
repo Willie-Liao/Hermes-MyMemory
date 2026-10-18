@@ -630,3 +630,163 @@ def test_history_run_phase2_once_per_day(tmp_path, monkeypatch):
     assert out["outcome"] == "completed"
     assert len(p1_calls) >= 2
     assert p2_calls == [p2_calls[0]]
+
+
+def _write_day_db(home: Path, messages: list[tuple], sessions: list[tuple]) -> None:
+    """Messages plus a sessions table so a day scan can drop cron and subagents."""
+    import sqlite3
+
+    db = home / "state.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE messages ("
+        "id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, "
+        "content TEXT, timestamp REAL, active INTEGER)"
+    )
+    conn.execute(
+        "CREATE TABLE sessions ("
+        "id TEXT PRIMARY KEY, source TEXT, session_key TEXT, "
+        "started_at REAL, ended_at REAL)"
+    )
+    conn.executemany(
+        "INSERT INTO messages (id, session_id, role, content, timestamp, active) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        messages,
+    )
+    conn.executemany(
+        "INSERT INTO sessions (id, source, session_key, started_at, ended_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        sessions,
+    )
+    conn.commit()
+    conn.close()
+
+
+def _freeze_civil_day(dr, monkeypatch, day):
+    """Pin both the scan clock and the per-session day filter to one civil date."""
+    from datetime import datetime, timezone
+
+    noon = datetime(day.year, day.month, day.day, 4, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(dr, "_history_now", lambda now=None: noon)
+    monkeypatch.setattr(dr.digest, "hermes_local_today", lambda: day)
+    monkeypatch.setattr(dr.digest, "hermes_local_today_str", lambda: day.isoformat())
+    monkeypatch.setattr(dr.digest, "_message_local_day", lambda _msg: day)
+    return noon
+
+
+def test_request_digest_all_covers_user_sessions_and_clears_once(tmp_path, monkeypatch):
+    """--all rewrites the board on the first user chat and appends the next.
+
+    Cron and subagent rows on the same civil day must not become digest runs.
+    """
+    from datetime import date
+
+    dr = _load_digest_run()
+    digest = dr.digest
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    day = date(2020, 1, 2)
+    noon = _freeze_civil_day(dr, monkeypatch, day)
+    early = _ts(noon, hours=0)
+    later = _ts(noon, hours=-1)
+    _write_day_db(
+        tmp_path,
+        [
+            (1, "chat-a", "user", "packed lunch", early, 1),
+            (2, "chat-a", "assistant", "noted", early, 1),
+            (3, "cron_job", "user", "cron ping", early, 1),
+            (4, "sub-1", "user", "subagent aside", early, 1),
+            (5, "chat-b", "user", "flag practice", later, 1),
+            (6, "chat-b", "assistant", "drill saved", later, 1),
+        ],
+        [
+            ("chat-a", "weixin", "agent:main:weixin:dm:a", early, None),
+            ("chat-b", "desktop", None, later, None),
+            ("cron_job", "cron", None, early, early),
+            ("sub-1", "subagent", None, early, early),
+        ],
+    )
+    calls: list[dict] = []
+
+    def fake_worker(*args, **kwargs):
+        calls.append(
+            {
+                "session_id": args[1],
+                "rewrite": kwargs.get("rewrite"),
+                "move_bookmark": kwargs.get("move_bookmark"),
+            }
+        )
+        return "appended"
+
+    monkeypatch.setattr(digest, "_run_digest_worker", fake_worker)
+    result = dr.request_digest("", scope="all")
+    assert result["session_ids"] == ["chat-a", "chat-b"]
+    assert result["session_id"] == "2 sessions"
+    assert result["outcome"] == "appended"
+    assert [item["rewrite"] for item in calls] == [True, False]
+    assert [item["move_bookmark"] for item in calls] == [True, True]
+    assert result["user"] == 2
+    assert result["assistant"] == 2
+
+
+def test_request_digest_date_does_not_move_bookmarks(tmp_path, monkeypatch):
+    from datetime import date
+
+    dr = _load_digest_run()
+    digest = dr.digest
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    day = date(2020, 1, 2)
+    noon = _freeze_civil_day(dr, monkeypatch, day)
+    _write_day_db(
+        tmp_path,
+        [
+            (1, "chat-a", "user", "yesterday plan", noon.timestamp(), 1),
+            (2, "chat-b", "user", "yesterday review", noon.timestamp() + 10, 1),
+        ],
+        [
+            ("chat-a", "weixin", None, noon.timestamp(), None),
+            ("chat-b", "weixin", None, noon.timestamp(), None),
+        ],
+    )
+    calls: list[bool] = []
+    monkeypatch.setattr(
+        digest,
+        "_run_digest_worker",
+        lambda *args, **kwargs: calls.append(kwargs.get("move_bookmark")) or "skip",
+    )
+    result = dr.request_digest("", scope="date", date_str="2020-01-02")
+    assert result["outcome"] == "skip"
+    assert calls == [False, False]
+    assert result["session_ids"] == ["chat-a", "chat-b"]
+
+
+def test_request_digest_batch_skips_bookmarked_sessions(tmp_path, monkeypatch):
+    from datetime import date
+
+    dr = _load_digest_run()
+    digest = dr.digest
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    day = date(2020, 1, 2)
+    noon = _freeze_civil_day(dr, monkeypatch, day)
+    _write_state(tmp_path, session_id="chat-a", last_id=2)
+    _write_day_db(
+        tmp_path,
+        [
+            (1, "chat-a", "user", "already staged", noon.timestamp(), 1),
+            (2, "chat-a", "assistant", "done", noon.timestamp(), 1),
+            (3, "chat-b", "user", "still open", noon.timestamp() + 5, 1),
+        ],
+        [
+            ("chat-a", "weixin", None, noon.timestamp(), None),
+            ("chat-b", "desktop", None, noon.timestamp(), None),
+        ],
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(
+        digest,
+        "_run_digest_worker",
+        lambda *args, **kwargs: calls.append(args[1]) or "appended",
+    )
+    result = dr.request_digest("chat-a", scope="batch")
+    assert calls == ["chat-b"]
+    assert result["session_ids"] == ["chat-b"]
+    assert result["outcome"] == "appended"

@@ -15,7 +15,7 @@ import sqlite3
 import sys
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +50,205 @@ except ImportError:  # pragma: no cover - direct pytest collection path
 span_weekly.digest = digest
 
 
+_DAY_SCOPES = frozenset({"all", "batch", "date"})
+_EXCLUDED_CHAT_SOURCES = frozenset({"cron", "subagent"})
+
+
+def _user_sessions_on_civil_day(
+    db_path: Path,
+    target_day: str,
+    *,
+    now: datetime,
+    bookmarks: dict[str, int] | None,
+) -> list[dict[str, Any]]:
+    """List user-chat sessions that spoke on ``target_day``, oldest first.
+
+    Cron and subagent rows live in the same state.db. Digesting them would
+    put job chatter on the daily board. ``bookmarks`` set means slash --batch:
+    a session with nothing after its bookmark is not a run.
+    """
+    if not db_path.is_file():
+        return []
+    try:
+        conn = _open_messages_ro(db_path)
+    except sqlite3.Error:
+        return []
+    try:
+        rows = conn.execute(
+            """
+            SELECT m.id, m.session_id, m.role, m.content, m.timestamp,
+                   s.source AS source
+            FROM messages AS m
+            LEFT JOIN sessions AS s ON s.id = m.session_id
+            WHERE m.active = 1 AND m.role IN ('user', 'assistant')
+            """
+        ).fetchall()
+    except sqlite3.Error:
+        conn.close()
+        return []
+    conn.close()
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        sid = str(row["session_id"] or "")
+        if not sid or sid.startswith("cron_"):
+            continue
+        source = str(row["source"] or "")
+        if source in _EXCLUDED_CHAT_SOURCES:
+            continue
+        content = (row["content"] or "").strip()
+        if not content or content.startswith("[CONTEXT COMPACTION"):
+            continue
+        unix = _as_unix(row["timestamp"])
+        if unix is None or _local_day(unix, now) != target_day:
+            continue
+        mid = int(row["id"])
+        if bookmarks is not None and mid <= int(bookmarks.get(sid) or 0):
+            continue
+        slot = grouped.get(sid)
+        if slot is None or unix < float(slot["first_ts"]):
+            grouped[sid] = {
+                "session_id": sid,
+                "platform": source,
+                "first_ts": unix,
+            }
+    return sorted(grouped.values(), key=lambda item: (item["first_ts"], item["session_id"]))
+
+
+def _ensure_digest_session_rows(rows: list[dict[str, Any]]) -> None:
+    """Give each discovered transcript a digest-state row before the worker runs.
+
+    ``_maybe_run_digest`` stops at no_state when the key was never recorded,
+    which is a zero-token slash reply instead of an extract.
+    """
+    with digest._digest_lock:
+        state = digest._load_state()
+        sessions = state.setdefault("sessions", {})
+        changed = False
+        for row in rows:
+            sid = str(row["session_id"])
+            entry = sessions.get(sid)
+            if not isinstance(entry, dict):
+                sessions[sid] = {
+                    "session_id": sid,
+                    "platform": str(row.get("platform") or ""),
+                }
+                changed = True
+                continue
+            if not entry.get("session_id"):
+                entry["session_id"] = sid
+                changed = True
+            if row.get("platform") and not entry.get("platform"):
+                entry["platform"] = str(row["platform"])
+                changed = True
+            sessions[sid] = entry
+        if changed:
+            digest._save_state(state)
+
+
+def _combine_day_outcomes(results: list[dict[str, Any]], session_ids: list[str]) -> str:
+    """One slash line: a staged session wins, then a skip, then a hard failure."""
+    names = [str(item.get("outcome") or "") for item in results]
+    if "appended" in names:
+        return "appended"
+    if any(name in {"skip", "already_extracted"} for name in names):
+        return "skip"
+    if "failed" in names:
+        return "failed"
+    if "in_flight" in names:
+        return "in_flight"
+    if "no_state" in names:
+        return "no_state"
+    if session_ids:
+        return names[-1] if names else "empty"
+    return "empty"
+
+
+def _digest_user_chats_on_day(
+    session_key: str,
+    *,
+    reason: str,
+    force: bool,
+    sync: bool,
+    scope: str,
+    date_str: str | None,
+) -> dict[str, Any]:
+    """Digest every user chat on the slash's civil day, in message order.
+
+    The invoking session alone misses a /new earlier the same day. The first
+    ``--all`` or past-date session clears that day's file; the rest append.
+    """
+    from memory_staging import daily_staging_path
+
+    if scope == "date":
+        target = str(date_str or "").strip()
+        try:
+            date.fromisoformat(target)
+        except ValueError:
+            target = ""
+    else:
+        target = digest.hermes_local_today_str()
+    home = digest._hermes_home()
+    path = str(daily_staging_path(home, target)) if target else ""
+    if not target:
+        return {
+            "outcome": "empty",
+            "session_id": session_key,
+            "user": 0,
+            "assistant": 0,
+            "path": path,
+            "session_ids": [],
+        }
+    now = _history_now()
+    bookmarks = _session_bookmarks() if scope == "batch" else None
+    found = _user_sessions_on_civil_day(
+        home / "state.db",
+        target,
+        now=now,
+        bookmarks=bookmarks,
+    )
+    session_ids = [str(row["session_id"]) for row in found]
+    if not found:
+        return {
+            "outcome": "empty",
+            "session_id": session_key or "0 sessions",
+            "user": 0,
+            "assistant": 0,
+            "path": path,
+            "session_ids": [],
+        }
+    _ensure_digest_session_rows(found)
+    results: list[dict[str, Any]] = []
+    for index, row in enumerate(found):
+        rewrite = False if scope == "batch" else index == 0
+        results.append(
+            digest._maybe_run_digest(
+                str(row["session_id"]),
+                reason,
+                force=force,
+                sync=sync,
+                date_str=target if scope == "date" else None,
+                scope=scope,
+                rewrite=rewrite,
+            )
+        )
+    users = sum(int(item.get("user") or 0) for item in results)
+    assistants = sum(int(item.get("assistant") or 0) for item in results)
+    if len(session_ids) == 1:
+        label = str(results[0].get("session_id") or session_ids[0])
+    else:
+        label = f"{len(session_ids)} sessions"
+    return {
+        "outcome": _combine_day_outcomes(results, session_ids),
+        "session_id": label,
+        "session_key": session_key,
+        "user": users,
+        "assistant": assistants,
+        "path": str(results[-1].get("path") or path),
+        "session_ids": session_ids,
+        "runs": results,
+    }
+
+
 def request_digest(
     session_key: str,
     *,
@@ -59,23 +258,34 @@ def request_digest(
     scope: str | None = None,
     date_str: str | None = None,
 ) -> dict[str, Any]:
-    """Run a digest now. Defaults to a forced, synchronous run for slash use.
+    """Run a digest now. A slash day scope covers every user chat that day.
 
-    ``scope`` is the slash choice: today's full board, today's bookmark tail,
-    or one past civil date. The returned usage is that run's ledger delta.
+    Scope-less callers stay on one session. ``--all``, ``--batch``, and a past
+    date otherwise drop transcripts that are not the chat that typed the slash.
+    The returned usage is that run's ledger delta.
     """
     from worker_llm import sum_usage_after, usage_ledger_offset
 
     offset = usage_ledger_offset()
     started = time.monotonic()
-    result = digest._maybe_run_digest(
-        session_key,
-        reason,
-        force=force,
-        sync=sync,
-        date_str=date_str,
-        scope=scope,
-    )
+    if scope in _DAY_SCOPES:
+        result = _digest_user_chats_on_day(
+            session_key,
+            reason=reason,
+            force=force,
+            sync=sync,
+            scope=scope,
+            date_str=date_str,
+        )
+    else:
+        result = digest._maybe_run_digest(
+            session_key,
+            reason,
+            force=force,
+            sync=sync,
+            date_str=date_str,
+            scope=scope,
+        )
     usage = sum_usage_after(offset)
     result = dict(result)
     result["usage"] = usage

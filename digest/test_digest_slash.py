@@ -235,6 +235,68 @@ def test_history_matrix_and_confirm_gate(monkeypatch):
     assert seen["run"] == 2
 
 
+def test_force_run_without_gateway_session_still_scans(monkeypatch):
+    """A missing gateway session must not block a day scan that reads state.db."""
+    slash = _load_slash()
+    monkeypatch.setattr(slash, "_active_session", lambda: None)
+    seen: dict = {}
+
+    def fake(sk, **kw):
+        seen["key"] = sk
+        seen["scope"] = kw.get("scope")
+        return {
+            "outcome": "appended",
+            "session_id": "2 sessions",
+            "user": 2,
+            "assistant": 1,
+            "usage": {"input_tokens": 4, "output_tokens": 1},
+            "seconds": 0.4,
+            "path": "/tmp/2020-01-02.md",
+        }
+
+    monkeypatch.setattr(slash.digest_run, "request_digest", fake)
+    out = slash.handle_digest("--all")
+    assert seen == {"key": "", "scope": "all"}
+    assert "2 sessions" in out
+    assert "input_tokens=4" in out
+
+
+def test_active_session_maps_weixin_routing_key(tmp_path, monkeypatch):
+    """The WeChat routing address is not the digest-state key; the transcript id is."""
+    import sqlite3
+
+    slash = _load_slash()
+    monkeypatch.setattr(slash.digest, "get_hermes_home", lambda: tmp_path)
+    state = tmp_path / "memories" / "staging" / ".digest-state.json"
+    state.parent.mkdir(parents=True)
+    state.write_text(
+        '{"sessions": {"sess-live": {"session_id": "sess-live", "platform": "weixin"}}}',
+        encoding="utf-8",
+    )
+    db = tmp_path / "state.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, session_key TEXT, "
+        "started_at REAL, ended_at REAL)"
+    )
+    conn.execute(
+        "INSERT INTO sessions VALUES (?, ?, ?, ?, ?)",
+        ("sess-old", "weixin", "agent:main:weixin:dm:route", 1.0, 2.0),
+    )
+    conn.execute(
+        "INSERT INTO sessions VALUES (?, ?, ?, ?, ?)",
+        ("sess-live", "weixin", "agent:main:weixin:dm:route", 3.0, None),
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(
+        slash,
+        "resolve_session",
+        lambda _raw="": ("agent:main:weixin:dm:route", "agent:main:weixin:dm:route"),
+    )
+    assert slash._active_session() == ("sess-live", "sess-live")
+
+
 def test_history_help_lists_presets(monkeypatch):
     slash = _load_slash()
     out = slash.handle_digest("help")

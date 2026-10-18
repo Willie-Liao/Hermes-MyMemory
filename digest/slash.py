@@ -22,6 +22,7 @@ from __future__ import annotations
 import importlib.util
 import re
 import shlex
+import sqlite3
 import sys
 from datetime import date
 from pathlib import Path
@@ -38,13 +39,66 @@ from memory_staging import resolve_session
 from worker_llm import format_token_line
 
 
+def _digest_state_has(session_key: str) -> bool:
+    """True when digest state already tracks this key, so slash must not remap it."""
+    with digest._digest_lock:
+        state = digest._load_state()
+    entry = (state.get("sessions") or {}).get(session_key)
+    return isinstance(entry, dict) and bool(entry)
+
+
+def _transcript_id_for_gateway_key(session_key: str) -> str | None:
+    """Map a WeChat routing key to the open Hermes transcript id.
+
+    Plugin slash dispatch binds HERMES_SESSION_KEY and leaves HERMES_SESSION_ID
+    empty, so a lookup on the routing address misses digest state and returns
+    zero tokens.
+    """
+    if not session_key:
+        return None
+    db_path = digest._hermes_home() / "state.db"
+    if not db_path.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db_path.resolve()}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                """
+                SELECT id FROM sessions
+                WHERE session_key = ?
+                ORDER BY (ended_at IS NULL) DESC, started_at DESC
+                LIMIT 1
+                """,
+                (session_key,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+    if not row or not row[0]:
+        return None
+    return str(row[0])
+
+
 def _active_session() -> tuple[str, str] | None:
     """Resolve the current Hermes session from gateway context only.
 
     Digest slash commands never accept ``--session``; they always target the
-    session that invoked the slash command.
+    session that invoked the slash command. A routing key with no digest row
+    is replaced by the open transcript id, which is what hooks actually store.
     """
-    return resolve_session("")
+    resolved = resolve_session("")
+    if resolved is None:
+        return None
+    session_key, session_id = resolved
+    if _digest_state_has(session_key):
+        return session_key, session_id or session_key
+    if session_id and session_id != session_key and _digest_state_has(session_id):
+        return session_id, session_id
+    mapped = _transcript_id_for_gateway_key(session_key)
+    if mapped:
+        return mapped, mapped
+    return session_key, session_id or session_key
 
 
 try:  # package import (normal plugin load)
@@ -123,10 +177,13 @@ def _past_day(day_text: str) -> str:
 
 
 def _force_run(scope: str, date_str: str | None = None) -> str:
+    """Start a day digest even when the gateway bound no transcript id.
+
+    ``--all``, ``--batch``, and a past date scan state.db themselves. Refusing
+    here made a WeChat slash return zero tokens before that scan could run.
+    """
     resolved = _active_session()
-    if resolved is None:
-        return _no_session()
-    session_key, _session_id = resolved
+    session_key = resolved[0] if resolved else ""
 
     result = digest_run.request_digest(
         session_key,
