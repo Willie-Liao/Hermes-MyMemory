@@ -90,8 +90,6 @@ RSYNC_EXCLUDES=(
   --exclude '.pytest_cache/'
   --exclude 'node_modules/'
   --exclude 'weekly/ui/dist/'
-  --exclude 'weekly/debug_w38_worker1_events.py'
-  --exclude 'weekly/test_w38_sunday_evening_patch.py'
   --exclude '.vite/'
   --exclude '*.pyc'
   --exclude '.DS_Store'
@@ -118,10 +116,6 @@ echo ""
 rsync -a "${RSYNC_EXCLUDES[@]}" "$PACK_ROOT/" "$DEST/"
 # AppleDouble sidecars match *.py and are not UTF-8, so source scans fail after a Mac pack.
 find "$DEST" -name '._*' -delete
-# Week-specific debug harnesses are not part of the supported install test suite.
-rm -f \
-  "$DEST/weekly/debug_w38_worker1_events.py" \
-  "$DEST/weekly/test_w38_sunday_evening_patch.py"
 echo "installed: plugins/MyMemory"
 
 resolve_runtime_python() {
