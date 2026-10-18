@@ -112,7 +112,8 @@ def test_update_pastes_brief_not_distill(tmp_path, monkeypatch):
     assert "Distill body" not in out
     assert "refer to [" not in out.lower()
     lines = [line for line in out.splitlines() if line.strip()]
-    assert lines[0].startswith("/weekly update: wrote 2026-W24 from 3 daily file(s) ->")
+    assert lines[0] == "/weekly update: wrote 2026-W24 from 3 daily file(s)"
+    assert str(week_path) not in out
     assert "input_tokens=6913" in out
     assert "output_tokens=2072" in out
     assert "seconds=" in out
@@ -323,6 +324,7 @@ def test_close_anytime(monkeypatch):
     assert captured["enforce_sunday"] is False
     assert "closed" in out.lower()
     assert "2026-W28" in out
+    assert "/tmp/2026-W29 reviewed.md" not in out
 
 
 def test_close_default_current_iso(monkeypatch):
@@ -387,6 +389,7 @@ def test_reopen_week(monkeypatch):
     assert captured["week"] == "2026-W28"
     assert "reopened" in out.lower()
     assert "2026-W28" in out
+    assert "/tmp/2026-W28.md" not in out
 
 
 def test_reopen_default_current_iso(monkeypatch):

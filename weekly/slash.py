@@ -113,6 +113,8 @@ def _update(args: list[str]) -> str:
     """Return a status line and token totals so the week summary stays in the file, not the chat.
 
     Pasting the Chronicle brief made /weekly update unlike /digest and /monthly update.
+    Weixin sends any absolute .md path in the reply as a document, so the rewrite
+    status omits the week path. A later user request can still name the file.
     """
     week_key = _week_arg(args)
     offset = usage_ledger_offset()
@@ -139,7 +141,7 @@ def _update(args: list[str]) -> str:
         weekly_mod._save_state(state)
         footer = (
             f"/weekly update: wrote {result.get('week')} from "
-            f"{result.get('sources')} daily file(s) -> {result.get('path')}"
+            f"{result.get('sources')} daily file(s)"
         )
         return footer + "\n" + _usage_line(result, offset, started)
     if outcome == "failed":
@@ -152,6 +154,10 @@ def _update(args: list[str]) -> str:
 
 
 def _close(args: list[str]) -> str:
+    """Close without embedding the week path, so Weixin does not attach the file.
+
+    The status line is enough. Sending the markdown waits for an explicit user ask.
+    """
     week_key = _week_arg(args)
     result = weekly_actions.close_week(week_key, enforce_sunday=False)
     outcome = result.get("outcome")
@@ -173,13 +179,17 @@ def _close(args: list[str]) -> str:
         if result.get("empty_week"):
             return (
                 f"/weekly close: closed empty week {week} "
-                f"(no current news) -> {result.get('path')}"
+                f"(no current news)"
             )
-        return f"/weekly close: closed {week} -> {result.get('path')}"
+        return f"/weekly close: closed {week}"
     return f"/weekly close: unexpected outcome {outcome!r}."
 
 
 def _reopen(args: list[str]) -> str:
+    """Reopen without embedding the week path, so Weixin does not attach the file.
+
+    The status line is enough. Sending the markdown waits for an explicit user ask.
+    """
     week_key = _week_arg(args)
     result = weekly_actions.reopen_week(week_key)
     outcome = result.get("outcome")
@@ -193,7 +203,7 @@ def _reopen(args: list[str]) -> str:
         restored = result.get("restored_blocks") or []
         return (
             f"/weekly reopen: reopened {week} "
-            f"({len(restored)} block(s) restored) -> {result.get('path')}"
+            f"({len(restored)} block(s) restored)"
         )
     return f"/weekly reopen: unexpected outcome {outcome!r}."
 
