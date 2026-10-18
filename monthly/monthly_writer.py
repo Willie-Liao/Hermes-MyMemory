@@ -148,7 +148,10 @@ def _evidence_text(raw: Any) -> MonthlyEvidenceText:
 
 
 def payload_from_dict(obj: dict[str, Any]) -> MonthlyPayload:
-    """Re-coerce YAML strings into dataclasses so callers never see leftover dicts."""
+    """Re-coerce YAML strings into dataclasses so callers never see leftover dicts.
+
+    A leftover comparison summary key is ignored so older month files still load.
+    """
     img = obj.get("user_image") if isinstance(obj.get("user_image"), dict) else {}
     rng = obj.get("range") if isinstance(obj.get("range"), dict) else {}
     gen = obj.get("generator") if isinstance(obj.get("generator"), dict) else {}
@@ -293,7 +296,6 @@ def payload_from_dict(obj: dict[str, Any]) -> MonthlyPayload:
             unchanged=changes("unchanged"),
             changed=changes("changed"),
             suggestion=str(cmp_raw.get("suggestion") or ""),
-            summary=str(cmp_raw.get("summary") or ""),
             empty_reason=str(cmp_raw.get("empty_reason") or ""),
         ),
         next_month_focus=tuple(
@@ -348,6 +350,58 @@ def payload_from_dict(obj: dict[str, Any]) -> MonthlyPayload:
         schema_version=int(obj.get("schema_version") or 1),
         cycle=str(obj.get("cycle") or "monthly"),
     )
+
+
+def drop_retired_comparison_summary(text: str) -> str:
+    """Drop the retired comparison paragraph so an old month file matches the writer.
+
+    The month-level summary list stays. Only a summary key under
+    comparison_with_last_month is removed, including a folded continuation,
+    so install does not rewrite the rest of the file.
+    """
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    in_cmp = False
+    cmp_indent = 0
+    child_indent: int | None = None
+    skipping = False
+    skip_indent = 0
+    for line in lines:
+        body = line.rstrip("\r\n")
+        if skipping:
+            if not body.strip():
+                continue
+            indent = len(body) - len(body.lstrip(" "))
+            if indent > skip_indent:
+                continue
+            skipping = False
+        if not body.strip() or body.lstrip().startswith("#"):
+            out.append(line)
+            continue
+        indent = len(body) - len(body.lstrip(" "))
+        key = body.strip().split(":", 1)[0]
+        if in_cmp and indent <= cmp_indent:
+            in_cmp = False
+            child_indent = None
+        if not in_cmp and key == "comparison_with_last_month":
+            in_cmp = True
+            cmp_indent = indent
+            child_indent = None
+            out.append(line)
+            continue
+        if in_cmp and child_indent is None and indent > cmp_indent:
+            child_indent = indent
+        if (
+            in_cmp
+            and child_indent is not None
+            and indent == child_indent
+            and key == "summary"
+        ):
+            skipping = True
+            skip_indent = indent
+            continue
+        out.append(line)
+    return "".join(out)
 
 
 def loads(raw: str) -> MonthlyPayload:

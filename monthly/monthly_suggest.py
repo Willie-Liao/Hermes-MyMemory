@@ -33,7 +33,9 @@ _SCHEMAS = (
     "core_progress",
     "key_decision",
     "key_procedure",
-    "comparison_with_last_month",
+    "comparison_unchanged",
+    "comparison_changed",
+    "comparison_suggestion",
 )
 _SCHEMA_SET = frozenset(_SCHEMAS)
 GUIDE = (
@@ -122,20 +124,17 @@ def compact_month(payload: Any) -> dict[str, Any]:
         if tagged:
             sections.append(tagged)
     comparison = payload.comparison_with_last_month
-    for row in comparison.changed:
-        tagged = _tagged("comparison_with_last_month", row.text)
-        if tagged:
-            sections.append(tagged)
     for row in comparison.unchanged:
-        tagged = _tagged("comparison_with_last_month", row.text)
+        tagged = _tagged("comparison_unchanged", row.text)
         if tagged:
             sections.append(tagged)
-    suggestion = _tagged("comparison_with_last_month", comparison.suggestion)
+    for row in comparison.changed:
+        tagged = _tagged("comparison_changed", row.text)
+        if tagged:
+            sections.append(tagged)
+    suggestion = _tagged("comparison_suggestion", comparison.suggestion)
     if suggestion:
         sections.append(suggestion)
-    summary = _tagged("comparison_with_last_month", comparison.summary)
-    if summary:
-        sections.append(summary)
     return {"month_key": payload.key, "sections": sections}
 
 
@@ -194,7 +193,7 @@ def _items_from_result(result: dict[str, Any], sections: list[str]) -> list[dict
 
 
 def _format_reply(record: dict[str, Any]) -> str:
-    """Print each monthly section on its own, with the bucket on the following line."""
+    """Print one plain line per item so markdown inside a body cannot open a new heading."""
     lines = ["## Monthly suggest"]
     missing = record.get("missing") or []
     if missing:
@@ -210,8 +209,9 @@ def _format_reply(record: dict[str, Any]) -> str:
         wrote = True
         lines.append(f"### {name}")
         for item in rows:
-            lines.append(f"- {item['text']}")
-            lines.append(f"  suggested to add to: [{item['bucket']}]")
+            text = str(item["text"]).replace("```", " ").replace("**", "").replace("#", "")
+            text = " ".join(text.split())
+            lines.append(f"- {text} → {item['bucket']}")
     if not wrote:
         lines.append("(no suggestions)")
     lines.append("")

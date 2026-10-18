@@ -83,7 +83,13 @@ def _filled_args(facts) -> dict:
             }
         ],
         "comparison_with_last_month": {
-            "summary": "The standing goal held and the preference got sharper.",
+            "unchanged": [
+                {"text": "The standing goal held.", "evidence": [decision.id]},
+            ],
+            "changed": [
+                {"text": "The preference got sharper.", "evidence": [decision.id]},
+            ],
+            "suggestion": "Keep the sharper preference next month.",
         },
     }
 
@@ -564,21 +570,26 @@ def test_reduce_prompt_compares_last_month_user_image():
     facts = mechanical_facts("2026-08")
     prompt = build_reduce_prompt("2026-08", [], facts, carry_card("2026-07"))
     assert "Keep the July goal." in prompt
-    assert "comparison_with_last_month.summary" in prompt
-    assert "needs a changed or unchanged row" not in prompt
+    assert "comparison_with_last_month.unchanged and changed" in prompt
+    assert "Leave unchanged and changed empty" not in prompt
+    assert "comparison_with_last_month.summary" not in prompt
 
 
-def test_comparison_summary_gap_follows_the_sentence():
+def test_comparison_row_gap_names_a_bad_evidence_id():
     from monthly_synth import judgment_gaps
 
     facts = mechanical_facts("2026-08")
     empty = _filled_args(facts)
-    empty["comparison_with_last_month"] = {"summary": ""}
+    empty["comparison_with_last_month"] = {
+        "unchanged": [],
+        "changed": [{"text": "The preference got sharper.", "evidence": ["mem-not-a-card"]}],
+        "suggestion": "",
+    }
     gaps = judgment_gaps(empty, facts, comparison_exempt=False)
-    assert any("comparison_with_last_month.summary is empty" in gap for gap in gaps)
-    gaps = judgment_gaps(_filled_args(facts), facts, comparison_exempt=False)
-    assert not any("comparison_with_last_month.summary" in gap for gap in gaps)
-    assert not any("changed or unchanged" in gap for gap in gaps)
+    assert any("mem-not-a-card" in gap for gap in gaps)
+    assert any("comparison_with_last_month.suggestion is empty" in gap for gap in gaps)
+    filled = judgment_gaps(_filled_args(facts), facts, comparison_exempt=False)
+    assert not any(gap.startswith("comparison_with_last_month") for gap in filled)
 
 
 def test_payload_from_synthesis_passes_bilingual_aliases():

@@ -1,47 +1,17 @@
-"""One live MiniMax-M2.5 reduce after the judgment schema is on disk.
+"""One live suggest call. The installer ignores this file.
 
-The installer ignores this file. REAL_LLM_TEST=0 skips it so a unit run cannot
-spend a model call.
+The old live reduce of 2026-06 wrote the real month home and only checked the
+retry log. That test is gone so a REAL_LLM_TEST run cannot rewrite June.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from pathlib import Path
 
 import pytest
-
-
-def _report(usage: dict, wrote: bool) -> str:
-    lines: list[str] = []
-    attempts = list(usage.get("attempts") or [])
-    for row in attempts:
-        lines.append(f"try {row.get('n')}  {row.get('tool')}")
-        teaching = str(row.get("reason") or "").strip()
-        lines.append("  teaching: " + (teaching if teaching else "(none)"))
-        failed = row.get("failed") or []
-        lines.append("  failed: " + (", ".join(failed) if failed else "(none)"))
-        retired = row.get("retired") or []
-        if retired:
-            lines.append("  retired: " + ", ".join(retired))
-        fixes = row.get("format_fixes") or []
-        if fixes:
-            lines.append("  format_fixes: " + "; ".join(fixes) + " (no model)")
-        lines.append(
-            "  input_tokens / output_tokens / total_tokens: "
-            f"{row.get('input_tokens')} / {row.get('output_tokens')} / {row.get('total_tokens')}"
-        )
-        lines.append(f"  duration_ms: {row.get('duration_ms')}")
-    lines.append("overall")
-    lines.append(
-        "  input_tokens / output_tokens / total_tokens: "
-        f"{usage.get('input_tokens')} / {usage.get('output_tokens')} / {usage.get('total_tokens')}"
-    )
-    latency = sum(int(row.get("duration_ms") or 0) for row in attempts)
-    lines.append(f"  latency_ms: {latency}")
-    lines.append(f"  write_month: {'yes' if wrote else 'no'}")
-    return "\n".join(lines)
 
 
 def _load_env_file(path: Path) -> None:
@@ -63,26 +33,89 @@ def _load_env_file(path: Path) -> None:
             os.environ[key] = val
 
 
-def test_live_reduce_records_steps(tmp_path: Path) -> None:
-    """Call generate_month for real so a section retry shows why it was sent back."""
+def test_live_suggest_format(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Print one October suggest reply so the flat lines and the bill are visible.
+
+    A temp home keeps the real 2026-10.md untouched. Comparison rows are filled
+    here so the three headings appear without a full month reduce.
+    """
     flag = os.environ.get("REAL_LLM_TEST", "0").strip().lower()
     if flag in {"", "0", "false", "no"}:
         pytest.skip("skipped=true tokens=0")
+    import time
+    from dataclasses import replace
+
+    from monthly_schema import MonthlyComparison, MonthlyComparisonChange
+    from monthly_suggest import suggest_from_tokens
+    from monthly_writer import loads, write_month
+    from worker_llm import _ledger_path, usage_ledger_offset
+
     home = Path(__file__).resolve().parents[3]
     for name in ("config.yaml", ".env"):
         source = home / name
         if source.is_file():
             shutil.copy(source, tmp_path / name)
     _load_env_file(tmp_path / ".env")
-    from monthly_actions import generate_month
-
-    result = generate_month("2026-06", reason="live-reduce", force_refresh=True)
-    usage = result.get("usage") or {}
-    wrote = result.get("outcome") == "ok"
-    text = _report(usage, wrote)
-    print(text)
-    assert "try 1" in text
-    assert "overall" in text
-    assert usage.get("model") == "MiniMax-M2.5"
-    assert int(usage.get("total_tokens") or 0) > 0
-    assert usage.get("attempts")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    source_month = home / "memories" / "staging" / "monthly" / "2026-10.md"
+    payload = loads(source_month.read_text(encoding="utf-8"))
+    evidence = ("mem-2026-10-02-decision-A440FC874ADF",)
+    payload = replace(
+        payload,
+        comparison_with_last_month=MonthlyComparison(
+            unchanged=(
+                MonthlyComparisonChange(
+                    text="Goal alignment stays AI education and skill creation.",
+                    evidence=evidence,
+                ),
+            ),
+            changed=(
+                MonthlyComparisonChange(
+                    text="Decision preference now includes literal dating-file adds.",
+                    evidence=evidence,
+                ),
+            ),
+            suggestion="Keep the parent-message tone on the next month's messages.",
+        ),
+    )
+    write_month(payload)
+    offset = usage_ledger_offset()
+    started = time.perf_counter()
+    text = suggest_from_tokens(["2026-10"])
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0}
+    ledger = _ledger_path()
+    if ledger.is_file():
+        with ledger.open(encoding="utf-8") as handle:
+            handle.seek(offset)
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("purpose") != "monthly-suggest":
+                    continue
+                totals["input_tokens"] += int(rec.get("input_tokens") or 0)
+                totals["output_tokens"] += int(rec.get("output_tokens") or 0)
+                totals["total_tokens"] += int(rec.get("total_tokens") or 0)
+                totals["cost_usd"] += float(rec.get("cost_usd") or 0.0)
+    report = (
+        f"{text}\n"
+        f"input_tokens / output_tokens / total_tokens: "
+        f"{totals['input_tokens']} / {totals['output_tokens']} / {totals['total_tokens']}\n"
+        f"cost_usd: {totals['cost_usd']:.6f}\n"
+        f"latency_ms: {latency_ms}"
+    )
+    print(report)
+    assert "## Monthly suggest" in text
+    assert "### comparison_unchanged" in text
+    assert "### comparison_changed" in text
+    assert "### comparison_suggestion" in text
+    assert "suggested to add to:" not in text
+    for line in text.splitlines():
+        if line.startswith("- "):
+            assert "#" not in line and "**" not in line and "→" in line
+    assert totals["total_tokens"] > 0
