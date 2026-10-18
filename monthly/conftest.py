@@ -1,4 +1,8 @@
-"""Put monthly/ and MyMemory on sys.path so pytest collection matches weekly's flat imports."""
+"""Keep monthly/ ahead of weekly/ so install pytest loads the real month schema.
+
+weekly/monthly_schema.py is a stub. If it is inserted after monthly/, collection
+imports that stub and the month tests fail when install runs pytest from the plugin root.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +15,7 @@ _monthly = Path(__file__).resolve().parent
 _mymemory = _monthly.parent
 _weekly = _mymemory / "weekly"
 _digest = _mymemory / "digest"
-for path in (_monthly, _mymemory, _weekly, _digest):
+for path in (_digest, _weekly, _mymemory, _monthly):
     text = str(path)
     if text not in sys.path:
         sys.path.insert(0, text)

@@ -186,15 +186,18 @@ def _cognition_case_line(month_key: str, facts: MechanicalFacts) -> str:
     portrait_first = (
         "In this tool call, user_image.goal_alignment, user_image.decision_preference, and "
         "user_image.behavior_pattern must each be an object with non-empty text and card ids. "
-        "null fails the month. Write those three objects before comparison_with_last_month.summary."
+        "null fails the month. Write those three objects before comparison_with_last_month."
     )
-    summary_rule = (
-        "Then write comparison_with_last_month.summary as one summary of how those three objects "
-        "differ from last month's user_image lines on the carry card. Leave unchanged and changed empty."
+    comparison_rule = (
+        "Then write comparison_with_last_month.unchanged and changed as rows of text plus evidence card ids, "
+        "comparing those three objects with last month's user_image lines on the carry card. "
+        "At least one of those two lists must have a row. "
+        "Write comparison_with_last_month.suggestion as one sentence drawn from the changed rows."
     )
     if not _previous_has_judgment(month_key):
         return (
-            "No previous month judgment. Leave cognition_change and comparison_with_last_month.summary empty. "
+            "No previous month judgment. Leave cognition_change empty and leave "
+            "comparison_with_last_month unchanged, changed, and suggestion empty. "
             "Code writes no information from last month. "
             + portrait_first
         )
@@ -207,13 +210,13 @@ def _cognition_case_line(month_key: str, facts: MechanicalFacts) -> str:
             + listed
             + ". Do not invent a pair. Do not send an empty string and do not send the phrase "
             "no information from last month. "
-            + summary_rule
+            + comparison_rule
         )
     return (
         portrait_first
         + " Previous month has a judgment. Write cognition_change as text plus evidence only. "
         "Do not send an empty string and do not send the phrase no information from last month. "
-        + summary_rule
+        + comparison_rule
     )
 
 
@@ -626,7 +629,6 @@ def payload_from_synthesis(
             unchanged=_changes("unchanged"),
             changed=_changes("changed"),
             suggestion=str(cmp_raw.get("suggestion") or ""),
-            summary=" ".join(str(cmp_raw.get("summary") or "").split()),
         )
 
     focus: list[MonthlyFocus] = []
@@ -1018,11 +1020,34 @@ def judgment_gaps(
                 gaps.append(f"next_month_focus[{index}].depends_on is missing")
     if not comparison_exempt:
         cmp_raw = args.get("comparison_with_last_month")
-        summary = ""
-        if isinstance(cmp_raw, dict):
-            summary = " ".join(str(cmp_raw.get("summary") or "").split())
-        if not summary or summary == _NO_LAST_MONTH:
-            gaps.append("comparison_with_last_month.summary is empty")
+        if not isinstance(cmp_raw, dict):
+            gaps.append("comparison_with_last_month is missing")
+        else:
+            suggestion = " ".join(str(cmp_raw.get("suggestion") or "").split())
+            if not suggestion or suggestion == _NO_LAST_MONTH:
+                gaps.append("comparison_with_last_month.suggestion is empty")
+            valid = 0
+            for key in ("unchanged", "changed"):
+                rows = cmp_raw.get(key)
+                if not isinstance(rows, list):
+                    continue
+                for index, row in enumerate(rows):
+                    if not isinstance(row, dict):
+                        gaps.append(f"comparison_with_last_month.{key}[{index}] is not an object")
+                        continue
+                    before = len(gaps)
+                    gaps.extend(
+                        _row_gaps(
+                            f"comparison_with_last_month.{key}[{index}]",
+                            row,
+                            ("text",),
+                            allowed,
+                        )
+                    )
+                    if len(gaps) == before:
+                        valid += 1
+            if valid == 0:
+                gaps.append("comparison_with_last_month has no unchanged or changed row")
     return gaps
 
 
@@ -1163,7 +1188,6 @@ def synthesize_month(
                 "unchanged": [],
                 "changed": [],
                 "suggestion": "",
-                "summary": "",
                 "empty_reason": _NO_LAST_MONTH,
             }
             format_fixes.append("comparison_with_last_month empty_reason set by code")

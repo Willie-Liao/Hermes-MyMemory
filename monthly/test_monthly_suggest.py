@@ -130,7 +130,8 @@ def test_suggest_saves_numbered_items(monkeypatch):
     assert "evidence" not in record["items"][0]
     assert len(record["items"]) == 3
     assert "### key_decision" in text
-    assert "suggested to add to: [USER.md]" in text
+    assert "- keep bilingual parent notes → USER.md" in text
+    assert "suggested to add to:" not in text
     assert "from a number" not in text
     assert "create a skill" in text
     assert "add" in text and "replace" in text and "remove" in text
@@ -144,14 +145,16 @@ def test_suggest_keeps_a_bare_item(monkeypatch):
         return {
             "failed": False,
             "tool_args": {
-                "text": "keep bilingual parent notes",
+                "text": "# Skill title\n**Trigger:** do the thing",
                 "bucket": "USER.md",
             },
         }
 
     text = suggest_from_tokens(["2026-08"], call_oneshot=fake)
+    bullet = next(line for line in text.splitlines() if line.startswith("- "))
     assert "### key_decision" in text
-    assert "suggested to add to: [USER.md]" in text
+    assert bullet == "- Skill title Trigger: do the thing → USER.md"
+    assert "#" not in bullet and "**" not in bullet
     assert "(no suggestions)" not in text
 
 
@@ -175,6 +178,6 @@ def test_suggest_keeps_nested_items_without_schema(monkeypatch):
         }
 
     text = suggest_from_tokens(["2026-08"], call_oneshot=fake)
-    assert text.count("suggested to add to:") == 3
+    assert text.count("→ USER.md") == 3
     assert "should not attach" not in text
     assert "### key_procedure" in text

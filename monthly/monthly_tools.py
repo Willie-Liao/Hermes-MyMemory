@@ -83,6 +83,18 @@ def submit_month_synthesis_schema() -> dict[str, Any]:
 
     The worker returns JSON tool arguments. YAML is rendered later by dump_yaml.
     """
+    comparison_row = {
+        "type": "object",
+        "properties": {
+            "text": _judgment_string("One portrait line versus last month."),
+            "evidence": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Card-line ids only. Do not change the date inside an id.",
+            },
+        },
+        "required": ["text", "evidence"],
+    }
     return _schema(
         "submit_month_synthesis",
         "Synthesize the month as JSON tool arguments, not a YAML document. "
@@ -93,15 +105,15 @@ def submit_month_synthesis_schema() -> dict[str, Any]:
         "key_decisions.evidence is decision ids only. key_procedures.evidence is procedure ids only. "
         "Notes mix both kinds in one list. Keep only -decision- ids on a decision row "
         "and only -procedure- ids on a procedure row. One leftover id of the other kind fails the row. "
-        "comparison_with_last_month.summary is one summary of this month's user_image "
-        "against last month's user_image lines. Leave unchanged and changed empty.",
+        "comparison_with_last_month.unchanged and changed are rows of text plus evidence card ids "
+        "against last month's user_image lines. suggestion is one sentence from the changed rows.",
         {
             "user_image": {
                 "type": "object",
                 "description": (
                     "Three objects in these tool arguments, never null: goal_alignment, "
                     "decision_preference, and behavior_pattern. Each is text plus evidence. "
-                    "A sentence in thinking does not count. Write these before the comparison summary."
+                    "A sentence in thinking does not count. Write these before comparison_with_last_month."
                 ),
                 "properties": {
                     "goal_alignment": _evidence_text_props(),
@@ -266,19 +278,16 @@ def submit_month_synthesis_schema() -> dict[str, Any]:
             "comparison_with_last_month": {
                 "type": "object",
                 "description": (
-                    "One summary of this month's user_image against last month's "
-                    "user_image lines on the carry card."
+                    "Compare this month's user_image with last month's user_image lines. "
+                    "unchanged and changed are rows of text plus evidence card ids. "
+                    "suggestion is one sentence from the changed rows."
                 ),
                 "properties": {
-                    "summary": {
-                        "type": "string",
-                        "description": (
-                            "How goal alignment, decision preference, behavior pattern, "
-                            "and cognition changed from last month's user image to this one."
-                        ),
-                    },
+                    "unchanged": {"type": "array", "items": comparison_row},
+                    "changed": {"type": "array", "items": comparison_row},
+                    "suggestion": _judgment_string("One next step drawn from the changed rows."),
                 },
-                "required": ["summary"],
+                "required": ["unchanged", "changed", "suggestion"],
             },
             "next_month_focus": {
                 "type": "array",
