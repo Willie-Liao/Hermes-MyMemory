@@ -107,17 +107,25 @@ def usage_ledger_offset() -> int:
         return 0
 
 
-def sum_usage_after(offset: int) -> dict[str, int]:
+def sum_usage_after(offset: int, *, keep_boundary_line: bool = False) -> dict[str, int]:
     """Sum input and output tokens appended after ``offset``.
 
-    A slash reply that omits this total hides whether the run called the model.
+    Weekly and monthly totals depend on the default skip of the next line.
+    Digest opts in with ``keep_boundary_line`` because its offset is a file
+    size sitting on a newline, so that line is a finished bill.
     """
     path = _ledger_path()
     totals = {"input_tokens": 0, "output_tokens": 0}
     try:
         with path.open(encoding="utf-8") as fh:
-            fh.seek(max(0, int(offset)))
-            if offset:
+            start = max(0, int(offset))
+            fh.seek(start)
+            drop = bool(offset)
+            if drop and keep_boundary_line:
+                fh.seek(start - 1)
+                drop = fh.read(1) != "\n"
+                fh.seek(start)
+            if drop:
                 fh.readline()
             for line in fh:
                 line = line.strip()

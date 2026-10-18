@@ -24,6 +24,7 @@ import re
 import shlex
 import sqlite3
 import sys
+import time
 from datetime import date
 from pathlib import Path
 
@@ -36,7 +37,7 @@ if str(_plugins_root) not in sys.path:
     sys.path.insert(0, str(_plugins_root))
 
 from memory_staging import resolve_session
-from worker_llm import format_token_line
+from worker_llm import format_token_line, sum_usage_after, usage_ledger_offset
 
 
 def _digest_state_has(session_key: str) -> bool:
@@ -181,6 +182,8 @@ def _force_run(scope: str, date_str: str | None = None) -> str:
 
     ``--all``, ``--batch``, and a past date scan state.db themselves. Refusing
     here made a WeChat slash return zero tokens before that scan could run.
+    The past-date wrap-up runs after that scan's bill is saved, so its tokens
+    are added onto the same reply.
     """
     resolved = _active_session()
     session_key = resolved[0] if resolved else ""
@@ -207,10 +210,21 @@ def _force_run(scope: str, date_str: str | None = None) -> str:
     counts = ""
     if result.get("user") is not None:
         counts = f" [window: {result.get('user')} user / {result.get('assistant')} assistant]"
+    usage = dict(result.get("usage") or {}) if isinstance(result.get("usage"), dict) else {}
+    seconds = float(result.get("seconds") or 0)
     if scope == "date" and result.get("path") and outcome in {"appended", "skip"}:
+        wrap_offset = usage_ledger_offset()
+        wrap_started = time.monotonic()
         digest.run_day_wrapup(result["path"])
-    usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
-    token_line = format_token_line(usage, float(result.get("seconds") or 0))
+        extra = sum_usage_after(wrap_offset, keep_boundary_line=True)
+        usage["input_tokens"] = int(usage.get("input_tokens") or 0) + int(
+            extra.get("input_tokens") or 0
+        )
+        usage["output_tokens"] = int(usage.get("output_tokens") or 0) + int(
+            extra.get("output_tokens") or 0
+        )
+        seconds += max(0.0, time.monotonic() - wrap_started)
+    token_line = format_token_line(usage, seconds)
     return f"/digest ({sid}): {line}{counts}\n{token_line}"
 
 

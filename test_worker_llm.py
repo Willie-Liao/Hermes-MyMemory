@@ -1379,3 +1379,24 @@ def test_yaml_v1_still_reshapes_nested_to_anthropic(tmp_path, monkeypatch):
     wl.run_worker_llm("hi", plugin="memory-digest", purpose="digest-phase1")
     assert nested["kwargs"]["base_url"] == "https://api.minimax.chat/anthropic"
     assert nested["kwargs"]["api_mode"] == "anthropic_messages"
+
+
+def test_sum_usage_after_keeps_boundary_line_only_when_asked(tmp_path, monkeypatch):
+    """Weekly and monthly drop the line at a newline offset; digest must keep it.
+
+    A file-size offset already sits on a finished row. Dropping it makes a
+    one-call digest reply print zero tokens.
+    """
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ledger = tmp_path / "metrics" / "llm-usage.jsonl"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text('{"input_tokens": 1, "output_tokens": 1}\n', encoding="utf-8")
+    offset = wl.usage_ledger_offset()
+    with ledger.open("a", encoding="utf-8") as fh:
+        fh.write('{"input_tokens": 6913, "output_tokens": 2072}\n')
+    assert wl.sum_usage_after(offset) == {"input_tokens": 0, "output_tokens": 0}
+    assert wl.sum_usage_after(offset, keep_boundary_line=True) == {
+        "input_tokens": 6913,
+        "output_tokens": 2072,
+    }

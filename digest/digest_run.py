@@ -286,7 +286,7 @@ def request_digest(
             date_str=date_str,
             scope=scope,
         )
-    usage = sum_usage_after(offset)
+    usage = sum_usage_after(offset, keep_boundary_line=True)
     result = dict(result)
     result["usage"] = usage
     result["seconds"] = max(0.0, time.monotonic() - started)

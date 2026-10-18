@@ -47,6 +47,53 @@ def test_force_run(monkeypatch):
     assert "seconds=" in out
 
 
+def test_past_date_reply_adds_wrapup_tokens(tmp_path, monkeypatch):
+    """A past-date slash bill includes the wrap-up call that runs after the scan.
+
+    The ledger already ends on a newline, so the wrap-up row is a finished
+    line. Dropping it would leave the reply at the phase-1 totals only.
+    """
+    import time
+
+    slash = _load_slash()
+    _stub_session(slash, monkeypatch)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ledger = tmp_path / "metrics" / "llm-usage.jsonl"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text('{"input_tokens": 1, "output_tokens": 1}\n', encoding="utf-8")
+    wrapups: list[str] = []
+
+    def fake(sk, **kw):
+        return {
+            "outcome": "appended",
+            "session_id": "s1",
+            "user": 3,
+            "assistant": 3,
+            "usage": {"input_tokens": 11, "output_tokens": 4},
+            "seconds": 2.5,
+            "path": "/tmp/2020-01-02.md",
+        }
+
+    def wrap(path):
+        wrapups.append(str(path))
+        time.sleep(0.2)
+        with ledger.open("a", encoding="utf-8") as fh:
+            fh.write('{"input_tokens": 100, "output_tokens": 20}\n')
+
+    monkeypatch.setattr(slash.digest_run, "request_digest", fake)
+    monkeypatch.setattr(slash.digest, "run_day_wrapup", wrap)
+    past = slash.handle_digest("2020-01-02")
+    assert "input_tokens=111" in past
+    assert "output_tokens=24" in past
+    assert float(past.rsplit("seconds=", 1)[1]) > 2.5
+    assert wrapups == ["/tmp/2020-01-02.md"]
+    wrapups.clear()
+    batch = slash.handle_digest("--batch")
+    assert "input_tokens=11" in batch
+    assert "output_tokens=4" in batch
+    assert wrapups == []
+
+
 def test_digest_slash_modes_do_not_wrap_up(monkeypatch):
     """--all and --batch stay on today; a past date is the only slash wrap-up."""
     slash = _load_slash()
