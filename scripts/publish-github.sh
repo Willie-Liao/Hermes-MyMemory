@@ -28,8 +28,6 @@ rsync -a \
   --exclude '.pytest_cache/' \
   --exclude 'node_modules/' \
   --exclude 'weekly/ui/dist/' \
-  --exclude 'weekly/debug_w38_worker1_events.py' \
-  --exclude 'weekly/test_w38_sunday_evening_patch.py' \
   --exclude '.env' --exclude '.env.local' --exclude 'auth.json' \
   "$PACK_ROOT/" "$WORKDIR/src/"
 cd "$WORKDIR/src"
