@@ -1382,10 +1382,10 @@ def test_yaml_v1_still_reshapes_nested_to_anthropic(tmp_path, monkeypatch):
 
 
 def test_sum_usage_after_keeps_boundary_line_only_when_asked(tmp_path, monkeypatch):
-    """Weekly and monthly drop the line at a newline offset; digest must keep it.
+    """The default drop skips a finished row at a newline offset; callers opt in to keep it.
 
     A file-size offset already sits on a finished row. Dropping it makes a
-    one-call digest reply print zero tokens.
+    one-call reply print zero tokens. Digest and weekly pass keep_boundary_line.
     """
     wl = _load_worker_llm()
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

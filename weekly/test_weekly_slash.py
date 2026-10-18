@@ -78,32 +78,43 @@ entities: []
 
 
 def test_update_pastes_brief_not_distill(tmp_path, monkeypatch):
-    """On generated: chat reply is Chronicle summary without Distill YAML."""
+    """Generated chat is the footer plus the new ledger row, not the Chronicle summary.
+
+    A file-size offset sits on a finished line. Dropping that line made a
+    one-call /weekly update print zero tokens.
+    """
     s = _load_slash()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "memories" / "staging").mkdir(parents=True)
+    ledger = tmp_path / "metrics" / "llm-usage.jsonl"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text('{"input_tokens": 1, "output_tokens": 1}\n', encoding="utf-8")
     week_path = tmp_path / "2026-W24.md"
     week_path.write_text(_SUMMARY_FIXTURE, encoding="utf-8")
 
     def fake_update(week_key=None, *, reason="slash"):
+        with ledger.open("a", encoding="utf-8") as fh:
+            fh.write('{"input_tokens": 6913, "output_tokens": 2072}\n')
         return {
             "outcome": "generated",
             "week": week_key,
             "sources": 3,
             "path": str(week_path),
-            "usage": {"input_tokens": 6, "output_tokens": 1},
-            "seconds": 0.4,
+            "brief": "- Ship landed Monday (Monday)",
         }
 
     monkeypatch.setattr(s.weekly_actions, "update_week", fake_update)
     out = s.handle_weekly("update 2026-W24")
 
-    assert "Ship landed Monday" in out
+    assert "Ship landed Monday" not in out
     assert "type: event" not in out
     assert "related:" not in out
     assert "Distill body" not in out
     assert "refer to [" not in out.lower()
-    assert "2026-W24" in out  # short path/week footer ok
-    assert "input_tokens=6" in out
-    assert "output_tokens=1" in out
+    lines = [line for line in out.splitlines() if line.strip()]
+    assert lines[0].startswith("/weekly update: wrote 2026-W24 from 3 daily file(s) ->")
+    assert "input_tokens=6913" in out
+    assert "output_tokens=2072" in out
     assert "seconds=" in out
 
 
@@ -160,7 +171,7 @@ def test_update_does_not_arm_cite_dig_in(tmp_path, monkeypatch):
 
 
 def test_update_pastes_chronicle_summary_for_chat(monkeypatch):
-    """Slash update pastes Chronicle bullets from generate_week brief."""
+    """Slash update keeps Chronicle bullets out of the chat reply."""
     s = _load_slash()
     raw = (
         "- Ship landed Monday (Monday)\n"
@@ -178,9 +189,10 @@ def test_update_pastes_chronicle_summary_for_chat(monkeypatch):
 
     monkeypatch.setattr(s.weekly_actions, "update_week", fake_update)
     out = s.handle_weekly("update 2026-W24")
-    assert "###" not in out
-    assert "Ship landed Monday" in out
-    assert "(Monday)" in out
+    assert "Ship landed Monday" not in out
+    assert "Follow up Tuesday" not in out
+    assert "(Monday)" not in out
+    assert out.splitlines()[0].startswith("/weekly update: wrote")
 
 
 def test_update_uses_brief_field_when_present(monkeypatch):
@@ -197,8 +209,9 @@ def test_update_uses_brief_field_when_present(monkeypatch):
 
     monkeypatch.setattr(s.weekly_actions, "update_week", fake_update)
     out = s.handle_weekly("update 2026-W24")
-    assert "Brief from generate_week return field." in out
+    assert "Brief from generate_week return field." not in out
     assert "type: event" not in out
+    assert out.splitlines()[0].startswith("/weekly update: wrote")
 
 
 def test_update_specific_week(monkeypatch):
@@ -221,7 +234,7 @@ def test_update_specific_week(monkeypatch):
     assert captured["week"] == "2026-W24"
     assert captured["reason"] == "update"
     assert "2026-W24" in out
-    assert "Week 24 brief summary for chat." in out
+    assert "Week 24 brief summary for chat." not in out
 
 
 def test_update_default_current_iso(monkeypatch):
@@ -244,7 +257,7 @@ def test_update_default_current_iso(monkeypatch):
     assert captured["week"] is None
     assert captured["reason"] == "update"
     assert "2026-W29" in out
-    assert "Current week brief." in out
+    assert "Current week brief." not in out
 
 
 def test_update_bad_week(monkeypatch):

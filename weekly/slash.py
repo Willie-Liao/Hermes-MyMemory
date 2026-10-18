@@ -94,31 +94,15 @@ def _week_arg(args: list[str]) -> str | None:
     return next((a for a in args if not a.startswith("-")), None)
 
 
-def _brief_from_update_result(result: dict) -> str:
-    """Prefer generate_week brief; else Chronicle rows from the written week YAML."""
-    brief = result.get("brief")
-    if isinstance(brief, str) and brief.strip():
-        return brief.strip()
-    path = result.get("path")
-    if not path:
-        return ""
-    try:
-        md = Path(path).read_text(encoding="utf-8")
-        payload = weekly_mod.weekly_json.loads(md)
-    except Exception:
-        return ""
-    lines: list[str] = []
-    for row in payload.summary:
-        days = ", ".join(row.weekdays)
-        lines.append(f"- {row.text} ({days})" if days else f"- {row.text}")
-    return "\n".join(lines)
-
-
 def _usage_line(result: dict, offset: int, started: float) -> str:
-    """Print the run's token totals when the weekly update called a model."""
+    """Count the ledger row at a newline file-size offset so a one-call update does not print zero tokens.
+
+    Prefer a usage dict the generator already summed. Otherwise keep the boundary
+    line, the same opt-in digest uses.
+    """
     usage = result.get("usage") if isinstance(result.get("usage"), dict) else None
     if usage is None:
-        usage = sum_usage_after(offset)
+        usage = sum_usage_after(offset, keep_boundary_line=True)
     seconds = result.get("seconds")
     if seconds is None:
         seconds = time.monotonic() - started
@@ -126,6 +110,10 @@ def _usage_line(result: dict, offset: int, started: float) -> str:
 
 
 def _update(args: list[str]) -> str:
+    """Return a status line and token totals so the week summary stays in the file, not the chat.
+
+    Pasting the Chronicle brief made /weekly update unlike /digest and /monthly update.
+    """
     week_key = _week_arg(args)
     offset = usage_ledger_offset()
     started = time.monotonic()
@@ -140,7 +128,6 @@ def _update(args: list[str]) -> str:
             f"{result.get('week')} yet. Chat with Hermes first, then update again."
         )
     if outcome == "generated":
-        brief = _brief_from_update_result(result)
         # Slash update = user opted into staging review tools → unlock.
         # Hermes slash handlers do not pass session_id; bind on first chat turn.
         state = weekly_mod._load_state()
@@ -154,11 +141,7 @@ def _update(args: list[str]) -> str:
             f"/weekly update: wrote {result.get('week')} from "
             f"{result.get('sources')} daily file(s) -> {result.get('path')}"
         )
-        if brief:
-            body = f"{brief}\n\n{footer}"
-        else:
-            body = footer
-        return body + "\n" + _usage_line(result, offset, started)
+        return footer + "\n" + _usage_line(result, offset, started)
     if outcome == "failed":
         return (
             f"/weekly update: generation failed for {result.get('week')} (validation/API)."

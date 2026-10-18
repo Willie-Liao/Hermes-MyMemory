@@ -108,11 +108,12 @@ def usage_ledger_offset() -> int:
 
 
 def sum_usage_after(offset: int, *, keep_boundary_line: bool = False) -> dict[str, int]:
-    """Sum input and output tokens appended after ``offset``.
+    """Avoid billing earlier runs, without dropping this run's first finished ledger row.
 
-    Weekly and monthly totals depend on the default skip of the next line.
-    Digest opts in with ``keep_boundary_line`` because its offset is a file
-    size sitting on a newline, so that line is a finished bill.
+    A file-size offset already sits on a newline, so the next line is a complete
+    bill. The default skip treats it as partial and a one-call reply prints zero
+    tokens. Digest and the weekly slash pass ``keep_boundary_line``. Monthly uses
+    the default only when the result has no usage dict.
     """
     path = _ledger_path()
     totals = {"input_tokens": 0, "output_tokens": 0}
