@@ -178,16 +178,6 @@ def _past_day(day_text: str) -> str:
 
 
 def _force_run(scope: str, date_str: str | None = None) -> str:
-    """Start the day digest off the slash reply so the next chat message is not queued behind it."""
-    from slash_jobs import run_or_background
-
-    return run_or_background(
-        "digest update",
-        lambda: _force_run_inline(scope, date_str),
-    )
-
-
-def _force_run_inline(scope: str, date_str: str | None = None) -> str:
     """Start a day digest even when the gateway bound no transcript id.
 
     ``--all``, ``--batch``, and a past date scan state.db themselves. Refusing
