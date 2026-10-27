@@ -20,8 +20,16 @@ def register(ctx) -> None:
     register() serves both loaders without dual recall hooks.
     Re-apply prefetch join budget here so a Hermes upgrade cannot restore 8s.
     Handlers are coroutines so a long slash run yields the gateway loop.
+    Restore a missing worker block here: Hermes can recreate config.yaml
+    without these lanes, and this load is the first MyMemory code that runs after.
     """
     apply_external_prefetch_timeout()
+    try:
+        from .worker_config import ensure_worker_block
+
+        ensure_worker_block()
+    except Exception:
+        pass
     if hasattr(ctx, "register_command"):
         from .digest import slash as digest_slash
         from .weekly import slash as weekly_slash
