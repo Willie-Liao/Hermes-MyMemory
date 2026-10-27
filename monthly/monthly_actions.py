@@ -412,25 +412,6 @@ def _slash_usage_line(result: dict, offset: int, started: float) -> str:
     return format_token_line(usage, float(seconds))
 
 
-def _update_inline(key: str) -> str:
-    """Run the month reduce off the slash reply so chat can continue.
-
-    A bad YYYY-MM is rejected before this starts. The reply under pytest still
-    names pending sections so a partial month does not look finished.
-    """
-    offset = usage_ledger_offset()
-    started = time.monotonic()
-    result = generate_month(key, reason="slash", force_refresh=True)
-    if result.get("outcome") == "bad_month":
-        return f"bad month {key!r}; expected YYYY-MM"
-    pending = [str(item) for item in (result.get("pending_sections") or [])]
-    extra = f"; pending: {', '.join(pending)}" if pending else ""
-    return (
-        f"updated {result.get('month')} ({result.get('outcome')}{extra})\n"
-        + _slash_usage_line(result, offset, started)
-    )
-
-
 def handle_monthly(raw_args: str) -> str:
     """Slash/CLI dispatcher for update, show, and suggest — monthly has no UI lifecycle.
 
@@ -455,9 +436,17 @@ def handle_monthly(raw_args: str) -> str:
         key = parse_month_key(rest) if rest else date.today().strftime("%Y-%m")
         if rest and key is None:
             return f"bad month {rest!r}; expected YYYY-MM"
-        from slash_jobs import run_or_background
-
-        return run_or_background("monthly update", lambda: _update_inline(key))
+        offset = usage_ledger_offset()
+        started = time.monotonic()
+        result = generate_month(key, reason="slash", force_refresh=True)
+        if result.get("outcome") == "bad_month":
+            return f"bad month {rest!r}; expected YYYY-MM"
+        pending = [str(item) for item in (result.get("pending_sections") or [])]
+        extra = f"; pending: {', '.join(pending)}" if pending else ""
+        return (
+            f"updated {result.get('month')} ({result.get('outcome')}{extra})\n"
+            + _slash_usage_line(result, offset, started)
+        )
     if cmd == "show":
         key = parse_month_key(rest) if rest else date.today().strftime("%Y-%m")
         if rest and key is None:

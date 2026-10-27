@@ -110,23 +110,13 @@ def _usage_line(result: dict, offset: int, started: float) -> str:
 
 
 def _update(args: list[str]) -> str:
-    """Return immediately in chat so a week rewrite does not hold the next message.
+    """Return a status line and token totals so the week summary stays in the file, not the chat.
 
     Pasting the Chronicle brief made /weekly update unlike /digest and /monthly update.
     Weixin sends any absolute .md path in the reply as a document, so the rewrite
     status omits the week path. A later user request can still name the file.
-    A bad week key is still answered on this turn; the model call is the part that waits.
     """
     week_key = _week_arg(args)
-    if week_key and weekly_mod._parse_week_key(week_key) is None:
-        return f"/weekly update: '{week_key}' is not a valid YYYY-Www week."
-    from slash_jobs import run_or_background
-
-    return run_or_background("weekly update", lambda: _update_inline(week_key))
-
-
-def _update_inline(week_key: str | None) -> str:
-    """Write the week file and the token line. Chat only sees this text under pytest."""
     offset = usage_ledger_offset()
     started = time.monotonic()
     result = weekly_actions.update_week(week_key, reason="update")

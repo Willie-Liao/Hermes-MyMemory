@@ -10,7 +10,6 @@
 
 - Digest and monthly worker calls send `thinking: disabled` on OpenAI-compatible routes and Anthropic phase-1 kwargs, with one retry when the provider rejects the thinking field.
 
-### Config restore and slash updates
+### Config restore
 
 - When a config file exists but the digest, weekly, or monthly worker lanes are missing, MyMemory copies them back from `~/.hermes/.mymemory-worker-pin.yaml` on the next load. A missing config.yaml is not created. With no pin yet, the lanes default to `minimax-cn` / `MiniMax-M2.5`.
-- `/digest --all`, `/digest --batch`, `/digest YYYY-MM-DD`, `/weekly update`, and `/monthly update` return immediately and run the model call on a background thread, so the next chat message is not queued behind the update.
