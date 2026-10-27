@@ -26,6 +26,28 @@ def hermes_home() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
+def monthly_config() -> dict[str, Any]:
+    """Read plugins.entries.MyMemory.monthly so the clock and generate share one source.
+
+    A missing or corrupt config.yaml must not stop month generation, so callers
+    apply the schema defaults when this returns {}.
+    """
+    path = hermes_home() / "config.yaml"
+    try:
+        import yaml
+
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    plugins = raw.get("plugins")
+    entries = plugins.get("entries") if isinstance(plugins, dict) else None
+    mine = entries.get("MyMemory") if isinstance(entries, dict) else None
+    monthly = mine.get("monthly") if isinstance(mine, dict) else None
+    return dict(monthly) if isinstance(monthly, dict) else {}
+
+
 def state_path() -> Path:
     """Keep monthly catch-up off .weekly-state.json so a clock write cannot drop weekly keys."""
     return hermes_home() / "memories" / "staging" / ".monthly-state.json"

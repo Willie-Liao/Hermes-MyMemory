@@ -799,9 +799,9 @@ def stop_digest_clock_thread() -> None:
 
 
 def _next_monthly_write_at(local: datetime) -> datetime | None:
-    """00:05 on the 1st, 10th, or 20th, kept off the phase-2 grid.
+    """Next monthly write_at on a slot or retry day, kept off the phase-2 grid.
 
-    A phase-2 tick at 00:05 would set past_tick and run leftover or phase 2.
+    A phase-2 tick at that minute would set past_tick and run leftover or phase 2.
     """
     try:
         monthly_dir = _mymemory / "monthly"
@@ -816,12 +816,12 @@ def _next_monthly_write_at(local: datetime) -> datetime | None:
 
 
 def _digest_clock_loop() -> None:
-    """Sleep until next_clock_at, the next monthly 00:05, or the earliest batch hold.
+    """Sleep until next_clock_at, the next monthly write_at, or the earliest batch hold.
 
     A civil-only wait would miss the 10-minute assistant hold after the 12th
     user turn. Fire the slept-for civil tick as ``now`` so a wake a few minutes
     past midnight still leftover-extracts that 23:55 civil day instead of
-    skipping until 08:00. A monthly 00:05 wake passes wall time so next_clock_at
+    skipping until 08:00. A monthly write_at wake passes wall time so next_clock_at
     stays on the phase-2 grid.
     """
     global _clock_thread

@@ -850,6 +850,7 @@ def test_run_worker_llm_oneshot_skips_aiagent(tmp_path, monkeypatch):
         "type": "function",
         "function": {"name": "submit_tighten_event"},
     }
+    assert create["extra_body"]["thinking"] == {"type": "disabled"}
     assert create["tools"][0]["type"] == "function"
     assert create["tools"][0]["function"]["name"] == "submit_tighten_event"
     assert create["messages"][0]["role"] == "system"
@@ -1379,6 +1380,7 @@ def test_yaml_v1_still_reshapes_nested_to_anthropic(tmp_path, monkeypatch):
     wl.run_worker_llm("hi", plugin="memory-digest", purpose="digest-phase1")
     assert nested["kwargs"]["base_url"] == "https://api.minimax.chat/anthropic"
     assert nested["kwargs"]["api_mode"] == "anthropic_messages"
+    assert nested["kwargs"]["reasoning_config"] == {"enabled": False}
 
 
 def test_sum_usage_after_keeps_boundary_line_only_when_asked(tmp_path, monkeypatch):
@@ -1400,3 +1402,233 @@ def test_sum_usage_after_keeps_boundary_line_only_when_asked(tmp_path, monkeypat
         "input_tokens": 6913,
         "output_tokens": 2072,
     }
+
+
+def _oneshot_success():
+    message = types.SimpleNamespace(
+        content="",
+        tool_calls=[
+            types.SimpleNamespace(
+                function=types.SimpleNamespace(
+                    name="submit_digest",
+                    arguments='{"ok": true}',
+                )
+            )
+        ],
+    )
+    choice = types.SimpleNamespace(message=message, finish_reason="tool_calls")
+    usage = types.SimpleNamespace(
+        prompt_tokens=3,
+        completion_tokens=2,
+        total_tokens=5,
+        prompt_tokens_details=types.SimpleNamespace(cached_tokens=0),
+        completion_tokens_details=types.SimpleNamespace(reasoning_tokens=0),
+    )
+    return types.SimpleNamespace(choices=[choice], usage=usage)
+
+
+def test_oneshot_no_profile_sends_thinking_disabled(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("BOX_API_KEY", "box-key")
+    monkeypatch.setenv("BOX_BASE_URL", "https://box.example/v1")
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-digest:\n      provider: box\n      model: box-1\n",
+        encoding="utf-8",
+    )
+    fake = types.ModuleType("providers")
+    fake.get_provider_profile = lambda name: None
+    monkeypatch.setitem(sys.modules, "providers", fake)
+    seen: dict = {}
+    _install_fake_openai(monkeypatch, seen=seen, message={"content": "", "tool_calls": None})
+    wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose="digest-phase1")
+    assert seen["create"]["extra_body"]["thinking"] == {"type": "disabled"}
+
+
+def test_oneshot_profile_disable_and_k2_does_not_keep_the_first_lane(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("XIAOMI_API_KEY", "mi-key")
+    monkeypatch.setenv("XIAOMI_BASE_URL", "https://mimo.example/v1")
+    monkeypatch.setenv("KIMI_API_KEY", "kimi-key")
+    monkeypatch.setenv("KIMI_BASE_URL", "https://kimi.example/v1")
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-digest:\n      provider: xiaomi\n      model: mimo-v2.5\n",
+        encoding="utf-8",
+    )
+
+    class Profile:
+        def __init__(self, name):
+            self.name = name
+
+        def build_api_kwargs_extras(self, **kwargs):
+            assert kwargs["reasoning_config"] == {"enabled": False}
+            if self.name == "kimi-coding":
+                return {"thinking": {"type": "disabled"}, "lane": "kimi"}, {"reasoning_effort": "none"}
+            return {}, {}
+
+    fake = types.ModuleType("providers")
+    fake.get_provider_profile = lambda name: Profile(str(name))
+    monkeypatch.setitem(sys.modules, "providers", fake)
+
+    class QuotaErr(Exception):
+        status_code = 429
+
+    bodies: list[dict] = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            bodies.append(dict(kwargs))
+            if len(bodies) == 1:
+                raise QuotaErr("insufficient quota")
+            return _oneshot_success()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.chat = FakeChat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = FakeClient
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    out = wl.run_worker_llm_oneshot(
+        "digest this",
+        plugin="memory-digest",
+        purpose="digest-phase1",
+        force_tool_name="submit_digest",
+        tool_schema={"name": "submit_digest", "parameters": {"type": "object", "properties": {}}},
+    )
+    assert out["failed"] is False
+    assert "lane" not in (bodies[0].get("extra_body") or {})
+    assert bodies[0]["extra_body"]["thinking"] == {"type": "disabled"}
+    assert bodies[0]["model"] == "mimo-v2.5"
+    assert bodies[1]["extra_body"]["lane"] == "kimi"
+    assert bodies[1]["reasoning_effort"] == "none"
+    assert bodies[1]["model"] == "kimi-for-coding-highspeed"
+
+
+def test_oneshot_drops_thinking_after_a_field_rejection(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("BOX_API_KEY", "box-key")
+    monkeypatch.setenv("BOX_BASE_URL", "https://box.example/v1")
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-digest:\n      provider: box\n      model: box-1\n",
+        encoding="utf-8",
+    )
+    fake = types.ModuleType("providers")
+    fake.get_provider_profile = lambda name: None
+    monkeypatch.setitem(sys.modules, "providers", fake)
+
+    class Reject(Exception):
+        status_code = 400
+
+        def __str__(self):
+            return "Unrecognized request argument supplied: thinking"
+
+    bodies: list[dict] = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            bodies.append(dict(kwargs))
+            if "extra_body" in kwargs or "reasoning_effort" in kwargs:
+                raise Reject()
+            return _oneshot_success()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.chat = FakeChat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = FakeClient
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    out = wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose="digest-phase1")
+    assert out["failed"] is False
+    assert "extra_body" not in bodies[1]
+    rec = json.loads(
+        (tmp_path / "metrics" / "llm-usage.jsonl").read_text(encoding="utf-8").strip().splitlines()[-1]
+    )
+    assert rec["thinking_off"] is False
+
+
+def test_phase1_anthropic_kwargs_disable_thinking_except_claude(monkeypatch):
+    wl = _load_worker_llm()
+    captured: dict = {}
+
+    def fake_build(**kwargs):
+        captured.update(kwargs)
+        return {"model": kwargs["model"], "max_tokens": kwargs["max_tokens"]}
+
+    adapter = types.ModuleType("agent.anthropic_adapter")
+    adapter.build_anthropic_kwargs = fake_build
+    monkeypatch.setitem(sys.modules, "agent.anthropic_adapter", adapter)
+    built = wl._build_phase1_anthropic_kwargs(
+        model="MiniMax-M2.5",
+        messages=[],
+        tools=[],
+        max_tokens=100,
+        base_url="https://api.minimax.chat/anthropic",
+    )
+    assert captured["reasoning_config"] == {"enabled": False}
+    assert built["thinking"] == {"type": "disabled"}
+    claude = wl._build_phase1_anthropic_kwargs(
+        model="claude-sonnet-4-6",
+        messages=[],
+        tools=[],
+        max_tokens=100,
+        base_url="https://api.anthropic.com",
+    )
+    assert "thinking" not in claude
+
+
+def test_anthropic_create_retries_without_thinking(monkeypatch):
+    wl = _load_worker_llm()
+    calls: list[dict] = []
+
+    class Reject(Exception):
+        def __str__(self):
+            return "Unrecognized request argument supplied: thinking"
+
+    class Messages:
+        def create(self, **kwargs):
+            calls.append(dict(kwargs))
+            if "thinking" in kwargs:
+                raise Reject()
+            return "ok"
+
+    class Client:
+        messages = Messages()
+
+    adapter = types.ModuleType("agent.anthropic_adapter")
+    adapter.build_anthropic_client = lambda *_a, **_k: Client()
+    monkeypatch.setitem(sys.modules, "agent.anthropic_adapter", adapter)
+    out = wl._anthropic_messages_create(
+        {"model": "MiniMax-M2.5", "thinking": {"type": "disabled"}},
+        api_key="k",
+        base_url="https://api.minimax.chat/anthropic",
+    )
+    assert out == "ok"
+    assert "thinking" not in calls[1]
+
+
+def test_nested_chat_fallback_puts_thinking_on_overrides(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    MyMemory:\n      weekly:\n"
+        "        provider: box\n        model: box-1\n",
+        encoding="utf-8",
+    )
+    fake = types.ModuleType("providers")
+    fake.get_provider_profile = lambda name: None
+    monkeypatch.setitem(sys.modules, "providers", fake)
+    seen: dict = {}
+    _install_fake_nested(monkeypatch, seen)
+    assert wl.run_worker_llm("hi", plugin="memory-weekly", purpose="ui_tighten") == "ok"
+    assert seen["kwargs"]["reasoning_config"] == {"enabled": False}
+    assert seen["kwargs"]["request_overrides"]["extra_body"]["thinking"] == {"type": "disabled"}

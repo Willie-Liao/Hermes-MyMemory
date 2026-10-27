@@ -63,6 +63,7 @@ _KEY_ORDER = (
     "state",
     "entities",
     "metrics",
+    "pending_sections",
 )
 
 BANNED_BODY_MARKERS = ("Beginning:", "Course:", "Outcome:", "Obstacle:")
@@ -85,7 +86,7 @@ def dumps(payload: MonthlyPayload) -> str:
 def dump_yaml(payload: MonthlyPayload) -> str:
     """YAML body of YYYY-MM.md so recall can parse the month without a sidecar."""
     data = payload_to_dict(payload)
-    ordered = {key: data[key] for key in _KEY_ORDER}
+    ordered = {key: data[key] for key in _KEY_ORDER if key in data}
     return yaml.safe_dump(ordered, sort_keys=False, allow_unicode=True)
 
 
@@ -349,6 +350,9 @@ def payload_from_dict(obj: dict[str, Any]) -> MonthlyPayload:
         ),
         schema_version=int(obj.get("schema_version") or 1),
         cycle=str(obj.get("cycle") or "monthly"),
+        pending_sections=tuple(
+            str(item) for item in (obj.get("pending_sections") or []) if str(item).strip()
+        ),
     )
 
 

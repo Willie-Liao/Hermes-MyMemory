@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 import time
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -25,7 +27,13 @@ from monthly_slice import (  # noqa: E402
     previous_month_key,
     week_slices,
 )
-from monthly_state import month_file_path  # noqa: E402
+from monthly_schema import MAP_BATCH_TOKENS, REDUCE_MAX_TOKENS  # noqa: E402
+from monthly_state import (  # noqa: E402
+    atomic_json_write,
+    month_file_path,
+    monthly_config,
+    monthly_staging_dir,
+)
 from monthly_synth import synthesize_month  # noqa: E402
 from monthly_writer import load_month, write_month, loads  # noqa: E402
 from worker_llm import format_token_line, sum_usage_after, usage_ledger_offset  # noqa: E402
@@ -50,28 +58,98 @@ def parse_month_key(value: str | None) -> str | None:
     return text
 
 
+_JUDGMENT_SECTIONS = (
+    "user_image",
+    "core_progress",
+    "key_decisions",
+    "key_procedures",
+    "problems_and_risks",
+    "next_month_focus",
+    "comparison_with_last_month",
+)
+
+
+def reduce_resume_path(month_key: str) -> Path:
+    """Keep a failed reduce beside the month so the next day patches only its gaps.
+
+    The map cache is content-hashed notes. Mixing the synthesis into it would
+    drop the gap list the clock needs.
+    """
+    return monthly_staging_dir() / ".reduce" / f"{month_key}.json"
+
+
+def _positive_int(bag: dict[str, Any], key: str, default: int) -> int:
+    try:
+        value = int(bag.get(key))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _load_resume(month_key: str) -> dict[str, Any]:
+    path = reduce_resume_path(month_key)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_resume(month_key: str, payload: dict[str, Any]) -> None:
+    path = reduce_resume_path(month_key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json_write(path, payload)
+
+
+def _delete_resume(month_key: str) -> None:
+    reduce_resume_path(month_key).unlink(missing_ok=True)
+
+
 def generate_month(
     month_key: str | None,
     *,
     reason: str = "bridge",
     call_oneshot=None,
     force_refresh: bool = False,
+    gaps_only: bool = False,
 ) -> dict[str, Any]:
-    """Run map-reduce for one calendar month and persist YYYY-MM.md only when judgments are filled.
+    """Run map-reduce for one calendar month and keep every section that passed.
 
-    An incomplete reduce used to write empty key lists. Leaving the previous file
-    in place keeps a failed retry from erasing a month.
+    An incomplete reduce used to drop the whole month, including sections that
+    had already passed. A later retry then paid for those sections again.
+    gaps_only patches the stored gaps and does not rerun the map.
     """
     del reason
     key = parse_month_key(month_key)
     if key is None:
         return {"outcome": "bad_month", "month": month_key or ""}
-    slices = week_slices(key, types=frozenset({"decision", "procedure"}))
-    batches = pack_batches(slices)
-    notes = [
-        map_batch(key, batch, call_oneshot=call_oneshot, force_refresh=force_refresh)
-        for batch in batches
-    ]
+    bag = monthly_config()
+    map_tokens = _positive_int(bag, "map_batch_tokens", MAP_BATCH_TOKENS)
+    reduce_tokens = _positive_int(bag, "reduce_max_tokens", REDUCE_MAX_TOKENS)
+    stored = _load_resume(key) if gaps_only else {}
+    if gaps_only and not stored:
+        return {
+            "outcome": "ok",
+            "month": key,
+            "path": "",
+            "map_calls": 0,
+            "pending_sections": [],
+            "usage": {"valid": True, "attempts": [], "gap_sections": []},
+        }
+    if gaps_only and not stored.get("merged"):
+        gaps_only = False
+        stored = {}
+    if gaps_only:
+        notes = [{"items": stored.get("notes") or [], "cache_hit": True}]
+    else:
+        slices = week_slices(key, types=frozenset({"decision", "procedure"}))
+        batches = pack_batches(slices, max_tokens=map_tokens)
+        notes = [
+            map_batch(key, batch, call_oneshot=call_oneshot, force_refresh=force_refresh)
+            for batch in batches
+        ]
     facts = mechanical_facts(key)
     start, _end = calendar_range(key)
     carry = carry_card(previous_month_key(start))
@@ -81,22 +159,62 @@ def generate_month(
         call_oneshot=call_oneshot,
         carry=carry,
         facts=facts,
+        reduce_max_tokens=reduce_tokens,
+        resume=stored if gaps_only else None,
     )
-    if not usage.get("valid"):
+    gap_sections = [
+        section
+        for section in (usage.get("gap_sections") or [])
+        if section in _JUDGMENT_SECTIONS
+    ]
+    passed = [section for section in _JUDGMENT_SECTIONS if section not in gap_sections]
+    if usage.get("comparison_exempt"):
+        passed = [section for section in passed if section != "comparison_with_last_month"]
+    map_calls = 0 if gaps_only else sum(0 if n.get("cache_hit") else 1 for n in notes)
+    resume_body = {
+        "merged": usage.get("merged") or {},
+        "gaps": list(usage.get("gaps") or []),
+        "notes": list(usage.get("notes") or []),
+    }
+    if not usage.get("valid") and not passed:
+        _save_resume(key, resume_body)
         return {
             "outcome": "incomplete",
             "month": key,
             "path": "",
-            "map_calls": sum(0 if n.get("cache_hit") else 1 for n in notes),
+            "map_calls": map_calls,
+            "pending_sections": gap_sections,
             "usage": usage,
             "payload": payload.to_dict(),
         }
+    previous = None
+    try:
+        previous = load_month(key)
+    except (FileNotFoundError, OSError, ValueError):
+        previous = None
+    carried = {}
+    if not usage.get("valid") and previous is not None:
+        for section in gap_sections:
+            carried[section] = getattr(previous, section)
+    payload = replace(
+        payload,
+        generator=replace(payload.generator, batch_tokens=map_tokens),
+        pending_sections=tuple(gap_sections) if not usage.get("valid") else (),
+        **carried,
+    )
+    if usage.get("valid"):
+        _delete_resume(key)
+        outcome = "ok"
+    else:
+        _save_resume(key, resume_body)
+        outcome = "partial"
     path = write_month(payload)
     return {
-        "outcome": "ok",
+        "outcome": outcome,
         "month": key,
         "path": str(path),
-        "map_calls": sum(0 if n.get("cache_hit") else 1 for n in notes),
+        "map_calls": map_calls,
+        "pending_sections": list(payload.pending_sections),
         "usage": usage,
         "payload": payload.to_dict(),
     }
@@ -298,7 +416,9 @@ def handle_monthly(raw_args: str) -> str:
     """Slash/CLI dispatcher for update, show, and suggest — monthly has no UI lifecycle.
 
     Suggest prints a list and a conversation guide. Later edits happen in chat, so this
-    dispatcher does not grow apply, drop, or confirm commands.
+    dispatcher does not grow apply, drop, or confirm commands. Update always reruns the
+    whole month and names any section that is still pending, so a second run does not
+    look like it discarded the sections that passed.
     """
     tokens = str(raw_args or "").strip().split()
     if not tokens or tokens[0] in {"help", "-h", "--help"}:
@@ -321,8 +441,10 @@ def handle_monthly(raw_args: str) -> str:
         result = generate_month(key, reason="slash", force_refresh=True)
         if result.get("outcome") == "bad_month":
             return f"bad month {rest!r}; expected YYYY-MM"
+        pending = [str(item) for item in (result.get("pending_sections") or [])]
+        extra = f"; pending: {', '.join(pending)}" if pending else ""
         return (
-            f"updated {result.get('month')} ({result.get('outcome')})\n"
+            f"updated {result.get('month')} ({result.get('outcome')}{extra})\n"
             + _slash_usage_line(result, offset, started)
         )
     if cmd == "show":
@@ -333,7 +455,10 @@ def handle_monthly(raw_args: str) -> str:
             payload = load_month(key)
         except FileNotFoundError:
             return f"missing {key}"
-        return "## Month summaries\n" + "\n".join(_paint_payload(payload))
+        pending = ""
+        if payload.pending_sections:
+            pending = "pending: " + ", ".join(payload.pending_sections) + "\n"
+        return pending + "## Month summaries\n" + "\n".join(_paint_payload(payload))
     return _HELP
 
 

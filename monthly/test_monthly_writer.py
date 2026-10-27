@@ -137,6 +137,21 @@ def test_write_month_atomic_on_serializer_failure(tmp_path, monkeypatch):
     assert path.read_text(encoding="utf-8") == original
 
 
+def test_pending_sections_round_trip_and_stay_off_when_empty(tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    bare = dump_yaml(_payload())
+    assert "pending_sections" not in bare
+    assert loads(bare).pending_sections == ()
+    marked = replace(_payload(), pending_sections=("user_image", "comparison_with_last_month"))
+    text = dump_yaml(marked)
+    assert "pending_sections" in text
+    restored = loads(text)
+    assert restored.pending_sections == ("user_image", "comparison_with_last_month")
+    assert dump_yaml(restored) == text
+
+
 def test_key_order_pinned():
     dumped = dump_yaml(_payload())
     keys = [line.split(":")[0] for line in dumped.splitlines() if line and not line.startswith(" ") and ":" in line]

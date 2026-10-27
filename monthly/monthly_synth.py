@@ -12,10 +12,12 @@ from typing import Any, Callable, Mapping
 
 _monthly = Path(__file__).resolve().parent
 _mymemory = _monthly.parent
-for path in (_monthly, _mymemory, _mymemory / "weekly"):
+# Monthly schema must stay ahead of weekly's stub of the same name.
+for path in (_mymemory / "weekly", _mymemory, _monthly):
     text = str(path)
-    if text not in sys.path:
-        sys.path.insert(0, text)
+    while text in sys.path:
+        sys.path.remove(text)
+    sys.path.insert(0, text)
 
 from monthly_schema import (  # noqa: E402
     CAP_CROSS_WEEK,
@@ -1102,25 +1104,40 @@ def synthesize_month(
     call_oneshot: CallOneshot | None = None,
     carry: str = "",
     facts: MechanicalFacts | None = None,
+    reduce_max_tokens: int = REDUCE_MAX_TOKENS,
+    resume: Mapping[str, Any] | None = None,
 ) -> tuple[MonthlyPayload, dict[str, Any]]:
     """Submit the month once, then patch only sections that still lack a judgment.
 
     A second full submit dropped the first payload. Format mistakes are fixed here
-    so they never spend another model call.
+    so they never spend another model call. A resume store skips the submit and
+    patches only the sections that failed last time, so a next-day retry does not
+    rebuild sections that already passed. A transport failure is not a judgment:
+    with no tool args, every section stays a gap so the caller does not replace
+    the month file. Reasoning models spend the output cap before the tool JSON,
+    so the cap is an argument rather than a fixed constant.
     """
     facts = facts or mechanical_facts(month_key)
     notes: list[dict[str, Any]] = []
     for record in note_records:
         notes.extend(item for item in (record.get("items") or []) if isinstance(item, dict))
+    stored = dict(resume or {})
+    if stored.get("notes"):
+        notes = [item for item in stored.get("notes") or [] if isinstance(item, dict)]
     prompt = build_reduce_prompt(month_key, notes, facts, carry)
     caller = call_oneshot or _default_oneshot
     comparison_exempt = not _previous_has_judgment(month_key)
-    merged: dict[str, Any] = {}
-    gaps = ["user_image is empty"]
+    resuming = bool(stored.get("gaps"))
+    merged: dict[str, Any] = dict(stored.get("merged") or {}) if resuming else {}
+    gaps = [str(line) for line in stored.get("gaps") or []] if resuming else ["user_image is empty"]
     attempts: list[dict[str, Any]] = []
     last_model = "MiniMax-M2.5"
+    token_cap = int(reduce_max_tokens or REDUCE_MAX_TOKENS)
+    received = False
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        if attempt == 1:
+        if resuming and not gaps:
+            break
+        if attempt == 1 and not resuming:
             schema = submit_month_synthesis_schema()
             call_prompt = prompt
             reason = ""
@@ -1139,7 +1156,7 @@ def synthesize_month(
             purpose="monthly-reduce",
             force_tool_name=schema["name"],
             tool_schema=schema,
-            max_tokens=REDUCE_MAX_TOKENS,
+            max_tokens=token_cap,
         )
         duration_ms = int((time.perf_counter() - started) * 1000)
         last_model = str(result.get("model") or last_model)
@@ -1162,7 +1179,8 @@ def synthesize_month(
             )
             continue
         incoming = result.get("tool_args") if isinstance(result.get("tool_args"), dict) else {}
-        if attempt == 1:
+        received = True
+        if attempt == 1 and not resuming:
             merged = dict(incoming)
         elif str(result.get("tool_name") or "") == submit_month_synthesis_schema()["name"]:
             attempts.append(
@@ -1215,6 +1233,16 @@ def synthesize_month(
         )
         if not gaps:
             break
+    if not received:
+        gaps = [
+            "user_image is empty",
+            "core_progress is empty",
+            "key_decisions is empty",
+            "key_procedures is empty",
+            "problems_and_risks is empty",
+            "next_month_focus is empty",
+            "comparison_with_last_month is empty",
+        ]
     for index in range(1, len(attempts)):
         before = set(_section_keys(list(attempts[index - 1].get("failed") or [])))
         after = set(_section_keys(list(attempts[index].get("failed") or [])))
@@ -1250,5 +1278,10 @@ def synthesize_month(
         "valid": not gaps,
         "model": last_model,
         "attempts": attempts,
+        "gaps": list(gaps),
+        "gap_sections": _section_keys(gaps),
+        "merged": {key: value for key, value in merged.items() if key != "_notes"},
+        "comparison_exempt": comparison_exempt,
+        "notes": notes,
     }
     return payload, usage_out

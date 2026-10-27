@@ -9,10 +9,12 @@ from typing import Any, Callable
 
 _monthly = Path(__file__).resolve().parent
 _mymemory = _monthly.parent
-for path in (_monthly, _mymemory, _mymemory / "weekly"):
+# Monthly schema must stay ahead of weekly's stub of the same name.
+for path in (_mymemory / "weekly", _mymemory, _monthly):
     text = str(path)
-    if text not in sys.path:
-        sys.path.insert(0, text)
+    while text in sys.path:
+        sys.path.remove(text)
+    sys.path.insert(0, text)
 
 from monthly_schema import CAP_NOTE_ITEMS, NOTE_WORD_CAP, MonthlyNoteItem  # noqa: E402
 from monthly_slice import Batch  # noqa: E402

@@ -396,6 +396,7 @@ class MonthlyPayload:
     metrics: MonthlyMetrics = field(default_factory=MonthlyMetrics)
     schema_version: int = 2
     cycle: str = "monthly"
+    pending_sections: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         caps = (
@@ -427,7 +428,10 @@ def _tuple_of(value: Any) -> tuple:
 
 
 def payload_to_dict(payload: MonthlyPayload) -> dict[str, Any]:
-    """Serialize dataclasses with YAML names (`from`, not `from_id`) for the month file."""
+    """Serialize dataclasses with YAML names (`from`, not `from_id`) for the month file.
+
+    Empty pending_sections stays off the file so a finished month matches the old shape.
+    """
     def evidence_text(item: MonthlyEvidenceText) -> dict[str, Any]:
         return {"text": item.text, "evidence": list(item.evidence)}
 
@@ -440,7 +444,7 @@ def payload_to_dict(payload: MonthlyPayload) -> dict[str, Any]:
             return "false"
 
     img = payload.user_image
-    return {
+    data = {
         "schema_version": payload.schema_version,
         "cycle": payload.cycle,
         "month_key": payload.key,
@@ -621,3 +625,6 @@ def payload_to_dict(payload: MonthlyPayload) -> dict[str, Any]:
             "weeks": payload.metrics.weeks,
         },
     }
+    if payload.pending_sections:
+        data["pending_sections"] = list(payload.pending_sections)
+    return data

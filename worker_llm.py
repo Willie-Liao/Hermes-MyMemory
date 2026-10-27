@@ -830,18 +830,24 @@ def _build_phase1_anthropic_kwargs(
 
     Calling this from MyMemory, not from ``AIAgent``, is what puts
     ``tool_choice='required'`` on the wire. ``build_api_kwargs`` drops it.
+    Thinking stays off so the output budget is the tool JSON. Adaptive Claude
+    accepts an explicit disable; other Anthropic-format models (MiniMax) omit
+    it unless the toggle is added, and a 400 drops it on retry.
     """
     from agent.anthropic_adapter import build_anthropic_kwargs
 
-    return build_anthropic_kwargs(
+    built = build_anthropic_kwargs(
         model=model,
         messages=messages,
         tools=tools,
         max_tokens=max_tokens,
-        reasoning_config=None,
+        reasoning_config={"enabled": False},
         tool_choice="required",
         base_url=base_url or None,
     )
+    if "thinking" not in built and "claude" not in str(model or "").lower():
+        built["thinking"] = {"type": "disabled"}
+    return built
 
 
 def _anthropic_messages_create(
@@ -850,11 +856,22 @@ def _anthropic_messages_create(
     api_key: str,
     base_url: str,
 ) -> Any:
-    """POST one Anthropic Messages call. Tests replace this so Hermes stays unedited."""
+    """POST one Anthropic Messages call. Tests replace this so Hermes stays unedited.
+
+    A thinking-disable 400 is retried once without that field so a route that
+    cannot turn thinking off still returns the tool call.
+    """
     from agent.anthropic_adapter import build_anthropic_client
 
     client = build_anthropic_client(api_key, base_url=base_url or None)
-    return client.messages.create(**dict(kwargs))
+    try:
+        return client.messages.create(**dict(kwargs))
+    except Exception as exc:
+        if "thinking" in kwargs and _reasoning_wire_rejection(exc):
+            bare = dict(kwargs)
+            bare.pop("thinking", None)
+            return client.messages.create(**bare)
+        raise
 
 
 def _anthropic_tool_uses(response: Any) -> list[tuple[str, str, dict[str, Any]]]:
@@ -1258,6 +1275,69 @@ def _xiaomi_worker_lane(provider: str, model: str) -> bool:
     return False
 
 
+def _reasoning_wire_rejection(exc: BaseException | None) -> bool:
+    """A 400 that names the thinking field means this route will not accept the disable.
+
+    Retrying once without that field keeps a model that cannot turn thinking off
+    from failing the whole worker call.
+    """
+    if exc is None:
+        return False
+    try:
+        from agent.error_classifier import (
+            is_reasoning_field_rejection,
+            is_reasoning_required_rejection,
+        )
+    except Exception:
+        return False
+    text = str(exc)
+    return bool(
+        is_reasoning_field_rejection(text) or is_reasoning_required_rejection(text)
+    )
+
+
+def _apply_worker_thinking_off(
+    kwargs: dict[str, Any],
+    provider: str,
+    model: str,
+    base_url: str = "",
+) -> str:
+    """Worker reasoning is discarded and spends max_tokens before the tool JSON arrives.
+
+    The provider profile's own disable goes on first. A silent profile gets the
+    shared thinking-disabled toggle. Returns ``profile`` or ``fallback``.
+    """
+    extra = dict(kwargs.get("extra_body") or {})
+    if extra.get("thinking") == {"type": "disabled"}:
+        extra.pop("thinking", None)
+    from_profile = False
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(str(provider or ""))
+        if profile is not None:
+            extra_add, top_add = profile.build_api_kwargs_extras(
+                reasoning_config={"enabled": False},
+                model=model,
+                base_url=base_url or None,
+            )
+            if isinstance(extra_add, Mapping) and extra_add:
+                extra.update(dict(extra_add))
+                from_profile = True
+            if isinstance(top_add, Mapping) and top_add:
+                kwargs.update(dict(top_add))
+                from_profile = True
+    except Exception:
+        from_profile = False
+    if not from_profile:
+        extra["thinking"] = {"type": "disabled"}
+    if extra:
+        kwargs["extra_body"] = extra
+    else:
+        kwargs.pop("extra_body", None)
+    return "profile" if from_profile else "fallback"
+
+
 def _llm_issue_kind(exc: BaseException | None) -> str | None:
     """Classify worker failures so Week Review can name quota vs connection without changing bool callers."""
     if exc is None:
@@ -1598,44 +1678,66 @@ def run_worker_llm_oneshot(
             client_kwargs: dict[str, Any] = {"api_key": api_key}
             if base_url:
                 client_kwargs["base_url"] = base_url
-            create_kwargs["model"] = model
+            sent = {
+                key: value
+                for key, value in create_kwargs.items()
+                if key not in {"extra_body", "reasoning_effort"}
+            }
+            sent["model"] = model
+            _apply_worker_thinking_off(sent, provider, model, base_url or "")
+            thinking_sent = "extra_body" in sent or "reasoning_effort" in sent
+            client = OpenAI(**client_kwargs)
+            resp = None
             try:
-                client = OpenAI(**client_kwargs)
-                resp = client.chat.completions.create(**create_kwargs)
+                resp = client.chat.completions.create(**sent)
             except Exception as exc:
                 last_exc = exc
-                if (
-                    attempt == 0
-                    and _xiaomi_worker_lane(provider, model)
-                    and _quota_exhausted(exc)
-                ):
-                    _mark_xiaomi_quota_dead()
-                    record_worker_usage(
-                        {
-                            "ts": datetime.now(timezone.utc).isoformat(),
-                            "plugin": plugin,
-                            "purpose": purpose,
-                            "model": model,
-                            "config_model": config_model,
-                            "issue": "quota",
-                            "input_tokens": 0,
-                            "output_tokens": 0,
-                            "cache_read_tokens": 0,
-                            "cache_write_tokens": 0,
-                            "reasoning_tokens": 0,
-                            "total_tokens": 0,
-                            "cost_usd": 0.0,
-                            "api_calls": 0,
-                            "duration_ms": _elapsed_ms(),
-                        }
-                    )
-                    provider, model = _K2_WORKER
-                    print(
-                        f"worker_llm: MiMo quota/rate-limit; switching ingest to {model}",
-                        flush=True,
-                    )
-                    continue
-                return _fail_record(exc, model)
+                if thinking_sent and _reasoning_wire_rejection(exc):
+                    bare = {
+                        key: value
+                        for key, value in sent.items()
+                        if key not in {"extra_body", "reasoning_effort"}
+                    }
+                    try:
+                        resp = client.chat.completions.create(**bare)
+                        thinking_sent = False
+                    except Exception as exc2:
+                        last_exc = exc2
+                        exc = exc2
+                if resp is None:
+                    if (
+                        attempt == 0
+                        and _xiaomi_worker_lane(provider, model)
+                        and _quota_exhausted(exc)
+                    ):
+                        _mark_xiaomi_quota_dead()
+                        record_worker_usage(
+                            {
+                                "ts": datetime.now(timezone.utc).isoformat(),
+                                "plugin": plugin,
+                                "purpose": purpose,
+                                "model": model,
+                                "config_model": config_model,
+                                "issue": "quota",
+                                "thinking_off": False,
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                                "cache_read_tokens": 0,
+                                "cache_write_tokens": 0,
+                                "reasoning_tokens": 0,
+                                "total_tokens": 0,
+                                "cost_usd": 0.0,
+                                "api_calls": 0,
+                                "duration_ms": _elapsed_ms(),
+                            }
+                        )
+                        provider, model = _K2_WORKER
+                        print(
+                            f"worker_llm: MiMo quota/rate-limit; switching ingest to {model}",
+                            flush=True,
+                        )
+                        continue
+                    return _fail_record(exc, model)
             choice = resp.choices[0]
             captured = _capture_from_oneshot_message(
                 choice.message, force_tool_name=force
@@ -1660,6 +1762,7 @@ def run_worker_llm_oneshot(
                     "purpose": purpose,
                     "model": model,
                     "config_model": config_model,
+                    "thinking_off": thinking_sent,
                     **usage_fields,
                     "cost_usd": 0.0,
                     "api_calls": 1,
@@ -1696,6 +1799,8 @@ def _run_worker_conversation(
     workers cannot inherit a Kimi Anthropic base_url from the chat gateway.
     MiniMax nested is Anthropic Messages even when env still has ``/v1``.
     Xiaomi/Kimi OpenAI workers keep ``/v1`` and must not inherit ``api_mode``.
+    Thinking is off on every worker turn: core applies the profile disable, and
+    a chat-completions lane whose profile is silent gets the shared toggle.
     """
     try:
         from hermes_cli.env_loader import load_hermes_dotenv
@@ -1741,6 +1846,8 @@ def _run_worker_conversation(
         result: Any = None
         agent: Any = None
         for attempt in (0, 1):
+            nest_mode = "chat_completions"
+            base_url = ""
             if provider:
                 runtime_kwargs["provider"] = provider
                 runtime_kwargs["requested_provider"] = provider
@@ -1788,9 +1895,20 @@ def _run_worker_conversation(
                 "skip_memory": True,
                 "enabled_toolsets": list(enabled_toolsets),
                 "max_iterations": max_iterations,
+                "reasoning_config": {"enabled": False},
             }
-            if request_overrides:
-                agent_kwargs["request_overrides"] = dict(request_overrides)
+            overrides = dict(request_overrides or {})
+            if nest_mode == "chat_completions":
+                scratch: dict[str, Any] = {}
+                kind = _apply_worker_thinking_off(
+                    scratch, str(provider or ""), str(model or ""), base_url
+                )
+                if kind == "fallback" and scratch.get("extra_body"):
+                    extra = dict(overrides.get("extra_body") or {})
+                    extra.update(scratch["extra_body"])
+                    overrides["extra_body"] = extra
+            if overrides:
+                agent_kwargs["request_overrides"] = overrides
             if tool_start_callback is not None:
                 agent_kwargs["tool_start_callback"] = tool_start_callback
             try:

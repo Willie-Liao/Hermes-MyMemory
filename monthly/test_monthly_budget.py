@@ -194,3 +194,21 @@ def test_handle_monthly_help_update_show(tmp_path, monkeypatch):
     )
     shown = handle_monthly("show 2026-08")
     assert "- one story (2026-W32)" in shown
+    monkeypatch.setattr(
+        "monthly_actions.generate_month",
+        lambda key, **_: {
+            "outcome": "partial",
+            "month": key,
+            "pending_sections": ["comparison_with_last_month"],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "seconds": 0.1,
+        },
+    )
+    partial = handle_monthly("update 2026-06")
+    assert "updated 2026-06 (partial; pending: comparison_with_last_month)" in partial
+    from dataclasses import replace
+    from monthly_writer import load_month
+
+    write_month(replace(load_month("2026-08"), pending_sections=("user_image",)))
+    shown_pending = handle_monthly("show 2026-08")
+    assert shown_pending.startswith("pending: user_image\n")

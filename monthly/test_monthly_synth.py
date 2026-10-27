@@ -524,8 +524,9 @@ def test_previous_month_blank_cognition_is_not_written(tmp_path, monkeypatch):
         }
 
     result = generate_month("2026-06", call_oneshot=call, force_refresh=True)
-    assert result["outcome"] == "incomplete"
-    assert not month_file_path("2026-06").is_file()
+    assert result["outcome"] == "partial"
+    assert month_file_path("2026-06").is_file()
+    assert "user_image" in result["pending_sections"]
     failed = " ".join(result["usage"]["attempts"][-1]["failed"])
     assert "cognition_change" in failed
 
@@ -735,11 +736,246 @@ def test_guidance_returns_synthesized_month_id(tmp_path):
     assert all(not str(hit["row"].id).startswith("mem-2026-08-key-decision-") for hit in miss)
 
 
-def test_generate_month_map_input_has_no_event_blocks():
-    from monthly_slice import pack_batches, week_slices
+def _note_ok(**kwargs):
+    if kwargs.get("force_tool_name") == "submit_month_note":
+        return {
+            "failed": False,
+            "tool_name": "submit_month_note",
+            "tool_args": {"items": []},
+            "input_tokens": 1,
+            "output_tokens": 1,
+        }
+    return None
 
-    slices = week_slices("2026-08", types=frozenset({"decision", "procedure"}))
-    types = {b.type for s in slices for b in s.blocks}
-    assert types <= {"decision", "procedure"}
-    for batch in pack_batches(slices):
-        assert "Beginning:" not in batch.rendered
+
+def _tool_ok(name, args):
+    return {
+        "failed": False,
+        "tool_name": name,
+        "tool_args": args,
+        "input_tokens": 1,
+        "output_tokens": 1,
+        "model": "MiniMax-M2.5",
+    }
+
+
+def _write_may_goal():
+    from monthly_schema import MonthlyEvidenceText, MonthlyPayload, MonthlyRange, MonthlyUserImage
+    from monthly_writer import write_month
+
+    write_month(
+        MonthlyPayload(
+            key="2026-05",
+            range=MonthlyRange(start="2026-05-01", end="2026-05-31"),
+            user_image=MonthlyUserImage(
+                goal_alignment=MonthlyEvidenceText(
+                    text="May already held a goal.",
+                    evidence=("mem-2026-05-decision-a",),
+                )
+            ),
+        )
+    )
+
+
+def test_generate_month_reads_token_caps(tmp_path, monkeypatch):
+    from monthly_actions import generate_month
+    import monthly_actions
+
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    MyMemory:\n      monthly:\n"
+        "        map_batch_tokens: 6000\n        reduce_max_tokens: 16384\n",
+        encoding="utf-8",
+    )
+    seen: dict = {}
+    real = monthly_actions.pack_batches
+
+    def wrapped(slices, **kwargs):
+        seen["map"] = kwargs.get("max_tokens")
+        return real(slices, **kwargs)
+
+    monkeypatch.setattr(monthly_actions, "pack_batches", wrapped)
+
+    def call(prompt, **kwargs):
+        note = _note_ok(**kwargs)
+        if note is not None:
+            return note
+        seen["reduce"] = kwargs.get("max_tokens")
+        return _tool_ok(kwargs.get("force_tool_name"), {})
+
+    generate_month("2026-06", call_oneshot=call, force_refresh=True)
+    assert seen["map"] == 6000
+    assert seen["reduce"] == 16384
+
+
+def test_generate_month_bad_caps_fall_back(tmp_path, monkeypatch):
+    from monthly_actions import generate_month
+    from monthly_schema import MAP_BATCH_TOKENS, REDUCE_MAX_TOKENS
+    import monthly_actions
+
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    MyMemory:\n      monthly:\n"
+        "        map_batch_tokens: abc\n        reduce_max_tokens: 0\n",
+        encoding="utf-8",
+    )
+    seen: dict = {}
+    real = monthly_actions.pack_batches
+
+    def wrapped(slices, **kwargs):
+        seen["map"] = kwargs.get("max_tokens")
+        return real(slices, **kwargs)
+
+    monkeypatch.setattr(monthly_actions, "pack_batches", wrapped)
+
+    def call(prompt, **kwargs):
+        note = _note_ok(**kwargs)
+        if note is not None:
+            return note
+        seen["reduce"] = kwargs.get("max_tokens")
+        return _tool_ok(kwargs.get("force_tool_name"), {})
+
+    generate_month("2026-06", call_oneshot=call, force_refresh=True)
+    assert seen["map"] == MAP_BATCH_TOKENS
+    assert seen["reduce"] == REDUCE_MAX_TOKENS
+
+
+def test_partial_month_keeps_passed_sections_and_second_run_carries_them():
+    from monthly_actions import generate_month, reduce_resume_path
+    from monthly_state import month_file_path
+    from monthly_writer import load_month
+
+    _write_may_goal()
+    facts = mechanical_facts("2026-06")
+    broken = _filled_args(facts)
+    broken["comparison_with_last_month"] = {
+        "unchanged": [],
+        "changed": [],
+        "suggestion": "",
+    }
+
+    def call(prompt, **kwargs):
+        note = _note_ok(**kwargs)
+        if note is not None:
+            return note
+        return _tool_ok(kwargs.get("force_tool_name"), broken)
+
+    first = generate_month("2026-06", call_oneshot=call, force_refresh=True)
+    assert first["outcome"] == "partial"
+    assert "comparison_with_last_month" in first["pending_sections"]
+    assert month_file_path("2026-06").is_file()
+    assert reduce_resume_path("2026-06").is_file()
+    kept = load_month("2026-06").key_decisions[0].text
+
+    fixed = _filled_args(facts)
+    fixed["key_decisions"] = []
+
+    def call_again(prompt, **kwargs):
+        note = _note_ok(**kwargs)
+        if note is not None:
+            return note
+        return _tool_ok(kwargs.get("force_tool_name"), fixed)
+
+    second = generate_month("2026-06", call_oneshot=call_again, force_refresh=True)
+    assert second["outcome"] == "partial"
+    assert "key_decisions" in second["pending_sections"]
+    assert load_month("2026-06").key_decisions[0].text == kept
+
+
+def test_gaps_only_patches_stored_sections_and_clears_the_store():
+    from monthly_actions import generate_month, reduce_resume_path
+    from monthly_writer import load_month
+
+    _write_may_goal()
+    facts = mechanical_facts("2026-06")
+    broken = _filled_args(facts)
+    broken["comparison_with_last_month"] = {
+        "unchanged": [],
+        "changed": [],
+        "suggestion": "",
+    }
+    filled = _filled_args(facts)
+    names: list[str] = []
+    fixing = {"on": False}
+
+    def call(prompt, **kwargs):
+        name = str(kwargs.get("force_tool_name") or "")
+        names.append(name)
+        note = _note_ok(**kwargs)
+        if note is not None:
+            return note
+        if name == "patch_month_synthesis" and fixing["on"]:
+            props = kwargs["tool_schema"]["parameters"]["properties"]
+            assert list(props) == ["comparison_with_last_month"]
+            return _tool_ok(
+                name,
+                {"comparison_with_last_month": filled["comparison_with_last_month"]},
+            )
+        return _tool_ok(name, broken)
+
+    first = generate_month("2026-06", call_oneshot=call, force_refresh=True)
+    assert first["outcome"] == "partial"
+    before = len(names)
+    names.clear()
+    fixing["on"] = True
+    second = generate_month("2026-06", call_oneshot=call, gaps_only=True)
+    assert "submit_month_note" not in names
+    assert "submit_month_synthesis" not in names
+    assert "patch_month_synthesis" in names
+    assert second["outcome"] == "ok"
+    assert second["pending_sections"] == []
+    assert not reduce_resume_path("2026-06").is_file()
+    assert load_month("2026-06").pending_sections == ()
+    assert before >= 1
+
+
+def test_transport_failure_does_not_replace_the_month():
+    from monthly_actions import generate_month
+    from monthly_schema import MonthlyDecision, MonthlyPayload, MonthlyRange
+    from monthly_state import month_file_path
+    from monthly_writer import write_month
+
+    write_month(
+        MonthlyPayload(
+            key="2026-06",
+            range=MonthlyRange(start="2026-06-01", end="2026-06-30"),
+            key_decisions=(
+                MonthlyDecision(
+                    id="mem-2026-06-key-decision-kept",
+                    kind="decision",
+                    text="Keep the June decision.",
+                    why_it_matters="it still changes the next time",
+                    evidence=("mem-2026-06-15-decision-a",),
+                ),
+            ),
+        )
+    )
+    path = month_file_path("2026-06")
+    before = path.read_text(encoding="utf-8")
+
+    def call(prompt, **kwargs):
+        note = _note_ok(**kwargs)
+        if note is not None:
+            return note
+        return {
+            "failed": True,
+            "tool_name": kwargs.get("force_tool_name"),
+            "tool_args": None,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "model": "mimo-v2.6-flash",
+        }
+
+    result = generate_month("2026-06", call_oneshot=call, force_refresh=True)
+    assert result["outcome"] == "incomplete"
+    assert path.read_text(encoding="utf-8") == before
+
+
+def test_gaps_only_without_a_store_makes_no_model_calls():
+    from monthly_actions import generate_month
+
+    def boom(prompt, **kwargs):
+        raise AssertionError("gaps_only with no store must not call the model")
+
+    result = generate_month("2026-06", call_oneshot=boom, gaps_only=True)
+    assert result["outcome"] == "ok"
+    assert result["map_calls"] == 0
+    assert result["pending_sections"] == []

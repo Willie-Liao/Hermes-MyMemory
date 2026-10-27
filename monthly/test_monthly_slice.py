@@ -183,8 +183,12 @@ def test_degree_orders_top_decision_first():
 
 
 def test_facts_absent_from_batches():
-    for batch in pack_batches(week_slices("2026-08")):
+    slices = week_slices("2026-08", types=frozenset({"decision", "procedure"}))
+    block_types = {b.type for s in slices for b in s.blocks}
+    assert block_types <= {"decision", "procedure"}
+    for batch in pack_batches(slices):
         assert "type: fact" not in batch.rendered
+        assert "Beginning:" not in batch.rendered
         types = {b.type for s in batch.slices for b in s.blocks}
         assert "fact" not in types
 

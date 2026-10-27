@@ -29,6 +29,27 @@ from MyMemory.weekly.slash import handle_weekly
 from MyMemory.digest import digest
 
 
+def _allow_mymemory_discovery(monkeypatch) -> None:
+    """Local hermes-home may list MyMemory under plugins.disabled; discovery tests need it on."""
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli import plugins_discovery
+    import plugins.memory as memory_plugins
+
+    real_disabled = plugins_discovery._get_disabled_plugins
+    filtered = lambda: {name for name in real_disabled() if name != "MyMemory"}
+    real_explicit = memory_plugins._explicitly_disabled
+
+    monkeypatch.setattr(plugins_discovery, "_get_disabled_plugins", filtered)
+    monkeypatch.setattr(plugins_mod, "_get_disabled_plugins", filtered)
+    monkeypatch.setattr(
+        memory_plugins,
+        "_explicitly_disabled",
+        lambda name, provider_dir: (
+            False if name == "MyMemory" else real_explicit(name, provider_dir)
+        ),
+    )
+
+
 def _block(*, block_id: str, body: str) -> str:
     return "\n".join(
         [
@@ -62,6 +83,7 @@ def test_plugin_manager_discover_registers_digest_and_weekly_slash(monkeypatch):
     from hermes_cli import plugins as plugins_mod
 
     monkeypatch.setenv("HERMES_HOME", str(_HERMES_HOME))
+    _allow_mymemory_discovery(monkeypatch)
     mgr = plugins_mod.PluginManager()
     monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
     monkeypatch.setattr(plugins_mod, "get_plugin_manager", lambda: mgr)
@@ -109,6 +131,7 @@ def test_registered_monthly_handler_runs_off_calling_thread(monkeypatch):
 
     monkeypatch.setattr(asyncio, "to_thread", tracking)
     monkeypatch.setenv("HERMES_HOME", str(_HERMES_HOME))
+    _allow_mymemory_discovery(monkeypatch)
     mgr = plugins_mod.PluginManager()
     monkeypatch.setattr(plugins_mod, "_plugin_manager", mgr)
     monkeypatch.setattr(plugins_mod, "get_plugin_manager", lambda: mgr)
@@ -356,6 +379,7 @@ def test_initialize_starts_clock_weekly_retention_once(monkeypatch):
 )
 def test_hermes_loader_discovers_mymemory(monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(_HERMES_HOME))
+    _allow_mymemory_discovery(monkeypatch)
     from plugins.memory import _is_memory_provider_dir, load_memory_provider
 
     assert _is_memory_provider_dir(_HERE) is True
