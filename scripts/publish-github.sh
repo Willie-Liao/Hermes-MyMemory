@@ -29,6 +29,12 @@ rsync -a \
   --exclude '.claude/' \
   --exclude '.test-hermes-home/' \
   --exclude 'probe_*.py' \
+  --exclude 'weekly/debug_w38_worker1_events.py' \
+  --exclude 'weekly/test_w38_sunday_evening_patch.py' \
+  --exclude 'monthly/test_monthly_eval.py' \
+  --exclude 'weekly/scripts/eval_weekly_threads_mimo.py' \
+  --exclude 'recall/embed_scale_latency_before.json' \
+  --exclude 'recall/embed_scale_latency_after.json' \
   --exclude 'node_modules/' \
   --exclude 'weekly/ui/dist/' \
   --exclude '.env' --exclude '.env.local' --exclude 'auth.json' \

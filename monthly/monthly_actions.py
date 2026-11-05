@@ -9,7 +9,7 @@ import time
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 _monthly = Path(__file__).resolve().parent
 _mymemory = _monthly.parent
@@ -267,24 +267,29 @@ def _lexical_sim(query: str, candidate: str) -> float:
     return len(qt & ct) / len(qt | ct)
 
 
-def _guidance_sim(query: str, candidate: str) -> float:
-    """Lexical overlap first; GTE cosine only if lexical misses the monthly-guidance gate.
+def _guidance_sim(
+    query: str,
+    candidate: str,
+    query_vec: Sequence[float] | None,
+    cand_vec: Sequence[float] | None,
+) -> float:
+    """Prefer lexical overlap so an exact English match never waits on ONNX.
 
-    Situation questions about a stored preference land near 0.91, so 0.92 admits
-    that match. This gate is monthly guidance only.
+    Cosine uses vectors the caller already loaded. A missing vector stays lexical
+    so prefetch does not encode one candidate at a time. The 0.92 gate is monthly
+    guidance only; situation questions about a stored preference land near 0.91.
     """
     lexical = _lexical_sim(query, candidate)
     if lexical >= _GUIDANCE_GATE:
         return lexical
+    if not query_vec or not cand_vec:
+        return lexical
     try:
-        from recall.embed import _cosine, _encode_texts
+        from recall.embed import _cosine
 
-        vecs = _encode_texts([query, candidate])
-        if vecs and len(vecs) == 2:
-            return float(_cosine(vecs[0], vecs[1]))
+        return float(_cosine(query_vec, cand_vec))
     except Exception:
-        pass
-    return lexical
+        return lexical
 
 
 def rank_monthly_guidance(
@@ -296,43 +301,75 @@ def rank_monthly_guidance(
     """Rank active monthly D/P for a task-shaped query so prefetch does not scan daily events first.
 
     Strength may reorder inside the admitted set; it cannot rescue a row below the 0.92 gate.
+    A row missing from embed-cache.json is scored lexically until the next 01:00 fill.
     """
     q = str(query or "").strip()
     if not q:
         return []
-    admitted: list[dict[str, Any]] = []
+    pending: list[tuple[str, Any, Any, str]] = []
     for payload in _iter_payloads(staging):
         superseded = {sid for row in payload.key_decisions for sid in row.supersedes}
         for row in payload.key_decisions:
             if not _is_active_decision(row, superseded):
                 continue
-            sim = _guidance_sim(q, row.lookup_text())
-            if sim < _GUIDANCE_GATE:
-                continue
-            rank = 0.8 * sim + 0.2 * (float(row.strength) / 10.0)
-            admitted.append(
-                {
-                    "kind": "decision",
-                    "month": payload.key,
-                    "sim": sim,
-                    "rank": rank,
-                    "row": row,
-                }
-            )
+            pending.append(("decision", payload, row, row.lookup_text()))
         for row in payload.key_procedures:
-            sim = _guidance_sim(q, row.lookup_text())
-            if sim < _GUIDANCE_GATE:
-                continue
-            rank = 0.8 * sim + 0.2 * (float(row.strength) / 10.0)
-            admitted.append(
+            pending.append(("procedure", payload, row, row.lookup_text()))
+    try:
+        from recall.embed_cache import load_cache, scale_block_id
+    except Exception:
+        load_cache = None
+        scale_block_id = None
+    cache: dict[str, Any] = {}
+    if load_cache is not None:
+        try:
+            cache = load_cache()
+        except Exception:
+            cache = {}
+    vectors: list[list[float] | None] = []
+    need_query = False
+    for _kind, payload, row, text in pending:
+        vec: list[float] | None = None
+        if scale_block_id is not None and _lexical_sim(q, text) < _GUIDANCE_GATE:
+            bid = scale_block_id(
                 {
-                    "kind": "procedure",
-                    "month": payload.key,
-                    "sim": sim,
-                    "rank": rank,
-                    "row": row,
+                    "scale": "month",
+                    "kind": "dp",
+                    "text": text.strip(),
+                    "mem_id": str(getattr(row, "id", "") or "").strip(),
+                    "month_key": str(getattr(payload, "key", "") or "").strip(),
                 }
             )
+            raw = (cache.get(bid) or {}).get("embedding") or []
+            if raw:
+                vec = list(raw)
+                need_query = True
+        vectors.append(vec)
+    query_vec: list[float] | None = None
+    if need_query:
+        try:
+            from recall.embed import _encode_texts
+
+            encoded = _encode_texts([q])
+            if encoded and encoded[0]:
+                query_vec = encoded[0]
+        except Exception:
+            query_vec = None
+    admitted: list[dict[str, Any]] = []
+    for (kind, payload, row, text), cand_vec in zip(pending, vectors):
+        sim = _guidance_sim(q, text, query_vec, cand_vec)
+        if sim < _GUIDANCE_GATE:
+            continue
+        rank = 0.8 * sim + 0.2 * (float(row.strength) / 10.0)
+        admitted.append(
+            {
+                "kind": kind,
+                "month": payload.key,
+                "sim": sim,
+                "rank": rank,
+                "row": row,
+            }
+        )
     prefs = [h for h in admitted if h["kind"] == "decision"]
     procs = [h for h in admitted if h["kind"] == "procedure"]
     prefs.sort(key=lambda h: (-h["rank"], h["row"].id))

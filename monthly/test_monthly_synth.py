@@ -691,8 +691,10 @@ def test_two_decision_cards_store_synthesis_not_either_clause():
     assert row.text not in {left.clause, right.clause}
 
 
-def test_guidance_returns_synthesized_month_id(tmp_path):
+def test_guidance_returns_synthesized_month_id(tmp_path, monkeypatch):
     """Guidance must surface the minted synthesis, not a one-day act the reduce dropped."""
+    from recall.embed_cache import scale_block_id
+
     from monthly_actions import format_guidance_hits, rank_monthly_guidance
     from monthly_writer import dump_yaml
 
@@ -723,6 +725,27 @@ def test_guidance_returns_synthesized_month_id(tmp_path):
     folder = tmp_path / "monthly"
     folder.mkdir()
     (folder / "2026-08.md").write_text(dump_yaml(payload), encoding="utf-8")
+    row = payload.key_decisions[0]
+    bid = scale_block_id(
+        {
+            "scale": "month",
+            "kind": "dp",
+            "text": row.lookup_text().strip(),
+            "mem_id": row.id,
+            "month_key": payload.key,
+        }
+    )
+    monkeypatch.setattr(
+        "recall.embed_cache.load_cache",
+        lambda: {bid: {"embedding": [1.0, 0.0]}},
+    )
+
+    def _encode(texts):
+        if texts and texts[0] == synthesis:
+            return [[1.0, 0.0]]
+        return [[0.0, 1.0]]
+
+    monkeypatch.setattr("recall.embed._encode_texts", _encode)
     hits = rank_monthly_guidance(synthesis, staging=tmp_path)
     assert hits
     assert hits[0]["row"].id.startswith("mem-2026-08-key-decision-")
@@ -734,6 +757,91 @@ def test_guidance_returns_synthesized_month_id(tmp_path):
         staging=tmp_path,
     )
     assert all(not str(hit["row"].id).startswith("mem-2026-08-key-decision-") for hit in miss)
+
+
+def _write_guidance_month(tmp_path):
+    from monthly_writer import dump_yaml
+
+    facts = mechanical_facts("2026-08")
+    real = next(b for b in facts.all_dpe if b.type == "decision")
+    synthesis = (
+        "user rules that cross-type blocks do not merge and the higher-priority type wins"
+    )
+    payload = payload_from_synthesis(
+        "2026-08",
+        {
+            "summary": "August",
+            "key_decisions": [
+                {
+                    "text": synthesis,
+                    "why_it_matters": "restated across the month",
+                    "evidence": [real.id],
+                }
+            ],
+        },
+        facts,
+        carry="",
+        model="mimo-v2.5",
+        map_calls=1,
+        reduce_tokens=1,
+        generated_at="2026-09-01T08:00:00+08:00",
+    )
+    folder = tmp_path / "monthly"
+    folder.mkdir()
+    (folder / "2026-08.md").write_text(dump_yaml(payload), encoding="utf-8")
+    return payload
+
+
+def test_guidance_uses_cached_vector_for_one_query_encode(tmp_path, monkeypatch):
+    """A Chinese query must admit a cached row without encoding that row again."""
+    from recall.embed_cache import scale_block_id
+
+    from monthly_actions import rank_monthly_guidance
+
+    payload = _write_guidance_month(tmp_path)
+    row = payload.key_decisions[0]
+    bid = scale_block_id(
+        {
+            "scale": "month",
+            "kind": "dp",
+            "text": row.lookup_text().strip(),
+            "mem_id": row.id,
+            "month_key": payload.key,
+        }
+    )
+    monkeypatch.setattr(
+        "recall.embed_cache.load_cache",
+        lambda: {bid: {"embedding": [1.0, 0.0]}},
+    )
+    calls: list[list[str]] = []
+
+    def _encode(texts):
+        calls.append(list(texts))
+        return [[1.0, 0.0] for _text in texts]
+
+    monkeypatch.setattr("recall.embed._encode_texts", _encode)
+    hits = rank_monthly_guidance("prefetch正常吗", staging=tmp_path)
+    assert hits
+    assert hits[0]["row"].id == row.id
+    assert calls == [["prefetch正常吗"]]
+
+
+def test_guidance_cache_miss_stays_lexical(tmp_path, monkeypatch):
+    """A missing vector must not encode the candidate during prefetch."""
+    from monthly_actions import rank_monthly_guidance
+
+    payload = _write_guidance_month(tmp_path)
+    monkeypatch.setattr("recall.embed_cache.load_cache", lambda: {})
+    calls: list[list[str]] = []
+
+    def _encode(texts):
+        calls.append(list(texts))
+        return [[1.0, 0.0] for _text in texts]
+
+    monkeypatch.setattr("recall.embed._encode_texts", _encode)
+    hits = rank_monthly_guidance("prefetch正常吗", staging=tmp_path)
+    assert calls == []
+    assert all(hit["row"].id != payload.key_decisions[0].id for hit in hits)
 
 
 def _note_ok(**kwargs):

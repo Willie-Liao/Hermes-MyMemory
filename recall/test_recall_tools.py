@@ -294,6 +294,41 @@ def test_default_model_is_gte_multilingual_base():
     assert DEFAULT_MODEL == "Alibaba-NLP/gte-multilingual-base"
 
 
+def test_rerank_embed_uses_cached_pool_without_reencoding(monkeypatch):
+    """Cards already in embed-cache must not be encoded again when global top-k misses them."""
+    from recall.ids import BlockRecord
+
+    recs = []
+    cache = {}
+    for i in range(12):
+        bid = f"mem-2026-08-01-decision-{i:012d}"
+        recs.append(
+            BlockRecord(
+                block_id=bid,
+                path=Path("x.md"),
+                parsed={},
+                body="body",
+                day="2026-08-01",
+                item_type="decision",
+                entity="e",
+            )
+        )
+        cache[bid] = {"embedding": [1.0, 0.0]}
+    calls: list[list[str]] = []
+
+    def _encode(texts):
+        calls.append(list(texts))
+        return [[1.0, 0.0] for _text in texts]
+
+    monkeypatch.setattr("recall.embed._encode_texts", _encode)
+    monkeypatch.setattr("recall.embed_cache.search_cache", lambda *_a, **_k: [])
+    monkeypatch.setattr("recall.embed_cache.load_cache", lambda: cache)
+    text = rerank_embed("prefetch正常吗", recs, k=8)
+    assert calls == [["prefetch正常吗"]]
+    assert "channel=embed" in text
+    assert recs[0].block_id in text
+
+
 def test_rerank_embed_missing_onnx_failopen(tmp_path, monkeypatch):
     monkeypatch.setenv("MYMEMORY_GTE_ONNX", str(tmp_path / "no-such.onnx"))
     write_fake_staging(tmp_path)
@@ -484,14 +519,10 @@ def test_embed_real_peak_keeps_two(staging, monkeypatch):
 
 
 def test_guidance_mode_monthly_preference_before_procedure(staging, monkeypatch):
-    """The monthly-guidance gate is 0.92, so this stub must clear it or the channel never appears."""
+    """Monthly guidance uses cached D/P vectors; encode the query once when lexical is below 0.92."""
 
-    def _stub_encode(texts):
-        query = texts[0] if texts else ""
-        score = 0.98 if "review summaries" in query else 0.1
-        return [[1.0, 0.0], _vec_for_cosine(score)]
+    from recall.embed_cache import scale_block_id
 
-    monkeypatch.setattr("recall.embed._encode_texts", _stub_encode)
     monthly = staging / "monthly" / "2026-08.md"
     monthly.write_text(
         monthly.read_text(encoding="utf-8")
@@ -515,6 +546,36 @@ def test_guidance_mode_monthly_preference_before_procedure(staging, monkeypatch)
         + "    strength: 9.0\n",
         encoding="utf-8",
     )
+    import sys
+    from pathlib import Path as _Path
+
+    mdir = _Path(__file__).resolve().parent.parent / "monthly"
+    if str(mdir) not in sys.path:
+        sys.path.insert(0, str(mdir))
+    from monthly_actions import _iter_payloads
+
+    cache: dict[str, dict] = {}
+    for payload in _iter_payloads(staging):
+        for row in (*payload.key_decisions, *payload.key_procedures):
+            bid = scale_block_id(
+                {
+                    "scale": "month",
+                    "kind": "dp",
+                    "text": row.lookup_text().strip(),
+                    "mem_id": str(row.id).strip(),
+                    "month_key": str(payload.key).strip(),
+                }
+            )
+            cache[bid] = {"embedding": [1.0, 0.0]}
+
+    def _stub_encode(texts):
+        q = texts[0] if texts else ""
+        if "review summaries" in q:
+            return [[1.0, 0.0]]
+        return [[0.0, 1.0]]
+
+    monkeypatch.setattr("recall.embed_cache.load_cache", lambda: cache)
+    monkeypatch.setattr("recall.embed._encode_texts", _stub_encode)
     text = recall_memory(
         "writing weekly review summaries",
         staging=staging,

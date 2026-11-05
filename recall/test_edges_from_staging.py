@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from recall.conftest import HOP1, HOP2, SEED
 from recall.edges import extract_edges
 from recall.ids import BlockIndex
@@ -42,3 +44,63 @@ def test_related_cross_day_and_no_event_to_event(staging):
     for e in edges:
         assert e["to"] not in dangling_set
         assert e["to"] in by_id
+
+
+def test_render_bands_writes_edges_once(staging, monkeypatch):
+    """A second prefetch must not rebuild edges.jsonl when the cards are unchanged."""
+    import recall.edges as edges
+    from recall.tools import render_bands
+
+    calls = {"n": 0}
+    real = edges.extract_edges
+
+    def _count(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(edges, "extract_edges", _count)
+    render_bands(staging)
+    path = staging / "edges.jsonl"
+    assert path.is_file()
+    assert path.read_text(encoding="utf-8").strip()
+    assert calls["n"] == 1
+    render_bands(staging)
+    assert calls["n"] == 1
+
+
+def test_load_edges_rewrites_when_a_daily_card_is_newer(staging, monkeypatch):
+    """A newer daily card must refresh edges.jsonl or Band B keeps yesterday's links."""
+    import recall.edges as edges
+
+    calls = {"n": 0}
+    real = edges.extract_edges
+
+    def _count(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(edges, "extract_edges", _count)
+    edges.load_edges(staging)
+    assert calls["n"] == 1
+    daily = next((staging / "daily").glob("*.md"))
+    path = staging / "edges.jsonl"
+    newer = path.stat().st_mtime + 5
+    os.utime(daily, (newer, newer))
+    edges.load_edges(staging)
+    assert calls["n"] == 2
+
+
+def test_load_edges_falls_back_when_staging_is_read_only(staging):
+    """A read-only staging dir must still return edges instead of failing prefetch."""
+    import recall.edges as edges
+
+    edges.load_edges(staging)
+    path = staging / "edges.jsonl"
+    path.unlink()
+    os.chmod(staging, 0o555)
+    try:
+        loaded = edges.load_edges(staging)
+        assert loaded
+        assert not path.exists()
+    finally:
+        os.chmod(staging, 0o755)

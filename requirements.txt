@@ -9,5 +9,6 @@ numpy
 pyyaml
 openai
 ruamel.yaml
-torch==2.15.0+cpu
+torch==2.15.0+cpu; sys_platform != "darwin"
+torch==2.15.0; sys_platform == "darwin"
 sentence-transformers>=3.0.0

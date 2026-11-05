@@ -30,6 +30,16 @@ git -C "$AGENT_ROOT" archive "$COMMIT" hermes-home/plugins/MyMemory \
   | tar -x -C "$WORKDIR/src" --strip-components=3
 
 cd "$WORKDIR/src"
+# Dated harnesses and local probe clocks must not ship in the public snapshot.
+rm -f \
+  weekly/debug_w38_worker1_events.py \
+  weekly/test_w38_sunday_evening_patch.py \
+  monthly/test_monthly_eval.py \
+  weekly/scripts/eval_weekly_threads_mimo.py \
+  recall/embed_scale_latency_before.json \
+  recall/embed_scale_latency_after.json
+find weekly -maxdepth 1 -type f -name 'debug_*.py' -delete 2>/dev/null || true
+find . -type f -name 'probe_*.py' -delete 2>/dev/null || true
 # No secrets or runtime memory in the public plugin repo.
 find . -type f \( -name '.env' -o -name '.env.local' -o -name 'auth.json' \) -delete 2>/dev/null || true
 while IFS= read -r -d '' f; do

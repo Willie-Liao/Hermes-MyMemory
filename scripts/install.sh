@@ -89,6 +89,12 @@ RSYNC_EXCLUDES=(
   --exclude '.claude/'
   --exclude '.test-hermes-home/'
   --exclude 'probe_*.py'
+  --exclude 'weekly/debug_w38_worker1_events.py'
+  --exclude 'weekly/test_w38_sunday_evening_patch.py'
+  --exclude 'monthly/test_monthly_eval.py'
+  --exclude 'weekly/scripts/eval_weekly_threads_mimo.py'
+  --exclude 'recall/embed_scale_latency_before.json'
+  --exclude 'recall/embed_scale_latency_after.json'
   --exclude 'Install MyMemory.command'
   --exclude '__pycache__/'
   --exclude '.pytest_cache/'
@@ -120,15 +126,20 @@ echo ""
 rsync -a "${RSYNC_EXCLUDES[@]}" "$PACK_ROOT/" "$DEST/"
 # AppleDouble sidecars match *.py and are not UTF-8, so source scans fail after a Mac pack.
 find "$DEST" -name '._*' -delete
-# Week-specific debug harnesses are not part of the supported install test suite.
-# rsync does not delete files already on the gateway, so drop retired names explicitly.
-rm -f \
-  "$DEST/weekly/debug_w38_worker1_events.py" \
-  "$DEST/weekly/test_w38_sunday_evening_patch.py" \
-  "$DEST/monthly/test_monthly_eval.py" \
-  "$DEST/weekly/scripts/eval_weekly_threads_mimo.py"
-find "$DEST/weekly" -maxdepth 1 -type f -name 'debug_*.py' -delete 2>/dev/null || true
-find "$DEST" -type f -name 'probe_*.py' -delete 2>/dev/null || true
+# Retired dated harnesses are not in run-tests.sh; rsync does not delete stale gateway files.
+purge_retired_mymemory_harnesses() {
+  local dest="$1"
+  rm -f \
+    "$dest/weekly/debug_w38_worker1_events.py" \
+    "$dest/weekly/test_w38_sunday_evening_patch.py" \
+    "$dest/monthly/test_monthly_eval.py" \
+    "$dest/weekly/scripts/eval_weekly_threads_mimo.py" \
+    "$dest/recall/embed_scale_latency_before.json" \
+    "$dest/recall/embed_scale_latency_after.json"
+  find "$dest/weekly" -maxdepth 1 -type f -name 'debug_*.py' -delete 2>/dev/null || true
+  find "$dest" -type f -name 'probe_*.py' -delete 2>/dev/null || true
+}
+purge_retired_mymemory_harnesses "$DEST"
 echo "installed: plugins/MyMemory"
 
 resolve_runtime_python() {

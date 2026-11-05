@@ -275,11 +275,12 @@ def rerank_embed(
     *_a,
     **_k,
 ) -> list | str:
-    """Cosine-rerank using pre-computed embedding cache; fall back to runtime encoding.
+    """Cosine-rerank from the 01:00 cache so a guidance miss does not re-encode the pool.
 
-    Cache-first: encode query once, search all cached block embeddings (<1ms).
-    Fall back to original pool encoding only when cache has < CACHE_MIN_ENTRIES matches.
-    COSINE_FLOOR is a prefilter. Gap-based pruning keeps rank separation.
+    A global top-k can miss this pool, and encoding those cards again blows the
+    prefetch timeout even though embed-cache.json already holds the vectors.
+    Live encoding remains only when the pool itself has fewer than CACHE_MIN_ENTRIES
+    cached hits. COSINE_FLOOR is a prefilter. Gap-based pruning keeps rank separation.
     """
     q = str(query or "").strip()
     live = list(records or [])
@@ -314,7 +315,21 @@ def rerank_embed(
             if rec is not None:
                 matched.append((score, rec))
 
-        # 3) Fall back to original runtime encoding if cache is too sparse
+        # 3) Score this pool from the cache. Global top-k often is not these cards.
+        if len(matched) < CACHE_MIN_ENTRIES:
+            cache = embed_cache.load_cache()
+            pooled: list[tuple[float, BlockRecord]] = []
+            for rec in live:
+                vec = (cache.get(rec.block_id) or {}).get("embedding") or []
+                if not vec:
+                    continue
+                score = _cosine(qv, vec)
+                if score >= COSINE_FLOOR:
+                    pooled.append((score, rec))
+            if len(pooled) >= CACHE_MIN_ENTRIES:
+                matched = pooled
+
+        # 4) Fall back to runtime encoding only when this pool's cache is sparse
         if len(matched) < CACHE_MIN_ENTRIES:
             ordered = sorted(live, key=lambda r: str(r.day or ""), reverse=True)
             try:

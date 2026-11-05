@@ -155,13 +155,49 @@ def write_edges(staging: Path | None = None) -> tuple[Path, list[str]]:
 
 
 def load_edges(staging: Path | None = None) -> list[dict[str, Any]]:
+    """Read edges.jsonl so prefetch Band B does not rebuild two thousand edges every turn.
+
+    Rewrite when the file is missing or older than daily cards, weekly sidecars,
+    or entity_index.json. A read-only staging directory falls back to an in-memory
+    extract so prefetch still returns edges.
+    """
     root = staging_root(staging)
     path = root / "edges.jsonl"
+    newest = 0.0
+    for folder in ("daily", "weekly"):
+        directory = root / folder
+        if not directory.is_dir():
+            continue
+        for card in directory.glob("*.md"):
+            try:
+                newest = max(newest, card.stat().st_mtime)
+            except OSError:
+                continue
+    index_path = root / "entity_index.json"
+    try:
+        newest = max(newest, index_path.stat().st_mtime)
+    except OSError:
+        pass
+    try:
+        fresh = path.is_file() and path.stat().st_mtime >= newest
+    except OSError:
+        fresh = False
+    if not fresh:
+        try:
+            write_edges(root)
+        except OSError:
+            edges, _dangling = extract_edges(root)
+            return edges
     if not path.is_file():
-        edges, _ = extract_edges(root)
+        edges, _dangling = extract_edges(root)
+        return edges
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        edges, _dangling = extract_edges(root)
         return edges
     out: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in raw.splitlines():
         line = line.strip()
         if not line:
             continue
