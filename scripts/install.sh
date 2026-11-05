@@ -93,6 +93,9 @@ RSYNC_EXCLUDES=(
   --exclude 'weekly/test_w38_sunday_evening_patch.py'
   --exclude 'monthly/test_monthly_eval.py'
   --exclude 'weekly/scripts/eval_weekly_threads_mimo.py'
+  --exclude 'weekly/scripts/probe_tighten_ui_latency.py'
+  --exclude 'weekly/test_monthly_schema.py'
+  --exclude 'digest/probe_recall_mimo.py'
   --exclude 'recall/embed_scale_latency_before.json'
   --exclude 'recall/embed_scale_latency_after.json'
   --exclude 'Install MyMemory.command'
@@ -134,6 +137,9 @@ purge_retired_mymemory_harnesses() {
     "$dest/weekly/test_w38_sunday_evening_patch.py" \
     "$dest/monthly/test_monthly_eval.py" \
     "$dest/weekly/scripts/eval_weekly_threads_mimo.py" \
+    "$dest/weekly/scripts/probe_tighten_ui_latency.py" \
+    "$dest/weekly/test_monthly_schema.py" \
+    "$dest/digest/probe_recall_mimo.py" \
     "$dest/recall/embed_scale_latency_before.json" \
     "$dest/recall/embed_scale_latency_after.json"
   find "$dest/weekly" -maxdepth 1 -type f -name 'debug_*.py' -delete 2>/dev/null || true

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import sys
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -178,15 +181,37 @@ def test_send_skips_without_chat_id_still_generates(tmp_path, monkeypatch):
     assert sent_calls  # generate path still invokes send helper
 
 
+def _start_loop() -> asyncio.AbstractEventLoop:
+    """Run a loop on a side thread so the sender can submit without owning it."""
+    loop = asyncio.new_event_loop()
+    started = threading.Event()
+
+    def _run() -> None:
+        asyncio.set_event_loop(loop)
+        started.set()
+        loop.run_forever()
+
+    threading.Thread(target=_run, daemon=True).start()
+    assert started.wait(2)
+    deadline = time.time() + 2
+    while not loop.is_running() and time.time() < deadline:
+        time.sleep(0.01)
+    assert loop.is_running()
+    return loop
+
+
 def test_send_uses_live_adapter_when_runner_present(monkeypatch):
     clock = _load_clock()
     monkeypatch.setenv("WEEKLY_BRIEF_WEIXIN_TO", "wx-chat")
+    loop = _start_loop()
+    seen: list[asyncio.AbstractEventLoop] = []
 
     class _Adapter:
         def __init__(self):
             self.sent = []
 
         async def send(self, chat_id, content, metadata=None, reply_to=None):
+            seen.append(asyncio.get_running_loop())
             self.sent.append((chat_id, content))
 
             class _R:
@@ -200,11 +225,46 @@ def test_send_uses_live_adapter_when_runner_present(monkeypatch):
 
     class _Runner:
         adapters = {"weixin": adapter}
+        _gateway_loop = loop
+
+    try:
+        monkeypatch.setattr(clock, "_gateway_runner_ref", lambda: _Runner())
+        out = clock.send_weekly_brief_weixin("hello weekly")
+        assert out["outcome"] == "sent"
+        assert adapter.sent == [("wx-chat", "hello weekly")]
+        assert seen == [loop]
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+
+
+def test_send_skips_when_gateway_loop_is_absent(monkeypatch):
+    clock = _load_clock()
+    monkeypatch.setenv("WEEKLY_BRIEF_WEIXIN_TO", "wx-chat")
+    calls: list[str] = []
+
+    class _Adapter:
+        async def send(self, chat_id, content, metadata=None, reply_to=None):
+            calls.append(content)
+            raise AssertionError("send must not run without a live gateway loop")
+
+    class _Runner:
+        adapters = {"weixin": _Adapter()}
 
     monkeypatch.setattr(clock, "_gateway_runner_ref", lambda: _Runner())
-    out = clock.send_weekly_brief_weixin("hello weekly")
-    assert out["outcome"] == "sent"
-    assert adapter.sent == [("wx-chat", "hello weekly")]
+    missing = clock.send_weekly_brief_weixin("hello weekly")
+    assert missing == {"outcome": "skipped", "reason": "no_loop"}
+
+    stopped = asyncio.new_event_loop()
+
+    class _Stopped:
+        adapters = {"weixin": _Adapter()}
+        _gateway_loop = stopped
+
+    monkeypatch.setattr(clock, "_gateway_runner_ref", lambda: _Stopped())
+    idle = clock.send_weekly_brief_weixin("hello weekly")
+    assert idle == {"outcome": "skipped", "reason": "no_loop"}
+    assert calls == []
+    stopped.close()
 
 
 def test_state_persists_sunday_keys(tmp_path, monkeypatch):

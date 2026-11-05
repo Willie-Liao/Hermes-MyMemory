@@ -33,6 +33,9 @@ rsync -a \
   --exclude 'weekly/test_w38_sunday_evening_patch.py' \
   --exclude 'monthly/test_monthly_eval.py' \
   --exclude 'weekly/scripts/eval_weekly_threads_mimo.py' \
+  --exclude 'weekly/scripts/probe_tighten_ui_latency.py' \
+  --exclude 'weekly/test_monthly_schema.py' \
+  --exclude 'digest/probe_recall_mimo.py' \
   --exclude 'recall/embed_scale_latency_before.json' \
   --exclude 'recall/embed_scale_latency_after.json' \
   --exclude 'node_modules/' \

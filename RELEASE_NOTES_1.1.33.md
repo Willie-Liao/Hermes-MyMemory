@@ -10,10 +10,12 @@
 
 - Detect missing runtime packages with **`importlib.util.find_spec`** only (no torch import at plugin load).
 - After installing `requirements.txt` into a new Hermes environment, **request a gateway restart** so the next process can register prefetch within the load timeout.
+- **WeChat sends** from the weekly brief and the runtime-deps notice go through `runner._gateway_loop`. A background thread no longer opens its own event loop, which had bound the Weixin send lock and dropped later replies.
+- The runtime-deps notice retries only while the adapter is not connected, and stops on the first real send error.
 
 ### Install and publish hygiene
 
-- Rsync excludes and post-install **`purge_retired_mymemory_harnesses`**: W38 debug tests, `test_monthly_eval.py`, `eval_weekly_threads_mimo.py`, `probe_*.py`, and local embed-scale probe JSON.
+- Rsync excludes and post-install **`purge_retired_mymemory_harnesses`**: W38 debug tests, `test_monthly_eval.py`, `eval_weekly_threads_mimo.py`, `probe_tighten_ui_latency.py`, `probe_recall_mimo.py`, the duplicate `weekly/test_monthly_schema.py`, other `probe_*.py`, and local embed-scale probe JSON.
 - Cloud push and GitHub publish use the same retired-harness list.
 
 ### Requirements

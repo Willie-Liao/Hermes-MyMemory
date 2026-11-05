@@ -1045,9 +1045,8 @@ def test_build_analyst_prompt_has_candidates_not_merged_events():
 def test_thread_prompt_token_time(tmp_path, monkeypatch):
     """Pre-cutover worker1_thread dump was the full YAML; compare chars here.
 
-    Live eval_weekly_threads_mimo.py --full-generate now prints worker1_thread
-    vs worker1_event input_tokens separately. Record a pre-change thread
-    input_tokens from that script before relying on the live path.
+    The dated live-eval script is gone, so this assertion is the remaining
+    check that the thread prompt stays on the candidate index.
     """
     workers = _load_workers("memory_weekly_token_time")
     monkeypatch.setattr(

@@ -301,6 +301,32 @@ def test_register_sends_unsent_notice_once(monkeypatch, tmp_path):
     assert not notice.exists()
 
 
+def test_register_stops_notice_after_send_error(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    notice = _notice_path(tmp_path)
+    notice.parent.mkdir(parents=True)
+    notice.write_text(
+        json.dumps({"missing": ["onnxruntime"], "sent": False}),
+        encoding="utf-8",
+    )
+    calls: list[str] = []
+
+    def fake_send(text):
+        calls.append(text)
+        return {"outcome": "error", "error": "prepare failed"}
+
+    clock = __import__("MyMemory.weekly.weekly_clock", fromlist=["send_weekly_brief_weixin"])
+    monkeypatch.setattr(clock, "send_weekly_brief_weixin", fake_send)
+    monkeypatch.setattr(MyMemory.threading, "Thread", _InlineThread)
+
+    MyMemory.register(_Ctx())
+
+    assert calls == [
+        "MyMemory installed the missing modules (onnxruntime) and restarted. Memory prefetch is registered."
+    ]
+    assert notice.is_file()
+
+
 def test_register_drops_notice_already_sent(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     notice = _notice_path(tmp_path)

@@ -266,12 +266,14 @@ def register(ctx) -> None:
                 )
 
                 def _deliver_runtime_deps_notice() -> None:
-                    """The pre-restart WeChat send can miss the adapter, which connects only after register returns.
+                    """Retry only while the adapter is not up; a real send error will not succeed if repeated.
 
-                    Leave the notice in place when the adapter never shows up so the next boot can try again.
+                    Leave the notice in place when delivery never succeeds so the next boot can try again.
+                    Stop on the first error so a dead WeChat session is not hammered for two minutes.
                     """
                     from .weekly.weekly_clock import send_weekly_brief_weixin
 
+                    waiting = {"no_runner", "no_adapter", "no_loop"}
                     deadline = time.time() + 120
                     delivered = False
                     while time.time() < deadline:
@@ -281,12 +283,14 @@ def register(ctx) -> None:
                             logger.warning(
                                 "MyMemory runtime-deps notice send failed: %s", exc
                             )
-                            result = {"outcome": "error"}
+                            return
                         if not isinstance(result, dict):
                             result = {}
                         if result.get("outcome") == "sent" or result.get("reason") == "no_chat_id":
                             delivered = True
                             break
+                        if result.get("outcome") == "error" or result.get("reason") not in waiting:
+                            return
                         time.sleep(1)
                     if not delivered:
                         return

@@ -95,11 +95,12 @@ def _lookup_weixin_adapter(runner: Any) -> Any:
 
 
 def send_weekly_brief_weixin(text: str) -> dict[str, Any]:
-    """Push the /weekly ui tunnel text through the live Weixin adapter.
+    """Submit adapter.send on the gateway loop so the Weixin lock stays on that loop.
 
-    Prefetch cannot deliver at 16:00; this is the same adapter.send cron used
-    after job stdout. Missing chat id or adapter skips send so generate still
-    persists.
+    A worker thread (runtime-deps notice, digest clock) has no running loop.
+    asyncio.run would bind the adapter send lock to a loop that dies when the
+    call returns, and every later reply fails until the gateway restarts.
+    Blocking .result() on the gateway loop itself would deadlock that loop.
     """
     chat_id = _weixin_chat_id()
     if not chat_id:
@@ -110,21 +111,24 @@ def send_weekly_brief_weixin(text: str) -> dict[str, Any]:
     adapter = _lookup_weixin_adapter(runner)
     if adapter is None:
         return {"outcome": "skipped", "reason": "no_adapter"}
+    loop = getattr(runner, "_gateway_loop", None)
+    if loop is None or not loop.is_running():
+        return {"outcome": "skipped", "reason": "no_loop"}
 
     async def _send():
         return await adapter.send(chat_id=chat_id, content=text)
 
     try:
         try:
-            running = asyncio.get_running_loop()
+            here = asyncio.get_running_loop()
         except RuntimeError:
-            running = None
-        if running is not None and running.is_running():
-            result = asyncio.run_coroutine_threadsafe(_send(), running).result(
-                timeout=60
+            here = None
+        if here is loop:
+            logger.warning(
+                "weekly clock WeChat send refused: caller is on the gateway loop"
             )
-        else:
-            result = asyncio.run(_send())
+            return {"outcome": "error", "reason": "on_gateway_loop"}
+        result = asyncio.run_coroutine_threadsafe(_send(), loop).result(timeout=60)
     except Exception as exc:
         logger.warning("weekly clock WeChat send failed: %s", exc)
         weekly._log(f"weekly clock WeChat send failed: {exc}")
