@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import json
 import logging
 import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 logger = logging.getLogger("mymemory.runtime")
@@ -32,10 +35,11 @@ _RUNTIME_MODULES = (
 
 
 def ensure_runtime_deps() -> None:
-    """A rebuilt Hermes venv drops these packages, but importing them at plugin load pulls Torch into the gateway.
+    """A rebuilt Hermes venv drops these packages, and a pip install overruns the 10s plugin load so this process cannot register.
 
     find_spec only asks whether this interpreter can see the distribution.
-    Install requirements.txt when one is missing, before provider.py loads digest.
+    Install requirements.txt when one is missing, then restart the gateway
+    from outside its service so the next process can register prefetch.
     Skip under pytest so collection does not download torch.
     """
     if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get(
@@ -48,13 +52,29 @@ def ensure_runtime_deps() -> None:
             missing.append(name)
     if not missing:
         return
+    home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+    notice_path = home / "logs" / "mymemory-runtime-deps-notice.json"
+    try:
+        previous = json.loads(notice_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        previous = None
+    if isinstance(previous, dict):
+        requested = previous.get("restart_requested_at")
+        if isinstance(requested, (int, float)) and not isinstance(requested, bool):
+            age = time.time() - float(requested)
+            if age < 15 * 60:
+                logger.error(
+                    "MyMemory still missing %s after a restart requested %.0fs ago; not installing again",
+                    ", ".join(missing),
+                    age,
+                )
+                return
     req = Path(__file__).resolve().parent / "requirements.txt"
     if not req.is_file():
         logger.error("MyMemory requirements.txt missing at %s", req)
         return
     logger.info(
-        "installing MyMemory requirements into %s; missing %s",
-        sys.executable,
+        "MyMemory missing: %s. Installing requirements.txt, then restarting the gateway so the plugin can register.",
         ", ".join(missing),
     )
     if importlib.util.find_spec("pip") is not None:
@@ -98,6 +118,75 @@ def ensure_runtime_deps() -> None:
         logger.error("MyMemory requirements install failed: %s", tail)
         return
     importlib.invalidate_caches()
+    still = [name for name in _RUNTIME_MODULES if importlib.util.find_spec(name) is None]
+    if still:
+        logger.error(
+            "MyMemory requirements install finished but still missing %s",
+            ", ".join(still),
+        )
+        return
+    notice = {
+        "missing": missing,
+        "sent": False,
+        "restart_requested_at": time.time(),
+    }
+    try:
+        notice_path.parent.mkdir(parents=True, exist_ok=True)
+        notice_path.write_text(json.dumps(notice), encoding="utf-8")
+    except OSError as exc:
+        logger.error("MyMemory could not record the runtime-deps notice: %s", exc)
+    try:
+        from .weekly.weekly_clock import send_weekly_brief_weixin
+
+        result = send_weekly_brief_weixin(
+            "MyMemory was missing: "
+            + ", ".join(missing)
+            + ". Installed them and restarting the gateway so memory prefetch can register."
+        )
+    except Exception as exc:
+        logger.warning("MyMemory could not send the missing-module notice: %s", exc)
+        result = None
+    if isinstance(result, dict) and result.get("outcome") == "sent":
+        notice["sent"] = True
+        try:
+            notice_path.write_text(json.dumps(notice), encoding="utf-8")
+        except OSError as exc:
+            logger.error("MyMemory could not record the sent runtime-deps notice: %s", exc)
+    if (
+        os.path.isdir("/run/systemd/system")
+        and shutil.which("systemctl")
+        and shutil.which("systemd-run")
+    ):
+        restart_cmd = [
+            "systemd-run",
+            "--collect",
+            "--unit",
+            f"mymemory-runtime-deps-restart-{os.getpid()}",
+            "systemctl",
+            "restart",
+            "hermes-gateway",
+        ]
+    else:
+        hermes = shutil.which("hermes")
+        if not hermes:
+            home_hermes = Path.home() / ".local" / "bin" / "hermes"
+            if home_hermes.is_file():
+                hermes = str(home_hermes)
+        if not hermes:
+            logger.error(
+                "MyMemory installed runtime deps but could not restart the gateway: hermes CLI not found"
+            )
+            return
+        restart_cmd = [hermes, "gateway", "restart"]
+    try:
+        subprocess.Popen(
+            restart_cmd,
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        logger.error("MyMemory gateway restart failed to start: %s", exc)
 
 
 ensure_runtime_deps()
@@ -109,6 +198,8 @@ from .provider import MyMemoryProvider, _slash_off_loop
 def register(ctx) -> None:
     """Attach /digest, /weekly, and /monthly on a real PluginContext; keep the provider on the collector.
 
+    The pre-restart WeChat line can miss the adapter, so an unsent runtime-deps
+    notice is delivered only once this load actually registers the provider.
     PluginContext has no register_memory_provider (mempalace crash). The
     memory loader's collector has no register_command. hasattr so one
     register() serves both loaders without dual recall hooks.
@@ -152,3 +243,60 @@ def register(ctx) -> None:
         )
     if hasattr(ctx, "register_memory_provider"):
         ctx.register_memory_provider(MyMemoryProvider())
+        home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+        notice_path = home / "logs" / "mymemory-runtime-deps-notice.json"
+        try:
+            raw = json.loads(notice_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw = None
+        if isinstance(raw, dict):
+            if raw.get("sent"):
+                try:
+                    notice_path.unlink()
+                except OSError:
+                    pass
+            else:
+                names = raw.get("missing")
+                if not isinstance(names, list):
+                    names = []
+                text = (
+                    "MyMemory installed the missing modules ("
+                    + ", ".join(str(name) for name in names)
+                    + ") and restarted. Memory prefetch is registered."
+                )
+
+                def _deliver_runtime_deps_notice() -> None:
+                    """The pre-restart WeChat send can miss the adapter, which connects only after register returns.
+
+                    Leave the notice in place when the adapter never shows up so the next boot can try again.
+                    """
+                    from .weekly.weekly_clock import send_weekly_brief_weixin
+
+                    deadline = time.time() + 120
+                    delivered = False
+                    while time.time() < deadline:
+                        try:
+                            result = send_weekly_brief_weixin(text)
+                        except Exception as exc:
+                            logger.warning(
+                                "MyMemory runtime-deps notice send failed: %s", exc
+                            )
+                            result = {"outcome": "error"}
+                        if not isinstance(result, dict):
+                            result = {}
+                        if result.get("outcome") == "sent" or result.get("reason") == "no_chat_id":
+                            delivered = True
+                            break
+                        time.sleep(1)
+                    if not delivered:
+                        return
+                    try:
+                        notice_path.unlink()
+                    except OSError:
+                        pass
+
+                threading.Thread(
+                    target=_deliver_runtime_deps_notice,
+                    name="mymemory-runtime-deps-notice",
+                    daemon=True,
+                ).start()
