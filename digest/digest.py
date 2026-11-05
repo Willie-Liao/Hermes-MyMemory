@@ -635,11 +635,12 @@ def _run_digest_clock_once(
     now: datetime | None = None,
     tz: Any = None,
 ) -> dict[str, Any]:
-    """Fire leftover extract and/or gated merge, then the Sunday weekly clock.
+    """A restart mid-merge must not leave phase2_in_flight set, or every later tick skips the merge.
 
     23:55 leftover writes today's file; 08:00 catch-up writes yesterday only
     when that night never stamped, so morning cannot spend tonight's slot.
-    Nightly/catch-up Phase 2 ignores the 25-card noon gate.
+    Nightly/catch-up Phase 2 ignores the 25-card noon gate. A flag with no
+    start time, or older than IN_FLIGHT_STALE_SECONDS, is a dead merge.
     """
     zone = tz or digest_clock.digest_clock_tz()
     local = digest_clock._as_local(now or datetime.now(zone), zone)
@@ -652,6 +653,7 @@ def _run_digest_clock_once(
         stored_next = digest_clock.parse_aware(state.get("next_clock_at"), zone)
         session_keys = list(state.get("sessions", {}).keys())
         in_flight = bool(state.get("phase2_in_flight"))
+        in_flight_at = state.get("phase2_in_flight_at")
     _kind, upcoming = digest_clock.next_deadline(local, zone)
     past_tick = stored_next is not None and stored_next <= local
     first_boot_on_grid = stored_next is None and on_grid
@@ -697,20 +699,33 @@ def _run_digest_clock_once(
 
     board_date = leftover_date or today
     daily_path, block_count = _today_block_count(board_date)
-    want_phase2 = (past_tick or first_boot_on_grid or bool(leftover_date)) and (
-        digest_clock.should_run_phase2_tick(
-            block_count,
-            last_p2,
-            local,
-            ignore_block_gate=bool(leftover_date),
-        )
+    due = past_tick or first_boot_on_grid or bool(leftover_date)
+    gate_ok = digest_clock.should_run_phase2_tick(
+        block_count,
+        last_p2,
+        local,
+        ignore_block_gate=bool(leftover_date),
     )
-    if want_phase2 and in_flight:
-        want_phase2 = False
+    started = _parse_ts(None if in_flight_at is None else str(in_flight_at))
+    stale = in_flight and _seconds_since(started) > IN_FLIGHT_STALE_SECONDS
+    fresh = in_flight and not stale
+    want_phase2 = due and gate_ok and not fresh
+    since = str(in_flight_at).strip() if in_flight_at else "none"
+    if due and gate_ok and stale:
+        _log(f"recover stale phase2 in-flight board={board_date} since={since}")
+    elif due and gate_ok and fresh:
+        _log(f"skip phase2 (clock): in flight board={board_date} since={since}")
+    elif due and not gate_ok:
+        last_shown = last_p2.isoformat() if last_p2 is not None else "none"
+        _log(
+            f"skip phase2 (clock): board={board_date} cards={block_count} "
+            f"last_phase2_at={last_shown}"
+        )
     if want_phase2:
         with _digest_lock:
             state = _load_state()
             state["phase2_in_flight"] = True
+            state["phase2_in_flight_at"] = datetime.now(timezone.utc).isoformat()
             _save_state(state)
         try:
             run_manual_phase2(daily_path, date_str=board_date)
@@ -718,13 +733,14 @@ def _run_digest_clock_once(
             with _digest_lock:
                 state = _load_state()
                 state["last_phase2_at"] = local.isoformat()
-                state["phase2_in_flight"] = False
                 _save_state(state)
         except Exception as exc:
             _log(f"digest clock phase2 failed: {exc}")
+        finally:
             with _digest_lock:
                 state = _load_state()
                 state["phase2_in_flight"] = False
+                state.pop("phase2_in_flight_at", None)
                 _save_state(state)
 
     if need_leftover and block_count > 0:

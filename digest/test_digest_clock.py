@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -142,6 +142,125 @@ def test_clock_phase2_grid_hours_over_gate(tmp_path, monkeypatch):
         now = datetime(2026, 8, 16, hour, minute, tzinfo=SHANGHAI)
         digest.maybe_run_digest_clock(now=now, sync=True)
         assert phase2 == [str(path)], (hour, minute)
+
+
+def _prepare_gated_noon(tmp_path, monkeypatch, phase2: list[str]):
+    """26 cards at noon, night already stamped, so the in-flight flag is the only gate.
+
+    A 25-card file would skip before the flag is read, and the test would not
+    show a dead flag blocking the merge.
+    """
+    digest = _load_digest()
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    daily_dir = tmp_path / "memories" / "staging" / "daily"
+    daily_dir.mkdir(parents=True)
+    path = daily_dir / "2026-08-16.md"
+    path.write_text(_card_yaml(26), encoding="utf-8")
+    monkeypatch.setattr(digest, "hermes_local_today_str", lambda: "2026-08-16")
+    monkeypatch.setattr(digest.digest_clock, "digest_clock_tz", lambda **_k: SHANGHAI)
+    monkeypatch.setattr(
+        digest,
+        "run_manual_phase2",
+        lambda daily_path, date_str="", _p=phase2: _p.append(str(daily_path))
+        or {"outcome": "rewritten"},
+    )
+    return digest, path
+
+
+def _saved_clock_state(digest) -> dict:
+    with digest._digest_lock:
+        return digest._load_state()
+
+
+def test_clock_phase2_recovers_in_flight_with_no_start_time(tmp_path, monkeypatch):
+    """A restart that left phase2_in_flight set, with no start time, must not skip every later tick."""
+    phase2: list[str] = []
+    digest, path = _prepare_gated_noon(tmp_path, monkeypatch, phase2)
+    with digest._digest_lock:
+        state = digest._load_state()
+        state.pop("last_phase2_at", None)
+        state.pop("next_clock_at", None)
+        state.pop("phase2_in_flight_at", None)
+        state["phase2_in_flight"] = True
+        state["last_nightly_date"] = "2026-08-16"
+        digest._save_state(state)
+    digest.maybe_run_digest_clock(
+        now=datetime(2026, 8, 16, 12, 0, tzinfo=SHANGHAI), sync=True
+    )
+    saved = _saved_clock_state(digest)
+    assert phase2 == [str(path)]
+    assert saved.get("phase2_in_flight") is False
+    assert "phase2_in_flight_at" not in saved
+
+
+def test_clock_phase2_keeps_fresh_in_flight(tmp_path, monkeypatch):
+    """A merge that started a minute ago is still the live one, so this tick must not start a second."""
+    phase2: list[str] = []
+    digest, _path = _prepare_gated_noon(tmp_path, monkeypatch, phase2)
+    started = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    with digest._digest_lock:
+        state = digest._load_state()
+        state.pop("last_phase2_at", None)
+        state.pop("next_clock_at", None)
+        state["phase2_in_flight"] = True
+        state["phase2_in_flight_at"] = started
+        state["last_nightly_date"] = "2026-08-16"
+        digest._save_state(state)
+    digest.maybe_run_digest_clock(
+        now=datetime(2026, 8, 16, 12, 0, tzinfo=SHANGHAI), sync=True
+    )
+    saved = _saved_clock_state(digest)
+    assert phase2 == []
+    assert saved.get("phase2_in_flight") is True
+    assert saved.get("phase2_in_flight_at") == started
+
+
+def test_clock_phase2_recovers_in_flight_older_than_ten_minutes(tmp_path, monkeypatch):
+    """Eleven minutes is past the session-digest stale window, so the clock must take the merge back."""
+    phase2: list[str] = []
+    digest, path = _prepare_gated_noon(tmp_path, monkeypatch, phase2)
+    started = (datetime.now(timezone.utc) - timedelta(minutes=11)).isoformat()
+    with digest._digest_lock:
+        state = digest._load_state()
+        state.pop("last_phase2_at", None)
+        state.pop("next_clock_at", None)
+        state["phase2_in_flight"] = True
+        state["phase2_in_flight_at"] = started
+        state["last_nightly_date"] = "2026-08-16"
+        digest._save_state(state)
+    digest.maybe_run_digest_clock(
+        now=datetime(2026, 8, 16, 12, 0, tzinfo=SHANGHAI), sync=True
+    )
+    saved = _saved_clock_state(digest)
+    assert phase2 == [str(path)]
+    assert saved.get("phase2_in_flight") is False
+    assert "phase2_in_flight_at" not in saved
+
+
+def test_clock_phase2_raise_clears_in_flight(tmp_path, monkeypatch):
+    """A merge that raises must clear the flag and its start time, or the next tick skips forever."""
+    digest, _path = _prepare_gated_noon(tmp_path, monkeypatch, [])
+    prior = "2026-08-16T00:00:00+08:00"
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("phase2 blew up")
+
+    monkeypatch.setattr(digest, "run_manual_phase2", _boom)
+    with digest._digest_lock:
+        state = digest._load_state()
+        state["last_phase2_at"] = prior
+        state.pop("next_clock_at", None)
+        state["phase2_in_flight"] = False
+        state["phase2_in_flight_at"] = "2026-08-16T03:00:00+00:00"
+        state["last_nightly_date"] = "2026-08-16"
+        digest._save_state(state)
+    digest.maybe_run_digest_clock(
+        now=datetime(2026, 8, 16, 12, 0, tzinfo=SHANGHAI), sync=True
+    )
+    saved = _saved_clock_state(digest)
+    assert saved.get("phase2_in_flight") is False
+    assert "phase2_in_flight_at" not in saved
+    assert saved.get("last_phase2_at") == prior
 
 
 def test_parse_aware_iso_offset():
