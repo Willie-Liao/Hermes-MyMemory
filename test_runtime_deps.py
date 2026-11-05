@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import subprocess
 import sys
-import types
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -25,17 +24,16 @@ def _allow_install(monkeypatch) -> None:
 
 def test_missing_imports_install_requirements_with_pip(monkeypatch):
     _allow_install(monkeypatch)
-    real_import = MyMemory.importlib.import_module
+    real_spec = MyMemory.importlib.util.find_spec
 
-    def boom(name, package=None):
+    def spec_for(name):
         if name in MyMemory._RUNTIME_MODULES:
-            raise ImportError(name)
-        return real_import(name, package)
+            return None
+        if name == "pip":
+            return object()
+        return real_spec(name)
 
-    monkeypatch.setattr(MyMemory.importlib, "import_module", boom)
-    monkeypatch.setattr(
-        MyMemory.importlib.util, "find_spec", lambda name: object()
-    )
+    monkeypatch.setattr(MyMemory.importlib.util, "find_spec", spec_for)
     calls: list[list[str]] = []
 
     def fake_run(cmd, **_kwargs):
@@ -52,12 +50,15 @@ def test_present_imports_do_not_spawn_pip(monkeypatch):
     _allow_install(monkeypatch)
     real_import = MyMemory.importlib.import_module
 
-    def present(name, package=None):
+    def refuse_runtime_import(name, package=None):
         if name in MyMemory._RUNTIME_MODULES:
-            return types.ModuleType(name)
+            raise AssertionError(f"startup must not import {name}")
         return real_import(name, package)
 
-    monkeypatch.setattr(MyMemory.importlib, "import_module", present)
+    monkeypatch.setattr(MyMemory.importlib, "import_module", refuse_runtime_import)
+    monkeypatch.setattr(
+        MyMemory.importlib.util, "find_spec", lambda name: object()
+    )
 
     def fail_run(*_args, **_kwargs):
         raise AssertionError("pip must not run when runtime imports succeed")

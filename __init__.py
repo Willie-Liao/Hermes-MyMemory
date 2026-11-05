@@ -19,8 +19,9 @@ from pathlib import Path
 
 logger = logging.getLogger("mymemory.runtime")
 
-# digest.py imports yaml at load. A Hermes update's new environment does not
-# ship these, so the plugin dies before register() can run.
+# digest.py imports yaml when the plugin loads. A Hermes update's new
+# environment does not ship these. Check the spec only: importing
+# sentence_transformers here would load torch into the gateway.
 _RUNTIME_MODULES = (
     "yaml",
     "onnxruntime",
@@ -31,9 +32,10 @@ _RUNTIME_MODULES = (
 
 
 def ensure_runtime_deps() -> None:
-    """A Hermes update's new environment omits PyYAML, so importing digest crashes the plugin.
+    """A rebuilt Hermes venv drops these packages, but importing them at plugin load pulls Torch into the gateway.
 
-    Install requirements.txt into this interpreter before provider.py loads digest.
+    find_spec only asks whether this interpreter can see the distribution.
+    Install requirements.txt when one is missing, before provider.py loads digest.
     Skip under pytest so collection does not download torch.
     """
     if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get(
@@ -42,9 +44,7 @@ def ensure_runtime_deps() -> None:
         return
     missing: list[str] = []
     for name in _RUNTIME_MODULES:
-        try:
-            importlib.import_module(name)
-        except ImportError:
+        if importlib.util.find_spec(name) is None:
             missing.append(name)
     if not missing:
         return
