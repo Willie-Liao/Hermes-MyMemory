@@ -1009,7 +1009,7 @@ def submit_operations_schema() -> dict[str, Any]:
 
 
 def submit_day_wrapup_schema() -> dict[str, Any]:
-    """Force catalog bullets so 23:55 wrap-up cannot dump a paragraph or YAML.
+    """Force catalog bullets so 23:59:59 wrap-up cannot dump a paragraph or YAML.
 
     Related same-day events may share one phrase; unrelated events stay
     separate. Length matches digest.MAX_WRAPUP_CHARS (200).

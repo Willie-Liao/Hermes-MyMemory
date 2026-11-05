@@ -146,7 +146,7 @@ def _compose_ready_message(week_key: str) -> str:
 def maybe_run(local: datetime, leftover_ran: bool = False) -> dict[str, Any]:
     """Sunday 16:00 generate+link; Monday 00:00 patch Sunday 16:00–00:00 then close.
 
-    leftover_ran is kept so digest can still pass the 23:55 leftover flag; close
+    leftover_ran is kept so digest can still pass the 23:59:59 leftover flag; close
     no longer uses it. Catch-up keys live in ``.weekly-state.json``.
     """
     del leftover_ran

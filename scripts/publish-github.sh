@@ -26,6 +26,9 @@ rsync -a \
   --exclude '.git/' \
   --exclude '__pycache__/' \
   --exclude '.pytest_cache/' \
+  --exclude '.claude/' \
+  --exclude '.test-hermes-home/' \
+  --exclude 'probe_*.py' \
   --exclude 'node_modules/' \
   --exclude 'weekly/ui/dist/' \
   --exclude '.env' --exclude '.env.local' --exclude 'auth.json' \

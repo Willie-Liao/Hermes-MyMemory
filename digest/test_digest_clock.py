@@ -64,11 +64,11 @@ def test_next_deadline_evening_to_nightly():
     now = datetime(2026, 8, 16, 21, 0, tzinfo=SHANGHAI)
     kind, when = next_deadline(now, SHANGHAI)
     assert kind == "nightly"
-    assert when == datetime(2026, 8, 16, 23, 55, tzinfo=SHANGHAI)
+    assert when == datetime(2026, 8, 16, 23, 59, 59, tzinfo=SHANGHAI)
 
 
 def test_next_deadline_after_nightly_is_next_morning():
-    now = datetime(2026, 8, 16, 23, 55, 1, tzinfo=SHANGHAI)
+    now = datetime(2026, 8, 16, 23, 59, 59, tzinfo=SHANGHAI)
     kind, when = next_deadline(now, SHANGHAI)
     assert kind == "tick"
     assert when == datetime(2026, 8, 17, 0, 0, tzinfo=SHANGHAI)
@@ -96,18 +96,22 @@ def test_phase2_tick_cooldown_skips_recent_merge():
     assert should_run_phase2_tick(26, last, now) is True
 
 
-def test_nightly_leftover_2355_today_and_morning_writes_yesterday():
-    """23:55 flushes today; 08:00 catch-up is only if yesterday's 23:55 never stamped."""
+def test_nightly_leftover_235959_today_and_morning_writes_yesterday():
+    """23:59:59 flushes today; 08:00 catch-up is only if yesterday's 23:59:59 never stamped."""
     morning = datetime(2026, 8, 17, 8, 0, tzinfo=SHANGHAI)
     noon = datetime(2026, 8, 16, 12, 0, tzinfo=SHANGHAI)
-    at = datetime(2026, 8, 16, 23, 55, tzinfo=SHANGHAI)
-    # Yesterday already flushed → morning must wait for tonight 23:55.
+    before = datetime(2026, 8, 16, 23, 59, 58, tzinfo=SHANGHAI)
+    at = datetime(2026, 8, 16, 23, 59, 59, tzinfo=SHANGHAI)
+    # Yesterday already flushed → morning must wait for tonight 23:59:59.
     assert should_run_nightly_leftover("2026-08-16", morning, SHANGHAI) is None
     assert should_run_nightly_leftover("2026-08-16", noon, SHANGHAI) is None
-    # Missed 16th 23:55 (stamp still 15th) → 08:00 on 17th writes the 16th file.
+    # Missed 16th 23:59:59 (stamp still 15th) → 08:00 on 17th writes the 16th file.
     assert should_run_nightly_leftover("2026-08-15", morning, SHANGHAI) == "2026-08-16"
     assert should_run_nightly_leftover(None, morning, SHANGHAI) == "2026-08-16"
-    # 23:55 same day.
+    # One second early is not the nightly slot.
+    assert should_run_nightly_leftover(None, before, SHANGHAI) is None
+    assert should_run_nightly_leftover("2026-08-15", before, SHANGHAI) is None
+    # 23:59:59 same day.
     assert should_run_nightly_leftover("2026-08-16", at, SHANGHAI) is None
     assert should_run_nightly_leftover("2026-08-15", at, SHANGHAI) == "2026-08-16"
     assert should_run_nightly_leftover(None, at, SHANGHAI) == "2026-08-16"
@@ -395,7 +399,7 @@ def test_clock_leftover_with_phase2_when_under_gate(tmp_path, monkeypatch):
         ),
         encoding="utf-8",
     )
-    now = datetime(2026, 8, 16, 23, 55, tzinfo=SHANGHAI)
+    now = datetime(2026, 8, 16, 23, 59, 59, tzinfo=SHANGHAI)
     digest.maybe_run_digest_clock(now=now, sync=True)
     assert leftover == ["s1", "s2"]
     assert phase2 == ["p2"]
@@ -460,7 +464,7 @@ def test_clock_2355_calls_wrapup_even_under_gate(tmp_path, monkeypatch):
         "run_day_wrapup",
         lambda daily_path: wrap.append(str(daily_path)),
     )
-    now = datetime(2026, 8, 16, 23, 55, tzinfo=SHANGHAI)
+    now = datetime(2026, 8, 16, 23, 59, 59, tzinfo=SHANGHAI)
     digest.maybe_run_digest_clock(now=now, sync=True)
     assert wrap == [str(path)]
 
@@ -494,7 +498,7 @@ def test_clock_leftover_then_one_phase2_when_over_gate(tmp_path, monkeypatch):
         json.dumps({"sessions": {"s1": {"session_id": "s1"}, "s2": {"session_id": "s2"}}}),
         encoding="utf-8",
     )
-    now = datetime(2026, 8, 16, 23, 56, tzinfo=SHANGHAI)
+    now = datetime(2026, 8, 16, 23, 59, 59, tzinfo=SHANGHAI)
     digest.maybe_run_digest_clock(now=now, sync=True)
     assert leftover == ["s1", "s2"]
     assert phase2 == ["p2"]
@@ -538,7 +542,7 @@ def test_clock_weekly_hook_after_leftover(tmp_path, monkeypatch):
         json.dumps({"sessions": {"s1": {"session_id": "s1"}}}),
         encoding="utf-8",
     )
-    now = datetime(2026, 8, 16, 23, 55, tzinfo=SHANGHAI)
+    now = datetime(2026, 8, 16, 23, 59, 59, tzinfo=SHANGHAI)
     digest.maybe_run_digest_clock(now=now, sync=True)
     assert order[0] == "leftover"
     assert ("weekly", True) in order
@@ -546,7 +550,7 @@ def test_clock_weekly_hook_after_leftover(tmp_path, monkeypatch):
 
 
 def test_clock_morning_skips_leftover_if_last_night_already_flushed(tmp_path, monkeypatch):
-    """08:00 must not consume tonight's slot when yesterday's 23:55 already stamped."""
+    """08:00 must not consume tonight's slot when yesterday's 23:59:59 already stamped."""
     digest = _load_digest()
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
     daily_dir = tmp_path / "memories" / "staging" / "daily"
@@ -584,7 +588,7 @@ def test_clock_morning_skips_leftover_if_last_night_already_flushed(tmp_path, mo
 
 
 def test_clock_morning_catchup_writes_yesterday_if_night_missed(tmp_path, monkeypatch):
-    """Missed 16th 23:55: 08:00 on the 17th leftover-extracts into the 16th file."""
+    """Missed 16th 23:59:59: 08:00 on the 17th leftover-extracts into the 16th file."""
     digest = _load_digest()
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
     daily_dir = tmp_path / "memories" / "staging" / "daily"
@@ -672,7 +676,7 @@ def test_clock_loop_sleeps_until_deadline_not_sixty(tmp_path, monkeypatch):
     monkeypatch.setattr(
         digest.digest_clock, "digest_clock_tz", lambda **_k: SHANGHAI
     )
-    future = datetime(2026, 8, 16, 23, 55, tzinfo=SHANGHAI)
+    future = datetime(2026, 8, 16, 23, 59, 59, tzinfo=SHANGHAI)
     state_path = tmp_path / "memories" / "staging" / ".digest-state.json"
     state_path.write_text(
         json.dumps({"next_clock_at": future.isoformat(), "sessions": {}}),
@@ -728,7 +732,7 @@ def test_clock_loop_death_writes_error(tmp_path, monkeypatch):
 
 
 def test_clock_loop_passes_stored_tick_as_now(tmp_path, monkeypatch):
-    """A wake after midnight must leftover the slept-for 23:55 civil day, not wall today."""
+    """A wake after midnight must leftover the slept-for 23:59:59 civil day, not wall today."""
     digest = _load_digest()
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
     (tmp_path / "memories" / "staging").mkdir(parents=True)
@@ -752,7 +756,7 @@ def test_clock_loop_passes_stored_tick_as_now(tmp_path, monkeypatch):
     monkeypatch.setattr(
         digest.digest_clock, "digest_clock_tz", lambda **_k: SHANGHAI
     )
-    stored = datetime(2026, 8, 16, 23, 55, tzinfo=SHANGHAI)
+    stored = datetime(2026, 8, 16, 23, 59, 59, tzinfo=SHANGHAI)
     wall = datetime(2026, 8, 17, 0, 5, tzinfo=SHANGHAI)
     state_path = tmp_path / "memories" / "staging" / ".digest-state.json"
     state_path.write_text(

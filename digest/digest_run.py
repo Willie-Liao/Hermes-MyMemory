@@ -600,7 +600,7 @@ def request_nightly_digest(
     sync: bool = True,
     tz: Any = None,
 ) -> dict[str, Any]:
-    """Same clock path as ticks; leftover Phase 1 is decided by local 23:55."""
+    """Same clock path as ticks; leftover Phase 1 is decided by local 23:59:59."""
     return digest.maybe_run_digest_clock(now=now, sync=sync, tz=tz)
 
 

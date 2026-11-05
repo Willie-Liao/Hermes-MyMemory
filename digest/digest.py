@@ -7,7 +7,7 @@ Plugin hooks (CLI + gateway):
     turns wait; there is no assistant floor)
   - on_session_finalize — digest session-boundary leftovers when the same
     user-count floor is met
-  -     plugin clock — sleep until next_clock_at (08:00/12:00/16:00/20:00/23:55
+  -     plugin clock — sleep until next_clock_at (08:00/12:00/16:00/20:00/23:59:59
     in config.yaml ``timezone:``). Day ticks Phase-2 only if today's file has
     more than 25 cards. Leftover force-extract runs when last_nightly is
     behind (including morning catch-up); that path also Phase-2's any card
@@ -595,11 +595,16 @@ def maybe_run_digest_clock(
 
 
 def _weekly_clock_leftover_flag(local: datetime, need_leftover: bool) -> bool:
-    """Pass leftover_ran after 23:55 Sunday so the weekly clock can see leftover finished.
+    """Pass leftover_ran after 23:59:59 Sunday so the weekly clock can see leftover finished.
 
-    Close itself waits for Monday 00:00 evening patch.
+    Close itself waits for Monday 00:00 evening patch. A 23:59:00 stamp would
+    claim leftover finished before the nightly extract runs.
     """
-    sunday_close = local.weekday() == 6 and (local.hour, local.minute) >= (23, 55)
+    sunday_close = local.weekday() == 6 and (
+        local.hour,
+        local.minute,
+        local.second,
+    ) >= (*digest_clock.NIGHTLY_TICK, digest_clock.NIGHTLY_SECOND)
     return bool(need_leftover) or sunday_close
 
 
@@ -637,7 +642,7 @@ def _run_digest_clock_once(
 ) -> dict[str, Any]:
     """A restart mid-merge must not leave phase2_in_flight set, or every later tick skips the merge.
 
-    23:55 leftover writes today's file; 08:00 catch-up writes yesterday only
+    23:59:59 leftover writes today's file; 08:00 catch-up writes yesterday only
     when that night never stamped, so morning cannot spend tonight's slot.
     Nightly/catch-up Phase 2 ignores the 25-card noon gate. A flag with no
     start time, or older than IN_FLIGHT_STALE_SECONDS, is a dead merge.
@@ -645,7 +650,11 @@ def _run_digest_clock_once(
     zone = tz or digest_clock.digest_clock_tz()
     local = digest_clock._as_local(now or datetime.now(zone), zone)
     today = local.date().isoformat()
-    on_grid = (local.hour, local.minute) in digest_clock.PHASE2_TICKS
+    minute_pair = (local.hour, local.minute)
+    on_grid = minute_pair in digest_clock.PHASE2_TICKS and (
+        minute_pair != digest_clock.NIGHTLY_TICK
+        or local.second >= digest_clock.NIGHTLY_SECOND
+    )
     with _digest_lock:
         state = _load_state()
         last_nightly = state.get("last_nightly_date")
@@ -836,7 +845,7 @@ def _digest_clock_loop() -> None:
 
     A civil-only wait would miss the 10-minute assistant hold after the 12th
     user turn. Fire the slept-for civil tick as ``now`` so a wake a few minutes
-    past midnight still leftover-extracts that 23:55 civil day instead of
+    past midnight still leftover-extracts that 23:59:59 civil day instead of
     skipping until 08:00. A monthly write_at wake passes wall time so next_clock_at
     stays on the phase-2 grid.
     """
@@ -2205,7 +2214,7 @@ def clamp_wrapup_phrase(raw: str) -> str:
 
 
 def run_day_wrapup(daily_path: Path | str) -> dict[str, Any]:
-    """Refresh ``## Day wrap-up`` once at 23:55 from typed JSON cards, never YAML."""
+    """Refresh ``## Day wrap-up`` once at 23:59:59 from typed JSON cards, never YAML."""
     path = Path(daily_path)
     if not path.exists():
         return {"outcome": "skipped", "reason": "missing"}
@@ -5508,7 +5517,7 @@ def _run_digest_pipeline(
     Passes ``daily_path.stem`` into Phase-1 so leftover persist and minted
     ids stay on that board date when wall-clock today has already rolled.
     ``rewrite`` clears today's fences before persist so /digest --all replaces
-    the board. ``wrapup`` is the past-date slash path; the 23:55 clock stays
+    the board. ``wrapup`` is the past-date slash path; the 23:59:59 clock stays
     the only automatic wrap-up.
     """
     if rewrite:
@@ -5703,7 +5712,7 @@ def _maybe_run_digest(
     undigested messages). ``sync`` runs the worker inline and returns its
     terminal outcome ('appended' / 'skip' / 'failed') instead of 'started'.
     Hook callers ignore the outcome dict; slash inspects it. Nightly leftover
-    passes ``date_str`` so a missed 23:55 still writes yesterday's file instead
+    passes ``date_str`` so a missed 23:59:59 still writes yesterday's file instead
     of the morning's civil date.
     """
     with _digest_lock:

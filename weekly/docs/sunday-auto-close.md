@@ -1,11 +1,11 @@
 # Sunday weekly generate + Monday evening patch + close
 
-Sunday automation lives in the MyMemory **plugin clock**, not Hermes cron. The digest civil thread (`start_digest_clock_thread`) already wakes at 00:00/08/12/16/20/23:55 in `config.yaml` `timezone:` (typically `Asia/Shanghai`). `weekly_clock.maybe_run` rides that loop.
+Sunday automation lives in the MyMemory **plugin clock**, not Hermes cron. The digest civil thread (`start_digest_clock_thread`) already wakes at 00:00/08/12/16/20/23:59:59 in `config.yaml` `timezone:` (typically `Asia/Shanghai`). `weekly_clock.maybe_run` rides that loop.
 
 ## What it does
 
 1. **Sunday 16:00:** `generate_week` for the current ISO week, start Weekly UI + Cloudflare tunnel, send the `/weekly ui` phone link via the live Weixin `adapter.send` (same adapter cron used after job stdout; prefetch cannot push).
-2. **Sunday 23:55:** digest leftover extract + day wrap-up only. Does **not** close the week.
+2. **Sunday 23:59:59:** digest leftover extract + day wrap-up only. Does **not** close the week.
 3. **Monday 00:00:** if Sunday 16:00 already ran, incrementally patch Sunday 16:00–00:00 daily cards (selected by `generated_at`, leftover `valid_from` unchanged) into the existing YAML Chronicle as Sunday summary bodies, then `close_week`. If Sunday 16:00 never ran, full-generate the previous ISO week then close. **Generate / Re-scan Chronicle weekday is the daily digest filename** (`2026-09-20.md` → Sunday), not leftover card `valid_from`.
 4. **Later Monday+ catch-up:** same previous-week target. Never close the new Monday week.
 

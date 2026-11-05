@@ -1,6 +1,6 @@
 """Phase-2 plugin clock: civil ticks in the Hermes IANA timezone.
 
-Keeps merge off the extract path. Deadlines are local 00:00/08:00/12:00/16:00/20:00/23:55
+Keeps merge off the extract path. Deadlines are local 00:00/08:00/12:00/16:00/20:00/23:59:59
 so a quiet day does not pay for consolidate just because chat batched.
 """
 
@@ -16,9 +16,10 @@ PHASE2_TICKS: tuple[tuple[int, int], ...] = (
     (12, 0),
     (16, 0),
     (20, 0),
-    (23, 55),
+    (23, 59),
 )
-NIGHTLY_TICK = (23, 55)
+NIGHTLY_TICK = (23, 59)
+NIGHTLY_SECOND = 59
 PHASE2_BLOCK_GATE = 25
 PHASE2_COOLDOWN = timedelta(minutes=20)
 DEFAULT_TZ_NAME = "Asia/Shanghai"
@@ -57,11 +58,16 @@ def _as_local(now: datetime, tz: ZoneInfo) -> datetime:
 
 
 def next_deadline(now: datetime, tz: ZoneInfo) -> tuple[str, datetime]:
-    """Next 00/08/12/16/20/23:55 civil instant strictly after ``now`` in ``tz``."""
+    """Next 00/08/12/16/20/23:59:59 civil instant strictly after ``now`` in ``tz``.
+
+    Day ticks stay at second 0. The nightly slot is 23:59:59 so a minute-only
+    23:59 entry cannot close the day fifty-nine seconds early.
+    """
     local = _as_local(now, tz)
     for hour, minute in PHASE2_TICKS:
+        second = NIGHTLY_SECOND if (hour, minute) == NIGHTLY_TICK else 0
         candidate = local.replace(
-            hour=hour, minute=minute, second=0, microsecond=0
+            hour=hour, minute=minute, second=second, microsecond=0
         )
         if candidate > local:
             kind = "nightly" if (hour, minute) == NIGHTLY_TICK else "tick"
@@ -106,8 +112,8 @@ def should_run_nightly_leftover(
 ) -> str | None:
     """Return the daily file date to flush, or None.
 
-    23:55 writes today when that night is unstamped. 08:00 writes yesterday
-    only if yesterday's 23:55 never stamped — so morning cannot consume
+    23:59:59 writes today when that night is unstamped. 08:00 writes yesterday
+    only if yesterday's 23:59:59 never stamped — so morning cannot consume
     tonight's leftover slot or land cards on the new civil day.
     """
     local = _as_local(now, tz)
@@ -115,7 +121,7 @@ def should_run_nightly_leftover(
     today_s = today.isoformat()
     yesterday_s = (today - timedelta(days=1)).isoformat()
     stamp = str(last_nightly_date or "")
-    if (local.hour, local.minute) >= NIGHTLY_TICK:
+    if (local.hour, local.minute, local.second) >= (*NIGHTLY_TICK, NIGHTLY_SECOND):
         return None if stamp == today_s else today_s
     if local.hour == 8:
         if stamp in (yesterday_s, today_s):

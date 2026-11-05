@@ -86,6 +86,9 @@ RSYNC_EXCLUDES=(
   --exclude '.git/'
   # Local GitNexus index. Copying it into the plugin fills a small test disk.
   --exclude '.gitnexus/'
+  --exclude '.claude/'
+  --exclude '.test-hermes-home/'
+  --exclude 'probe_*.py'
   --exclude 'Install MyMemory.command'
   --exclude '__pycache__/'
   --exclude '.pytest_cache/'
@@ -117,14 +120,46 @@ echo ""
 rsync -a "${RSYNC_EXCLUDES[@]}" "$PACK_ROOT/" "$DEST/"
 # AppleDouble sidecars match *.py and are not UTF-8, so source scans fail after a Mac pack.
 find "$DEST" -name '._*' -delete
+# Week-specific debug harnesses are not part of the supported install test suite.
+# rsync does not delete files already on the gateway, so drop retired names explicitly.
+rm -f \
+  "$DEST/weekly/debug_w38_worker1_events.py" \
+  "$DEST/weekly/test_w38_sunday_evening_patch.py" \
+  "$DEST/monthly/test_monthly_eval.py" \
+  "$DEST/weekly/scripts/eval_weekly_threads_mimo.py"
+find "$DEST/weekly" -maxdepth 1 -type f -name 'debug_*.py' -delete 2>/dev/null || true
+find "$DEST" -type f -name 'probe_*.py' -delete 2>/dev/null || true
 echo "installed: plugins/MyMemory"
 
 resolve_runtime_python() {
-  # Channel 4 and the installer YAML merge must use the interpreter Hermes
-  # actually runs. A fresh official install keeps that under ~/.hermes/tools
-  # and leaves /usr/bin/python3 without pip, so falling through to it aborts.
+  # Packages in an older venv are invisible to the gateway when it loads a
+  # different environment under installs/.../environments/.../venv. Prefer that
+  # mapped interpreter, then the official tools Python, and only then a venv.
   if [[ -n "${HERMES_PYTHON:-}" && -x "${HERMES_PYTHON}" ]]; then
     echo "${HERMES_PYTHON}"
+    return 0
+  fi
+  local pid="" sp="" venv=""
+  if command -v systemctl >/dev/null 2>&1; then
+    pid="$(systemctl show -p MainPID --value hermes-gateway 2>/dev/null || true)"
+  fi
+  if [[ -n "$pid" && "$pid" != "0" && -r "/proc/${pid}/maps" ]]; then
+    sp="$(grep -oE '/[^[:space:]]+/installs/[^[:space:]]+/environments/[^[:space:]]+/venv/lib/python[0-9.]+/site-packages' "/proc/${pid}/maps" | head -n 1 || true)"
+    if [[ -z "$sp" ]]; then
+      sp="$(grep -oE '/[^[:space:]]+/venv/lib/python[0-9.]+/site-packages' "/proc/${pid}/maps" | head -n 1 || true)"
+    fi
+    if [[ -n "$sp" ]]; then
+      venv="${sp%/lib/python*/site-packages}"
+      if [[ -x "${venv}/bin/python" ]]; then
+        echo "${venv}/bin/python"
+        return 0
+      fi
+    fi
+  fi
+  local tools_py
+  tools_py="$(ls -1d "${HERMES_HOME}"/tools/python-*/bin/python3 2>/dev/null | tail -n 1 || true)"
+  if [[ -n "$tools_py" && -x "$tools_py" ]]; then
+    echo "$tools_py"
     return 0
   fi
   local candidate
@@ -144,12 +179,6 @@ resolve_runtime_python() {
       return 0
     fi
   done
-  local tools_py
-  tools_py="$(ls -1d "${HERMES_HOME}"/tools/python-*/bin/python3 2>/dev/null | tail -n 1 || true)"
-  if [[ -n "$tools_py" && -x "$tools_py" ]]; then
-    echo "$tools_py"
-    return 0
-  fi
   if command -v python3 >/dev/null 2>&1; then
     command -v python3
     return 0
@@ -173,7 +202,8 @@ install_python_packages() {
     uv_bin="${HOME}/.local/bin/uv"
   fi
   if [[ -n "$uv_bin" ]]; then
-    "$uv_bin" pip install --python "$py" "$@"
+    # unsafe-best-match lets the CPU torch pin in requirements.txt win over the PyPI wheel.
+    "$uv_bin" pip install --python "$py" --index-strategy unsafe-best-match "$@"
     return
   fi
   echo "error: ${py} has no pip and uv is not installed" >&2
@@ -223,24 +253,25 @@ ensure_gte_int8() {
   echo "ok: GTE int8 installed under ${GTE_CACHE_DIR}"
 }
 echo ""
-echo "Channel 4 runtime (onnxruntime, tokenizers, numpy)…"
+echo "MyMemory runtime (requirements.txt)…"
 if RUNTIME_PY="$(resolve_runtime_python)"; then
   export HERMES_PYTHON="$RUNTIME_PY"
   if [[ "${MYMEMORY_SKIP_GTE:-}" != "1" ]]; then
     # openai: worker oneshot imports it lazily. ruamel.yaml: Hermes hermes_yaml imports it.
-    py_pkgs=(onnxruntime tokenizers numpy pyyaml openai ruamel.yaml)
+    req="${PACK_ROOT}/requirements.txt"
+    py_pkgs=(-r "$req")
     if [[ "$SKIP_TESTS" != true ]]; then
       # recall/test_layer_compression.py imports tiktoken at collection time.
       py_pkgs+=(pytest tiktoken)
     fi
-    echo "Installing ${py_pkgs[*]} into ${RUNTIME_PY}"
+    echo "Installing ${req} into ${RUNTIME_PY}"
     install_python_packages "$RUNTIME_PY" "${py_pkgs[@]}"
-    echo "ok: ${RUNTIME_PY} can import onnxruntime, tokenizers, numpy"
+    echo "ok: ${RUNTIME_PY} can import sentence_transformers, onnxruntime, tokenizers, numpy"
   else
-    echo "note: skipping onnxruntime install (MYMEMORY_SKIP_GTE=1)"
+    echo "note: skipping runtime requirements (MYMEMORY_SKIP_GTE=1)"
   fi
 else
-  echo "note: no Python found — install onnxruntime tokenizers numpy into the Hermes interpreter" >&2
+  echo "note: no Python found — pip install -r requirements.txt into the Hermes interpreter" >&2
   RUNTIME_PY=""
 fi
 echo ""
