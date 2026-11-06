@@ -1,9 +1,10 @@
-"""Plugin load must install requirements.txt before digest imports yaml.
+"""Plugin load must install missing requirements.txt lines without importing them.
 
 A Hermes update creates an environment without these packages. Collection
 sets PYTEST_CURRENT_TEST so importing MyMemory does not run pip.
 A finished install still cannot register inside the load that Hermes already
 abandoned, so the success path must restart the gateway from outside it.
+distribution() reads metadata only, so sentence_transformers does not load torch.
 """
 
 from __future__ import annotations
@@ -22,24 +23,88 @@ if str(_HERE.parent) not in sys.path:
 import MyMemory  # noqa: E402
 
 
+_INDEX_URL = "https://download.pytorch.org/whl/cpu"
+_EXTRA_URL = "https://pypi.org/simple"
+_FILE_BODY = """--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+onnxruntime
+pyyaml
+torch==2.15.0+cpu; sys_platform != "darwin"
+torch==2.15.0; sys_platform == "darwin"
+sentence-transformers>=3.0.0
+"""
+_HEAVY_IMPORTS = {
+    "sentence_transformers",
+    "torch",
+    "yaml",
+    "pyyaml",
+    "openai",
+    "numpy",
+    "tokenizers",
+    "onnxruntime",
+}
+
+
 def _allow_install(monkeypatch) -> None:
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.delenv("MYMEMORY_SKIP_RUNTIME_DEPS", raising=False)
 
 
-def test_missing_imports_install_requirements_with_pip(monkeypatch, tmp_path):
-    _allow_install(monkeypatch)
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+def _applicable_specs() -> list[str]:
+    """The torch line that matches this OS, so both pins are not installed."""
+    torch = "torch==2.15.0" if sys.platform == "darwin" else "torch==2.15.0+cpu"
+    return ["onnxruntime", "pyyaml", torch, "sentence-transformers>=3.0.0"]
+
+
+def _applicable_names() -> list[str]:
+    return ["onnxruntime", "pyyaml", "torch", "sentence-transformers"]
+
+
+def _index_args() -> list[str]:
+    return [
+        "--index-url",
+        _INDEX_URL,
+        "--extra-index-url",
+        _EXTRA_URL,
+    ]
+
+
+def _point_requirements(monkeypatch, tmp_path, body: str = _FILE_BODY) -> None:
+    path = tmp_path / "requirements.txt"
+    path.write_text(body, encoding="utf-8")
+    monkeypatch.setattr(MyMemory, "_REQUIREMENTS_FILE", path)
+
+
+def _pip_present(monkeypatch) -> None:
     real_spec = MyMemory.importlib.util.find_spec
 
     def spec_for(name):
-        if name in MyMemory._RUNTIME_MODULES:
-            return None
         if name == "pip":
             return object()
         return real_spec(name)
 
     monkeypatch.setattr(MyMemory.importlib.util, "find_spec", spec_for)
+
+
+def _distribution(monkeypatch, missing: set[str], installed: dict | None = None) -> None:
+    """Report requirement names as absent without importing those packages."""
+
+    def distribution(name):
+        if installed is not None and installed.get("ok"):
+            return object()
+        if name in missing:
+            raise MyMemory.importlib.metadata.PackageNotFoundError(name)
+        return object()
+
+    monkeypatch.setattr(MyMemory.importlib.metadata, "distribution", distribution)
+
+
+def test_missing_imports_install_requirements_with_pip(monkeypatch, tmp_path):
+    _allow_install(monkeypatch)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _point_requirements(monkeypatch, tmp_path)
+    _pip_present(monkeypatch)
+    _distribution(monkeypatch, set(_applicable_names()))
     calls: list[list[str]] = []
 
     def fake_run(cmd, **_kwargs):
@@ -53,23 +118,22 @@ def test_missing_imports_install_requirements_with_pip(monkeypatch, tmp_path):
 
     monkeypatch.setattr(MyMemory.subprocess, "Popen", fail_popen)
     MyMemory.ensure_runtime_deps()
-    req = str(Path(MyMemory.__file__).resolve().parent / "requirements.txt")
-    assert calls == [[sys.executable, "-m", "pip", "install", "-r", req]]
+    assert calls == [[sys.executable, "-m", "pip", "install", *_index_args(), *_applicable_specs()]]
 
 
-def test_present_imports_do_not_spawn_pip(monkeypatch):
+def test_present_imports_do_not_spawn_pip(monkeypatch, tmp_path, caplog):
     _allow_install(monkeypatch)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _point_requirements(monkeypatch, tmp_path)
+    _distribution(monkeypatch, set())
     real_import = MyMemory.importlib.import_module
 
     def refuse_runtime_import(name, package=None):
-        if name in MyMemory._RUNTIME_MODULES:
+        if name in _HEAVY_IMPORTS:
             raise AssertionError(f"startup must not import {name}")
         return real_import(name, package)
 
     monkeypatch.setattr(MyMemory.importlib, "import_module", refuse_runtime_import)
-    monkeypatch.setattr(
-        MyMemory.importlib.util, "find_spec", lambda name: object()
-    )
 
     def fail_run(*_args, **_kwargs):
         raise AssertionError("pip must not run when runtime imports succeed")
@@ -80,33 +144,46 @@ def test_present_imports_do_not_spawn_pip(monkeypatch):
         raise AssertionError("gateway restart must not run when runtime imports succeed")
 
     monkeypatch.setattr(MyMemory.subprocess, "Popen", fail_popen)
+    with caplog.at_level("INFO", logger="mymemory.runtime"):
+        MyMemory.ensure_runtime_deps()
+    assert f"{len(_applicable_names())} specs in " in caplog.text
+    assert "missing=0" in caplog.text
+
+
+def test_only_extra_requirement_line_is_installed(monkeypatch, tmp_path):
+    """A line added to requirements.txt is installed when the others are already present."""
+    _allow_install(monkeypatch)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _point_requirements(monkeypatch, tmp_path, _FILE_BODY + "openai\n")
+    _pip_present(monkeypatch)
+    _distribution(monkeypatch, {"openai"})
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(MyMemory.subprocess, "run", fake_run)
+
+    def fail_popen(*_args, **_kwargs):
+        raise AssertionError("gateway restart must not run when the new line stays missing")
+
+    monkeypatch.setattr(MyMemory.subprocess, "Popen", fail_popen)
     MyMemory.ensure_runtime_deps()
+    assert calls == [[sys.executable, "-m", "pip", "install", *_index_args(), "openai"]]
 
 
 def _notice_path(home: Path) -> Path:
     return home / "logs" / "mymemory-runtime-deps-notice.json"
 
 
-def _spec_until_installed(monkeypatch, installed: dict[str, bool]):
-    real_spec = MyMemory.importlib.util.find_spec
-
-    def spec_for(name):
-        if name in MyMemory._RUNTIME_MODULES and not installed["ok"]:
-            return None
-        if name == "pip":
-            return object()
-        if name in MyMemory._RUNTIME_MODULES:
-            return object()
-        return real_spec(name)
-
-    monkeypatch.setattr(MyMemory.importlib.util, "find_spec", spec_for)
-
-
 def test_missing_imports_restart_gateway_after_install(monkeypatch, tmp_path):
     _allow_install(monkeypatch)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _point_requirements(monkeypatch, tmp_path)
+    _pip_present(monkeypatch)
     installed = {"ok": False}
-    _spec_until_installed(monkeypatch, installed)
+    _distribution(monkeypatch, set(_applicable_names()), installed)
     calls: list[list[str]] = []
 
     def fake_run(cmd, **_kwargs):
@@ -134,18 +211,17 @@ def test_missing_imports_restart_gateway_after_install(monkeypatch, tmp_path):
 
     MyMemory.ensure_runtime_deps()
 
-    req = str(Path(MyMemory.__file__).resolve().parent / "requirements.txt")
-    assert calls == [[sys.executable, "-m", "pip", "install", "-r", req]]
+    assert calls == [[sys.executable, "-m", "pip", "install", *_index_args(), *_applicable_specs()]]
     assert len(spawned) == 1
     cmd, kwargs = spawned[0]
     assert cmd == ["/usr/bin/hermes", "gateway", "restart"]
     assert kwargs.get("start_new_session") is True
-    names = ", ".join(MyMemory._RUNTIME_MODULES)
+    names = ", ".join(_applicable_names())
     assert sent == [
         f"MyMemory was missing: {names}. Installed them and restarting the gateway so memory prefetch can register."
     ]
     notice = json.loads(_notice_path(tmp_path).read_text(encoding="utf-8"))
-    assert notice["missing"] == list(MyMemory._RUNTIME_MODULES)
+    assert notice["missing"] == _applicable_names()
     assert notice["sent"] is True
     assert isinstance(notice["restart_requested_at"], float)
 
@@ -153,16 +229,9 @@ def test_missing_imports_restart_gateway_after_install(monkeypatch, tmp_path):
 def test_failed_install_does_not_restart(monkeypatch, tmp_path):
     _allow_install(monkeypatch)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    real_spec = MyMemory.importlib.util.find_spec
-
-    def spec_for(name):
-        if name in MyMemory._RUNTIME_MODULES:
-            return None
-        if name == "pip":
-            return object()
-        return real_spec(name)
-
-    monkeypatch.setattr(MyMemory.importlib.util, "find_spec", spec_for)
+    _point_requirements(monkeypatch, tmp_path)
+    _pip_present(monkeypatch)
+    _distribution(monkeypatch, set(_applicable_names()))
 
     def fake_run(cmd, **_kwargs):
         return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="no wheel")
@@ -191,16 +260,9 @@ def test_recent_restart_notice_does_not_install_again(monkeypatch, tmp_path):
         ),
         encoding="utf-8",
     )
-    real_spec = MyMemory.importlib.util.find_spec
-
-    def spec_for(name):
-        if name in MyMemory._RUNTIME_MODULES:
-            return None
-        if name == "pip":
-            return object()
-        return real_spec(name)
-
-    monkeypatch.setattr(MyMemory.importlib.util, "find_spec", spec_for)
+    _point_requirements(monkeypatch, tmp_path)
+    _pip_present(monkeypatch)
+    _distribution(monkeypatch, {"onnxruntime"})
 
     def fail_run(*_args, **_kwargs):
         raise AssertionError("pip must not run again inside the restart guard")
@@ -216,8 +278,10 @@ def test_recent_restart_notice_does_not_install_again(monkeypatch, tmp_path):
 def test_systemd_restart_uses_transient_unit(monkeypatch, tmp_path):
     _allow_install(monkeypatch)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _point_requirements(monkeypatch, tmp_path)
+    _pip_present(monkeypatch)
     installed = {"ok": False}
-    _spec_until_installed(monkeypatch, installed)
+    _distribution(monkeypatch, set(_applicable_names()), installed)
 
     def fake_run(cmd, **_kwargs):
         installed["ok"] = True
