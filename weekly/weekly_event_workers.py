@@ -1,15 +1,18 @@
-"""Parallel Worker 1 coordinator: one event worker + analyst workers.
+"""Parallel Worker 1 coordinator: one event worker plus the thread analyst.
+
+Conflict, hypothesis, and overdue brief sections are retired, so this coordinator
+must not build those blocks or the date brief would grow sections nothing reads.
 
 Topology:
   1. One ``worker1_event`` LLM reads all active-day events and groups by date
      (emits mem ids in ``related``; no fact/procedure/decision attach).
   2. Post-worker validator: mem ids resolve in daily F/P/D and agree with event text.
   3. Deterministic merger (Mon–Sun) + DayBriefs (event cites on date; narrative sans cites).
-  4. Conflict / Hypothesis / Span analysts run in parallel on merged events.
+  4. Thread analyst runs on merged events.
   5. Never writes hot memory; purposes are observable via ``call_llm(..., purpose=)``.
 
 Returns Distill YAML blocks plus a ``WeeklyReviewPayload``. Step 3 renders the
-four-part Brief deterministically from that payload.
+date brief deterministically from that payload.
 """
 
 from __future__ import annotations
@@ -35,10 +38,8 @@ try:
     from .weekly_event_schema import (
         EMPTY_DAY_TEXT,
         ClaimSentence,
-        ConflictItem,
         DayBrief,
         EventCite,
-        HypothesisItem,
         IntraDayThread,
         SpanCandidate,
         ThreadStep,
@@ -61,10 +62,8 @@ except ImportError:  # pragma: no cover - flat pytest load
     from weekly_event_schema import (  # type: ignore[no-redef]
         EMPTY_DAY_TEXT,
         ClaimSentence,
-        ConflictItem,
         DayBrief,
         EventCite,
-        HypothesisItem,
         IntraDayThread,
         SpanCandidate,
         ThreadStep,
@@ -911,12 +910,7 @@ def _validate_analyst_blocks(
         related = fm.get("related") or []
         if not isinstance(related, list) or not related:
             errors.append(f"{expected_type} related is required")
-        elif expected_type in {"conflict", "hypothesis"} and event_ids:
-            has_event = any(str(r).strip() in event_ids for r in related)
-            if not has_event:
-                errors.append(
-                    f"{expected_type} related must include a week event id"
-                )
+        del event_ids  # event-id membership was only required for retired types
     return errors
 
 
@@ -2049,62 +2043,6 @@ def _entities_from_dailies(
     return _entities_from_event_blocks(blocks)
 
 
-def _blocks_to_conflict_items(
-    blocks: Sequence[dict[str, Any]],
-) -> tuple[ConflictItem, ...]:
-    items: list[ConflictItem] = []
-    for block in blocks:
-        fm = block.get("frontmatter") or {}
-        related = fm.get("related") or ()
-        if isinstance(related, list):
-            related_ids = tuple(
-                str(r).strip()
-                for r in related
-                if str(r).strip() and not str(r).strip().startswith("[")
-            )
-        else:
-            related_ids = ()
-        try:
-            items.append(
-                ConflictItem(
-                    id=str(fm.get("id") or f"cfl-{len(items)+1}"),
-                    text=str(block.get("body") or "").strip() or "Conflict.",
-                    related_event_ids=related_ids,
-                )
-            )
-        except ValueError:
-            continue
-    return tuple(items)
-
-
-def _blocks_to_hypothesis_items(
-    blocks: Sequence[dict[str, Any]],
-) -> tuple[HypothesisItem, ...]:
-    items: list[HypothesisItem] = []
-    for block in blocks:
-        fm = block.get("frontmatter") or {}
-        related = fm.get("related") or ()
-        if isinstance(related, list):
-            related_ids = tuple(
-                str(r).strip()
-                for r in related
-                if str(r).strip() and not str(r).strip().startswith("[")
-            )
-        else:
-            related_ids = ()
-        try:
-            items.append(
-                HypothesisItem(
-                    id=str(fm.get("id") or f"hyp-{len(items)+1}"),
-                    text=str(block.get("body") or "").strip() or "Hypothesis.",
-                    related_event_ids=related_ids,
-                )
-            )
-        except ValueError:
-            continue
-    return tuple(items)
-
-
 def _entities_from_tool_args(
     args: Mapping[str, Any],
     week_dates: Sequence[date],
@@ -2266,9 +2204,6 @@ def run_parallel_worker1(
 
     payload = WeeklyReviewPayload(
         days=(),
-        conflicts=(),
-        hypotheses=(),
-        span_candidates=(),
         legend=dict(legend),
         week_key=week_key,
         cross_day_thread=tuple(cross_day),

@@ -61,12 +61,6 @@ import {
   stagingUiRecallAvailable,
   type StagingUiPendingOp,
 } from './src/stagingUiRecall';
-import {
-  applyWeeklyReviewRecall,
-  applyWeeklyReviewSave,
-  weeklyReviewRecallAvailable,
-  type WeeklyReviewPendingOp,
-} from './src/weeklyReviewRecall';
 import type { StagedAction } from './src/types';
 import {
   createUiLifecycle,
@@ -323,70 +317,6 @@ async function startServer() {
         success: true,
         count: result.count,
         recallAvailable: stagingUiRecallAvailable(),
-      });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  // Weekly Review Save / Recall (hypothesis Confirm/Delete + overdue span ops)
-  app.get('/api/weekly/weeks/:week/review/recall', (req, res) => {
-    try {
-      const week = req.params.week;
-      if (!isValidWeekKey(week)) {
-        return res.status(400).json({ error: 'A valid week code (YYYY-Www) is required.' });
-      }
-      res.json({ available: weeklyReviewRecallAvailable() });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  app.post('/api/weekly/weeks/:week/review/save', (req, res) => {
-    try {
-      const week = req.params.week;
-      if (!isValidWeekKey(week)) {
-        return res.status(400).json({ error: 'A valid week code (YYYY-Www) is required.' });
-      }
-      const ops = Array.isArray(req.body?.ops)
-        ? (req.body.ops as WeeklyReviewPendingOp[])
-        : [];
-      const mismatched = ops.find((op) => op && op.weekKey && op.weekKey !== week);
-      if (mismatched) {
-        return res.status(400).json({
-          error: `Op weekKey ${mismatched.weekKey} does not match route week ${week}.`,
-        });
-      }
-      const result = applyWeeklyReviewSave(ops);
-      if ('error' in result) {
-        return res.status(400).json({ error: result.error });
-      }
-      appendWeeklyUiLog(`ui weekly review save week=${week} count=${result.count}`);
-      res.json({
-        success: true,
-        count: result.count,
-        recallAvailable: weeklyReviewRecallAvailable(),
-      });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message });
-    }
-  });
-
-  app.post('/api/weekly/weeks/:week/review/recall', (req, res) => {
-    try {
-      const week = req.params.week;
-      if (!isValidWeekKey(week)) {
-        return res.status(400).json({ error: 'A valid week code (YYYY-Www) is required.' });
-      }
-      const result = applyWeeklyReviewRecall();
-      if ('error' in result) {
-        return res.status(400).json({ error: result.error });
-      }
-      appendWeeklyUiLog(`ui weekly review recall week=${week} count=${result.count}`);
-      res.json({
-        success: true,
-        count: result.count,
-        recallAvailable: weeklyReviewRecallAvailable(),
       });
     } catch (err: any) {
       res.status(500).json({ error: err.message });

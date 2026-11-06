@@ -88,47 +88,6 @@ def _golden_payload(schema):
 
     return schema.WeeklyReviewPayload(
         days=tuple(days),
-        conflicts=(
-            schema.ConflictItem(
-                id="cfl-validation-order",
-                text=(
-                    "The procedure says validation precedes writes, but one "
-                    "daily block records a write before validation."
-                ),
-            ),
-        ),
-        hypotheses=(
-            schema.HypothesisItem(
-                id="hyp-parallel-latency",
-                text=(
-                    "The parallel event workers may reduce weekly generation "
-                    "latency without changing citation identity."
-                ),
-            ),
-        ),
-        span_candidates=(
-            schema.SpanCandidate(
-                id="span-project-deadline",
-                label="Project deadline",
-                start_date=date(2026, 7, 27),
-                end_date=date(2026, 8, 2),
-                confidence="explicit",
-            ),
-            schema.SpanCandidate(
-                id="span-low-noise",
-                label="Noise span",
-                start_date=date(2026, 7, 28),
-                end_date=date(2026, 7, 30),
-                confidence="low",
-            ),
-            schema.SpanCandidate(
-                id="span-medium-noise",
-                label="Maybe initiative",
-                start_date=date(2026, 7, 29),
-                end_date=date(2026, 8, 1),
-                confidence="medium",
-            ),
-        ),
         legend={
             1: "mem-2026-07-27-kickoff",
             2: "mem-2026-07-27-digest",
@@ -174,11 +133,41 @@ def test_golden_fixture_named_event_paragraphs():
     assert schema.validate_sentence_final_cites(rendered) == []
 
 
-def test_golden_fixture_conflict_between_claims():
-    text = (FIXTURES / "weekly_four_part_w31.md").read_text(encoding="utf-8")
-    assert "Conflict" in text
-    assert "validation precedes writes" in text
-    assert "[6]" in text
+def test_old_brief_skips_retired_headings_and_keeps_days():
+    """Old files still name the retired sections. Day events must survive the skip."""
+    schema = _load_schema()
+    old = (
+        "Weekly Brief — 2026-W31\n\n"
+        "Monday — 2026-07-27 · Events [1] [2]\n"
+        "**Project kickoff moved to event-first digest**\n"
+        "Project kickoff moved to the new event-first digest flow.\n\n"
+        "Conflict\n"
+        "- validation precedes writes. [6]\n\n"
+        "Hypothesis\n"
+        "- parallel workers may reduce latency. [7]\n\n"
+        "Possible overdue report\n"
+        "- None.\n\n"
+        "Cite map\n"
+        "- [1] event mem-2026-07-27-kickoff\n"
+        "- [2] event mem-2026-07-27-digest\n"
+        "- [6] conflict cfl-validation-order\n"
+    )
+    parsed = schema.parse_four_part_brief(old)
+    monday = parsed.days[0]
+    assert monday.day.isoformat() == "2026-07-27"
+    assert [e.number for e in monday.events] == [1, 2]
+    assert monday.events[0].mem_id == "mem-2026-07-27-kickoff"
+    assert "validation precedes writes" not in schema.worker2_format_day_events(
+        monday.sentences
+    )
+    assert parsed.legend == {
+        1: "mem-2026-07-27-kickoff",
+        2: "mem-2026-07-27-digest",
+    }
+    rendered = schema.render_weekly_review_brief("2026-W31", parsed)
+    assert "Conflict\n" not in rendered
+    assert "Hypothesis\n" not in rendered
+    assert "Possible overdue report" not in rendered
 
 
 def test_render_parse_round_trip_matches_golden():
@@ -189,29 +178,11 @@ def test_render_parse_round_trip_matches_golden():
     assert rendered.strip() == golden.strip()
 
     parsed = schema.parse_four_part_brief(rendered)
-    # Brief Possible overdue is always empty (Weekly UI does not render it).
-    errors = schema.payloads_structurally_equal(
-        schema.WeeklyReviewPayload(
-            days=payload.days,
-            conflicts=payload.conflicts,
-            hypotheses=payload.hypotheses,
-            span_candidates=(),
-            legend=payload.legend,
-            typed_legend=payload.typed_legend,
-            week_key=payload.week_key,
-        ),
-        schema.WeeklyReviewPayload(
-            days=parsed.days,
-            conflicts=parsed.conflicts,
-            hypotheses=parsed.hypotheses,
-            span_candidates=(),
-            legend=parsed.legend,
-            typed_legend=parsed.typed_legend,
-            week_key=parsed.week_key,
-        ),
-        ignore_span_start=True,
-    )
+    errors = schema.payloads_structurally_equal(payload, parsed)
     assert errors == [], errors
+    assert "Conflict\n" not in rendered
+    assert "Hypothesis\n" not in rendered
+    assert "Possible overdue report" not in rendered
 
 
 def test_assign_typed_citations_does_not_renumber_events():
@@ -222,14 +193,8 @@ def test_assign_typed_citations_does_not_renumber_events():
     assigned = schema.assign_typed_citations(payload)
     assert assigned.summary == payload.summary
     assert assigned.legend == before
+    assert assigned is payload
     assert citations.next_cite_after_legend(before) == 6
-    assert set(assigned.typed_legend) == {6, 7}
-    assert assigned.typed_legend[6].kind == "conflict"
-    assert assigned.typed_legend[7].kind == "hypothesis"
-    # Spans are not Brief-cited; overdue section stays empty.
-    overdue_text = schema.render_overdue_section(assigned.span_candidates)
-    assert overdue_text == "Possible overdue report\n- None."
-    assert all(s.cite is None for s in assigned.span_candidates)
 
 
 def test_assign_typed_citations_keeps_summary():
@@ -281,23 +246,20 @@ def test_extract_brief_returns_four_part_from_wrapped_document():
     brief = cite.extract_brief(md)
     assert schema.is_four_part_brief(brief)
     assert "Weekly Brief — 2026-W31" in brief
-    assert "Possible overdue report" in brief
+    assert "Monday — 2026-07-27 · Events [1] [2]" in brief
     assert "## Action ledger" not in brief
-    typed = cite.load_typed_cite_map(md)
-    assert typed[6] == {"kind": "conflict", "id": "cfl-validation-order"}
-    assert typed[7] == {"kind": "hypothesis", "id": "hyp-parallel-latency"}
-    assert 8 not in typed
-    assert 1 not in typed  # event cites stay out of typed map
+    assert cite.load_typed_cite_map(md) == {}
 
 
-def test_four_part_sections_always_present_when_empty():
+def test_empty_week_renders_days_and_cite_map():
     schema = _load_schema()
     days = tuple(
         schema.DayBrief(day=date(2026, 7, 27) + timedelta(days=i)) for i in range(7)
     )
     payload = schema.WeeklyReviewPayload(days=days, week_key="2026-W31")
     text = schema.render_weekly_review_brief("2026-W31", payload)
-    assert "Conflict\n- None." in text
-    assert "Hypothesis\n- None." in text
-    assert "Possible overdue report\n- None." in text
+    assert "Conflict\n" not in text
+    assert "Hypothesis\n" not in text
+    assert "Possible overdue report" not in text
+    assert "Cite map" in text
     assert text.count("No record for this day.") == 7

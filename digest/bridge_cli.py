@@ -100,18 +100,6 @@ def _handle_raw(raw: str) -> tuple[dict[str, Any], str]:
                     wait=a.get("wait", True),
                     status_only=a.get("status_only", False),
                 ),
-                "list_weekly_span_candidates": lambda **a: digest_run.list_weekly_span_candidates(
-                    str(a.get("week_key") or "")
-                ),
-                "resolve_weekly_span": lambda **a: digest_run.resolve_weekly_span(
-                    str(a.get("week_key") or ""),
-                    str(a.get("block_id") or ""),
-                    str(a.get("action") or ""),
-                    proposed_valid_to=a.get("proposed_valid_to"),
-                    interval=a.get("interval"),
-                    due_date=a.get("due_date"),
-                    idempotency_key=a.get("idempotency_key"),
-                ),
             }
             fn = dispatch.get(op)
             if fn is None:

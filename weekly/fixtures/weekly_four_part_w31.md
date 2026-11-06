@@ -26,18 +26,7 @@ No record for this day.
 Sunday — 2026-08-02 · Events
 No record for this day.
 
-Conflict
-- The procedure says validation precedes writes, but one daily block records a write before validation. [6]
-
-Hypothesis
-- The parallel event workers may reduce weekly generation latency without changing citation identity. [7]
-
-Possible overdue report
-- None.
-
 Cite map
 - [1] event mem-2026-07-27-kickoff
 - [2] event mem-2026-07-27-digest
 - [5] event mem-2026-07-28-workers
-- [6] conflict cfl-validation-order
-- [7] hypothesis hyp-parallel-latency

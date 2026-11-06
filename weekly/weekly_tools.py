@@ -344,8 +344,6 @@ def validate_closed_choice_args(args: Mapping[str, Any], *, role: str) -> list[s
     errors: list[str] = []
     items_key = {
         "event": "events",
-        "conflict": "conflicts",
-        "hypothesis": "hypotheses",
         "thread": "cross-day-thread",
     }.get(role, "")
     items = args.get(items_key) if items_key else None

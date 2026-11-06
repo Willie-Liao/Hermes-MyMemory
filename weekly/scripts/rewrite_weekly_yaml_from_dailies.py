@@ -70,8 +70,6 @@ def rewrite_week(week_key: str) -> Path:
         cross_day_thread=existing_threads,
         intra_day_thread=_intra_day_from_dailies(week_dates, by_day),
         entities=_entities_from_dailies(week_dates, by_day),
-        conflicts=(),
-        hypotheses=(),
     )
     yaml_text = dump_yaml(payload)
     status = read_week_status(md_path) if md_path.is_file() else None

@@ -1165,8 +1165,6 @@ def _generate_weekly_content(
         week_key=week_key,
         cross_day_thread=w1.cross_day_thread or payload.cross_day_thread,
         entities=w1.entities or payload.entities,
-        conflicts=(),
-        hypotheses=(),
     )
     assigned = assign_typed_citations(payload)
     assigned = replace(

@@ -3,9 +3,6 @@
 import { splitBriefCites, type BriefSegment } from './briefCiteNav.ts';
 
 export const EMPTY_DAY_TEXT = 'No record for this day.';
-export const CONFLICT_SECTION_TITLE = 'Conflict';
-export const HYPOTHESIS_SECTION_TITLE = 'Hypothesis';
-export const OVERDUE_SECTION_TITLE = 'Possible overdue report';
 export const CITE_MAP_SECTION_TITLE = 'Cite map';
 
 export const WEEKDAY_ORDER = [
@@ -18,8 +15,7 @@ export const WEEKDAY_ORDER = [
   'Sunday',
 ] as const;
 
-export type SpanConfidence = 'explicit' | 'high' | 'medium' | 'low';
-export type TypedCiteKind = 'event' | 'conflict' | 'hypothesis' | 'span';
+export type TypedCiteKind = 'event';
 
 export type CiteMapEntry = {
   n: number;
@@ -35,24 +31,9 @@ export type FourPartDay = {
   empty: boolean;
 };
 
-export type FourPartBullet = {
-  text: string;
-  cite: number | null;
-};
-
-export type FourPartOverdueRow = {
-  label: string;
-  proposedEnd: string;
-  confidence: SpanConfidence;
-  cite: number | null;
-};
-
 export type FourPartBrief = {
   weekKey: string;
   days: FourPartDay[];
-  conflicts: FourPartBullet[];
-  hypotheses: FourPartBullet[];
-  overdue: FourPartOverdueRow[];
   citeMap: CiteMapEntry[];
   isFourPart: boolean;
 };
@@ -60,42 +41,24 @@ export type FourPartBrief = {
 const TITLE_RE = /^Weekly Brief — (?<week>\d{4}-W\d{2})\s*$/;
 const DAY_HEADER_RE =
   /^(?<weekday>[A-Za-z]+) — (?<date>\d{4}-\d{2}-\d{2}) · Events(?<markers>(?: \[\d+\])*)$/;
-const SECTION_RE = /^(Conflict|Hypothesis|Possible overdue report|Cite map)\s*$/;
+const TITLE_ONLY_RE = /^[A-Za-z][A-Za-z ]*$/;
 const BULLET_RE = /^- (?<body>.+)$/;
-const TRAILING_CITE_RE = /^(?<text>.*?)\s+\[(?<cite>\d+)\]\s*$/;
 const CITE_MAP_ENTRY_RE =
-  /^\[(?<n>\d+)\]\s+(?<kind>event|conflict|hypothesis|span)\s+(?<target>\S+)\s*$/i;
-const OVERDUE_ROW_RE =
-  /^(?<label>.+?) — proposed end (?<end>\d{4}-\d{2}-\d{2}) — (?<confidence>explicit|high|medium|low)(?:\s+\[(?<cite>\d+)\])?\s*$/i;
+  /^\[(?<n>\d+)\]\s+(?<kind>\w+)\s+(?<target>\S+)\s*$/i;
 const CITE_MARKER_RE = /\[(\d+)\]/g;
-const OVERDUE_ACTIONS_PREFIX = '[Confirm]';
+
+/** Cite map, or a retired single-line heading. Sentences have punctuation. */
+function isSectionTitle(stripped: string): boolean {
+  if (stripped === CITE_MAP_SECTION_TITLE) return true;
+  return TITLE_ONLY_RE.test(stripped);
+}
 
 export function isFourPartBrief(text: string): boolean {
   const stripped = (text || '').trim();
   if (!stripped) return false;
   const first = stripped.split('\n')[0]?.trim() ?? '';
   if (TITLE_RE.test(first)) return true;
-  return (
-    stripped.includes(CONFLICT_SECTION_TITLE)
-    && stripped.includes(HYPOTHESIS_SECTION_TITLE)
-    && stripped.includes(OVERDUE_SECTION_TITLE)
-    && stripped.includes(' · Events')
-  );
-}
-
-function stripTrailingCite(body: string): { text: string; cite: number | null } {
-  const m = TRAILING_CITE_RE.exec(body.trim());
-  if (!m?.groups) return { text: body.trim(), cite: null };
-  return { text: m.groups.text.trim(), cite: Number(m.groups.cite) };
-}
-
-function findSectionStarts(lines: string[]): Map<string, number> {
-  const starts = new Map<string, number>();
-  for (let i = 0; i < lines.length; i++) {
-    const m = SECTION_RE.exec(lines[i].trim());
-    if (m) starts.set(m[1], i);
-  }
-  return starts;
+  return stripped.includes(' · Events');
 }
 
 function parseDayBlocks(lines: string[]): FourPartDay[] {
@@ -121,7 +84,7 @@ function parseDayBlocks(lines: string[]): FourPartDay[] {
         i += 1;
         continue;
       }
-      if (DAY_HEADER_RE.test(stripped) || SECTION_RE.test(stripped)) break;
+      if (DAY_HEADER_RE.test(stripped) || isSectionTitle(stripped)) break;
       paraLines.push(stripped);
       i += 1;
     }
@@ -137,73 +100,6 @@ function parseDayBlocks(lines: string[]): FourPartDay[] {
   return days;
 }
 
-function parseBulletSection(
-  lines: string[],
-  start: number,
-): { items: FourPartBullet[]; next: number } {
-  const items: FourPartBullet[] = [];
-  let i = start;
-  while (i < lines.length) {
-    const stripped = lines[i].trim();
-    if (!stripped) {
-      i += 1;
-      continue;
-    }
-    if (SECTION_RE.test(stripped) || DAY_HEADER_RE.test(stripped)) break;
-    if (stripped.startsWith(OVERDUE_ACTIONS_PREFIX)) {
-      i += 1;
-      continue;
-    }
-    const bullet = BULLET_RE.exec(stripped);
-    if (bullet?.groups) {
-      const body = bullet.groups.body.trim();
-      if (body.toLowerCase() === 'none.') {
-        i += 1;
-        continue;
-      }
-      const { text, cite } = stripTrailingCite(body);
-      items.push({ text, cite });
-      i += 1;
-      continue;
-    }
-    i += 1;
-  }
-  return { items, next: i };
-}
-
-function parseOverdueSection(lines: string[], start: number): FourPartOverdueRow[] {
-  const rows: FourPartOverdueRow[] = [];
-  let i = start;
-  while (i < lines.length) {
-    const stripped = lines[i].trim();
-    if (!stripped) {
-      i += 1;
-      continue;
-    }
-    if (SECTION_RE.test(stripped)) break;
-    const bullet = BULLET_RE.exec(stripped);
-    if (bullet?.groups) {
-      const body = bullet.groups.body.trim();
-      if (body.toLowerCase() === 'none.') {
-        i += 1;
-        continue;
-      }
-      const row = OVERDUE_ROW_RE.exec(body);
-      if (row?.groups) {
-        const confidence = row.groups.confidence.toLowerCase() as SpanConfidence;
-        rows.push({
-          label: row.groups.label.trim(),
-          proposedEnd: row.groups.end,
-          confidence,
-          cite: row.groups.cite ? Number(row.groups.cite) : null,
-        });
-      }
-    }
-    i += 1;
-  }
-  return rows;
-}
-
 function parseCiteMap(lines: string[], start: number): CiteMapEntry[] {
   const out: CiteMapEntry[] = [];
   let i = start;
@@ -213,7 +109,7 @@ function parseCiteMap(lines: string[], start: number): CiteMapEntry[] {
       i += 1;
       continue;
     }
-    if (SECTION_RE.test(stripped) || DAY_HEADER_RE.test(stripped)) break;
+    if (isSectionTitle(stripped) || DAY_HEADER_RE.test(stripped)) break;
     const bullet = BULLET_RE.exec(stripped);
     if (!bullet?.groups) {
       i += 1;
@@ -225,10 +121,10 @@ function parseCiteMap(lines: string[], start: number): CiteMapEntry[] {
       continue;
     }
     const entry = CITE_MAP_ENTRY_RE.exec(body);
-    if (entry?.groups) {
+    if (entry?.groups && entry.groups.kind.toLowerCase() === 'event') {
       out.push({
         n: Number(entry.groups.n),
-        kind: entry.groups.kind.toLowerCase() as TypedCiteKind,
+        kind: 'event',
         targetId: entry.groups.target,
       });
     }
@@ -245,10 +141,6 @@ export function stripCiteMapFooter(text: string): string {
   return lines.slice(0, idx).join('\n').replace(/\s+$/, '\n');
 }
 
-export function filterExplicitHighOverdue(rows: FourPartOverdueRow[]): FourPartOverdueRow[] {
-  return rows.filter((r) => r.confidence === 'explicit' || r.confidence === 'high');
-}
-
 export function parseFourPartBrief(text: string): FourPartBrief {
   const raw = text || '';
   const lines = raw.split('\n');
@@ -258,40 +150,13 @@ export function parseFourPartBrief(text: string): FourPartBrief {
     if (title?.groups) weekKey = title.groups.week;
   }
 
-  const sectionStarts = findSectionStarts(lines);
-  const conflictI = sectionStarts.get(CONFLICT_SECTION_TITLE);
-  const dateEnd = conflictI ?? lines.length;
-  const days = parseDayBlocks(lines.slice(1, dateEnd));
-
-  let conflicts: FourPartBullet[] = [];
-  if (conflictI != null) {
-    conflicts = parseBulletSection(lines, conflictI + 1).items;
-  }
-
-  let hypotheses: FourPartBullet[] = [];
-  const hypI = sectionStarts.get(HYPOTHESIS_SECTION_TITLE);
-  if (hypI != null) {
-    hypotheses = parseBulletSection(lines, hypI + 1).items;
-  }
-
-  let overdue: FourPartOverdueRow[] = [];
-  const overdueI = sectionStarts.get(OVERDUE_SECTION_TITLE);
-  if (overdueI != null) {
-    overdue = parseOverdueSection(lines, overdueI + 1);
-  }
-
-  let citeMap: CiteMapEntry[] = [];
-  const citeI = sectionStarts.get(CITE_MAP_SECTION_TITLE);
-  if (citeI != null) {
-    citeMap = parseCiteMap(lines, citeI + 1);
-  }
+  const days = parseDayBlocks(lines.slice(1));
+  const citeI = lines.findIndex((line) => line.trim() === CITE_MAP_SECTION_TITLE);
+  const citeMap = citeI >= 0 ? parseCiteMap(lines, citeI + 1) : [];
 
   return {
     weekKey,
     days,
-    conflicts,
-    hypotheses,
-    overdue: filterExplicitHighOverdue(overdue),
     citeMap,
     isFourPart: isFourPartBrief(raw),
   };

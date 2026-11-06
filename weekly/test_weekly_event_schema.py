@@ -49,36 +49,6 @@ def test_missing_and_empty_dates_render_no_record_text():
     assert "Wednesday — 2026-07-29 · Events\nNo record for this day." in section
 
 
-def test_duplicate_ids_rejected():
-    schema = _load()
-    payload = schema.WeeklyReviewPayload(
-        days=(),
-        conflicts=(schema.ConflictItem(id="dup-1", text="Tension A"),),
-        hypotheses=(schema.HypothesisItem(id="dup-1", text="Bet A"),),
-    )
-    errors = schema.validate_no_duplicate_ids(payload)
-    assert any("dup-1" in e for e in errors)
-
-
-def test_duplicate_ids_ok_when_unique():
-    schema = _load()
-    payload = schema.WeeklyReviewPayload(
-        days=(),
-        conflicts=(schema.ConflictItem(id="cfl-1", text="Tension A"),),
-        hypotheses=(schema.HypothesisItem(id="hyp-1", text="Bet A"),),
-        span_candidates=(
-            schema.SpanCandidate(
-                id="span-1",
-                label="Initiative",
-                start_date=date(2026, 7, 27),
-                end_date=date(2026, 7, 29),
-                confidence="medium",
-            ),
-        ),
-    )
-    assert schema.validate_no_duplicate_ids(payload) == []
-
-
 def test_invalid_confidence_rejected_for_span_candidates():
     schema = _load()
     with pytest.raises(ValueError):

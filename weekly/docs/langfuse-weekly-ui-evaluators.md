@@ -93,23 +93,21 @@ Before creating evaluators, confirm the project default judge model is **minimax
    Judge the assistant outputs in this trace (Event-First weekly markdown,
    Distill YAML when present, tighten text, etc.).
 
-   Event-First weekly reviews must expose these four sections (when the op
+   Event-First weekly reviews must expose the date brief and cite map (when the op
    produces a weekly brief):
 
    1. Weekly Brief by date (Mon–Sun): each day is
       "<Weekday> — YYYY-MM-DD · Events [N]…" then one **named** plain paragraph
       per event (``**summary title**`` + concise body, blank-line separated; no
       Beginning/Course/Outcome labels), or exactly "No record for this day." when empty.
-   2. Conflict
-   3. Hypothesis
-   4. Possible overdue report — always `- None.` in Brief. Weekly UI does not
-      render that section (span-watch / validate ladder retired).
+   2. Cite map of event ids. Conflict, hypothesis, and overdue sections are retired
+      and must not be required in a new brief.
 
    Criteria (score 1 only if all relevant checks pass for this op; else 0):
 
-   - rescan / generate_week / reorganise generate half: four sections present and
-     ordered as above; Mon–Sun coverage; empty days use "No record for this day.";
-     Events markers only where events exist; Brief overdue is `- None.`;
+   - rescan / generate_week / reorganise generate half: date brief and cite map
+     present as above; Mon–Sun coverage; empty days use "No record for this day.";
+     Events markers only where events exist;
      citations grounded in source digests; no fabricated facts or invented events.
    - Legacy Distill/Brief (older weeks only): valid YAML/structure when Distill is
      present; themes reflect distilled content; no hallucinated themes.
@@ -182,7 +180,7 @@ If traces appear but Scores stay empty: confirm both evaluators are **Active**, 
 When scoring or manually reviewing `rescan` / `reorganise` for week `2026-W31` (or the week in `suite_config.yaml`):
 
 1. Confirm report rows for both ops with `e2e_ms`, `stages`, and `over_budget`.
-2. Open the generated weekly markdown under `$HERMES_HOME/memories/staging/weekly/` (or UI Chronicle payload) and check the four sections + span visibility rule above.
+2. Open the generated weekly markdown under `$HERMES_HOME/memories/staging/weekly/` (or UI Chronicle payload) and check the date brief and event cite map above.
 3. Offline fallback: parse `fixtures/weekly_four_part_w31.md` if the live LLM suite cannot run.
 
 #### Live W31 run (2026-08-02)
@@ -191,7 +189,7 @@ When scoring or manually reviewing `rescan` / `reorganise` for week `2026-W31` (
 - Report: `$HERMES_HOME/metrics/weekly-ui-latency-last.{json,md}` (`suite_run_id` `2ac91832-…`).
 - `rescan`: ok, e2e ≈ 48.7 s, stage `generate_week_ms`, under 120 s budget.
 - `reorganise`: ok, e2e ≈ 107.8 s, stages `request_resummarise_ms` + `generate_week_ms`, under 240 s budget.
-- Generated `memories/staging/weekly/2026-W31.md` includes Event-First four sections (Weekly Brief Mon–Sun with named plain event paragraphs / `No record for this day.`, Conflict, Hypothesis, Possible overdue report as `- None.`).
+- Generated `memories/staging/weekly/2026-W31.md` includes the date brief (Weekly Brief Mon–Sun with named plain event paragraphs / `No record for this day.`) and an event cite map.
 
 ---
 

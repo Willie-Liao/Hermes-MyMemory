@@ -4,7 +4,6 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   EMPTY_DAY_TEXT,
-  filterExplicitHighOverdue,
   formatDayHeader,
   isFourPartBrief,
   parseFourPartBrief,
@@ -70,44 +69,25 @@ describe('fourPartBrief', () => {
     expect(stripInlineCiteMarkers(mon!.paragraph)).not.toMatch(/\[\d+\]/);
   });
 
-  it('preserves statement-final cite markers for conflict/hypothesis', () => {
-    const parsed = parseFourPartBrief(golden);
-    expect(parsed.conflicts[0].cite).toBe(6);
-    expect(parsed.hypotheses[0].cite).toBe(7);
-  });
-
-  it('suppresses low/medium overdue rows', () => {
-    const withLow = `${golden}\n- Sneaky low span — proposed end 2026-08-03 — low [99]\n`;
-    const parsed = parseFourPartBrief(withLow);
-    expect(parsed.overdue.every((r) => r.confidence === 'explicit' || r.confidence === 'high')).toBe(
-      true,
-    );
-    expect(parsed.overdue.some((r) => r.label.includes('Sneaky'))).toBe(false);
-    expect(
-      filterExplicitHighOverdue([
-        {
-          label: 'x',
-          proposedEnd: '2026-08-01',
-          confidence: 'medium',
-          cite: 1,
-        },
-      ]),
-    ).toEqual([]);
+  it('skips retired headings and keeps the same Monday events', () => {
+    const old = `${golden.replace(
+      'Cite map',
+      'Conflict\n- validation precedes writes. [6]\n\nHypothesis\n- maybe later. [7]\n\nPossible overdue report\n- None.\n\nCite map',
+    )}\n- [6] conflict cfl-old\n`;
+    const parsed = parseFourPartBrief(old);
+    const mon = parsed.days.find((d) => d.date === '2026-07-27');
+    expect(mon?.eventCites).toEqual([1, 2]);
+    expect(mon?.paragraph).not.toContain('validation precedes writes');
+    expect(parsed.citeMap.some((e) => e.kind === 'event' && e.n === 1)).toBe(true);
+    expect(parsed.citeMap.some((e) => e.n === 6)).toBe(false);
   });
 
   it('parses Cite map but stripCiteMapFooter hides it from display text', () => {
     const parsed = parseFourPartBrief(golden);
-    expect(parsed.citeMap.some((e) => e.kind === 'span')).toBe(false);
-    expect(parsed.citeMap.some((e) => e.kind === 'conflict' && e.n === 6)).toBe(true);
     expect(parsed.citeMap.some((e) => e.kind === 'event' && e.n === 1)).toBe(true);
+    expect(parsed.citeMap.every((e) => e.kind === 'event')).toBe(true);
     const stripped = stripCiteMapFooter(golden);
     expect(stripped).not.toContain('Cite map');
-    expect(stripped).toContain('Possible overdue report');
-  });
-
-  it('Brief Possible overdue is empty; Weekly UI does not render it', () => {
-    const parsed = parseFourPartBrief(golden);
-    expect(parsed.overdue).toHaveLength(0);
-    expect(golden).toContain('Possible overdue report\n- None.');
+    expect(stripped).toContain('No record for this day.');
   });
 });

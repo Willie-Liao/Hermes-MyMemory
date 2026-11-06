@@ -13,11 +13,8 @@ const src = path.join(root, 'src');
 
 const VITEST_FILES = new Set([
   'fourPartBrief.test.ts',
-  'memoryApprovalActionQueue.test.ts',
-  'overdueActions.test.ts',
   'viewScroll.test.ts',
   'weeklyReorganise.test.ts',
-  'weeklyReviewRecall.test.ts',
   'weeklyJson.test.ts',
 ]);
 

@@ -57,11 +57,6 @@ _RELATED_CITE_RE = re.compile(
     r"^\[(\d+)\]\s+(mem-(?:\d{4}-\d{2}-\d{2}|\d{8})-[\w-]+)\s*$",
     re.IGNORECASE,
 )
-_TYPED_CITE_MAP_RE = re.compile(
-    r"^-\s+\[(\d+)\]\s+(conflict|hypothesis|span)\s+(\S+)\s*$",
-    re.IGNORECASE | re.MULTILINE,
-)
-
 _CITE_DIG_IN_KEY = "cite_dig_in"
 _STAGING_RECALL_KEY = "staging_recall"
 _CITE_STEPS = ("resolve", "load_block", "session_lookup", "answer")
@@ -86,8 +81,8 @@ def _section_body(md: str, header_re: re.Pattern[str]) -> str:
 def extract_brief(md: str) -> str:
     """Return Brief presentation prose (no Distill YAML, no ``## Brief`` header).
 
-    For Event-First weekly files this is the four-part container (Weekly Brief /
-    Conflict / Hypothesis / Possible overdue report). For legacy files it is
+    For Event-First weekly files this is the date brief (Weekly Brief title,
+    day events, optional cite map). For legacy files it is
     the Worker 2 theme Brief. Theme ``##`` headings under Brief (e.g.
     ``## Events``) are kept — only ``## Distill`` / ``## Action ledger``
     (and numbered ledger variants) end the section.
@@ -111,22 +106,13 @@ def extract_brief(md: str) -> str:
 
 
 def load_typed_cite_map(md: str) -> dict[int, dict[str, str]]:
-    """Parse typed (non-event) cites from the Brief ``Cite map`` section.
+    """Non-event cite kinds are retired, so the map stays empty.
 
-    Returns ``{N: {"kind": "conflict"|"hypothesis"|"span", "id": "…"}}``.
-    Event citations stay in ``load_cite_map`` / Distill related and are never
-    renumbered here.
+    Event citations stay in ``load_cite_map``. Returning entries here would
+    reattach conflict, hypothesis, or span ids from old cite maps.
     """
-    brief = extract_brief(md)
-    if not brief:
-        return {}
-    out: dict[int, dict[str, str]] = {}
-    for match in _TYPED_CITE_MAP_RE.finditer(brief):
-        out[int(match.group(1))] = {
-            "kind": match.group(2).casefold(),
-            "id": match.group(3),
-        }
-    return out
+    del md
+    return {}
 
 
 def _frontmatter_blocks(content: str) -> list[tuple[int, str, str]]:

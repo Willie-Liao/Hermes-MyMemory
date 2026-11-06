@@ -1383,7 +1383,7 @@ export default function WeekReview({
                         {weeklyJson
                           ? `summary · ${selectedWeek.week}`
                           : isFourPartBrief(chronicleSummary)
-                          ? `Brief · Conflict · ${selectedWeek.week}`
+                          ? `Brief · ${selectedWeek.week}`
                           : `What you did · ${selectedWeek.week}`}
                       </p>
                     </div>

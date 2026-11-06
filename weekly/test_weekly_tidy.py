@@ -347,9 +347,6 @@ def test_list_tidy_candidates_includes_four_part_cite_map_events(tmp_path, monke
         "Weekly Brief — 2026-W27\n\n"
         "Monday — 2026-06-30 · Events [1]\n"
         "Title work landed.\n\n"
-        "Conflict\n- None.\n\n"
-        "Hypothesis\n- None.\n\n"
-        "Possible overdue report\n- None.\n\n"
         "Cite map\n"
         "- [1] event mem-20260630-title-locked\n"
         "- [2] event mem-20260630-ship-event\n",

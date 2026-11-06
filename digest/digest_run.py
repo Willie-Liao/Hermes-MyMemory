@@ -31,25 +31,6 @@ except ImportError:  # pragma: no cover - direct pytest collection path
     sys.modules[_mod_name] = digest
     _spec.loader.exec_module(digest)
 
-try:  # package import (normal plugin load)
-    from . import span_weekly
-except ImportError:  # pragma: no cover - direct pytest collection path
-    _sw_module_path = Path(__file__).with_name("span_weekly.py")
-    _sw_mod_name = "memory_digest_span_weekly"
-    _sw_spec = importlib.util.spec_from_file_location(_sw_mod_name, _sw_module_path)
-    if _sw_spec is None or _sw_spec.loader is None:
-        raise
-    span_weekly = importlib.util.module_from_spec(_sw_spec)
-    sys.modules[_sw_mod_name] = span_weekly
-    _sw_spec.loader.exec_module(span_weekly)
-
-# Force span_weekly to share this module's digest instance (matters for direct
-# pytest collection, where each independent fallback import above would
-# otherwise create its own separate digest module and silently defeat
-# monkeypatching against `dr.digest`).
-span_weekly.digest = digest
-
-
 _DAY_SCOPES = frozenset({"all", "batch", "date"})
 _EXCLUDED_CHAT_SOURCES = frozenset({"cron", "subagent"})
 
@@ -537,33 +518,6 @@ def request_weekly_reorganise(
         "path": str(daily_path),
         "date": target_date,
     }
-
-
-def list_weekly_span_candidates(week_key: str) -> dict[str, Any]:
-    """Open + overdue span candidates for one ISO week (Weekly UI, chat-independent)."""
-    return span_weekly.list_weekly_span_candidates(week_key)
-
-
-def resolve_weekly_span(
-    week_key: str,
-    block_id: str,
-    action: str,
-    *,
-    proposed_valid_to: str | None = None,
-    interval: str | None = None,
-    due_date: str | None = None,
-    idempotency_key: str | None = None,
-) -> dict[str, Any]:
-    """Apply confirm / put_off / set_due_date to a daily block's valid_to."""
-    return span_weekly.resolve_weekly_span(
-        week_key,
-        block_id,
-        action,
-        proposed_valid_to=proposed_valid_to,
-        interval=interval,
-        due_date=due_date,
-        idempotency_key=idempotency_key,
-    )
 
 
 def _update_bookmark(session_key: str, transform) -> dict[str, Any]:

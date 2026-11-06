@@ -74,7 +74,6 @@ describe('Chronicle source wiring', () => {
 
   it('does not mount Possible overdue queue on Chronicle', () => {
     const weekReview = readFileSync(join(root, 'components/WeekReview.tsx'), 'utf8');
-    expect(weekReview).not.toContain('MemoryApprovalActionQueue');
     expect(weekReview).not.toContain('chronicle-overdue-queue');
     expect(weekReview).not.toContain('fetchWeeklySpans');
     expect(weekReview).not.toContain('spans?mode=list');

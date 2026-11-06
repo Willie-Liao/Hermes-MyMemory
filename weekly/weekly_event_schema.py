@@ -1,8 +1,7 @@
 """Event-first weekly schema (Steps 1 + 3 of the Event-First Weekly UI plan).
 
-Defines one stable intermediate schema for date-labeled events, sourced
-facts/procedures/decisions, conflicts, hypotheses, and span candidates, plus
-helpers to render/parse the four-part weekly review brief:
+Defines one stable intermediate schema for date-labeled events and sourced
+facts/procedures/decisions, plus helpers to render/parse the weekly review brief:
 
     Weekly Brief — 2026-W31
 
@@ -12,17 +11,12 @@ helpers to render/parse the four-part weekly review brief:
     Wednesday — 2026-07-29 · Events
     No record for this day.
 
-    Conflict
-    - ...
+    Cite map
+    - [1] event mem-…
 
-    Hypothesis
-    - ...
-
-    Possible overdue report
-    - ... — explicit [N]
-
-Legacy ``## Distill`` / ``## Brief`` loading stays intact for old weekly files;
-this module never migrates on-disk documents.
+Old briefs may still contain retired single-line headings between the days and
+the cite map. Parsers skip those lines so day events still load. This module
+never migrates on-disk documents and never emits those headings.
 """
 
 from __future__ import annotations
@@ -33,17 +27,11 @@ from datetime import date
 from typing import Literal, Sequence
 
 ClaimKind = Literal["fact", "procedure", "decision"]
-TypedCiteKind = Literal["conflict", "hypothesis", "span"]
 
 _ALLOWED_CLAIM_KINDS: frozenset[str] = frozenset({"fact", "procedure", "decision"})
-# Align with Worker-1 overdue section parser; UI no longer queues these rows.
+# Thread spans still use this closed set. Brief overdue rows no longer do.
 _ALLOWED_SPAN_CONFIDENCE: frozenset[str] = frozenset(
     {"explicit", "high", "medium", "low"}
-)
-# Only these confidences appear in the Possible overdue report section.
-OVERDUE_SPAN_CONFIDENCES: frozenset[str] = frozenset({"explicit", "high"})
-_ALLOWED_TYPED_CITE_KINDS: frozenset[str] = frozenset(
-    {"conflict", "hypothesis", "span"}
 )
 
 WEEKDAY_NAMES: tuple[str, ...] = (
@@ -59,13 +47,7 @@ WEEKDAY_NAMES: tuple[str, ...] = (
 EMPTY_DAY_TEXT = "No record for this day."
 
 WEEKLY_BRIEF_TITLE_PREFIX = "Weekly Brief — "
-CONFLICT_SECTION_TITLE = "Conflict"
-HYPOTHESIS_SECTION_TITLE = "Hypothesis"
-OVERDUE_SECTION_TITLE = "Possible overdue report"
 CITE_MAP_SECTION_TITLE = "Cite map"
-OVERDUE_ACTIONS_LINE = (
-    "[Confirm] [Put off by ▾: 1 day | 7 days | 2 weeks | 1 month] [Set due date]"
-)
 
 _DAY_HEADER_RE = re.compile(
     r"^(?P<weekday>[A-Za-z]+) — (?P<date>\d{4}-\d{2}-\d{2}) · Events"
@@ -75,20 +57,12 @@ _CITE_MARKER_RE = re.compile(r"\[(\d+)\]")
 _WEEKLY_BRIEF_TITLE_RE = re.compile(
     r"^Weekly Brief — (?P<week>\d{4}-W\d{2})\s*$"
 )
-_SECTION_TITLE_RE = re.compile(
-    r"^(Conflict|Hypothesis|Possible overdue report|Cite map)\s*$"
-)
 _BULLET_RE = re.compile(r"^-\s+(?P<body>.+)$")
 _CITE_MAP_ENTRY_RE = re.compile(
-    r"^\[(?P<n>\d+)\]\s+(?P<kind>event|conflict|hypothesis|span)\s+(?P<target>\S+)\s*$",
+    r"^\[(?P<n>\d+)\]\s+(?P<kind>\w+)\s+(?P<target>\S+)\s*$",
     re.IGNORECASE,
 )
-_OVERDUE_ROW_RE = re.compile(
-    r"^(?P<label>.+?) — proposed end (?P<end>\d{4}-\d{2}-\d{2}) — "
-    r"(?P<confidence>explicit|high|medium|low)"
-    r"(?:\s+\[(?P<cite>\d+)\])?\s*$",
-    re.IGNORECASE,
-)
+_TITLE_ONLY_RE = re.compile(r"[A-Za-z][A-Za-z ]*")
 _TRAILING_CITE_RE = re.compile(r"^(?P<text>.*?)\s+\[(?P<cite>\d+)\]\s*$")
 
 
@@ -134,38 +108,6 @@ class ClaimSentence:
             raise ValueError(f"ClaimSentence.cite must be >= 1, got {self.cite}")
         if self.title is not None and not str(self.title).strip():
             raise ValueError("ClaimSentence.title must be non-empty when set")
-
-
-@dataclass(frozen=True)
-class ConflictItem:
-    """A tension between two or more related events/claims."""
-
-    id: str
-    text: str
-    related_event_ids: tuple[str, ...] = ()
-    cite: int | None = None
-
-    def __post_init__(self) -> None:
-        if not str(self.id).strip():
-            raise ValueError("ConflictItem.id must be non-empty")
-        if not str(self.text).strip():
-            raise ValueError("ConflictItem.text must be non-empty")
-
-
-@dataclass(frozen=True)
-class HypothesisItem:
-    """An open, unconfirmed working bet tied back to one or more events."""
-
-    id: str
-    text: str
-    related_event_ids: tuple[str, ...] = ()
-    cite: int | None = None
-
-    def __post_init__(self) -> None:
-        if not str(self.id).strip():
-            raise ValueError("HypothesisItem.id must be non-empty")
-        if not str(self.text).strip():
-            raise ValueError("HypothesisItem.text must be non-empty")
 
 
 @dataclass(frozen=True)
@@ -289,30 +231,6 @@ class SpanCandidate:
 
 
 @dataclass(frozen=True)
-class TypedCite:
-    """Non-event citation target (conflict / hypothesis / span) for UI navigation.
-
-    Event evidence keeps the continuous ``legend`` map; typed cites continue
-    numbering after the max event cite and must never renumber event markers.
-    """
-
-    number: int
-    kind: TypedCiteKind
-    target_id: str
-
-    def __post_init__(self) -> None:
-        if self.number < 1:
-            raise ValueError(f"TypedCite.number must be >= 1, got {self.number}")
-        if self.kind not in _ALLOWED_TYPED_CITE_KINDS:
-            raise ValueError(
-                f"TypedCite.kind {self.kind!r} not in "
-                f"{sorted(_ALLOWED_TYPED_CITE_KINDS)}"
-            )
-        if not str(self.target_id).strip():
-            raise ValueError("TypedCite.target_id must be non-empty")
-
-
-@dataclass(frozen=True)
 class DayBrief:
     """One calendar day's worth of cited events + sourced sentences."""
 
@@ -323,14 +241,10 @@ class DayBrief:
 
 @dataclass(frozen=True)
 class WeeklyReviewPayload:
-    """Carry cross-day-thread, wrap-ups, and entities beside the four-part brief so JSON can dump without Distill."""
+    """Carry cross-day-thread, wrap-ups, and entities beside the date brief so JSON can dump without Distill."""
 
     days: tuple[DayBrief, ...]
-    conflicts: tuple[ConflictItem, ...] = ()
-    hypotheses: tuple[HypothesisItem, ...] = ()
-    span_candidates: tuple[SpanCandidate, ...] = ()
     legend: dict[int, str] = field(default_factory=dict)
-    typed_legend: dict[int, TypedCite] = field(default_factory=dict)
     week_key: str = ""
     cross_day_thread: tuple[SpanCandidate, ...] = ()
     intra_day_thread: tuple["IntraDayThread", ...] = ()
@@ -642,7 +556,6 @@ def _merge_sunday_evening_payload(
         cross_day_thread=_merge_cross_day(
             base.cross_day_thread, delta.cross_day_thread, offset
         ),
-        span_candidates=(*base.span_candidates, *delta.span_candidates),
         week_key=base.week_key or delta.week_key,
     )
 
@@ -791,33 +704,14 @@ def validate_week_order(days: Sequence[DayBrief]) -> list[str]:
     return errors
 
 
-def validate_no_duplicate_ids(payload: WeeklyReviewPayload) -> list[str]:
-    """Reject id collisions across conflicts, hypotheses, and span candidates."""
-    errors: list[str] = []
-    owner_by_id: dict[str, str] = {}
-    groups: tuple[tuple[str, Sequence[object]], ...] = (
-        ("conflict", payload.conflicts),
-        ("hypothesis", payload.hypotheses),
-        ("span_candidate", payload.span_candidates),
-    )
-    for kind, items in groups:
-        for item in items:
-            item_id = str(getattr(item, "id"))
-            if item_id in owner_by_id:
-                errors.append(
-                    f"duplicate id {item_id!r}: used by both "
-                    f"{owner_by_id[item_id]} and {kind}"
-                )
-                continue
-            owner_by_id[item_id] = kind
-    return errors
-
-
 def validate_weekly_review_payload(payload: WeeklyReviewPayload) -> list[str]:
-    """Run all Step 1 structural checks over a full ``WeeklyReviewPayload``."""
+    """Run structural checks over a full ``WeeklyReviewPayload``.
+
+    Conflict, hypothesis, and span-candidate id checks are gone with those
+    brief sections. Day order and sentence cites are what still corrupt a brief.
+    """
     errors: list[str] = []
     errors.extend(validate_week_order(payload.days))
-    errors.extend(validate_no_duplicate_ids(payload))
     for day_brief in payload.days:
         header = format_day_header(day_brief.day, [e.number for e in day_brief.events])
         errors.extend(validate_day_header(header))
@@ -837,132 +731,51 @@ def max_event_cite_number(legend: dict[int, str]) -> int:
     return max(legend.keys(), default=0)
 
 
-def overdue_span_candidates(
-    spans: Sequence[SpanCandidate],
-) -> tuple[SpanCandidate, ...]:
-    """Return only explicit/high spans for the Possible overdue report."""
-    return tuple(
-        s for s in spans if s.confidence in OVERDUE_SPAN_CONFIDENCES
-    )
+def _is_section_title(stripped: str) -> bool:
+    """Stop a day paragraph at Cite map or a retired single-line heading.
+
+    Old briefs still put extra headings between Sunday and the cite map.
+    A heading is letters and spaces only, so event sentences and bullets stay
+    inside the day. Naming those headings here would keep them in the renderer.
+    """
+    if stripped == CITE_MAP_SECTION_TITLE:
+        return True
+    return _TITLE_ONLY_RE.fullmatch(stripped) is not None
 
 
 def assign_typed_citations(payload: WeeklyReviewPayload) -> WeeklyReviewPayload:
-    """Keep Worker-1 summary on the rebuilt payload so dump cannot empty Chronicle.
+    """Return the payload unchanged so a cite pass cannot drop Worker-1 summary.
 
-    Conflict → hypothesis receive the next contiguous numbers. Span candidates
-    are not Brief-cited (Weekly UI does not render Possible overdue).
+    Rebuilding the payload to number retired sections omitted summary and
+    emptied Chronicle. Event legend numbers are already assigned.
     """
-    next_n = max_event_cite_number(payload.legend) + 1
-    typed: dict[int, TypedCite] = {}
-
-    new_conflicts: list[ConflictItem] = []
-    for item in payload.conflicts:
-        cite = next_n
-        next_n += 1
-        typed[cite] = TypedCite(number=cite, kind="conflict", target_id=item.id)
-        new_conflicts.append(replace(item, cite=cite))
-
-    new_hypotheses: list[HypothesisItem] = []
-    for item in payload.hypotheses:
-        cite = next_n
-        next_n += 1
-        typed[cite] = TypedCite(number=cite, kind="hypothesis", target_id=item.id)
-        new_hypotheses.append(replace(item, cite=cite))
-
-    # Keep any carry-over spans uncited; Brief overdue stays empty by design.
-    new_spans = [replace(item, cite=None) for item in payload.span_candidates]
-
-    return WeeklyReviewPayload(
-        days=payload.days,
-        conflicts=tuple(new_conflicts),
-        hypotheses=tuple(new_hypotheses),
-        span_candidates=tuple(new_spans),
-        legend=dict(payload.legend),
-        typed_legend=typed,
-        week_key=payload.week_key,
-        cross_day_thread=payload.cross_day_thread,
-        intra_day_thread=payload.intra_day_thread,
-        entities=payload.entities,
-        summary=payload.summary,
-    )
-
-
-def _bullet_with_cite(text: str, cite: int | None) -> str:
-    body = text.strip()
-    if cite is None:
-        return f"- {body}"
-    if _CITE_MARKER_RE.search(body):
-        # Already carries a marker; still ensure the assigned cite is present.
-        if f"[{cite}]" not in body:
-            body = f"{body} [{cite}]"
-        return f"- {body}"
-    if body and body[-1] not in ".!?":
-        body = f"{body}."
-    return f"- {body} [{cite}]"
-
-
-def render_conflict_section(conflicts: Sequence[ConflictItem]) -> str:
-    lines = [CONFLICT_SECTION_TITLE]
-    if not conflicts:
-        lines.append("- None.")
-    else:
-        for item in conflicts:
-            lines.append(_bullet_with_cite(item.text, item.cite))
-    return "\n".join(lines)
-
-
-def render_hypothesis_section(hypotheses: Sequence[HypothesisItem]) -> str:
-    lines = [HYPOTHESIS_SECTION_TITLE]
-    if not hypotheses:
-        lines.append("- None.")
-    else:
-        for item in hypotheses:
-            lines.append(_bullet_with_cite(item.text, item.cite))
-    return "\n".join(lines)
-
-
-def render_overdue_section(spans: Sequence[SpanCandidate]) -> str:
-    """Brief Possible overdue is always empty; Weekly UI does not render it."""
-    del spans  # retained for call-site compatibility
-    return "\n".join([OVERDUE_SECTION_TITLE, "- None."])
+    return payload
 
 
 def render_cite_map_section(payload: WeeklyReviewPayload) -> str:
-    """Machine-readable citation targets (event + typed) for UI / round-trip."""
+    """Machine-readable event citation targets for UI / round-trip."""
     lines = [CITE_MAP_SECTION_TITLE]
     for n, mem_id in sorted(payload.legend.items()):
         lines.append(f"- [{n}] event {mem_id}")
-    for n, typed in sorted(payload.typed_legend.items()):
-        lines.append(f"- [{n}] {typed.kind} {typed.target_id}")
     if len(lines) == 1:
         lines.append("- None.")
     return "\n".join(lines)
 
 
 def render_four_part_brief(week_key: str, payload: WeeklyReviewPayload) -> str:
-    """Render the four display sections (no Cite map footer)."""
+    """Render the date brief (no Cite map footer, no retired sections)."""
     key = (week_key or payload.week_key or "").strip()
     parts = [
         f"{WEEKLY_BRIEF_TITLE_PREFIX}{key}".rstrip(),
         "",
         render_date_brief_section(payload.days),
-        "",
-        render_conflict_section(payload.conflicts),
-        "",
-        render_hypothesis_section(payload.hypotheses),
-        "",
-        render_overdue_section(payload.span_candidates),
     ]
     return "\n".join(parts).rstrip() + "\n"
 
 
 def render_weekly_review_brief(week_key: str, payload: WeeklyReviewPayload) -> str:
-    """Render four-part brief plus Cite map (Worker 2 / persistence body)."""
-    assigned = (
-        payload
-        if payload.typed_legend
-        else assign_typed_citations(payload)
-    )
+    """Render the date brief plus Cite map (Worker 2 / persistence body)."""
+    assigned = assign_typed_citations(payload)
     if week_key and not assigned.week_key:
         assigned = replace(assigned, week_key=week_key)
     body = render_four_part_brief(week_key or assigned.week_key, assigned)
@@ -970,18 +783,17 @@ def render_weekly_review_brief(week_key: str, payload: WeeklyReviewPayload) -> s
 
 
 def is_four_part_brief(text: str) -> bool:
-    """True when Brief body looks like the Event-First four-part container."""
+    """True when Brief body is the event-first date container.
+
+    A Weekly Brief title is enough. Retired headings are not required, so old
+    files and date-only briefs both match.
+    """
     stripped = (text or "").strip()
     if not stripped:
         return False
     if _WEEKLY_BRIEF_TITLE_RE.match(stripped.splitlines()[0].strip()):
         return True
-    return (
-        CONFLICT_SECTION_TITLE in stripped
-        and HYPOTHESIS_SECTION_TITLE in stripped
-        and OVERDUE_SECTION_TITLE in stripped
-        and " · Events" in stripped
-    )
+    return " · Events" in stripped
 
 
 def _split_sentences_with_cites(paragraph: str) -> tuple[ClaimSentence, ...]:
@@ -1063,7 +875,7 @@ def _parse_day_blocks(lines: list[str]) -> tuple[DayBrief, ...]:
         raw_lines: list[str] = []
         while i < len(lines):
             stripped = lines[i].strip()
-            if _DAY_HEADER_RE.match(stripped) or _SECTION_TITLE_RE.match(stripped):
+            if _DAY_HEADER_RE.match(stripped) or _is_section_title(stripped):
                 break
             raw_lines.append(lines[i])
             i += 1
@@ -1101,46 +913,12 @@ def _parse_day_blocks(lines: list[str]) -> tuple[DayBrief, ...]:
     return tuple(days)
 
 
-def _strip_trailing_cite(text: str) -> tuple[str, int | None]:
-    match = _TRAILING_CITE_RE.match(text.strip())
-    if not match:
-        return text.strip(), None
-    return match.group("text").strip(), int(match.group("cite"))
-
-
-def _parse_bullet_section(
-    lines: list[str], start: int
-) -> tuple[list[tuple[str, int | None]], int]:
-    """Parse ``- body`` bullets until the next section title; return (items, next_i)."""
-    items: list[tuple[str, int | None]] = []
-    i = start
-    while i < len(lines):
-        stripped = lines[i].strip()
-        if not stripped:
-            i += 1
-            continue
-        if _SECTION_TITLE_RE.match(stripped) or _DAY_HEADER_RE.match(stripped):
-            break
-        if stripped.startswith(OVERDUE_ACTIONS_LINE[:9]):  # "[Confirm]"
-            i += 1
-            continue
-        bullet = _BULLET_RE.match(stripped)
-        if bullet:
-            body = bullet.group("body").strip()
-            if body.casefold() == "none.":
-                i += 1
-                continue
-            text, cite = _strip_trailing_cite(body)
-            items.append((text, cite))
-            i += 1
-            continue
-        # Continuation / action line under overdue
-        i += 1
-    return items, i
-
-
 def parse_four_part_brief(text: str) -> WeeklyReviewPayload:
-    """Parse a four-part (+ optional Cite map) brief back into a payload."""
+    """Parse a date brief (+ optional Cite map) back into a payload.
+
+    Retired single-line headings between the days and the cite map are skipped
+    so an old file still yields the same day events and event legend.
+    """
     lines = (text or "").splitlines()
     week_key = ""
     if lines:
@@ -1148,74 +926,12 @@ def parse_four_part_brief(text: str) -> WeeklyReviewPayload:
         if title:
             week_key = title.group("week")
 
-    # Locate section starts
-    section_starts: dict[str, int] = {}
-    for idx, raw in enumerate(lines):
-        match = _SECTION_TITLE_RE.match(raw.strip())
-        if match:
-            section_starts[match.group(1)] = idx
-
-    conflict_i = section_starts.get(CONFLICT_SECTION_TITLE)
-    # Date region: after title until Conflict (or end)
-    date_end = conflict_i if conflict_i is not None else len(lines)
-    days = _parse_day_blocks(lines[1:date_end])
-
-    conflicts: list[ConflictItem] = []
-    hypotheses: list[HypothesisItem] = []
-    spans: list[SpanCandidate] = []
+    days = _parse_day_blocks(lines[1:])
     legend: dict[int, str] = {}
-    typed_legend: dict[int, TypedCite] = {}
-
-    if conflict_i is not None:
-        items, _ = _parse_bullet_section(lines, conflict_i + 1)
-        for idx, (body, cite) in enumerate(items, start=1):
-            conflicts.append(
-                ConflictItem(id=f"conflict-{idx}", text=body, cite=cite)
-            )
-
-    hyp_i = section_starts.get(HYPOTHESIS_SECTION_TITLE)
-    if hyp_i is not None:
-        items, _ = _parse_bullet_section(lines, hyp_i + 1)
-        for idx, (body, cite) in enumerate(items, start=1):
-            hypotheses.append(
-                HypothesisItem(id=f"hypothesis-{idx}", text=body, cite=cite)
-            )
-
-    overdue_i = section_starts.get(OVERDUE_SECTION_TITLE)
-    if overdue_i is not None:
-        i = overdue_i + 1
-        span_idx = 0
-        while i < len(lines):
-            stripped = lines[i].strip()
-            if not stripped:
-                i += 1
-                continue
-            if _SECTION_TITLE_RE.match(stripped):
-                break
-            bullet = _BULLET_RE.match(stripped)
-            if bullet:
-                body = bullet.group("body").strip()
-                if body.casefold() == "none.":
-                    i += 1
-                    continue
-                row = _OVERDUE_ROW_RE.match(body)
-                if row:
-                    span_idx += 1
-                    cite = int(row.group("cite")) if row.group("cite") else None
-                    end = date.fromisoformat(row.group("end"))
-                    spans.append(
-                        SpanCandidate(
-                            id=f"span-{span_idx}",
-                            label=row.group("label").strip(),
-                            start_date=end,  # start unknown in display row
-                            end_date=end,
-                            confidence=row.group("confidence").casefold(),
-                            cite=cite,
-                        )
-                    )
-            i += 1
-
-    cite_i = section_starts.get(CITE_MAP_SECTION_TITLE)
+    cite_i = next(
+        (idx for idx, raw in enumerate(lines) if raw.strip() == CITE_MAP_SECTION_TITLE),
+        None,
+    )
     if cite_i is not None:
         i = cite_i + 1
         while i < len(lines):
@@ -1223,7 +939,7 @@ def parse_four_part_brief(text: str) -> WeeklyReviewPayload:
             if not stripped:
                 i += 1
                 continue
-            if _SECTION_TITLE_RE.match(stripped) or _DAY_HEADER_RE.match(stripped):
+            if _is_section_title(stripped) or _DAY_HEADER_RE.match(stripped):
                 break
             bullet = _BULLET_RE.match(stripped)
             if not bullet:
@@ -1234,19 +950,10 @@ def parse_four_part_brief(text: str) -> WeeklyReviewPayload:
                 i += 1
                 continue
             entry = _CITE_MAP_ENTRY_RE.match(body)
-            if entry:
-                n = int(entry.group("n"))
-                kind = entry.group("kind").casefold()
-                target = entry.group("target")
-                if kind == "event":
-                    legend[n] = target
-                elif kind in _ALLOWED_TYPED_CITE_KINDS:
-                    typed_legend[n] = TypedCite(
-                        number=n, kind=kind, target_id=target  # type: ignore[arg-type]
-                    )
+            if entry and entry.group("kind").casefold() == "event":
+                legend[int(entry.group("n"))] = entry.group("target")
             i += 1
 
-    # Reconcile event mem_ids and typed block IDs from cite map.
     reconciled_days: list[DayBrief] = []
     for day_brief in days:
         events = tuple(
@@ -1257,41 +964,6 @@ def parse_four_part_brief(text: str) -> WeeklyReviewPayload:
             DayBrief(day=day_brief.day, events=events, sentences=day_brief.sentences)
         )
 
-    reconciled_conflicts: list[ConflictItem] = []
-    for item in conflicts:
-        target = None
-        if item.cite is not None and item.cite in typed_legend:
-            tc = typed_legend[item.cite]
-            if tc.kind == "conflict":
-                target = tc.target_id
-        reconciled_conflicts.append(
-            replace(item, id=target or item.id)
-        )
-
-    reconciled_hypotheses: list[HypothesisItem] = []
-    for item in hypotheses:
-        target = None
-        if item.cite is not None and item.cite in typed_legend:
-            tc = typed_legend[item.cite]
-            if tc.kind == "hypothesis":
-                target = tc.target_id
-        reconciled_hypotheses.append(
-            replace(item, id=target or item.id)
-        )
-
-    reconciled_spans: list[SpanCandidate] = []
-    for item in spans:
-        target = None
-        start = item.start_date
-        if item.cite is not None and item.cite in typed_legend:
-            tc = typed_legend[item.cite]
-            if tc.kind == "span":
-                target = tc.target_id
-        reconciled_spans.append(
-            replace(item, id=target or item.id, start_date=start)
-        )
-
-    # If legend came only from day events without cite map, keep placeholder mem ids.
     if not legend:
         for day_brief in reconciled_days:
             for event in day_brief.events:
@@ -1299,11 +971,7 @@ def parse_four_part_brief(text: str) -> WeeklyReviewPayload:
 
     return WeeklyReviewPayload(
         days=tuple(reconciled_days),
-        conflicts=tuple(reconciled_conflicts),
-        hypotheses=tuple(reconciled_hypotheses),
-        span_candidates=tuple(reconciled_spans),
         legend=legend,
-        typed_legend=typed_legend,
         week_key=week_key,
         cross_day_thread=(),
         intra_day_thread=(),
@@ -1314,10 +982,12 @@ def parse_four_part_brief(text: str) -> WeeklyReviewPayload:
 def payloads_structurally_equal(
     left: WeeklyReviewPayload,
     right: WeeklyReviewPayload,
-    *,
-    ignore_span_start: bool = True,
 ) -> list[str]:
-    """Return mismatch descriptions for a golden round-trip comparison."""
+    """Return mismatch descriptions for a golden round-trip comparison.
+
+    Retired brief sections are not part of the payload, so only week, days,
+    and the event legend can drift.
+    """
     errors: list[str] = []
     if left.week_key != right.week_key:
         errors.append(f"week_key {left.week_key!r} != {right.week_key!r}")
@@ -1332,25 +1002,6 @@ def payloads_structurally_equal(
             errors.append(f"event mem_ids on {a.day} differ")
         if worker2_format_day_events(a.sentences) != worker2_format_day_events(b.sentences):
             errors.append(f"paragraph mismatch on {a.day}")
-    if [(c.id, c.text, c.cite) for c in left.conflicts] != [
-        (c.id, c.text, c.cite) for c in right.conflicts
-    ]:
-        errors.append("conflicts differ")
-    if [(h.id, h.text, h.cite) for h in left.hypotheses] != [
-        (h.id, h.text, h.cite) for h in right.hypotheses
-    ]:
-        errors.append("hypotheses differ")
-    def _span_key(s: SpanCandidate) -> tuple:
-        if ignore_span_start:
-            return (s.id, s.label, s.end_date, s.confidence, s.cite)
-        return (s.id, s.label, s.start_date, s.end_date, s.confidence, s.cite)
-
-    left_overdue = overdue_span_candidates(left.span_candidates)
-    right_overdue = overdue_span_candidates(right.span_candidates)
-    if [_span_key(s) for s in left_overdue] != [_span_key(s) for s in right_overdue]:
-        errors.append("overdue spans differ")
     if left.legend != right.legend:
         errors.append(f"legend {left.legend} != {right.legend}")
-    if left.typed_legend != right.typed_legend:
-        errors.append("typed_legend differs")
     return errors

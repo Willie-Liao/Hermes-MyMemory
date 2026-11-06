@@ -140,34 +140,6 @@ def test_bridge_dispatches_request_resummarise(monkeypatch, capsys):
     }
 
 
-def test_bridge_dispatches_list_weekly_span_candidates(monkeypatch, capsys):
-    bridge = _load_bridge_module()
-    captured: dict = {}
-
-    class FakeRun:
-        @staticmethod
-        def list_weekly_span_candidates(week_key):
-            captured["week_key"] = week_key
-            return {"week_key": week_key, "outcome": "listed", "candidates": []}
-
-    monkeypatch.setattr(bridge, "_load_digest_run", lambda: FakeRun)
-    monkeypatch.setattr(
-        sys,
-        "stdin",
-        StringIO(
-            json.dumps(
-                {"op": "list_weekly_span_candidates", "args": {"week_key": "2026-W29"}}
-            )
-        ),
-    )
-
-    assert bridge.main() == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["ok"] is True
-    assert payload["result"]["outcome"] == "listed"
-    assert captured["week_key"] == "2026-W29"
-
-
 def test_bridge_rejects_validate_weekly_spans(monkeypatch, capsys):
     """Span-watch ladder retired; Weekly UI must not dispatch validate_weekly_spans."""
     bridge = _load_bridge_module()
@@ -189,69 +161,6 @@ def test_bridge_rejects_validate_weekly_spans(monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is False
     assert "unknown op" in payload["error"]
-
-
-def test_bridge_dispatches_resolve_weekly_span(monkeypatch, capsys):
-    bridge = _load_bridge_module()
-    captured: dict = {}
-
-    class FakeRun:
-        @staticmethod
-        def resolve_weekly_span(
-            week_key,
-            block_id,
-            action,
-            *,
-            proposed_valid_to=None,
-            interval=None,
-            due_date=None,
-            idempotency_key=None,
-        ):
-            captured.update(
-                {
-                    "week_key": week_key,
-                    "block_id": block_id,
-                    "action": action,
-                    "proposed_valid_to": proposed_valid_to,
-                    "interval": interval,
-                    "due_date": due_date,
-                    "idempotency_key": idempotency_key,
-                }
-            )
-            return {"outcome": "applied", "valid_to": "2026-08-01"}
-
-    monkeypatch.setattr(bridge, "_load_digest_run", lambda: FakeRun)
-    monkeypatch.setattr(
-        sys,
-        "stdin",
-        StringIO(
-            json.dumps(
-                {
-                    "op": "resolve_weekly_span",
-                    "args": {
-                        "week_key": "2026-W29",
-                        "block_id": "mem-1",
-                        "action": "confirm",
-                        "proposed_valid_to": "2026-08-01",
-                    },
-                }
-            )
-        ),
-    )
-
-    assert bridge.main() == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["ok"] is True
-    assert payload["result"]["outcome"] == "applied"
-    assert captured == {
-        "week_key": "2026-W29",
-        "block_id": "mem-1",
-        "action": "confirm",
-        "proposed_valid_to": "2026-08-01",
-        "interval": None,
-        "due_date": None,
-        "idempotency_key": None,
-    }
 
 
 def test_bridge_dispatch_failure_returns_error_envelope(monkeypatch, capsys):
