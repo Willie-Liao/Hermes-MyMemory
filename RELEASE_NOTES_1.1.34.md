@@ -12,3 +12,9 @@ Weekly briefs are the date events and the event cite map. Conflict, Hypothesis, 
 
 - The unmounted overdue queue, weekly review save/recall routes, and the span-candidate bridge (`list_weekly_span_candidates`, `resolve_weekly_span`) are gone.
 - WeekReview body-slot Save/Recall stays.
+
+### Skill
+
+- `memory-health-once` checks real session logs and real files. Daily shape runs `/digest` for the past day. Wrap daily reads the last day, and wrap weekly reads the last week.
+- `scripts/install.sh` stores that skill and writes it into `$HERMES_HOME/skills/` even when the pack has no skill file.
+- A blank `memory.provider` is set to `MyMemory`, then the gateway restarts.
