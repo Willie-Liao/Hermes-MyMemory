@@ -9,10 +9,12 @@ initialize.
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 import importlib.util
 import json
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -22,35 +24,88 @@ from pathlib import Path
 
 logger = logging.getLogger("mymemory.runtime")
 
-# digest.py imports yaml when the plugin loads. A Hermes update's new
-# environment does not ship these. Check the spec only: importing
+# The file is the list. distribution() reads metadata only: importing
 # sentence_transformers here would load torch into the gateway.
-_RUNTIME_MODULES = (
-    "yaml",
-    "onnxruntime",
-    "tokenizers",
-    "numpy",
-    "sentence_transformers",
-)
+_REQUIREMENTS_FILE = Path(__file__).resolve().parent / "requirements.txt"
+_LOAD_STARTED = time.perf_counter()
 
 
 def ensure_runtime_deps() -> None:
-    """A rebuilt Hermes venv drops these packages, and a pip install overruns the 10s plugin load so this process cannot register.
+    """A new requirements.txt line must install on the next load without importing that package.
 
-    find_spec only asks whether this interpreter can see the distribution.
-    Install requirements.txt when one is missing, then restart the gateway
-    from outside its service so the next process can register prefetch.
-    Skip under pytest so collection does not download torch.
+    Importing sentence_transformers here loads torch and can spend the 10s plugin
+    deadline before register() runs. distribution() only reads metadata. Install
+    the missing specs, then restart outside this process so the next one can
+    register prefetch. Skip under pytest so collection does not download torch.
     """
     if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get(
         "MYMEMORY_SKIP_RUNTIME_DEPS"
     ) == "1":
         return
-    missing: list[str] = []
-    for name in _RUNTIME_MODULES:
-        if importlib.util.find_spec(name) is None:
-            missing.append(name)
-    if not missing:
+    req = _REQUIREMENTS_FILE
+    if not req.is_file():
+        logger.error("MyMemory requirements.txt missing at %s", req)
+        return
+    try:
+        text = req.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.error("MyMemory requirements.txt unreadable at %s: %s", req, exc)
+        return
+    started = time.perf_counter()
+    index_args: list[str] = []
+    wanted: list[tuple[str, str]] = []
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("-"):
+            index_args.extend(shlex.split(line))
+            continue
+        spec, _, marker = line.partition(";")
+        spec = spec.strip()
+        marker = marker.strip()
+        if not spec:
+            continue
+        if marker:
+            parts = marker.split()
+            if (
+                len(parts) == 3
+                and parts[0] == "sys_platform"
+                and parts[1] in {"==", "!="}
+            ):
+                quoted = parts[2].strip("\"'")
+                matches = sys.platform == quoted
+                applies = matches if parts[1] == "==" else not matches
+                if not applies:
+                    continue
+            else:
+                logger.warning(
+                    "MyMemory requirements marker kept (unrecognized): %s",
+                    marker,
+                )
+        name = spec
+        for index, ch in enumerate(spec):
+            if ch in "=<>!~[":
+                name = spec[:index].strip()
+                break
+        if name:
+            wanted.append((name, spec))
+    missing_names: list[str] = []
+    missing_specs: list[str] = []
+    for name, spec in wanted:
+        try:
+            importlib.metadata.distribution(name)
+        except importlib.metadata.PackageNotFoundError:
+            missing_names.append(name)
+            missing_specs.append(spec)
+    elapsed_ms = max(0, int((time.perf_counter() - started) * 1000))
+    logger.info(
+        "%d specs in %dms, missing=%d",
+        len(wanted),
+        elapsed_ms,
+        len(missing_names),
+    )
+    if not missing_names:
         return
     home = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
     notice_path = home / "logs" / "mymemory-runtime-deps-notice.json"
@@ -65,20 +120,16 @@ def ensure_runtime_deps() -> None:
             if age < 15 * 60:
                 logger.error(
                     "MyMemory still missing %s after a restart requested %.0fs ago; not installing again",
-                    ", ".join(missing),
+                    ", ".join(missing_names),
                     age,
                 )
                 return
-    req = Path(__file__).resolve().parent / "requirements.txt"
-    if not req.is_file():
-        logger.error("MyMemory requirements.txt missing at %s", req)
-        return
     logger.info(
-        "MyMemory missing: %s. Installing requirements.txt, then restarting the gateway so the plugin can register.",
-        ", ".join(missing),
+        "MyMemory missing: %s. Installing those requirements, then restarting the gateway so the plugin can register.",
+        ", ".join(missing_names),
     )
     if importlib.util.find_spec("pip") is not None:
-        cmd = [sys.executable, "-m", "pip", "install", "-r", str(req)]
+        cmd = [sys.executable, "-m", "pip", "install", *index_args, *missing_specs]
     else:
         uv = shutil.which("uv")
         if uv is None:
@@ -99,8 +150,8 @@ def ensure_runtime_deps() -> None:
             sys.executable,
             "--index-strategy",
             "unsafe-best-match",
-            "-r",
-            str(req),
+            *index_args,
+            *missing_specs,
         ]
     try:
         completed = subprocess.run(
@@ -118,13 +169,19 @@ def ensure_runtime_deps() -> None:
         logger.error("MyMemory requirements install failed: %s", tail)
         return
     importlib.invalidate_caches()
-    still = [name for name in _RUNTIME_MODULES if importlib.util.find_spec(name) is None]
+    still: list[str] = []
+    for name in missing_names:
+        try:
+            importlib.metadata.distribution(name)
+        except importlib.metadata.PackageNotFoundError:
+            still.append(name)
     if still:
         logger.error(
             "MyMemory requirements install finished but still missing %s",
             ", ".join(still),
         )
         return
+    missing = missing_names
     notice = {
         "missing": missing,
         "sent": False,
@@ -207,6 +264,8 @@ def register(ctx) -> None:
     Handlers are coroutines so a long slash run yields the gateway loop.
     Restore a missing worker block here: Hermes can recreate config.yaml
     without these lanes, and this load is the first MyMemory code that runs after.
+    Log plugin-load seconds here because Hermes records a load only when it
+    exceeds plugins.load_timeout_seconds.
     """
     apply_external_prefetch_timeout()
     try:
@@ -304,3 +363,4 @@ def register(ctx) -> None:
                     name="mymemory-runtime-deps-notice",
                     daemon=True,
                 ).start()
+    logger.info("MyMemory plugin load %.3fs", time.perf_counter() - _LOAD_STARTED)
