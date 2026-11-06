@@ -89,15 +89,6 @@ RSYNC_EXCLUDES=(
   --exclude '.claude/'
   --exclude '.test-hermes-home/'
   --exclude 'probe_*.py'
-  --exclude 'weekly/debug_w38_worker1_events.py'
-  --exclude 'weekly/test_w38_sunday_evening_patch.py'
-  --exclude 'monthly/test_monthly_eval.py'
-  --exclude 'weekly/scripts/eval_weekly_threads_mimo.py'
-  --exclude 'weekly/scripts/probe_tighten_ui_latency.py'
-  --exclude 'weekly/test_monthly_schema.py'
-  --exclude 'digest/probe_recall_mimo.py'
-  --exclude 'recall/embed_scale_latency_before.json'
-  --exclude 'recall/embed_scale_latency_after.json'
   --exclude 'Install MyMemory.command'
   --exclude '__pycache__/'
   --exclude '.pytest_cache/'
@@ -129,24 +120,30 @@ echo ""
 rsync -a "${RSYNC_EXCLUDES[@]}" "$PACK_ROOT/" "$DEST/"
 # AppleDouble sidecars match *.py and are not UTF-8, so source scans fail after a Mac pack.
 find "$DEST" -name '._*' -delete
-# Retired dated harnesses are not in run-tests.sh; rsync does not delete stale gateway files.
+# rsync does not delete a probe or debug script left on the gateway.
 purge_retired_mymemory_harnesses() {
   local dest="$1"
-  rm -f \
-    "$dest/weekly/debug_w38_worker1_events.py" \
-    "$dest/weekly/test_w38_sunday_evening_patch.py" \
-    "$dest/monthly/test_monthly_eval.py" \
-    "$dest/weekly/scripts/eval_weekly_threads_mimo.py" \
-    "$dest/weekly/scripts/probe_tighten_ui_latency.py" \
-    "$dest/weekly/test_monthly_schema.py" \
-    "$dest/digest/probe_recall_mimo.py" \
-    "$dest/recall/embed_scale_latency_before.json" \
-    "$dest/recall/embed_scale_latency_after.json"
   find "$dest/weekly" -maxdepth 1 -type f -name 'debug_*.py' -delete 2>/dev/null || true
   find "$dest" -type f -name 'probe_*.py' -delete 2>/dev/null || true
 }
 purge_retired_mymemory_harnesses "$DEST"
 echo "installed: plugins/MyMemory"
+
+install_memory_health_skill() {
+  # Hermes loads skills from $HERMES_HOME/skills, not from the plugin tree.
+  # A missing pack file must fail the install, or a GitHub install looks done
+  # while memory-health-once never lands.
+  local src="$PACK_ROOT/skills/memory-health-once"
+  local dest="$HERMES_HOME/skills/memory-health-once"
+  if [[ ! -f "$src/SKILL.md" ]]; then
+    echo "error: pack is missing skills/memory-health-once/SKILL.md" >&2
+    exit 1
+  fi
+  mkdir -p "$dest"
+  rsync -a --exclude '.DS_Store' "$src/" "$dest/"
+  echo "installed: skills/memory-health-once"
+}
+install_memory_health_skill
 
 resolve_runtime_python() {
   # Packages in an older venv are invisible to the gateway when it loads a

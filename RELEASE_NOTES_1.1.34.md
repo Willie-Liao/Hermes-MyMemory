@@ -12,3 +12,10 @@ Weekly briefs are the date events and the event cite map. Conflict, Hypothesis, 
 
 - The unmounted overdue queue, weekly review save/recall routes, and the span-candidate bridge (`list_weekly_span_candidates`, `resolve_weekly_span`) are gone.
 - WeekReview body-slot Save/Recall stays.
+
+### Install
+
+- `scripts/install.sh` copies `skills/memory-health-once` into `$HERMES_HOME/skills/` so a MyMemory install also installs that skill.
+- Dated one-off harness names are no longer listed in the installer. Those files are not in the pack. Probe and debug scripts are still deleted by pattern.
+- Install stops if `skills/memory-health-once/SKILL.md` is missing from the pack.
+- The skill checks `memory.provider` and quotes it. A blank `""` means the provider is unset. It also checks that PluginManager has loaded MyMemory and registered `/digest`, `/weekly`, and `/monthly`.
