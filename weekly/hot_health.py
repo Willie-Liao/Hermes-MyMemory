@@ -11,6 +11,11 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+_MYMEMORY = Path(__file__).resolve().parent.parent
+if str(_MYMEMORY) not in sys.path:
+    sys.path.insert(0, str(_MYMEMORY))
+from llm_json import loads_lenient  # noqa: E402
+
 try:
     from hermes_constants import get_hermes_home
 except Exception:  # pragma: no cover - standalone plugin/test fallback
@@ -184,15 +189,35 @@ def _call_llm(prompt: str, *, purpose: str = "hot_health") -> str:
     plugins_root_str = str(plugins_root)
     if plugins_root_str not in sys.path:
         sys.path.insert(0, plugins_root_str)
-    from worker_llm import run_worker_llm
+    from worker_llm import run_worker_llm_oneshot
 
-    return run_worker_llm(
+    out = run_worker_llm_oneshot(
         prompt,
         plugin="memory-weekly",
         purpose=purpose,
-        platform="cli",
-        max_iterations=10,
+        force_tool_name="submit_hot_health",
+        tool_schema={
+            "name": "submit_hot_health",
+            "description": "Health suggestions for the three hot files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "MEMORY.md": {"type": "array"},
+                    "USER.md": {"type": "array"},
+                    "HERMES.md": {"type": "array"},
+                },
+                "required": ["MEMORY.md", "USER.md", "HERMES.md"],
+            },
+        },
+        system_prompt=(
+            "Reply with one submit_hot_health tool call. "
+            "Stable instructions stay here; the hot file text is in the user message."
+        ),
     )
+    args = out.get("tool_args") if isinstance(out.get("tool_args"), dict) else {}
+    if not args:
+        return str(out.get("final_response") or "")
+    return json.dumps(args, ensure_ascii=False)
 
 
 def _parse_response(raw: str) -> dict[str, Any]:
@@ -204,7 +229,7 @@ def _parse_response(raw: str) -> dict[str, Any]:
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         text = "\n".join(lines).strip()
-    parsed = json.loads(text)
+    parsed = loads_lenient(text)
     if not isinstance(parsed, dict):
         raise ValueError("hot health response must be a JSON object")
     return parsed

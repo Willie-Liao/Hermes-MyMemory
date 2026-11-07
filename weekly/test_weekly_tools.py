@@ -192,6 +192,13 @@ def test_coerce_json_string_bag():
     assert len(out["events"]) == 1
 
 
+def test_coerce_events_single_quoted_json_string():
+    out = weekly_tools.coerce_event_tool_args(
+        {"events": "[{'entity': 'ThesisChapter', 'predicate': 'recorded'}]"}
+    )
+    assert out["events"][0]["entity"] == "ThesisChapter"
+
+
 def test_coerce_events_json_string():
     import json
 

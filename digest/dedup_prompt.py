@@ -13,7 +13,14 @@ from __future__ import annotations
 
 import json
 import re
+import sys
+from pathlib import Path
 from typing import Any, Iterable, Mapping
+
+_MYMEMORY = Path(__file__).resolve().parent.parent
+if str(_MYMEMORY) not in sys.path:
+    sys.path.insert(0, str(_MYMEMORY))
+from llm_json import loads_lenient  # noqa: E402
 
 
 MAX_ERRORS_IN_PROPOSER_PROMPT = 8
@@ -607,8 +614,8 @@ def parse_proposal(raw: str) -> list[dict[str, Any]]:
     if start == -1 or end == -1 or end < start:
         raise ValueError("proposer reply contains no JSON array")
     try:
-        payload = json.loads(text[start : end + 1])
-    except json.JSONDecodeError as exc:
+        payload = loads_lenient(text[start : end + 1])
+    except ValueError as exc:
         raise ValueError(f"proposer reply is not valid JSON: {exc}") from exc
     if not isinstance(payload, list):
         raise ValueError("proposer reply is not a JSON array")

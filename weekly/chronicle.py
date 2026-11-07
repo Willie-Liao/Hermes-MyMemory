@@ -125,15 +125,30 @@ def _call_llm(prompt: str) -> str:
     plugins_root_str = str(plugins_root)
     if plugins_root_str not in sys.path:
         sys.path.insert(0, plugins_root_str)
-    from worker_llm import run_worker_llm
+    from worker_llm import run_worker_llm_oneshot
 
-    return run_worker_llm(
+    out = run_worker_llm_oneshot(
         prompt,
         plugin="memory-weekly",
         purpose="chronicle",
-        platform="cli",
-        max_iterations=10,
+        force_tool_name="submit_chronicle",
+        tool_schema={
+            "name": "submit_chronicle",
+            "description": "What the user did this week.",
+            "parameters": {
+                "type": "object",
+                "properties": {"items": {"type": "array", "items": {"type": "string"}}},
+                "required": ["items"],
+            },
+        },
+        system_prompt=(
+            "Reply with one submit_chronicle tool call. items is 1-6 short strings."
+        ),
     )
+    args = out.get("tool_args") if isinstance(out.get("tool_args"), dict) else {}
+    if not args:
+        return str(out.get("final_response") or "")
+    return json.dumps(args, ensure_ascii=False)
 
 
 def _parse_week_key(value: str) -> bool:

@@ -1,7 +1,7 @@
 """Stateless Simple/Hybrid/Complex planner plus integer gate around recall.
 
-TiMem's ablation: either step alone regresses. Both calls stay on run_worker_llm
-text (no tools/tool_choice/response_format) so xiaomi cannot silently drop them.
+TiMem's ablation: either step alone regresses. Both calls are forced tool
+oneshots so a prose reply cannot drop the scope label or the keep indices.
 Fail-open: unparseable planner → hybrid; unparseable gate → keep all.
 """
 
@@ -103,16 +103,60 @@ def gate_candidates(
 
 
 def text_runner(purpose: str = "recall-plan"):
-    """Bind run_worker_llm with empty toolsets so policy cannot pass tool_choice."""
+    """Forced tool oneshot so the prefetch gate does not scrape free-form integers.
+
+    Scope prompts ask for a label. Gate prompts ask for indices. A text-only
+    nested agent made both of those a parse guess on the recall hot path.
+    """
 
     def _run(prompt: str) -> str:
-        from worker_llm import run_worker_llm
+        from worker_llm import run_worker_llm_oneshot
 
-        return run_worker_llm(
+        gate = "integer indices" in prompt.casefold() or "integers only" in prompt.casefold()
+        if gate:
+            schema = {
+                "name": "keep_indices",
+                "description": "Indices of candidates that help answer the user.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "keep": {"type": "array", "items": {"type": "integer"}},
+                    },
+                    "required": ["keep"],
+                },
+            }
+            force = "keep_indices"
+        else:
+            schema = {
+                "name": "classify_scope",
+                "description": "Recall scope label.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "scope": {"type": "string", "enum": ["Simple", "Hybrid", "Complex"]},
+                    },
+                    "required": ["scope"],
+                },
+            }
+            force = "classify_scope"
+        out = run_worker_llm_oneshot(
             prompt,
             plugin="MyMemory",
             purpose=purpose,
-            enabled_toolsets=[],
+            force_tool_name=force,
+            tool_schema=schema,
+            system_prompt=(
+                "Reply with one tool call. Put the decision in the arguments, not in prose."
+            ),
+            timeout_s=20,
+            max_retries=0,
         )
+        args = out.get("tool_args") if isinstance(out.get("tool_args"), dict) else {}
+        if gate:
+            keep = args.get("keep") if isinstance(args, dict) else None
+            if isinstance(keep, list):
+                return " ".join(str(item) for item in keep)
+            return ""
+        return str((args or {}).get("scope") or "")
 
     return _run

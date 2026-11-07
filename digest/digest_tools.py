@@ -14,7 +14,14 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sys
 import uuid
+from pathlib import Path
+
+_MYMEMORY = Path(__file__).resolve().parent.parent
+if str(_MYMEMORY) not in sys.path:
+    sys.path.insert(0, str(_MYMEMORY))
+from llm_json import loads_lenient  # noqa: E402
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any
@@ -1853,8 +1860,8 @@ def parse_tool_args_from_result(
                 args = dict(raw)
             elif isinstance(raw, str):
                 try:
-                    parsed = json.loads(raw or "{}")
-                except json.JSONDecodeError:
+                    parsed = loads_lenient(raw or "{}")
+                except ValueError:
                     parsed = {}
                 args = dict(parsed) if isinstance(parsed, Mapping) else {}
             else:

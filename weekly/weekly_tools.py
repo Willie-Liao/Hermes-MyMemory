@@ -11,8 +11,15 @@ from __future__ import annotations
 import copy
 import json
 import re
+import sys
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
+
+_MYMEMORY = Path(__file__).resolve().parent.parent
+if str(_MYMEMORY) not in sys.path:
+    sys.path.insert(0, str(_MYMEMORY))
+from llm_json import loads_lenient  # noqa: E402
 
 CONFIDENCE_ENUM = ("explicit", "high", "medium", "low")
 WORKER_STATUS_ENUM = ("candidate",)
@@ -492,8 +499,8 @@ def coerce_event_tool_args(args: Any, *, _depth: int = 0) -> dict[str, Any]:
 
     if isinstance(args, str):
         try:
-            parsed = json.loads(args)
-        except (json.JSONDecodeError, TypeError, ValueError):
+            parsed = loads_lenient(args)
+        except (TypeError, ValueError):
             return {}
         return coerce_event_tool_args(parsed, _depth=_depth + 1)
 
@@ -511,8 +518,8 @@ def coerce_event_tool_args(args: Any, *, _depth: int = 0) -> dict[str, Any]:
     events = bag.get("events")
     if isinstance(events, str):
         try:
-            parsed_events = json.loads(events)
-        except (json.JSONDecodeError, TypeError, ValueError):
+            parsed_events = loads_lenient(events)
+        except (TypeError, ValueError):
             return bag
         bag["events"] = parsed_events
         return coerce_event_tool_args(bag, _depth=_depth + 1)

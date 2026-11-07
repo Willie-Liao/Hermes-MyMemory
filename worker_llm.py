@@ -25,6 +25,7 @@ OpenAI-compatible ``chat.completions`` call, no nested ``AIAgent``.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import re
@@ -36,16 +37,32 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from llm_json import loads_lenient
+from llm_json import parse_path as _llm_parse_path
 from llm_wire import resolve_worker_endpoint
 
-_ENV_WORKER_LLM_DEPTH = "HERMES_WORKER_LLM_DEPTH"
-_worker_llm_depth = 0
-_worker_llm_depth_lock = threading.Lock()
+_worker_llm_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "mymemory_worker_llm_depth", default=0
+)
 # Gateway progressive disclosure — never the weekly/digest submit/patch payload.
 _PROGRESSIVE_DISCLOSURE_TOOLS = frozenset({"tool_search", "tool_describe", "tool_call"})
-# Providers whose nested AIAgent is forced onto Anthropic Messages. That
-# request builder drops tool_choice, so phase-1 allow-list calls bypass it.
-_ANTHROPIC_FORMAT_PROVIDERS = frozenset({"minimax-cn", "minimax", "anthropic"})
+# Default wire facts. config.yaml plugins.entries.MyMemory.provider_capabilities
+# overrides a row. fallback_* is the chain used after a quota error.
+_DEFAULT_PROVIDER_CAPS: dict[str, dict[str, str]] = {
+    "xiaomi": {
+        "wire": "openai",
+        "tool_choice": "named",
+        "fallback_provider": "kimi-coding",
+        "fallback_model": "kimi-for-coding-highspeed",
+    },
+    "minimax-cn": {"wire": "anthropic", "tool_choice": "none"},
+    "minimax": {"wire": "anthropic", "tool_choice": "none"},
+    "anthropic": {"wire": "anthropic", "tool_choice": "named"},
+    "kimi-coding": {"wire": "openai", "tool_choice": "named"},
+}
+_QUOTA_DEAD_TTL_S = 3600
+_USD_PER_MILLION = {"default": (0.2, 0.6)}
+_openai_clients: dict[tuple[str, str, float, int], Any] = {}
 _PHASE1_TOOL_NAMES = (
     "submit_digest_blocks",
     "patch_digest_blocks",
@@ -59,31 +76,21 @@ _WRONG_PHASE1_TOOL_TEACH = (
 
 @contextmanager
 def worker_llm_scope() -> Iterator[None]:
-    """Mark this thread as inside a helper/worker LLM turn."""
-    global _worker_llm_depth
-    with _worker_llm_depth_lock:
-        _worker_llm_depth += 1
-        os.environ[_ENV_WORKER_LLM_DEPTH] = str(_worker_llm_depth)
+    """Keep the helper-LLM flag on this context so a background job cannot silence live-chat hooks.
+
+    A process-wide counter made digest, weekly, and monthly workers look active
+    on the main chat thread, so recall, urgency, and relatedness skipped a real turn.
+    """
+    token = _worker_llm_depth.set(_worker_llm_depth.get() + 1)
     try:
         yield
     finally:
-        with _worker_llm_depth_lock:
-            _worker_llm_depth -= 1
-            if _worker_llm_depth > 0:
-                os.environ[_ENV_WORKER_LLM_DEPTH] = str(_worker_llm_depth)
-            else:
-                os.environ.pop(_ENV_WORKER_LLM_DEPTH, None)
+        _worker_llm_depth.reset(token)
 
 
 def in_worker_llm() -> bool:
-    """True when a helper LLM turn is active on this thread / process."""
-    with _worker_llm_depth_lock:
-        if _worker_llm_depth > 0:
-            return True
-    try:
-        return int(os.environ.get(_ENV_WORKER_LLM_DEPTH, "0") or "0") > 0
-    except ValueError:
-        return False
+    """True only inside worker_llm_scope on this context, not on other threads."""
+    return _worker_llm_depth.get() > 0
 
 
 def _hermes_home() -> Path:
@@ -391,6 +398,60 @@ def _emit_langfuse_usage(record: dict[str, Any]) -> None:
         return
 
 
+def _cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Fill the ledger so two models can be compared. A missing price stays on the default row."""
+    rates = _USD_PER_MILLION.get(str(model or "").strip(), _USD_PER_MILLION["default"])
+    return (int(input_tokens) * rates[0] + int(output_tokens) * rates[1]) / 1_000_000
+
+
+def _usage_record(
+    *,
+    plugin: str,
+    purpose: str,
+    model: str,
+    config_model: str,
+    duration_ms: int,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    reasoning_tokens: int = 0,
+    total_tokens: int | None = None,
+    api_calls: int = 0,
+    issue: str | None = None,
+    thinking_off: bool | None = None,
+    cost_usd: float | None = None,
+    parse_path: str = "",
+) -> dict[str, Any]:
+    """One usage shape so oneshot, the nested agent, and Anthropic cannot drift apart."""
+    total = input_tokens + output_tokens if total_tokens is None else total_tokens
+    rec: dict[str, Any] = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "plugin": plugin,
+        "purpose": purpose,
+        "model": model,
+        "config_model": config_model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "total_tokens": total,
+        "cost_usd": (
+            _cost_usd(model, input_tokens, output_tokens) if cost_usd is None else cost_usd
+        ),
+        "api_calls": api_calls,
+        "duration_ms": duration_ms,
+    }
+    if issue:
+        rec["issue"] = issue
+    if thinking_off is not None:
+        rec["thinking_off"] = thinking_off
+    if parse_path:
+        rec["parse_path"] = parse_path
+    return rec
+
+
 def record_worker_usage(record: dict[str, Any]) -> None:
     """Append one JSONL usage record and refresh llm-health. Fail-open — never raise to callers.
 
@@ -408,7 +469,6 @@ def record_worker_usage(record: dict[str, Any]) -> None:
 
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.I)
-_TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
 _THINK_RE = re.compile(r"<(thinking|think)>.*?</\1>", re.DOTALL | re.I)
 
 
@@ -426,6 +486,8 @@ def _json_object_slices(text: str) -> list[str]:
 
     The last slice is the payload that follows any earlier CoT object. Stepping
     back inside the object made the month's final `{text, evidence}` the winner.
+    Single quotes are strings too: a `}` inside `'...'` must not end the slice
+    before json5 can parse the object.
     """
     slices: list[str] = []
     i = 0
@@ -435,21 +497,21 @@ def _json_object_slices(text: str) -> list[str]:
         if start < 0:
             break
         depth = 0
-        in_str = False
+        quote = ""
         escape = False
         end: int | None = None
         for j in range(start, n):
             ch = text[j]
-            if in_str:
+            if quote:
                 if escape:
                     escape = False
                 elif ch == "\\":
                     escape = True
-                elif ch == '"':
-                    in_str = False
+                elif ch == quote:
+                    quote = ""
                 continue
-            if ch == '"':
-                in_str = True
+            if ch in ("'", '"'):
+                quote = ch
                 continue
             if ch == "{":
                 depth += 1
@@ -466,17 +528,17 @@ def _json_object_slices(text: str) -> list[str]:
 
 
 def _parse_json_mapping(blob: str) -> dict[str, Any] | None:
-    for attempt in (blob, _TRAILING_COMMA_RE.sub(r"\1", blob)):
-        try:
-            val = json.loads(attempt)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(val, Mapping):
-            return dict(val)
-        if isinstance(val, str):
-            nested = _loads_json_object(val)
-            if nested is not None:
-                return nested
+    """Parse one model JSON object, including JSON5 slips, without a second model call."""
+    try:
+        val = loads_lenient(blob)
+    except ValueError:
+        return None
+    if isinstance(val, Mapping):
+        return dict(val)
+    if isinstance(val, str):
+        nested = _loads_json_object(val)
+        if nested is not None:
+            return nested
     return None
 
 
@@ -583,6 +645,7 @@ def _pair_from_tool_call(
         salvaged = _salvage_truncated_tool_args(raw_args)
         if salvaged:
             args = {**args, **salvaged}
+            _llm_parse_path.set("salvage")
     if not name:
         return None
     return (name, args)
@@ -815,7 +878,7 @@ def _anthropic_format_worker(plugin: str, purpose: str) -> bool:
     """
     runtime = _plugin_worker_runtime(plugin, purpose)
     provider = str(runtime.get("provider") or "").strip().lower()
-    return provider in _ANTHROPIC_FORMAT_PROVIDERS
+    return _worker_wire(provider) == "anthropic"
 
 
 def _build_phase1_anthropic_kwargs(
@@ -1030,6 +1093,8 @@ def _run_anthropic_phase1_loop(
     tool_calls: list[tuple[str, dict[str, Any]]] = []
     input_tokens = 0
     output_tokens = 0
+    cache_read_tokens = 0
+    cache_write_tokens = 0
     api_calls = 0
     budget = max(1, int(max_iterations))
     try:
@@ -1048,6 +1113,8 @@ def _run_anthropic_phase1_loop(
             usage = getattr(response, "usage", None)
             input_tokens += _usage_int(usage, "input_tokens", "prompt_tokens")
             output_tokens += _usage_int(usage, "output_tokens", "completion_tokens")
+            cache_read_tokens += _usage_int(usage, "cache_read_input_tokens")
+            cache_write_tokens += _usage_int(usage, "cache_creation_input_tokens")
             uses = _anthropic_tool_uses(response)
             if not uses:
                 text = ""
@@ -1069,13 +1136,14 @@ def _run_anthropic_phase1_loop(
                         "config_model": model,
                         "input_tokens": input_tokens,
                         "output_tokens": output_tokens,
-                        "cache_read_tokens": 0,
-                        "cache_write_tokens": 0,
+                        "cache_read_tokens": cache_read_tokens,
+                        "cache_write_tokens": cache_write_tokens,
                         "reasoning_tokens": 0,
                         "total_tokens": input_tokens + output_tokens,
-                        "cost_usd": 0.0,
+                        "cost_usd": _cost_usd(model, input_tokens, output_tokens),
                         "api_calls": api_calls,
                         "duration_ms": _elapsed_ms(),
+                        "parse_path": _llm_parse_path.get(),
                     }
                 )
                 return {
@@ -1124,13 +1192,14 @@ def _run_anthropic_phase1_loop(
             "config_model": model,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "cache_read_tokens": 0,
-            "cache_write_tokens": 0,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_write_tokens": cache_write_tokens,
             "reasoning_tokens": 0,
             "total_tokens": input_tokens + output_tokens,
-            "cost_usd": 0.0,
+            "cost_usd": _cost_usd(model, input_tokens, output_tokens),
             "api_calls": api_calls,
             "duration_ms": _elapsed_ms(),
+            "parse_path": _llm_parse_path.get(),
         }
     )
     tool_name: str | None = None
@@ -1262,8 +1331,50 @@ ONESHOT_SYSTEM = (
 )
 
 _K2_WORKER = ("kimi-coding", "kimi-for-coding-highspeed")
-_xiaomi_quota_dead = False
+_xiaomi_quota_dead_until = 0.0
 _xiaomi_quota_lock = threading.Lock()
+
+
+def _provider_caps(provider: str) -> dict[str, str]:
+    """Wire format and fallback for one provider. A config row wins over the built-in table.
+
+    New models should be a row, not another ``if provider ==`` branch in the transport.
+    """
+    plug = str(provider or "").strip().lower()
+    caps = dict(_DEFAULT_PROVIDER_CAPS.get(plug) or {"wire": "openai", "tool_choice": "named"})
+    path = _hermes_home() / "config.yaml"
+    try:
+        import yaml
+
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return caps
+    plugins = raw.get("plugins") if isinstance(raw, dict) else None
+    entries = plugins.get("entries") if isinstance(plugins, dict) else None
+    mine = entries.get("MyMemory") if isinstance(entries, dict) else None
+    table = mine.get("provider_capabilities") if isinstance(mine, dict) else None
+    row = table.get(plug) if isinstance(table, dict) else None
+    if isinstance(row, dict):
+        for key, value in row.items():
+            if value is not None:
+                caps[str(key)] = str(value)
+    return caps
+
+
+def _worker_wire(provider: str) -> str:
+    """OpenAI or Anthropic message shape for this provider."""
+    wire = str(_provider_caps(provider).get("wire") or "openai").strip().lower()
+    return wire if wire in {"openai", "anthropic"} else "openai"
+
+
+def _fallback_lane(provider: str) -> tuple[str, str]:
+    """Next provider after quota death. Xiaomi defaults to Kimi when the table has no row."""
+    caps = _provider_caps(provider)
+    nxt = str(caps.get("fallback_provider") or "").strip()
+    model = str(caps.get("fallback_model") or "").strip()
+    if nxt and model:
+        return nxt, model
+    return _K2_WORKER
 
 
 def _xiaomi_worker_lane(provider: str, model: str) -> bool:
@@ -1391,24 +1502,28 @@ def _quota_exhausted(exc: BaseException) -> bool:
 
 
 def _mark_xiaomi_quota_dead() -> None:
-    global _xiaomi_quota_dead
+    """Pin the fallback lane for one hour, then try the primary again.
+
+    A flag that never cleared left a long-running gateway on K2 after one quota error.
+    """
+    global _xiaomi_quota_dead_until
     with _xiaomi_quota_lock:
-        _xiaomi_quota_dead = True
+        _xiaomi_quota_dead_until = time.time() + _QUOTA_DEAD_TTL_S
 
 
 def _xiaomi_quota_is_dead() -> bool:
     with _xiaomi_quota_lock:
-        return _xiaomi_quota_dead
+        return time.time() < _xiaomi_quota_dead_until
 
 
 def _maybe_k2_worker(provider: str, model: str) -> tuple[str, str]:
-    """Stay on MiMo until quota dies; then pin this process to kimi-k2.
+    """Stay on the primary until its quota window is open; then use that row's fallback.
 
     Empty provider/model stay empty so undeclared workers inherit chat instead
     of resurrecting Xiaomi when ``config.yaml`` ``model:`` is MiniMax or Kimi.
     """
     if _xiaomi_worker_lane(provider, model) and _xiaomi_quota_is_dead():
-        return _K2_WORKER
+        return _fallback_lane(provider)
     return (str(provider or "").strip(), str(model or "").strip())
 
 
@@ -1570,6 +1685,89 @@ def _capture_from_oneshot_message(
     }
 
 
+_SCHEMA_TYPES = {
+    "object": lambda v: isinstance(v, Mapping),
+    "array": lambda v: isinstance(v, list),
+    "string": lambda v: isinstance(v, str),
+    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+    "boolean": lambda v: isinstance(v, bool),
+}
+
+
+def _parameters_of(schema: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    if not isinstance(schema, Mapping) or not schema:
+        return {}
+    params = schema.get("parameters")
+    if isinstance(params, Mapping):
+        return params
+    fn = schema.get("function")
+    if isinstance(fn, Mapping) and isinstance(fn.get("parameters"), Mapping):
+        return fn["parameters"]
+    if schema.get("type") == "object" or "properties" in schema or "required" in schema:
+        return schema
+    return {}
+
+
+def _tool_schema_error(args: Any, schema: Mapping[str, Any] | None) -> str:
+    """Name the shape mistakes so one teach retry can fix them. Empty means the args match.
+
+    json5 already accepted the text. This is missing fields, wrong types, and bad enums.
+    """
+    params = _parameters_of(schema)
+    if not params:
+        return ""
+    if not isinstance(args, Mapping):
+        return "tool arguments must be an object"
+    errors: list[str] = []
+    required = params.get("required") or []
+    props = params.get("properties") if isinstance(params.get("properties"), Mapping) else {}
+    for key in required:
+        if key not in args:
+            errors.append(f"missing required field {key}")
+    if isinstance(props, Mapping):
+        for key, spec in props.items():
+            if key not in args or not isinstance(spec, Mapping):
+                continue
+            value = args[key]
+            typ = spec.get("type")
+            if isinstance(typ, str) and typ in _SCHEMA_TYPES and not _SCHEMA_TYPES[typ](value):
+                errors.append(f"{key} must be {typ}")
+            enum = spec.get("enum")
+            if isinstance(enum, list) and value not in enum:
+                errors.append(f"{key} must be one of {enum}")
+    return "; ".join(errors)
+
+
+def _purpose_limits(purpose: str) -> tuple[float, int]:
+    """Short recall calls must not sit on the SDK's 600s timeout and hidden retries."""
+    why = str(purpose or "").lower()
+    if "recall" in why or "prefetch" in why:
+        return 20.0, 0
+    if "monthly" in why:
+        return 300.0, 1
+    return 120.0, 0
+
+
+def _cached_openai_client(api_key: str, base_url: str, timeout: float, max_retries: int) -> Any:
+    """Reuse one client per endpoint so each worker call does not build a new pool."""
+    from openai import OpenAI
+
+    key = (base_url, api_key, float(timeout), int(max_retries))
+    client = _openai_clients.get(key)
+    if client is None:
+        kwargs: dict[str, Any] = {
+            "api_key": api_key,
+            "timeout": timeout,
+            "max_retries": max_retries,
+        }
+        if base_url:
+            kwargs["base_url"] = base_url
+        client = OpenAI(**kwargs)
+        _openai_clients[key] = client
+    return client
+
+
 def run_worker_llm_oneshot(
     prompt: str,
     *,
@@ -1579,12 +1777,18 @@ def run_worker_llm_oneshot(
     tool_schema: Mapping[str, Any] | None = None,
     max_tokens: int = 2048,
     temperature: float = 0.2,
+    system_prompt: str | None = None,
+    teach_schema: bool = True,
+    timeout_s: float | None = None,
+    max_retries: int | None = None,
 ) -> dict[str, Any]:
     """One OpenAI-compatible chat.completions call. No nested Hermes AIAgent.
 
     Prefers the local LiteLLM proxy when enabled so MiniMax/Kimi URL suffixes
     cannot 404; records ``duration_ms`` on the usage ledger so prefetch wall
     time and digest LLM retries are not guessed from a single timeout.
+    A schema miss gets one teach retry. Callers that already teach pass
+    ``teach_schema=False``.
     """
     _ensure_hermes_dotenv()
     started = time.perf_counter()
@@ -1604,9 +1808,14 @@ def run_worker_llm_oneshot(
         fn = wrapped.get("function") if isinstance(wrapped.get("function"), Mapping) else {}
         tool_name = str((fn or {}).get("name") or "").strip()
     messages = [
-        {"role": "system", "content": ONESHOT_SYSTEM},
+        {"role": "system", "content": system_prompt or ONESHOT_SYSTEM},
         {"role": "user", "content": prompt},
     ]
+    limit_timeout, limit_retries = _purpose_limits(purpose)
+    if timeout_s is not None:
+        limit_timeout = float(timeout_s)
+    if max_retries is not None:
+        limit_retries = int(max_retries)
     create_kwargs: dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -1620,8 +1829,6 @@ def run_worker_llm_oneshot(
                 "type": "function",
                 "function": {"name": force},
             }
-    from openai import OpenAI
-
     config_model = str(plugin_runtime.get("model") or model or "").strip()
     last_exc: BaseException | None = None
 
@@ -1630,25 +1837,16 @@ def run_worker_llm_oneshot(
 
     def _fail_record(exc: BaseException | None, used_model: str) -> dict[str, Any]:
         kind = _llm_issue_kind(exc)
-        rec: dict[str, Any] = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "plugin": plugin,
-            "purpose": purpose,
-            "model": used_model,
-            "config_model": config_model,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "cache_read_tokens": 0,
-            "cache_write_tokens": 0,
-            "reasoning_tokens": 0,
-            "total_tokens": 0,
-            "cost_usd": 0.0,
-            "api_calls": 0,
-            "duration_ms": _elapsed_ms(),
-        }
-        if kind:
-            rec["issue"] = kind
-        record_worker_usage(rec)
+        record_worker_usage(
+            _usage_record(
+                plugin=plugin,
+                purpose=purpose,
+                model=used_model,
+                config_model=config_model,
+                duration_ms=_elapsed_ms(),
+                issue=kind,
+            )
+        )
         return {
             "final_response": str(exc or "oneshot failed"),
             "tool_name": None,
@@ -1660,6 +1858,8 @@ def run_worker_llm_oneshot(
             "model": config_model,
         }
 
+    schema_taught = False
+    length_bumped = False
     with worker_llm_scope():
         for attempt in (0, 1):
             try:
@@ -1675,9 +1875,9 @@ def run_worker_llm_oneshot(
                 )
             except Exception:
                 pass
-            client_kwargs: dict[str, Any] = {"api_key": api_key}
-            if base_url:
-                client_kwargs["base_url"] = base_url
+            client = _cached_openai_client(
+                api_key, base_url or "", limit_timeout, limit_retries
+            )
             sent = {
                 key: value
                 for key, value in create_kwargs.items()
@@ -1686,7 +1886,6 @@ def run_worker_llm_oneshot(
             sent["model"] = model
             _apply_worker_thinking_off(sent, provider, model, base_url or "")
             thinking_sent = "extra_body" in sent or "reasoning_effort" in sent
-            client = OpenAI(**client_kwargs)
             resp = None
             try:
                 resp = client.chat.completions.create(**sent)
@@ -1731,7 +1930,7 @@ def run_worker_llm_oneshot(
                                 "duration_ms": _elapsed_ms(),
                             }
                         )
-                        provider, model = _K2_WORKER
+                        provider, model = _fallback_lane(provider)
                         print(
                             f"worker_llm: MiMo quota/rate-limit; switching ingest to {model}",
                             flush=True,
@@ -1742,6 +1941,48 @@ def run_worker_llm_oneshot(
             captured = _capture_from_oneshot_message(
                 choice.message, force_tool_name=force
             )
+            if getattr(choice, "finish_reason", None) == "length" and not length_bumped:
+                length_bumped = True
+                sent["max_tokens"] = int(sent.get("max_tokens") or max_tokens) * 2
+                try:
+                    resp = client.chat.completions.create(**sent)
+                except Exception as exc:
+                    return _fail_record(exc, model)
+                choice = resp.choices[0]
+                captured = _capture_from_oneshot_message(
+                    choice.message, force_tool_name=force
+                )
+            schema_error = (
+                _tool_schema_error(captured.get("tool_args") or {}, schema)
+                if teach_schema
+                else ""
+            )
+            if schema_error and not schema_taught:
+                schema_taught = True
+                sent["messages"] = [
+                    *list(sent.get("messages") or messages),
+                    {"role": "assistant", "content": captured.get("final_response") or ""},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Schema validation failed: "
+                            + schema_error
+                            + ". Call the tool again with arguments that match the schema."
+                        ),
+                    },
+                ]
+                try:
+                    resp = client.chat.completions.create(**sent)
+                except Exception as exc:
+                    return _fail_record(exc, model)
+                choice = resp.choices[0]
+                captured = _capture_from_oneshot_message(
+                    choice.message, force_tool_name=force
+                )
+                schema_error = _tool_schema_error(captured.get("tool_args") or {}, schema)
+            if schema_error and teach_schema:
+                captured["failed"] = True
+                captured["final_response"] = schema_error
             usage = getattr(resp, "usage", None)
             details = getattr(usage, "prompt_tokens_details", None) if usage is not None else None
             reasoning = (
@@ -1756,24 +1997,23 @@ def run_worker_llm_oneshot(
                 "total_tokens": _usage_int(usage, "total_tokens"),
             }
             record_worker_usage(
-                {
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "plugin": plugin,
-                    "purpose": purpose,
-                    "model": model,
-                    "config_model": config_model,
-                    "thinking_off": thinking_sent,
+                _usage_record(
+                    plugin=plugin,
+                    purpose=purpose,
+                    model=model,
+                    config_model=config_model,
+                    duration_ms=_elapsed_ms(),
+                    thinking_off=thinking_sent,
+                    api_calls=1 + int(schema_taught) + int(length_bumped),
+                    parse_path=_llm_parse_path.get(),
                     **usage_fields,
-                    "cost_usd": 0.0,
-                    "api_calls": 1,
-                    "duration_ms": _elapsed_ms(),
-                }
+                )
             )
             captured.update(usage_fields)
             captured["finish_reason"] = getattr(choice, "finish_reason", None)
-            captured["max_tokens"] = max_tokens
-            captured["api_calls"] = 1
-            captured["failed"] = False
+            captured["max_tokens"] = sent.get("max_tokens", max_tokens)
+            captured["api_calls"] = 1 + int(schema_taught) + int(length_bumped)
+            captured["failed"] = bool(captured.get("failed"))
             captured["duration_ms"] = _elapsed_ms()
             captured["model"] = model or config_model
             return captured
@@ -1840,7 +2080,7 @@ def _run_worker_conversation(
         if plugin_provider:
             provider, model = _maybe_k2_worker(plugin_provider, str(model or ""))
         elif _xiaomi_quota_is_dead():
-            provider, model = _K2_WORKER
+            provider, model = _fallback_lane("xiaomi")
         else:
             provider = ""
         result: Any = None
@@ -1868,8 +2108,7 @@ def _run_worker_conversation(
                     )
                     nest_mode = (
                         "anthropic_messages"
-                        if str(provider).strip().lower()
-                        in {"minimax-cn", "minimax", "anthropic"}
+                        if _worker_wire(str(provider)) == "anthropic"
                         else "chat_completions"
                     )
                     try:
@@ -1957,7 +2196,7 @@ def _run_worker_conversation(
                     and _quota_exhausted(exc)
                 ):
                     _mark_xiaomi_quota_dead()
-                    provider, model = _K2_WORKER
+                    provider, model = _fallback_lane(provider)
                     print(
                         f"worker_llm: MiMo quota/rate-limit; switching ingest to {model}",
                         flush=True,

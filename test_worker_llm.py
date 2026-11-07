@@ -60,7 +60,7 @@ def _install_fake_openai(monkeypatch, *, seen: dict, message):
 
 def test_worker_llm_scope_sets_and_clears_flag(monkeypatch):
     wl = _load_worker_llm()
-    monkeypatch.delenv(wl._ENV_WORKER_LLM_DEPTH, raising=False)
+    monkeypatch.setenv("HERMES_WORKER_LLM_DEPTH", "9")
     assert wl.in_worker_llm() is False
     with wl.worker_llm_scope():
         assert wl.in_worker_llm() is True
@@ -75,6 +75,24 @@ def test_worker_llm_scope_nests():
             assert wl.in_worker_llm() is True
         assert wl.in_worker_llm() is True
     assert wl.in_worker_llm() is False
+
+
+def test_worker_llm_scope_does_not_silence_another_thread():
+    """A background digest must not make the live chat look like a worker turn."""
+    import threading
+
+    wl = _load_worker_llm()
+    seen: dict[str, bool] = {}
+
+    def other() -> None:
+        seen["flag"] = wl.in_worker_llm()
+
+    with wl.worker_llm_scope():
+        thread = threading.Thread(target=other)
+        thread.start()
+        thread.join()
+        assert wl.in_worker_llm() is True
+    assert seen["flag"] is False
 
 
 def test_run_worker_llm_records_usage(tmp_path, monkeypatch):
@@ -664,6 +682,55 @@ def test_capture_strips_thinking_from_final_response():
     assert "Prefers concise notes." in captured["final_response"]
 
 
+def test_extract_tool_calls_accepts_json5_slips():
+    wl = _load_worker_llm()
+    samples = [
+        "{kind: 'Factual', content: 'x',}",
+        "{'kind': 'Factual', 'content': 'x'}",
+        "{kind: 'Factual', content: 'x', // slip\n}",
+        "{kind: 'Factual', /* note */ content: 'x'}",
+    ]
+    for raw in samples:
+        result = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [{"name": "submit_tighten_fact", "arguments": raw}],
+                }
+            ]
+        }
+        found = wl.extract_tool_calls_from_result(result)
+        assert found == [("submit_tighten_fact", {"kind": "Factual", "content": "x"})]
+
+
+def test_json_object_slice_keeps_brace_inside_single_quotes():
+    wl = _load_worker_llm()
+    raw = "{'note': 'a } b', kind: 'Factual'}"
+    assert wl._json_object_slices(raw) == [raw]
+    assert wl._parse_json_mapping(raw) == {"note": "a } b", "kind": "Factual"}
+
+
+def test_trailing_comma_parses_when_json5_import_fails(monkeypatch):
+    monkeypatch.setitem(sys.modules, "json5", None)
+    wl = _load_worker_llm()
+    found = wl.extract_tool_calls_from_result(
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "name": "submit_tighten_fact",
+                            "arguments": '{"kind": "Factual", "content": "x",}',
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    assert found == [("submit_tighten_fact", {"kind": "Factual", "content": "x"})]
+
+
 def test_extract_tool_calls_flat_shape_and_broken_arguments_string():
     wl = _load_worker_llm()
     result = {
@@ -1162,7 +1229,7 @@ def test_undeclared_plugin_model_follows_chat_oneshot_and_nested(tmp_path, monke
         message={"content": "", "tool_calls": None},
     )
     for purpose in ("digest-dedup", "digest-wrapup"):
-        seen.clear()
+        seen.pop("create", None)
         out = wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose=purpose)
         assert out["failed"] is False
         assert seen["create"]["model"] == "MiniMax-M3"
@@ -1339,7 +1406,7 @@ def test_oneshot_lanes_share_openai_v1(tmp_path, monkeypatch):
         ("memory-weekly", "ui_tighten"),
     )
     for plugin, purpose in lanes:
-        seen.clear()
+        seen.pop("create", None)
         out = wl.run_worker_llm_oneshot("hi", plugin=plugin, purpose=purpose)
         assert out["failed"] is False, purpose
         assert seen["client"]["base_url"] == "https://api.minimax.chat/v1", purpose
@@ -1632,3 +1699,189 @@ def test_nested_chat_fallback_puts_thinking_on_overrides(tmp_path, monkeypatch):
     assert wl.run_worker_llm("hi", plugin="memory-weekly", purpose="ui_tighten") == "ok"
     assert seen["kwargs"]["reasoning_config"] == {"enabled": False}
     assert seen["kwargs"]["request_overrides"]["extra_body"]["thinking"] == {"type": "disabled"}
+
+
+def test_oneshot_schema_retries_once_then_fails(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("XIAOMI_API_KEY", "test-key")
+    monkeypatch.setenv("XIAOMI_BASE_URL", "https://example.test/v1")
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-weekly:\n      provider: xiaomi\n      model: mimo-v2.5\n",
+        encoding="utf-8",
+    )
+    calls: list[dict] = []
+
+    class FakeMessage:
+        def __init__(self, arguments: str):
+            self.content = ""
+            self.tool_calls = [
+                types.SimpleNamespace(
+                    function=types.SimpleNamespace(name="submit", arguments=arguments)
+                )
+            ]
+
+    class FakeChoice:
+        def __init__(self, arguments: str):
+            self.message = FakeMessage(arguments)
+            self.finish_reason = "tool_calls"
+
+    class FakeUsage:
+        prompt_tokens = 1
+        completion_tokens = 1
+        total_tokens = 2
+        prompt_tokens_details = None
+        completion_tokens_details = None
+
+    class FakeResponse:
+        def __init__(self, arguments: str):
+            self.choices = [FakeChoice(arguments)]
+            self.usage = FakeUsage()
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return FakeResponse("{}")
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.chat = FakeChat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = FakeClient
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    schema = {
+        "name": "submit",
+        "parameters": {
+            "type": "object",
+            "properties": {"title": {"type": "string"}},
+            "required": ["title"],
+        },
+    }
+    out = wl.run_worker_llm_oneshot(
+        "write",
+        plugin="memory-weekly",
+        purpose="ui_tighten",
+        force_tool_name="submit",
+        tool_schema=schema,
+    )
+    assert len(calls) == 2
+    assert "missing required field title" in calls[1]["messages"][-1]["content"]
+    assert out["failed"] is True
+    assert "missing required field title" in out["final_response"]
+
+
+def test_oneshot_uses_caller_system_prompt(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("XIAOMI_API_KEY", "test-key")
+    monkeypatch.setenv("XIAOMI_BASE_URL", "https://example.test/v1")
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-weekly:\n      provider: xiaomi\n      model: mimo-v2.5\n",
+        encoding="utf-8",
+    )
+    seen: dict = {}
+    tool_call = types.SimpleNamespace(
+        function=types.SimpleNamespace(name="submit", arguments='{"title": "a"}')
+    )
+    _install_fake_openai(monkeypatch, seen=seen, message={"content": "", "tool_calls": [tool_call]})
+    wl.run_worker_llm_oneshot(
+        "dynamic body",
+        plugin="memory-weekly",
+        purpose="ui_tighten",
+        force_tool_name="submit",
+        tool_schema={"name": "submit", "parameters": {"type": "object", "properties": {}}},
+        system_prompt="Stable monthly instructions.",
+    )
+    assert seen["create"]["messages"][0]["content"] == "Stable monthly instructions."
+    assert seen["create"]["messages"][1]["content"] == "dynamic body"
+
+
+def test_quota_dead_window_expires():
+    wl = _load_worker_llm()
+    wl._mark_xiaomi_quota_dead()
+    assert wl._xiaomi_quota_is_dead() is True
+    wl._xiaomi_quota_dead_until = 1
+    assert wl._xiaomi_quota_is_dead() is False
+
+
+def test_provider_caps_row_overrides_builtin(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    MyMemory:\n      provider_capabilities:\n"
+        "        xiaomi:\n          wire: anthropic\n"
+        "          fallback_provider: box\n          fallback_model: box-1\n",
+        encoding="utf-8",
+    )
+    assert wl._worker_wire("xiaomi") == "anthropic"
+    assert wl._fallback_lane("xiaomi") == ("box", "box-1")
+    assert wl._worker_wire("minimax-cn") == "anthropic"
+
+
+def test_length_finish_retries_with_more_tokens(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("XIAOMI_API_KEY", "test-key")
+    monkeypatch.setenv("XIAOMI_BASE_URL", "https://example.test/v1")
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-weekly:\n      provider: xiaomi\n      model: mimo-v2.5\n",
+        encoding="utf-8",
+    )
+    limits: list[int] = []
+
+    class Msg:
+        content = ""
+        tool_calls = [
+            types.SimpleNamespace(
+                function=types.SimpleNamespace(name="submit", arguments='{"title": "ok"}')
+            )
+        ]
+
+    class Choice:
+        def __init__(self, reason: str):
+            self.message = Msg()
+            self.finish_reason = reason
+
+    class Usage:
+        prompt_tokens = 1
+        completion_tokens = 1
+        total_tokens = 2
+        prompt_tokens_details = None
+        completion_tokens_details = None
+
+    class Resp:
+        def __init__(self, reason: str):
+            self.choices = [Choice(reason)]
+            self.usage = Usage()
+
+    class Completions:
+        def create(self, **kwargs):
+            limits.append(kwargs["max_tokens"])
+            reason = "length" if len(limits) == 1 else "tool_calls"
+            return Resp(reason)
+
+    class Chat:
+        completions = Completions()
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.chat = Chat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    out = wl.run_worker_llm_oneshot(
+        "hi",
+        plugin="memory-weekly",
+        purpose="ui_tighten",
+        force_tool_name="submit",
+        tool_schema={"name": "submit", "parameters": {"type": "object", "properties": {}}},
+        max_tokens=100,
+    )
+    assert limits == [100, 200]
+    assert out["failed"] is False
+    assert out["tool_args"] == {"title": "ok"}

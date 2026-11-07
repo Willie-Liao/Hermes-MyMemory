@@ -4,8 +4,15 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
+
+_MYMEMORY = Path(__file__).resolve().parent.parent
+if str(_MYMEMORY) not in sys.path:
+    sys.path.insert(0, str(_MYMEMORY))
+from llm_json import loads_lenient  # noqa: E402
 
 WORKER_TYPES = ("event", "fact", "procedure", "decision")
 FACT_KIND_ENUM = ("Factual", "Narration")
@@ -217,8 +224,8 @@ def _json_object(raw: Any) -> dict[str, Any] | None:
         text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
         text = re.sub(r"\s*```$", "", text)
     try:
-        val = json.loads(text)
-    except json.JSONDecodeError:
+        val = loads_lenient(text)
+    except ValueError:
         return None
     return dict(val) if isinstance(val, Mapping) else None
 

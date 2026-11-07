@@ -918,6 +918,12 @@ def test_decision_worker_accepts_user_ruling_about_third_party_topic():
     assert digest._validate_worker_output(content, "decision") == []
 
 
+def test_parse_proposal_trailing_comma_does_not_raise():
+    dedup = load_plugin_module("dedup_prompt.py", "memory_digest_dedup_trailing_comma")
+    ops = dedup.parse_proposal('[{"op": "drop", "id": "mem-1",}]')
+    assert ops == [{"op": "drop", "id": "mem-1"}]
+
+
 def test_dedup_prompt_includes_fact_narration_merge_few_shot():
     dedup = load_plugin_module("dedup_prompt.py", "memory_digest_dedup_prompt_test")
     prompt = dedup.build_proposer_prompt([], [])

@@ -177,6 +177,60 @@ def _notice_path(home: Path) -> Path:
     return home / "logs" / "mymemory-runtime-deps-notice.json"
 
 
+def test_json5_missing_is_installed_from_real_requirements(monkeypatch, tmp_path):
+    """A fresh Hermes env must install the shipped json5 line, not a stand-in file."""
+    _allow_install(monkeypatch)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _pip_present(monkeypatch)
+    installed = {"ok": False}
+    _distribution(monkeypatch, {"json5"}, installed)
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(list(cmd))
+        installed["ok"] = True
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    spawned: list[list[str]] = []
+
+    def fake_popen(cmd, **kwargs):
+        spawned.append(list(cmd))
+        return object()
+
+    monkeypatch.setattr(MyMemory.subprocess, "run", fake_run)
+    monkeypatch.setattr(MyMemory.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        MyMemory.shutil, "which", lambda name: "/usr/bin/hermes" if name == "hermes" else None
+    )
+    clock = __import__("MyMemory.weekly.weekly_clock", fromlist=["send_weekly_brief_weixin"])
+    monkeypatch.setattr(clock, "send_weekly_brief_weixin", lambda text: {"outcome": "sent"})
+
+    MyMemory.ensure_runtime_deps()
+
+    assert len(calls) == 1
+    cmd = calls[0]
+    assert cmd[:4] == [sys.executable, "-m", "pip", "install"]
+    assert cmd[-1] == "json5>=0.9"
+    assert "json5>=0.9" in cmd
+    assert cmd.count("json5>=0.9") == 1
+    assert "--index-url" in cmd and "--extra-index-url" in cmd
+    assert len(spawned) == 1
+    notice = json.loads(_notice_path(tmp_path).read_text(encoding="utf-8"))
+    assert notice["missing"] == ["json5"]
+
+
+def test_json5_present_is_not_reinstalled(monkeypatch, tmp_path):
+    _allow_install(monkeypatch)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _distribution(monkeypatch, set())
+
+    def fail_run(*_args, **_kwargs):
+        raise AssertionError("pip must not run when json5 is already installed")
+
+    monkeypatch.setattr(MyMemory.subprocess, "run", fail_run)
+    MyMemory.ensure_runtime_deps()
+
+
 def test_missing_imports_restart_gateway_after_install(monkeypatch, tmp_path):
     _allow_install(monkeypatch)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
