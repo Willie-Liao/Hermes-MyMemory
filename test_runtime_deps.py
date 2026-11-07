@@ -4,7 +4,7 @@ A Hermes update creates an environment without these packages. Collection
 sets PYTEST_CURRENT_TEST so importing MyMemory does not run pip.
 A finished install still cannot register inside the load that Hermes already
 abandoned, so the success path must restart the gateway from outside it.
-distribution() reads metadata only, so sentence_transformers does not load torch.
+distribution() reads metadata only, so tokenizers does not load the GTE stack.
 """
 
 from __future__ import annotations
@@ -23,24 +23,19 @@ if str(_HERE.parent) not in sys.path:
 import MyMemory  # noqa: E402
 
 
-_INDEX_URL = "https://download.pytorch.org/whl/cpu"
 _EXTRA_URL = "https://pypi.org/simple"
-_FILE_BODY = """--index-url https://download.pytorch.org/whl/cpu
---extra-index-url https://pypi.org/simple
+_FILE_BODY = """--extra-index-url https://pypi.org/simple
 onnxruntime
 pyyaml
-torch==2.15.0+cpu; sys_platform != "darwin"
-torch==2.15.0; sys_platform == "darwin"
-sentence-transformers>=3.0.0
+pkg-mac; sys_platform == "darwin"
+pkg-other; sys_platform != "darwin"
 """
 _HEAVY_IMPORTS = {
-    "sentence_transformers",
-    "torch",
+    "tokenizers",
     "yaml",
     "pyyaml",
     "openai",
     "numpy",
-    "tokenizers",
     "onnxruntime",
 }
 
@@ -51,19 +46,18 @@ def _allow_install(monkeypatch) -> None:
 
 
 def _applicable_specs() -> list[str]:
-    """The torch line that matches this OS, so both pins are not installed."""
-    torch = "torch==2.15.0" if sys.platform == "darwin" else "torch==2.15.0+cpu"
-    return ["onnxruntime", "pyyaml", torch, "sentence-transformers>=3.0.0"]
+    """The marker line that matches this OS, so the other pin is not installed."""
+    marked = "pkg-mac" if sys.platform == "darwin" else "pkg-other"
+    return ["onnxruntime", "pyyaml", marked]
 
 
 def _applicable_names() -> list[str]:
-    return ["onnxruntime", "pyyaml", "torch", "sentence-transformers"]
+    marked = "pkg-mac" if sys.platform == "darwin" else "pkg-other"
+    return ["onnxruntime", "pyyaml", marked]
 
 
 def _index_args() -> list[str]:
     return [
-        "--index-url",
-        _INDEX_URL,
         "--extra-index-url",
         _EXTRA_URL,
     ]
@@ -209,11 +203,7 @@ def test_json5_missing_is_installed_from_real_requirements(monkeypatch, tmp_path
 
     assert len(calls) == 1
     cmd = calls[0]
-    assert cmd[:4] == [sys.executable, "-m", "pip", "install"]
-    assert cmd[-1] == "json5>=0.9"
-    assert "json5>=0.9" in cmd
-    assert cmd.count("json5>=0.9") == 1
-    assert "--index-url" in cmd and "--extra-index-url" in cmd
+    assert cmd == [sys.executable, "-m", "pip", "install", "json5>=0.9"]
     assert len(spawned) == 1
     notice = json.loads(_notice_path(tmp_path).read_text(encoding="utf-8"))
     assert notice["missing"] == ["json5"]
@@ -398,7 +388,7 @@ def test_register_sends_unsent_notice_once(monkeypatch, tmp_path):
     notice = _notice_path(tmp_path)
     notice.parent.mkdir(parents=True)
     notice.write_text(
-        json.dumps({"missing": ["onnxruntime", "sentence_transformers"], "sent": False}),
+        json.dumps({"missing": ["onnxruntime", "tokenizers"], "sent": False}),
         encoding="utf-8",
     )
     sent: list[str] = []
@@ -414,7 +404,7 @@ def test_register_sends_unsent_notice_once(monkeypatch, tmp_path):
     MyMemory.register(_Ctx())
 
     assert sent == [
-        "MyMemory installed the missing modules (onnxruntime, sentence_transformers) and restarted. Memory prefetch is registered."
+        "MyMemory installed the missing modules (onnxruntime, tokenizers) and restarted. Memory prefetch is registered."
     ]
     assert not notice.exists()
 

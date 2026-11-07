@@ -1,8 +1,5 @@
-# Gateway runtime for MyMemory. Channel 4 encode uses onnxruntime.
-# Phase-2 Pearson/MI loads MiniLM through sentence-transformers.
-# CPU index first so torch does not pull a CUDA wheel onto the cloud host.
---index-url https://download.pytorch.org/whl/cpu
---extra-index-url https://pypi.org/simple
+# Gateway runtime for MyMemory. Recall, the 01:00 cache, monthly guidance,
+# and the digest Phase-2 gate share one GTE int8 session.
 onnxruntime
 tokenizers
 numpy
@@ -10,6 +7,3 @@ pyyaml
 openai
 ruamel.yaml
 json5>=0.9
-torch==2.15.0+cpu; sys_platform != "darwin"
-torch==2.15.0; sys_platform == "darwin"
-sentence-transformers>=3.0.0

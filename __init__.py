@@ -25,7 +25,7 @@ from pathlib import Path
 logger = logging.getLogger("mymemory.runtime")
 
 # The file is the list. distribution() reads metadata only: importing
-# sentence_transformers here would load torch into the gateway.
+# tokenizers here would load the GTE stack into the gateway before register().
 _REQUIREMENTS_FILE = Path(__file__).resolve().parent / "requirements.txt"
 _LOAD_STARTED = time.perf_counter()
 
@@ -33,10 +33,10 @@ _LOAD_STARTED = time.perf_counter()
 def ensure_runtime_deps() -> None:
     """A new requirements.txt line must install on the next load without importing that package.
 
-    Importing sentence_transformers here loads torch and can spend the 10s plugin
-    deadline before register() runs. distribution() only reads metadata. Install
-    the missing specs, then restart outside this process so the next one can
-    register prefetch. Skip under pytest so collection does not download torch.
+    Importing tokenizers or onnxruntime here can spend the 10s plugin deadline
+    before register() runs. distribution() only reads metadata. Install the
+    missing specs, then restart outside this process so the next one can
+    register prefetch. Skip under pytest so collection does not download wheels.
     """
     if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get(
         "MYMEMORY_SKIP_RUNTIME_DEPS"
@@ -148,8 +148,6 @@ def ensure_runtime_deps() -> None:
             "install",
             "--python",
             sys.executable,
-            "--index-strategy",
-            "unsafe-best-match",
             *index_args,
             *missing_specs,
         ]

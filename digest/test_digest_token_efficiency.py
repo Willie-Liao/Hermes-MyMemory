@@ -603,29 +603,7 @@ def test_proposer_tool_loop_submit_then_patch(tmp_path, monkeypatch):
         }
 
     monkeypatch.setattr(digest, "_invoke_digest_worker_tool", fake_tool)
-
-    class _StubMiniLM:
-        def encode(self, texts, normalize_embeddings=True):
-            del normalize_embeddings
-            rows = []
-            for raw in texts:
-                text = str(raw)
-                if "Apple" in text or "alpha-apple" in text:
-                    rows.append([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-                elif "Banana" in text:
-                    rows.append([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-                elif "Zebra" in text:
-                    rows.append([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
-                elif "Proc" in text:
-                    rows.append([0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-                elif "Event" in text:
-                    rows.append([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-                else:
-                    rows.append([0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-            return rows
-
-    monkeypatch.setattr(digest, "_PHASE2_MINILM", _StubMiniLM())
-    monkeypatch.setattr(digest, "_PHASE2_EMBED_CACHE", {})
+    _stub_phase2_embed(monkeypatch, _phase2_content_vector)
 
     skipper = digest.make_llm_proposer("cli", session_id="s1", run_id="r-skip")
     singleton = {
@@ -642,29 +620,21 @@ def test_proposer_tool_loop_submit_then_patch(tmp_path, monkeypatch):
     assert calls == []
     assert skipped == []
 
-    class _BoomMiniLM:
-        def encode(self, texts, normalize_embeddings=True):
-            del texts, normalize_embeddings
-            raise RuntimeError("minilm unavailable")
-
-    monkeypatch.setattr(digest, "_PHASE2_MINILM", _BoomMiniLM())
-    monkeypatch.setattr(digest, "_PHASE2_EMBED_CACHE", {})
+    _stub_phase2_embed(monkeypatch, lambda _text: [])
     opener = digest.make_llm_proposer("cli", session_id="s1", run_id="r-open")
     opener([], [singleton], errors=(), attempt=1)
     assert calls[-1] == "submit_operations"
     assert "mem-2026-08-11-fact-x" in prompts[-1]
     assert "Compare only these same-type pairs" not in prompts[-1]
 
-    monkeypatch.setattr(digest, "_PHASE2_MINILM", None)
-    monkeypatch.setattr(digest, "_PHASE2_EMBED_CACHE", {})
-    monkeypatch.setenv("HERMES_PHASE2_SKIP_MINILM", "1")
+    _stub_phase2_embed(monkeypatch, lambda _text: [])
+    monkeypatch.setenv("HERMES_PHASE2_SKIP_EMBED", "1")
     skip_ram = digest.make_llm_proposer("cli", session_id="s1", run_id="r-ram")
     skip_ram([], [singleton, {**singleton, "id": "mem-2026-08-11-fact-y", "body": "Other."}], errors=(), attempt=1)
     assert calls[-1] == "submit_operations"
-    monkeypatch.delenv("HERMES_PHASE2_SKIP_MINILM", raising=False)
+    monkeypatch.delenv("HERMES_PHASE2_SKIP_EMBED", raising=False)
 
-    monkeypatch.setattr(digest, "_PHASE2_MINILM", _StubMiniLM())
-    monkeypatch.setattr(digest, "_PHASE2_EMBED_CACHE", {})
+    _stub_phase2_embed(monkeypatch, _phase2_content_vector)
     proposer = digest.make_llm_proposer("cli", session_id="s1", run_id="r1")
     existing = []
     new = [
@@ -813,13 +783,13 @@ def test_oneshot_attempt2_uses_teach_and_foul_touched_patch(monkeypatch, tmp_pat
     proposer = digest.make_oneshot_proposer(
         session_id="s1", run_id="r1", invoke_tool=fake_oneshot
     )
-    class _StubMiniLM:
-        def encode(self, texts, normalize_embeddings=True):
-            del texts, normalize_embeddings
-            return [[1.0, 0.0, 0.0, 0.0], [0.99, 0.14, 0.0, 0.0]]
 
-    monkeypatch.setattr(digest, "_PHASE2_MINILM", _StubMiniLM())
-    monkeypatch.setattr(digest, "_PHASE2_EMBED_CACHE", {})
+    def _oneshot_vector(text: str) -> list[float]:
+        if "Keep this" in text:
+            return [1.0, 0.0, 0.0, 0.0]
+        return [0.99, 0.14, 0.0, 0.0]
+
+    _stub_phase2_embed(monkeypatch, _oneshot_vector)
     keep = {
         "id": "mem-keep",
         "type": "fact",
@@ -1156,20 +1126,18 @@ def test_phase2_gate_records_sep29_procedure_pair(tmp_path, monkeypatch, capsys)
     """A two-card board always keeps the sole pair, so the threshold is never applied.
 
     These two leave-notice procedures need a third procedure or the gate cannot
-    show whether 0.06 would have dropped them. The installer venv does not ship
-    sentence_transformers; a missing embedder is recorded as full_board, which
-    is not this filter decision.
+    show whether the GTE MI threshold would have dropped them. A missing ONNX
+    file is recorded as full_board, which is not this filter decision.
     """
-    try:
-        import sentence_transformers  # noqa: F401
-    except ImportError:
+    digest = _load("digest")
+    from recall import embed as recall_embed
+
+    if recall_embed._onnx_file() is None:
         import pytest
 
-        pytest.skip("sentence_transformers is not installed in this interpreter")
-    digest = _load("digest")
+        pytest.skip("GTE int8 ONNX file is not installed")
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(digest, "_PHASE2_EMBED_CACHE", {})
-    monkeypatch.setattr(digest, "_PHASE2_MINILM", None)
     leave_ics = {
         "id": "mem-2026-09-29-procedure-4AC1328A5C86",
         "type": "procedure",
@@ -1275,14 +1243,50 @@ def _phase2_two_facts():
     ]
 
 
-def _stub_phase2_minilm(digest):
-    class _StubMiniLM:
-        def encode(self, texts, normalize_embeddings=True):
-            del texts, normalize_embeddings
-            return [[1.0, 0.0, 0.0, 0.0], [0.2, 0.9, 0.0, 0.0]]
+def _phase2_content_vector(text: str) -> list[float]:
+    """Fixed vectors so the token-efficiency board keeps Apple with Banana and drops Zebra on MI."""
+    if "Apple" in text or "alpha-apple" in text:
+        return [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    if "Banana" in text:
+        return [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    if "Zebra" in text:
+        return [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+    if "Proc" in text:
+        return [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    if "Event" in text:
+        return [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    return [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
-    digest._PHASE2_MINILM = _StubMiniLM()
-    digest._PHASE2_EMBED_CACHE = {}
+
+def _stub_phase2_embed(monkeypatch, vectors_for):
+    """Keep Phase-2 tests off the real GTE session and off a process-wide embed cache.
+
+    A direct write to the embed cache survived the test and poisoned the next
+    gate. vectors_for(text) returns one vector; an empty vector fail-opens
+    the way recall.embed._encode_texts does when the session is missing.
+    """
+    digest = sys.modules["digest"]
+
+    def _encode(texts):
+        rows = []
+        for raw in texts:
+            row = list(vectors_for(str(raw)))
+            if not row:
+                return []
+            rows.append([float(v) for v in row])
+        return rows
+
+    import recall.embed as recall_embed
+
+    monkeypatch.setattr(recall_embed, "_encode_texts", _encode)
+    monkeypatch.setattr(digest, "_PHASE2_EMBED_CACHE", {})
+
+
+def _two_fact_vector(text: str) -> list[float]:
+    """Non-empty vectors so the empty-ops test encodes instead of fail-opening past the tool call."""
+    if "Banana" in text:
+        return [0.2, 0.9, 0.0, 0.0]
+    return [1.0, 0.0, 0.0, 0.0]
 
 
 def test_phase2_empty_ops_records_no_merge(tmp_path, monkeypatch):
@@ -1293,7 +1297,7 @@ def test_phase2_empty_ops_records_no_merge(tmp_path, monkeypatch):
     """
     digest = _load("digest")
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
-    _stub_phase2_minilm(digest)
+    _stub_phase2_embed(monkeypatch, _two_fact_vector)
 
     def empty_tool(prompt, platform, *, purpose, force_tool_name):
         del prompt, platform, purpose
@@ -1330,7 +1334,7 @@ def test_phase2_empty_ops_records_no_merge(tmp_path, monkeypatch):
         }
 
     monkeypatch.setattr(digest, "_invoke_digest_worker_tool", merge_tool)
-    digest._PHASE2_EMBED_CACHE = {}
+    digest._PHASE2_EMBED_CACHE.clear()
     keeper = digest.make_llm_proposer("cli", session_id="s1", run_id="kept")
     keeper([], _phase2_two_facts(), errors=(), attempt=1)
     state = json.loads(
@@ -1347,7 +1351,7 @@ def test_phase2_empty_ops_records_no_merge(tmp_path, monkeypatch):
         raise RuntimeError("socket reset")
 
     monkeypatch.setattr(digest, "_invoke_digest_worker_tool", boom)
-    digest._PHASE2_EMBED_CACHE = {}
+    digest._PHASE2_EMBED_CACHE.clear()
     failing = digest.make_llm_proposer("cli", session_id="s1", run_id="boom")
     try:
         failing([], _phase2_two_facts(), errors=(), attempt=1)

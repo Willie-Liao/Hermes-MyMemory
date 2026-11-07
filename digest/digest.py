@@ -145,15 +145,17 @@ MAX_ERRORS_IN_PROMPT = 8
 MAX_RETRY_ERROR_CHARS = 800
 # Clear a stuck in-flight flag if the worker never finished (e.g. gateway crash).
 IN_FLIGHT_STALE_SECONDS = 600
-# Phase-2 Pearson/MI prefilter (ES-Mem eqs 1–2). Lazy MiniLM; in-memory only.
-PHASE2_MINILM_MODEL = "all-MiniLM-L6-v2"
-PHASE2_MI_THRESHOLD = 0.06  # Absolute MI threshold (relaxed from 0.10)
+# Phase-2 Pearson/MI prefilter (ES-Mem eqs 1–2). Shared GTE int8; in-memory only.
+# 2026-11-07: on 3 local staging days (25 same-type multi-pairs) GTE MI sits
+# well above the previous English encoder's 0.06 cutoff. 0.77 keeps 21/25,
+# the same kept-pair rate, and still keeps the sep29 leave-notice pair
+# (MI 1.33) while dropping the unrelated bread procedure (MI about 0.68–0.71).
+PHASE2_MI_THRESHOLD = 0.77
 PHASE2_GATE_HISTORY_CAP = 20
-# Skip MiniLM on tiny boxes only. 768MiB available used to fail-open the 3.5GiB
-# Aliyun host under load even though total RAM is enough for all-MiniLM-L6-v2.
-PHASE2_MINILM_SKIP_TOTAL = 2 * 1024 * 1024 * 1024
-PHASE2_MINILM_SKIP_AVAIL = 256 * 1024 * 1024
-_PHASE2_MINILM: Any = None
+# Skip GTE on tiny boxes only. 768MiB available used to fail-open the 3.5GiB
+# Aliyun host under load even though total RAM is enough for the int8 session.
+PHASE2_EMBED_SKIP_TOTAL = 2 * 1024 * 1024 * 1024
+PHASE2_EMBED_SKIP_AVAIL = 256 * 1024 * 1024
 _PHASE2_EMBED_CACHE: dict[str, list[float]] = {}
 
 # Civil-day event bullets after YAML fences — not a fifth memory type.
@@ -3652,15 +3654,15 @@ def _phase2_prompt_and_tool(
 ) -> tuple[str, str, str, str | None]:
     """Record whether Pearson/MI filtered the board or fell open to every card.
 
-    Without that digest-state row a RAM fail-open and a real filter look the
-    same, and the 0.06 threshold cannot be checked later. Skip MiniLM only on
-    ≤2GiB boxes or <256MiB available so a 3.5GiB VPS can still filter;
-    embed/math failure fail-opens to the full board. Attempt ≥2 still shrinks
-    to foul-touched cards only and does not write a gate record. The fourth
-    return is that row's `at`, or None when no row was saved or the model
-    will not be called (skip_llm).
+    Chinese and English cards need one bilingual encoder. A second embedding
+    library was the gateway's only heavy wheel. One shared GTE session keeps
+    those vectors. A missing encode or a small box
+    (HERMES_PHASE2_SKIP_EMBED, ≤2GiB, or <256MiB free) fail-opens to the full
+    board so a RAM skip cannot look like a real filter. Attempt ≥2 still
+    shrinks to foul-touched cards only and does not write a gate record. The
+    fourth return is that row's `at`, or None when no row was saved or the
+    model will not be called (skip_llm).
     """
-    global _PHASE2_MINILM
     mode = "submit" if attempt == 1 or not previous_ops else "patch"
     force_name = (
         "submit_operations" if mode == "submit" else "patch_operations"
@@ -3733,45 +3735,44 @@ def _phase2_prompt_and_tool(
                 i for i, key in enumerate(keys) if key not in _PHASE2_EMBED_CACHE
             ]
             if missing_i:
-                if _PHASE2_MINILM is None:
-                    skip_flag = os.environ.get(
-                        "HERMES_PHASE2_SKIP_MINILM", ""
-                    ).strip().lower()
-                    mem_total = 0
-                    mem_avail = 0
-                    try:
-                        with open("/proc/meminfo", encoding="utf-8") as fh:
-                            for line in fh:
-                                parts = line.split()
-                                if len(parts) < 2:
-                                    continue
-                                kib = int(parts[1]) * 1024
-                                if line.startswith("MemTotal:"):
-                                    mem_total = kib
-                                elif line.startswith("MemAvailable:"):
-                                    mem_avail = kib
-                    except (OSError, ValueError):
-                        pass
-                    skip_ram = (
-                        skip_flag in {"1", "true", "yes"}
-                        or (0 < mem_total <= PHASE2_MINILM_SKIP_TOTAL)
-                        or (0 < mem_avail < PHASE2_MINILM_SKIP_AVAIL)
-                    )
-                    if skip_ram:
-                        msg = (
-                            "phase2 Pearson/MI gate skipped MiniLM (ram) "
-                            f"total_mib={mem_total // (1024 * 1024)} "
-                            f"avail_mib={mem_avail // (1024 * 1024)}"
-                        )
-                        _log(msg)
-                        raise RuntimeError(msg)
-                    from sentence_transformers import SentenceTransformer
-
-                    _PHASE2_MINILM = SentenceTransformer(PHASE2_MINILM_MODEL)
-                encoded = _PHASE2_MINILM.encode(
-                    [texts[i] for i in missing_i],
-                    normalize_embeddings=True,
+                skip_flag = os.environ.get(
+                    "HERMES_PHASE2_SKIP_EMBED", ""
+                ).strip().lower()
+                mem_total = 0
+                mem_avail = 0
+                try:
+                    with open("/proc/meminfo", encoding="utf-8") as fh:
+                        for line in fh:
+                            parts = line.split()
+                            if len(parts) < 2:
+                                continue
+                            kib = int(parts[1]) * 1024
+                            if line.startswith("MemTotal:"):
+                                mem_total = kib
+                            elif line.startswith("MemAvailable:"):
+                                mem_avail = kib
+                except (OSError, ValueError):
+                    pass
+                skip_ram = (
+                    skip_flag in {"1", "true", "yes"}
+                    or (0 < mem_total <= PHASE2_EMBED_SKIP_TOTAL)
+                    or (0 < mem_avail < PHASE2_EMBED_SKIP_AVAIL)
                 )
+                if skip_ram:
+                    msg = (
+                        "phase2 Pearson/MI gate skipped GTE (ram) "
+                        f"total_mib={mem_total // (1024 * 1024)} "
+                        f"avail_mib={mem_avail // (1024 * 1024)}"
+                    )
+                    _log(msg)
+                    raise RuntimeError(msg)
+                from recall import embed as recall_embed
+
+                encoded = recall_embed._encode_texts(
+                    [texts[i] for i in missing_i]
+                )
+                if len(encoded) != len(missing_i):
+                    raise RuntimeError("phase2 GTE encode unavailable")
                 for pos, idx in enumerate(missing_i):
                     row = encoded[pos]
                     _PHASE2_EMBED_CACHE[keys[idx]] = [

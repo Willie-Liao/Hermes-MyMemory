@@ -268,8 +268,7 @@ install_python_packages() {
     uv_bin="${HOME}/.local/bin/uv"
   fi
   if [[ -n "$uv_bin" ]]; then
-    # unsafe-best-match lets the CPU torch pin in requirements.txt win over the PyPI wheel.
-    "$uv_bin" pip install --python "$py" --index-strategy unsafe-best-match "$@"
+    "$uv_bin" pip install --python "$py" "$@"
     return
   fi
   echo "error: ${py} has no pip and uv is not installed" >&2
@@ -332,7 +331,7 @@ if RUNTIME_PY="$(resolve_runtime_python)"; then
     fi
     echo "Installing ${req} into ${RUNTIME_PY}"
     install_python_packages "$RUNTIME_PY" "${py_pkgs[@]}"
-    echo "ok: ${RUNTIME_PY} can import sentence_transformers, onnxruntime, tokenizers, numpy"
+    echo "ok: ${RUNTIME_PY} can import onnxruntime, tokenizers, numpy"
   else
     echo "note: skipping runtime requirements (MYMEMORY_SKIP_GTE=1)"
   fi
