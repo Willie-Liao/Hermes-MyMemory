@@ -1,0 +1,9 @@
+# Gateway runtime for MyMemory. Recall, the 01:00 cache, monthly guidance,
+# and the digest Phase-2 gate share one GTE int8 session.
+onnxruntime
+tokenizers
+numpy
+pyyaml
+openai
+ruamel.yaml
+json5>=0.9

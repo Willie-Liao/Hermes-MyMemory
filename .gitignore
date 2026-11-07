@@ -1,0 +1,39 @@
+# Secrets and local runtime
+.env
+.env.*
+!.env.example
+auth.json
+*.pem
+
+# Local embed-ladder before/after clocks (plan Step 1 / 5)
+recall/embed_scale_latency_before.json
+recall/embed_scale_latency_after.json
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Node / weekly UI
+node_modules/
+coverage/
+weekly/ui/dist/
+weekly/ui/build/
+*.log
+.DS_Store
+
+# Hermes runtime that must never ship from a live home
+state.db
+state.db-*
+memories/staging/.digest-state.json
+memories/staging/.weekly-state.json
+memories/staging/.monthly-state.json
+*.db-wal
+*.db-shm
