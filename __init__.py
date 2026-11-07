@@ -28,15 +28,17 @@ logger = logging.getLogger("mymemory.runtime")
 # tokenizers here would load the GTE stack into the gateway before register().
 _REQUIREMENTS_FILE = Path(__file__).resolve().parent / "requirements.txt"
 _LOAD_STARTED = time.perf_counter()
+# Tests join this so a background install can be asserted without blocking load.
+_DEPS_INSTALL_THREAD: threading.Thread | None = None
 
 
-def ensure_runtime_deps() -> None:
-    """A new requirements.txt line must install on the next load without importing that package.
+def ensure_runtime_deps(*, background: bool = True) -> None:
+    """A missing wheel must not spend Hermes's 10s plugin-load deadline.
 
-    Importing tokenizers or onnxruntime here can spend the 10s plugin deadline
-    before register() runs. distribution() only reads metadata. Install the
-    missing specs, then restart outside this process so the next one can
-    register prefetch. Skip under pytest so collection does not download wheels.
+    distribution() only reads metadata. The pip install and gateway restart
+    run on a daemon thread so register() still happens this process; the next
+    process imports the new packages. Tests pass background=False. Skip under
+    pytest so collection does not download wheels.
     """
     if os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get(
         "MYMEMORY_SKIP_RUNTIME_DEPS"
@@ -124,124 +126,142 @@ def ensure_runtime_deps() -> None:
                     age,
                 )
                 return
-    logger.info(
-        "MyMemory missing: %s. Installing those requirements, then restarting the gateway so the plugin can register.",
-        ", ".join(missing_names),
-    )
-    if importlib.util.find_spec("pip") is not None:
-        cmd = [sys.executable, "-m", "pip", "install", *index_args, *missing_specs]
-    else:
-        uv = shutil.which("uv")
-        if uv is None:
-            home_uv = Path.home() / ".local" / "bin" / "uv"
-            if home_uv.is_file():
-                uv = str(home_uv)
-        if not uv:
-            logger.error(
-                "MyMemory requirements not installed: %s has no pip and uv is missing",
+
+    def _install_then_restart() -> None:
+        """Install off the load thread, then restart so the next process can register.
+
+        A litellm wheel can take longer than Hermes's 10s plugin cap. Running
+        here keeps that cost off import.
+        """
+        logger.info(
+            "MyMemory missing: %s. Installing those requirements, then restarting the gateway so the plugin can register.",
+            ", ".join(missing_names),
+        )
+        if importlib.util.find_spec("pip") is not None:
+            cmd = [sys.executable, "-m", "pip", "install", *index_args, *missing_specs]
+        else:
+            uv = shutil.which("uv")
+            if uv is None:
+                home_uv = Path.home() / ".local" / "bin" / "uv"
+                if home_uv.is_file():
+                    uv = str(home_uv)
+            if not uv:
+                logger.error(
+                    "MyMemory requirements not installed: %s has no pip and uv is missing",
+                    sys.executable,
+                )
+                return
+            cmd = [
+                uv,
+                "pip",
+                "install",
+                "--python",
                 sys.executable,
+                *index_args,
+                *missing_specs,
+            ]
+        try:
+            completed = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=1800,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.error("MyMemory requirements install failed: %s", exc)
+            return
+        if completed.returncode != 0:
+            tail = (completed.stderr or completed.stdout or "").strip()[-600:]
+            logger.error("MyMemory requirements install failed: %s", tail)
+            return
+        importlib.invalidate_caches()
+        still: list[str] = []
+        for name in missing_names:
+            try:
+                importlib.metadata.distribution(name)
+            except importlib.metadata.PackageNotFoundError:
+                still.append(name)
+        if still:
+            logger.error(
+                "MyMemory requirements install finished but still missing %s",
+                ", ".join(still),
             )
             return
-        cmd = [
-            uv,
-            "pip",
-            "install",
-            "--python",
-            sys.executable,
-            *index_args,
-            *missing_specs,
-        ]
-    try:
-        completed = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=1800,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        logger.error("MyMemory requirements install failed: %s", exc)
-        return
-    if completed.returncode != 0:
-        tail = (completed.stderr or completed.stdout or "").strip()[-600:]
-        logger.error("MyMemory requirements install failed: %s", tail)
-        return
-    importlib.invalidate_caches()
-    still: list[str] = []
-    for name in missing_names:
+        missing = missing_names
+        notice = {
+            "missing": missing,
+            "sent": False,
+            "restart_requested_at": time.time(),
+        }
         try:
-            importlib.metadata.distribution(name)
-        except importlib.metadata.PackageNotFoundError:
-            still.append(name)
-    if still:
-        logger.error(
-            "MyMemory requirements install finished but still missing %s",
-            ", ".join(still),
-        )
-        return
-    missing = missing_names
-    notice = {
-        "missing": missing,
-        "sent": False,
-        "restart_requested_at": time.time(),
-    }
-    try:
-        notice_path.parent.mkdir(parents=True, exist_ok=True)
-        notice_path.write_text(json.dumps(notice), encoding="utf-8")
-    except OSError as exc:
-        logger.error("MyMemory could not record the runtime-deps notice: %s", exc)
-    try:
-        from .weekly.weekly_clock import send_weekly_brief_weixin
-
-        result = send_weekly_brief_weixin(
-            "MyMemory was missing: "
-            + ", ".join(missing)
-            + ". Installed them and restarting the gateway so memory prefetch can register."
-        )
-    except Exception as exc:
-        logger.warning("MyMemory could not send the missing-module notice: %s", exc)
-        result = None
-    if isinstance(result, dict) and result.get("outcome") == "sent":
-        notice["sent"] = True
-        try:
+            notice_path.parent.mkdir(parents=True, exist_ok=True)
             notice_path.write_text(json.dumps(notice), encoding="utf-8")
         except OSError as exc:
-            logger.error("MyMemory could not record the sent runtime-deps notice: %s", exc)
-    if (
-        os.path.isdir("/run/systemd/system")
-        and shutil.which("systemctl")
-        and shutil.which("systemd-run")
-    ):
-        restart_cmd = [
-            "systemd-run",
-            "--collect",
-            "--unit",
-            f"mymemory-runtime-deps-restart-{os.getpid()}",
-            "systemctl",
-            "restart",
-            "hermes-gateway",
-        ]
-    else:
-        hermes = shutil.which("hermes")
-        if not hermes:
-            home_hermes = Path.home() / ".local" / "bin" / "hermes"
-            if home_hermes.is_file():
-                hermes = str(home_hermes)
-        if not hermes:
-            logger.error(
-                "MyMemory installed runtime deps but could not restart the gateway: hermes CLI not found"
+            logger.error("MyMemory could not record the runtime-deps notice: %s", exc)
+        try:
+            from .weekly.weekly_clock import send_weekly_brief_weixin
+
+            result = send_weekly_brief_weixin(
+                "MyMemory was missing: "
+                + ", ".join(missing)
+                + ". Installed them and restarting the gateway so memory prefetch can register."
             )
-            return
-        restart_cmd = [hermes, "gateway", "restart"]
-    try:
-        subprocess.Popen(
-            restart_cmd,
-            start_new_session=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except OSError as exc:
-        logger.error("MyMemory gateway restart failed to start: %s", exc)
+        except Exception as exc:
+            logger.warning("MyMemory could not send the missing-module notice: %s", exc)
+            result = None
+        if isinstance(result, dict) and result.get("outcome") == "sent":
+            notice["sent"] = True
+            try:
+                notice_path.write_text(json.dumps(notice), encoding="utf-8")
+            except OSError as exc:
+                logger.error("MyMemory could not record the sent runtime-deps notice: %s", exc)
+        if (
+            os.path.isdir("/run/systemd/system")
+            and shutil.which("systemctl")
+            and shutil.which("systemd-run")
+        ):
+            restart_cmd = [
+                "systemd-run",
+                "--collect",
+                "--unit",
+                f"mymemory-runtime-deps-restart-{os.getpid()}",
+                "systemctl",
+                "restart",
+                "hermes-gateway",
+            ]
+        else:
+            hermes = shutil.which("hermes")
+            if not hermes:
+                home_hermes = Path.home() / ".local" / "bin" / "hermes"
+                if home_hermes.is_file():
+                    hermes = str(home_hermes)
+            if not hermes:
+                logger.error(
+                    "MyMemory installed runtime deps but could not restart the gateway: hermes CLI not found"
+                )
+                return
+            restart_cmd = [hermes, "gateway", "restart"]
+        try:
+            subprocess.Popen(
+                restart_cmd,
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            logger.error("MyMemory gateway restart failed to start: %s", exc)
+
+    if not background:
+        _install_then_restart()
+        return
+    global _DEPS_INSTALL_THREAD
+    _DEPS_INSTALL_THREAD = threading.Thread(
+        target=_install_then_restart,
+        name="mymemory-runtime-deps",
+        daemon=True,
+    )
+    _DEPS_INSTALL_THREAD.start()
 
 
 ensure_runtime_deps()

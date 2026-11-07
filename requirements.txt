@@ -7,3 +7,6 @@ pyyaml
 openai
 ruamel.yaml
 json5>=0.9
+# Opt-in worker wire. Dry-run against the Hermes venv (2026-11-07) left
+# openai 2.24.0 and pydantic 2.13.4 in place. tokenizers was not installed there.
+litellm==1.108.2

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -1814,12 +1815,15 @@ def test_provider_caps_row_overrides_builtin(tmp_path, monkeypatch):
     (tmp_path / "config.yaml").write_text(
         "plugins:\n  entries:\n    MyMemory:\n      provider_capabilities:\n"
         "        xiaomi:\n          wire: anthropic\n"
-        "          fallback_provider: box\n          fallback_model: box-1\n",
+        "          fallback_provider: box\n          fallback_model: box-1\n"
+        "        gemini:\n          wire: litellm\n          litellm_prefix: gemini\n",
         encoding="utf-8",
     )
     assert wl._worker_wire("xiaomi") == "anthropic"
     assert wl._fallback_lane("xiaomi") == ("box", "box-1")
     assert wl._worker_wire("minimax-cn") == "anthropic"
+    assert wl._worker_wire("gemini") == "litellm"
+    assert wl._worker_wire("unknown-vendor") == "openai"
 
 
 def test_length_finish_retries_with_more_tokens(tmp_path, monkeypatch):
@@ -1885,3 +1889,117 @@ def test_length_finish_retries_with_more_tokens(tmp_path, monkeypatch):
     assert limits == [100, 200]
     assert out["failed"] is False
     assert out["tool_args"] == {"title": "ok"}
+
+
+def _gemini_litellm_config() -> str:
+    return (
+        "plugins:\n  entries:\n    MyMemory:\n      provider_capabilities:\n"
+        "        gemini:\n          wire: litellm\n          litellm_prefix: gemini\n"
+        "    memory-weekly:\n      provider: gemini\n      model: gemma-3\n"
+    )
+
+
+def _litellm_tool_response():
+    message = types.SimpleNamespace(
+        content="",
+        tool_calls=[
+            types.SimpleNamespace(
+                function=types.SimpleNamespace(
+                    name="submit",
+                    arguments='{"title": "from-gemini"}',
+                )
+            )
+        ],
+    )
+    choice = types.SimpleNamespace(message=message, finish_reason="tool_calls")
+    usage = types.SimpleNamespace(
+        prompt_tokens=4,
+        completion_tokens=3,
+        total_tokens=7,
+        prompt_tokens_details=types.SimpleNamespace(cached_tokens=0),
+        completion_tokens_details=types.SimpleNamespace(reasoning_tokens=0),
+    )
+    return types.SimpleNamespace(choices=[choice], usage=usage)
+
+
+def test_litellm_wire_parses_tool_args_and_prefixes_model(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("GEMINI_API_KEY", "gem-key")
+    monkeypatch.delenv("GEMINI_BASE_URL", raising=False)
+    monkeypatch.delenv("LITELLM_LOCAL_MODEL_COST_MAP", raising=False)
+    (tmp_path / "config.yaml").write_text(_gemini_litellm_config(), encoding="utf-8")
+    seen: dict = {}
+
+    def completion(**kwargs):
+        seen["kwargs"] = kwargs
+        return _litellm_tool_response()
+
+    fake = types.ModuleType("litellm")
+    fake.completion = completion
+    monkeypatch.setitem(sys.modules, "litellm", fake)
+    out = wl.run_worker_llm_oneshot(
+        "write",
+        plugin="memory-weekly",
+        purpose="ui_tighten",
+        force_tool_name="submit",
+        tool_schema={"name": "submit", "parameters": {"type": "object", "properties": {}}},
+    )
+    assert out["failed"] is False
+    assert out["tool_name"] == "submit"
+    assert out["tool_args"] == {"title": "from-gemini"}
+    assert seen["kwargs"]["model"] == "gemini/gemma-3"
+    assert seen["kwargs"]["api_key"] == "gem-key"
+    assert "api_base" not in seen["kwargs"]
+    assert "extra_body" not in seen["kwargs"]
+    assert os.environ.get("LITELLM_LOCAL_MODEL_COST_MAP") == "True"
+
+
+def test_litellm_wire_429_is_quota(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("GEMINI_API_KEY", "gem-key")
+    (tmp_path / "config.yaml").write_text(_gemini_litellm_config(), encoding="utf-8")
+
+    def completion(**_kwargs):
+        err = Exception("rate limit")
+        err.status_code = 429
+        raise err
+
+    fake = types.ModuleType("litellm")
+    fake.completion = completion
+    monkeypatch.setitem(sys.modules, "litellm", fake)
+    out = wl.run_worker_llm_oneshot(
+        "write",
+        plugin="memory-weekly",
+        purpose="ui_tighten",
+        force_tool_name="submit",
+        tool_schema={"name": "submit", "parameters": {"type": "object", "properties": {}}},
+    )
+    assert out["failed"] is True
+    assert out["llm_issue"] == "quota"
+
+
+def test_litellm_wire_missing_import_fails_closed(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("GEMINI_API_KEY", "gem-key")
+    (tmp_path / "config.yaml").write_text(_gemini_litellm_config(), encoding="utf-8")
+    sys.modules.pop("litellm", None)
+    import builtins
+
+    real_import = builtins.__import__
+
+    def guarded(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "litellm" or name.startswith("litellm."):
+            raise ImportError("litellm not installed")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded)
+    out = wl.run_worker_llm_oneshot(
+        "write",
+        plugin="memory-weekly",
+        purpose="ui_tighten",
+    )
+    assert out["failed"] is True
+    assert "litellm not installed" in out["final_response"]

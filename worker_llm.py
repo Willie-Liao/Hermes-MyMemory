@@ -1362,9 +1362,13 @@ def _provider_caps(provider: str) -> dict[str, str]:
 
 
 def _worker_wire(provider: str) -> str:
-    """OpenAI or Anthropic message shape for this provider."""
+    """Keep an unknown wire from silently pretending to be OpenAI.
+
+    openai and anthropic are native. litellm is opt-in and translated by LiteLLM
+    back into the same chat.completions reply shape. Anything else stays openai.
+    """
     wire = str(_provider_caps(provider).get("wire") or "openai").strip().lower()
-    return wire if wire in {"openai", "anthropic"} else "openai"
+    return wire if wire in {"openai", "anthropic", "litellm"} else "openai"
 
 
 def _fallback_lane(provider: str) -> tuple[str, str]:
@@ -1577,7 +1581,12 @@ def _oneshot_runtime(plugin_runtime: Mapping[str, str], provider: str) -> dict[s
 
 
 def _oneshot_credentials(runtime: Mapping[str, Any] | str) -> tuple[str, str]:
-    """Read API key from .env and base_url from YAML then env; empty URL fails closed as connection."""
+    """Read API key from .env and base_url from YAML then env.
+
+    OpenAI and Anthropic wires fail closed on an empty key or URL so a blank
+    host cannot be called. The litellm wire allows both empty because LiteLLM
+    reads its own provider env (GEMINI_API_KEY, AWS credentials).
+    """
     if isinstance(runtime, str):
         bag: dict[str, Any] = {"provider": runtime}
     else:
@@ -1586,12 +1595,13 @@ def _oneshot_credentials(runtime: Mapping[str, Any] | str) -> tuple[str, str]:
     derived_key, url_env = _provider_env_names(plug)
     key_env = str(bag.get("key_env") or "").strip() or derived_key
     api_key = (os.environ.get(key_env) or "").strip()
-    if not api_key:
+    litellm_wire = _worker_wire(plug) == "litellm"
+    if not api_key and not litellm_wire:
         raise ValueError(f"missing {key_env} for oneshot worker provider {plug}")
     env_url = (os.environ.get(url_env) or "").strip()
     yaml_url = str(bag.get("base_url") or "").strip()
     base_url = env_url or yaml_url
-    if not base_url:
+    if not base_url and not litellm_wire:
         raise ValueError(f"missing {url_env} for oneshot worker provider {plug}")
     return api_key, base_url
 
@@ -1749,13 +1759,44 @@ def _purpose_limits(purpose: str) -> tuple[float, int]:
     return 120.0, 0
 
 
-def _cached_openai_client(api_key: str, base_url: str, timeout: float, max_retries: int) -> Any:
-    """Reuse one client per endpoint so each worker call does not build a new pool."""
-    from openai import OpenAI
+def _cached_openai_client(
+    api_key: str,
+    base_url: str,
+    timeout: float,
+    max_retries: int,
+    wire: str = "openai",
+) -> Any:
+    """Reuse one client per endpoint so each worker call does not build a new pool.
 
-    key = (base_url, api_key, float(timeout), int(max_retries))
+    litellm is imported only on that wire so plugin load stays inside Hermes's
+    10s cap. Callers still use chat.completions.create.
+    """
+    key = (wire, base_url, api_key, float(timeout), int(max_retries))
     client = _openai_clients.get(key)
-    if client is None:
+    if client is not None:
+        return client
+    if wire == "litellm":
+        os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+        import functools
+        import types
+
+        import litellm
+
+        bound: dict[str, Any] = {
+            "timeout": timeout,
+            "num_retries": max_retries,
+        }
+        if api_key:
+            bound["api_key"] = api_key
+        if base_url:
+            bound["api_base"] = base_url
+        create = functools.partial(litellm.completion, **bound)
+        client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create))
+        )
+    else:
+        from openai import OpenAI
+
         kwargs: dict[str, Any] = {
             "api_key": api_key,
             "timeout": timeout,
@@ -1764,7 +1805,7 @@ def _cached_openai_client(api_key: str, base_url: str, timeout: float, max_retri
         if base_url:
             kwargs["base_url"] = base_url
         client = OpenAI(**kwargs)
-        _openai_clients[key] = client
+    _openai_clients[key] = client
     return client
 
 
@@ -1782,11 +1823,13 @@ def run_worker_llm_oneshot(
     timeout_s: float | None = None,
     max_retries: int | None = None,
 ) -> dict[str, Any]:
-    """One OpenAI-compatible chat.completions call. No nested Hermes AIAgent.
+    """One chat.completions call. No nested Hermes AIAgent.
 
-    Prefers the local LiteLLM proxy when enabled so MiniMax/Kimi URL suffixes
-    cannot 404; records ``duration_ms`` on the usage ledger so prefetch wall
-    time and digest LLM retries are not guessed from a single timeout.
+    OpenAI and Anthropic-compatible providers use the OpenAI SDK on the
+    provider /v1 surface. wire litellm calls litellm.completion so Gemini,
+    Bedrock, and Codex come back in that same reply shape. Records
+    ``duration_ms`` on the usage ledger so prefetch wall time and digest LLM
+    retries are not guessed from a single timeout.
     A schema miss gets one teach retry. Callers that already teach pass
     ``teach_schema=False``.
     """
@@ -1869,22 +1912,37 @@ def run_worker_llm_oneshot(
             except Exception as exc:
                 last_exc = exc
                 return _fail_record(exc, model)
+            wire = _worker_wire(provider)
+            if wire != "litellm":
+                try:
+                    base_url, _used_gw = resolve_worker_endpoint(
+                        base_url, "chat_completions"
+                    )
+                except Exception:
+                    pass
             try:
-                base_url, _used_gw = resolve_worker_endpoint(
-                    base_url, "chat_completions"
+                client = _cached_openai_client(
+                    api_key,
+                    base_url or "",
+                    limit_timeout,
+                    limit_retries,
+                    wire=wire,
                 )
-            except Exception:
-                pass
-            client = _cached_openai_client(
-                api_key, base_url or "", limit_timeout, limit_retries
-            )
+            except ImportError as exc:
+                last_exc = exc
+                return _fail_record(exc, model)
             sent = {
                 key: value
                 for key, value in create_kwargs.items()
                 if key not in {"extra_body", "reasoning_effort"}
             }
             sent["model"] = model
-            _apply_worker_thinking_off(sent, provider, model, base_url or "")
+            if wire == "litellm":
+                prefix = str(_provider_caps(provider).get("litellm_prefix") or "").strip()
+                if prefix and "/" not in sent["model"]:
+                    sent["model"] = f"{prefix}/{sent['model']}"
+            else:
+                _apply_worker_thinking_off(sent, provider, model, base_url or "")
             thinking_sent = "extra_body" in sent or "reasoning_effort" in sent
             resp = None
             try:
