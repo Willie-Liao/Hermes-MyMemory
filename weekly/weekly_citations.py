@@ -4,9 +4,8 @@ Non-LLM helper: ``related`` list (file order) is SoT for ``mem-…`` ids; bodies
 are rewritten to contiguous ``[1]…[N]`` across all events. Non-event blocks pass
 through unchanged.
 
-Typed (conflict / hypothesis / span) citations are assigned separately by
-``weekly_event_schema.assign_typed_citations`` and must never renumber the
-event legend produced here.
+Event legend numbers produced here are the citation numbers. A second pass
+that renumbered them would detach Brief markers from daily block ids.
 """
 
 from __future__ import annotations

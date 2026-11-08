@@ -119,6 +119,23 @@ def _unlock_staging(weekly, session_id: str = _DEFAULT_STAGING_SID) -> str:
     return session_id
 
 
+def _snooze_week(weekly, session_id: str = "") -> None:
+    """Snooze through weekly_actions on the same weekly module the test loaded.
+
+    A second import of weekly.py would ignore the test clock and write a
+    snooze the injection hook never sees.
+    """
+    actions_path = Path(__file__).with_name("weekly_actions.py")
+    spec = importlib.util.spec_from_file_location(
+        "memory_weekly_actions_presentation", actions_path
+    )
+    assert spec is not None and spec.loader is not None
+    actions = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(actions)
+    actions.weekly = weekly
+    actions.snooze_week(session_id=session_id)
+
+
 def test_pre_llm_injects_pending_review_and_snooze_blocks(tmp_path, monkeypatch):
     weekly = _load_weekly(tmp_path, monkeypatch)
     _write_weekly(tmp_path, "2026-W24.md")
@@ -126,19 +143,9 @@ def test_pre_llm_injects_pending_review_and_snooze_blocks(tmp_path, monkeypatch)
 
     injected = weekly.on_pre_llm_call(user_message="hello", is_first_turn=True, session_id="s-unlock")
     assert injected is not None
-    assert "Staging memory review for 2026-W24" in injected["context"]
+    assert "Additions:" in injected["context"]
 
-    weekly.on_post_tool_call(
-        tool_name="clarify",
-        args={"question": "Staging memory review for 2026-W24"},
-        result=json.dumps(
-            {
-                "question": "Staging memory review for 2026-W24",
-                "user_response": "2",
-            }
-        ),
-        status="success",
-    )
+    _snooze_week(weekly, session_id="s-unlock")
 
     assert weekly.on_pre_llm_call(user_message="hello again", is_first_turn=True, session_id="s-unlock") is None
 
@@ -184,54 +191,6 @@ def test_hermes_cron_session_env_skips_pending_week_inject(tmp_path, monkeypatch
     assert injected is None
 
 
-def test_skip_marks_week_completed(tmp_path, monkeypatch):
-    weekly = _load_weekly(tmp_path, monkeypatch)
-    _write_weekly(tmp_path, "2026-W24.md")
-    _unlock_staging(weekly)
-
-    weekly.on_pre_llm_call(user_message="hello", is_first_turn=True, session_id="s-unlock")
-    weekly.on_post_tool_call(
-        tool_name="clarify",
-        args={"question": "Staging memory review for 2026-W24"},
-        result=json.dumps(
-            {
-                "question": "Staging memory review for 2026-W24",
-                "user_response": "Skip this week",
-            }
-        ),
-        status="success",
-    )
-
-    injected = weekly.on_pre_llm_call(user_message="hello again", is_first_turn=True, session_id="s-unlock")
-    assert injected is None or "Staging review tidy is pending" not in (injected.get("context") or "")
-    closed = tmp_path / "memories" / "staging" / "weekly" / "2026-W24.md"
-    assert closed.exists()
-    assert "week_status: reviewed" in closed.read_text(encoding="utf-8") or True
-
-
-def test_close_week_aliases_mark_completed(tmp_path, monkeypatch):
-    weekly = _load_weekly(tmp_path, monkeypatch)
-    _write_weekly(tmp_path, "2026-W24.md")
-
-    for response in ("Close week", "完成了"):
-        state_path = tmp_path / "memories" / "staging" / ".weekly-state.json"
-        state_path.write_text(json.dumps({"presentation": {"completed_weeks": []}}), encoding="utf-8")
-
-        weekly.on_post_tool_call(
-            tool_name="clarify",
-            args={"question": "Staging memory review for 2026-W24"},
-            result=json.dumps(
-                {
-                    "question": "Staging memory review for 2026-W24",
-                    "user_response": response,
-                }
-            ),
-            status="success",
-        )
-        presentation = _presentation(tmp_path)
-        assert "2026-W24" in presentation["completed_weeks"]
-
-
 def test_weeks_status_rows_filesystem_pending_and_reviewed(tmp_path, monkeypatch):
     weekly = _load_weekly(tmp_path, monkeypatch)
     weekly_dir = tmp_path / "memories" / "staging" / "weekly"
@@ -273,67 +232,17 @@ def test_weeks_status_rows_includes_completed(tmp_path, monkeypatch):
     assert statuses["2026-W24"] == "pending"
 
 
-def test_build_presentation_context_uses_close_week_label(tmp_path, monkeypatch):
+def test_build_presentation_context_three_aspects(tmp_path, monkeypatch):
     weekly = _load_weekly(tmp_path, monkeypatch)
     path = _write_weekly(tmp_path, "2026-W24.md")
     context = weekly._build_presentation_context("2026-W24", path, force=False)
-    assert "Close week (mark complete)" in context
-    assert "After the walkthrough and recap" in context
-
-
-def _clarify(weekly, response: str) -> None:
-    weekly.on_post_tool_call(
-        tool_name="clarify",
-        args={"question": "Staging memory review for 2026-W24"},
-        result=json.dumps(
-            {
-                "question": "Staging memory review for 2026-W24",
-                "user_response": response,
-            }
-        ),
-        status="success",
-    )
-
-
-def test_review_now_opens_hot_promotion_window(tmp_path, monkeypatch):
-    weekly = _load_weekly(tmp_path, monkeypatch)
-    _write_weekly(tmp_path, "2026-W24.md")
-    _unlock_staging(weekly)
-
-    weekly.on_pre_llm_call(user_message="hello", is_first_turn=True, session_id="s-unlock")
-    _clarify(weekly, "Review proposed additions now")
-
-    presentation = _presentation(tmp_path)
-    assert presentation["hot_promotion_allowed"] is True
-    assert presentation.get("hot_promotion_until")
-
-
-def test_skip_clears_hot_promotion_window(tmp_path, monkeypatch):
-    weekly = _load_weekly(tmp_path, monkeypatch)
-    _write_weekly(tmp_path, "2026-W24.md")
-    _unlock_staging(weekly)
-
-    weekly.on_pre_llm_call(user_message="hello", is_first_turn=True, session_id="s-unlock")
-    _clarify(weekly, "Review proposed additions now")
-    _clarify(weekly, "Skip this week")
-
-    presentation = _presentation(tmp_path)
-    assert "hot_promotion_allowed" not in presentation
-    assert "hot_promotion_until" not in presentation
-
-
-def test_check_later_clears_hot_promotion_window(tmp_path, monkeypatch):
-    weekly = _load_weekly(tmp_path, monkeypatch)
-    _write_weekly(tmp_path, "2026-W24.md")
-    _unlock_staging(weekly)
-
-    weekly.on_pre_llm_call(user_message="hello", is_first_turn=True, session_id="s-unlock")
-    _clarify(weekly, "Review proposed additions now")
-    _clarify(weekly, "Check later")
-
-    presentation = _presentation(tmp_path)
-    assert "hot_promotion_allowed" not in presentation
-    assert "hot_promotion_until" not in presentation
+    assert "Additions:" in context
+    assert "Hypotheses:" in context
+    assert "Conflicts:" in context
+    assert "via: invalidates" in context
+    assert "clarify" not in context
+    folded = context.casefold()
+    assert "mark complete" not in folded
 
 
 def test_resumed_session_first_message_presents_pending_week(tmp_path, monkeypatch):
@@ -428,18 +337,7 @@ def test_snooze_replay_same_session(tmp_path, monkeypatch):
     )
     assert injected is not None
 
-    weekly.on_post_tool_call(
-        tool_name="clarify",
-        args={"question": "Staging memory review for 2026-W24"},
-        result=json.dumps(
-            {
-                "question": "Staging memory review for 2026-W24",
-                "user_response": "2",
-            }
-        ),
-        status="success",
-        session_id="s1",
-    )
+    _snooze_week(weekly, session_id="s1")
 
     now_val[0] = base + timedelta(minutes=30)
     assert (
@@ -476,17 +374,7 @@ def test_snooze_without_session_id_unchanged_after_expiry(tmp_path, monkeypatch)
 
     assert weekly.on_pre_llm_call(user_message="hello", is_first_turn=True, session_id="s-unlock") is not None
 
-    weekly.on_post_tool_call(
-        tool_name="clarify",
-        args={"question": "Staging memory review for 2026-W24"},
-        result=json.dumps(
-            {
-                "question": "Staging memory review for 2026-W24",
-                "user_response": "Check later",
-            }
-        ),
-        status="success",
-    )
+    _snooze_week(weekly)
 
     now_val[0] = base + timedelta(hours=2)
     assert (
@@ -625,42 +513,7 @@ What stood out was the grading handoff timing.
     return path
 
 
-def test_unlocked_brief_paste_soft_locate_no_distill(tmp_path, monkeypatch):
-    weekly = _load_weekly(tmp_path, monkeypatch)
-    _write_distill_brief_week(tmp_path)
-    _unlock_staging(weekly, "s-brief")
-
-    injected = weekly.on_pre_llm_call(
-        user_message="hello",
-        is_first_turn=True,
-        session_id="s-brief",
-    )
-    assert injected is not None
-    context = injected["context"]
-    ctx = context.casefold()
-    assert "Andrae feedback landed [1]" in context
-    assert "grading handoff timing" in context
-    assert "Brief [N]" in context or "[N] mem-" in context  # soft locate hint
-    assert "optional guidance" in ctx or "you may locate" in ctx
-    assert "hypothesis" in ctx or "conflict" in ctx
-    assert "distill" in ctx  # still says do not dump Distill YAML
-    assert "type: event" not in context
-    assert "## Distill" not in context
-
-    presentation = _presentation(tmp_path)
-    assert presentation.get("dig_in_active") is not True
-
-    cite_path = Path(__file__).with_name("weekly_cite.py")
-    cite_spec = importlib.util.spec_from_file_location(
-        "memory_weekly_cite_presentation_arm", cite_path
-    )
-    assert cite_spec is not None and cite_spec.loader is not None
-    cite = importlib.util.module_from_spec(cite_spec)
-    cite_spec.loader.exec_module(cite)
-    assert cite.get_dig_in() is None
-
-
-def test_legacy_week_without_brief_keeps_clarify_presentation(tmp_path, monkeypatch):
+def test_week_without_brief_gets_short_presentation(tmp_path, monkeypatch):
     weekly = _load_weekly(tmp_path, monkeypatch)
     _write_weekly(tmp_path, "2026-W24.md")
     _unlock_staging(weekly, "s-legacy")
@@ -671,7 +524,7 @@ def test_legacy_week_without_brief_keeps_clarify_presentation(tmp_path, monkeypa
         session_id="s-legacy",
     )
     assert injected is not None
-    assert "Close week (mark complete)" in injected["context"]
+    assert "Additions:" in injected["context"]
     presentation = _presentation(tmp_path)
     assert presentation.get("dig_in_active") is not True
 
@@ -762,28 +615,7 @@ def test_worker_prompt_skips_presentation_even_with_weekly_memory_substring(tmp_
     )
 
 
-def test_build_brief_paste_context_processed_brief_no_hashes(tmp_path, monkeypatch):
-    """Paste inject uses processed Brief (no # themes) with soft locate."""
-    weekly = _load_weekly(tmp_path, monkeypatch)
-    path = _write_weekly(tmp_path, "2026-W24.md")
-    raw = (
-        "### Events\n- Ship landed [1].\n\n"
-        "### Hypothesis\n- None.\n\n"
-        "### Conflict\n- None.\n\n"
-        "### Procedure\n- Follow up.\n"
-    )
-    out = weekly._build_brief_paste_context("2026-W24", path, raw, force=True)
-    ctx = out.casefold()
-    assert "as-is" not in out
-    assert "###" not in out
-    assert "Events" in out
-    assert "[1]" in out
-    assert "optional guidance" in ctx or "you may locate" in ctx
-    assert "Brief [N]" in out or "[N] mem-" in out
-    assert "Do not include Distill" in out or "no Distill" in out.lower() or "do not dump" in ctx
-
-
-def test_slash_unlock_then_brief_paste(tmp_path, monkeypatch):
+def test_unlock_then_short_presentation(tmp_path, monkeypatch):
     weekly = _load_weekly(tmp_path, monkeypatch)
     _write_distill_brief_week(tmp_path)
     _unlock_staging(weekly, session_id="s-yes")
@@ -794,8 +626,8 @@ def test_slash_unlock_then_brief_paste(tmp_path, monkeypatch):
         session_id="s-yes",
     )
     assert injected is not None
-    assert "Andrae feedback landed [1]" in injected["context"]
-    assert "processed Brief" in injected["context"]
+    assert "Additions:" in injected["context"]
+    assert "Do not drop Hypothesis" not in injected["context"]
 
     # Other session must not inherit unlock — no Brief.
     other = weekly.on_pre_llm_call(

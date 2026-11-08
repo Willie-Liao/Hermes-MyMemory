@@ -160,15 +160,9 @@ def test_presentation_complete_closed_mark_not_in_overdue_ask(tmp_path, monkeypa
     presentation["active_week"] = "2026-W28"
     weekly._save_state(state)
 
-    weekly.on_post_tool_call(
-        tool_name="clarify",
-        args={"question": "Staging memory review for 2026-W28"},
-        result={
-            "question": "Staging memory review for 2026-W28",
-            "user_response": "skip this week",
-        },
-        status="success",
-    )
+    actions = _load_actions()
+    actions.weekly = weekly
+    actions.skip_week()
 
     mark = weekly._load_state()["week_open_marks"]["2026-W28"]
     assert mark["status"] == "closed"

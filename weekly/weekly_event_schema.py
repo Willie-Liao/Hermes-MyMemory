@@ -743,15 +743,6 @@ def _is_section_title(stripped: str) -> bool:
     return _TITLE_ONLY_RE.fullmatch(stripped) is not None
 
 
-def assign_typed_citations(payload: WeeklyReviewPayload) -> WeeklyReviewPayload:
-    """Return the payload unchanged so a cite pass cannot drop Worker-1 summary.
-
-    Rebuilding the payload to number retired sections omitted summary and
-    emptied Chronicle. Event legend numbers are already assigned.
-    """
-    return payload
-
-
 def render_cite_map_section(payload: WeeklyReviewPayload) -> str:
     """Machine-readable event citation targets for UI / round-trip."""
     lines = [CITE_MAP_SECTION_TITLE]
@@ -775,7 +766,7 @@ def render_four_part_brief(week_key: str, payload: WeeklyReviewPayload) -> str:
 
 def render_weekly_review_brief(week_key: str, payload: WeeklyReviewPayload) -> str:
     """Render the date brief plus Cite map (Worker 2 / persistence body)."""
-    assigned = assign_typed_citations(payload)
+    assigned = payload
     if week_key and not assigned.week_key:
         assigned = replace(assigned, week_key=week_key)
     body = render_four_part_brief(week_key or assigned.week_key, assigned)

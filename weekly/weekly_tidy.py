@@ -1,4 +1,8 @@
-"""Weekly ledger parse, Brief-cite candidates, and reopen for closed weeks."""
+"""Weekly ledger parse, Brief-cite candidates, and reopen for closed weeks.
+
+Candidate rows come from Brief cites and daily event blocks. The old numbered
+addition / hypothesis / procedure sections are not a source anymore.
+"""
 
 from __future__ import annotations
 
@@ -37,26 +41,9 @@ from memory_staging import (
     weekly_staging_path,
 )
 
-_SECTION_HEADERS = (
-    (1, re.compile(r"^##\s*1\.\s*Proposed additions", re.IGNORECASE)),
-    (2, re.compile(r"^##\s*2\.\s*Hypotheses", re.IGNORECASE)),
-    (3, re.compile(r"^##\s*3\.\s*Reinforced procedures", re.IGNORECASE)),
-)
-_LEDGER_HEADER = re.compile(r"^##\s*8\.\s*Action ledger", re.IGNORECASE)
 _VALID_ACTIONS = frozenset({"promote", "discard", "skip"})
-_STRUCTURED_FIELD_KEYS = frozenset(
-    {"record_id", "block_ids", "target", "text", "valid_to", "reason"}
-)
-_SUBSECTION_HEADER_RE = re.compile(r"^###\s*(\d+\.\d+)", re.IGNORECASE)
-_PROSE_RECORD_RE = re.compile(r"^(F|H|P)(\d+)\.\s+(.+)$", re.IGNORECASE)
-_LEVEL_TWO_HEADER_RE = re.compile(r"^##(?!#)\s*")
 _DISTILL_HEADER_RE = re.compile(r"^##\s*Distill\s*$", re.IGNORECASE | re.MULTILINE)
 _LEVEL_TWO_ANYWHERE_RE = re.compile(r"^##(?!#)\s+", re.MULTILINE)
-# Distill related / sources may use dated or compact mem-ids.
-_MEM_ID_FIND_RE = re.compile(
-    r"\b(mem-(?:\d{4}-\d{2}-\d{2}|\d{8})-[\w-]+)\b",
-    re.IGNORECASE,
-)
 # Four-part Brief Cite map: "- [N] event mem-…"
 _FOUR_PART_CITE_MAP_EVENT_RE = re.compile(
     r"^-\s*\[(\d+)\]\s+event\s+(\S+)\s*$",
@@ -66,75 +53,6 @@ _CITE_MAP_SECTION_RE = re.compile(
     r"^Cite map\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
-_DISTILL_PROMOTE_TIERS = {
-    "hypothesis": "hypothesis",
-    "procedure": "procedure",
-}
-
-
-def _tier_for(subsection: str, section: int) -> str:
-    if subsection == "1.1":
-        return "proposed"
-    if subsection == "1.2":
-        return "not_proposed"
-    if section == 2:
-        return "hypothesis"
-    if section == 3:
-        return "procedure"
-    return ""
-
-
-def _parse_structured_fields(first_stripped: str, lines: list[str], start: int) -> tuple[dict[str, str], int]:
-    fields: dict[str, str] = {}
-    body = first_stripped[2:].strip()
-    if ":" in body:
-        key, _, val = body.partition(":")
-        fields[key.strip()] = val.strip()
-    idx = start + 1
-    while idx < len(lines):
-        raw = lines[idx]
-        if not raw or not raw[:1].isspace():
-            break
-        cont = raw.strip()
-        if not cont or cont.startswith("- "):
-            break
-        if ":" in cont:
-            key, _, val = cont.partition(":")
-            fields[key.strip()] = val.strip()
-        idx += 1
-    return fields, idx
-
-
-def _parse_indented_fields(lines: list[str], start: int) -> tuple[dict[str, str], int]:
-    fields: dict[str, str] = {}
-    idx = start + 1
-    while idx < len(lines):
-        raw = lines[idx]
-        if not raw or not raw[:1].isspace():
-            break
-        cont = raw.strip()
-        if cont and ":" in cont:
-            key, _, val = cont.partition(":")
-            fields[key.strip()] = val.strip()
-        idx += 1
-    return fields, idx
-
-
-def _block_id_from_fields(fields: dict[str, str]) -> str:
-    block_ids_raw = fields.get("block_ids", "")
-    block_match = BLOCK_ID_RE.search(block_ids_raw)
-    if block_match:
-        return block_match.group(1)
-    for value in fields.values():
-        match = BLOCK_ID_RE.search(value)
-        if match:
-            return match.group(1)
-    return ""
-
-
-def _slugify(label: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", label.strip().casefold()).strip("-")
-    return slug[:48] or "record"
 
 
 def _weekly_file_for_tidy(week_key: str) -> Path | None:
@@ -195,204 +113,6 @@ def _iter_distill_yaml_blocks(region: str) -> list[tuple[dict[str, Any], str]]:
             continue
         blocks.append((parsed, "\n".join(body_lines).strip()))
     return blocks
-
-
-def _first_mem_id(*values: Any) -> str:
-    for value in values:
-        if value is None:
-            continue
-        if isinstance(value, list):
-            for item in value:
-                found = _first_mem_id(item)
-                if found:
-                    return found
-            continue
-        text = str(value).strip()
-        if not text:
-            continue
-        match = _MEM_ID_FIND_RE.search(text)
-        if match:
-            return match.group(1)
-        match = BLOCK_ID_RE.search(text)
-        if match:
-            return match.group(1)
-    return ""
-
-
-def _parse_distill_yaml_candidates(text: str) -> list[dict[str, str]]:
-    """Map Distill YAML blocks to tidy candidates (hypothesis/procedure only)."""
-    region = _distill_region(text)
-    if not region:
-        return []
-
-    candidates: list[dict[str, str]] = []
-    for fm, body in _iter_distill_yaml_blocks(region):
-        block_type = str(fm.get("type") or "").strip().casefold()
-        tier = _DISTILL_PROMOTE_TIERS.get(block_type)
-        if not tier:
-            # event / conflict / unknown — not auto-promote candidates
-            continue
-        record_id = str(fm.get("id") or "").strip()
-        if not record_id:
-            continue
-        block_id = _first_mem_id(fm.get("related"), fm.get("sources"))
-        proposed = (body or "").strip()
-        label = proposed.splitlines()[0].strip() if proposed else record_id
-        entry: dict[str, str] = {
-            "record_id": record_id,
-            "label": label or record_id,
-            "section": "Distill",
-            "block_id": block_id,
-            "source": "Distill",
-            "tier": tier,
-        }
-        if proposed:
-            entry["proposed_text"] = proposed
-        valid_to = str(fm.get("valid_to") or "").strip()
-        if valid_to:
-            entry["valid_to"] = valid_to
-        candidates.append(entry)
-    return candidates
-
-
-def parse_weekly_candidates(week_key: str) -> list[dict[str, str]]:
-    """Extract actionable rows from Distill YAML or legacy §1–§3."""
-    path = _weekly_file_for_tidy(week_key)
-    if path is None or not path.exists():
-        return []
-
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return []
-
-    if _DISTILL_HEADER_RE.search(text):
-        return _parse_distill_yaml_candidates(text)
-
-    lines = text.splitlines()
-    current_section = 0
-    current_subsection = ""
-    candidates: list[dict[str, str]] = []
-    current_label = ""
-
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-        if _LEDGER_HEADER.match(stripped):
-            break
-        matched_section = False
-        for section_no, pattern in _SECTION_HEADERS:
-            if pattern.match(stripped):
-                current_section = section_no
-                current_subsection = ""
-                current_label = ""
-                matched_section = True
-                break
-        if _LEVEL_TWO_HEADER_RE.match(stripped):
-            if not matched_section:
-                current_section = 0
-                current_subsection = ""
-                current_label = ""
-            i += 1
-            continue
-        if stripped.startswith("### ") and current_section == 1:
-            sub_match = _SUBSECTION_HEADER_RE.match(stripped)
-            if sub_match:
-                current_subsection = sub_match.group(1)
-            current_label = stripped[4:].strip()
-            i += 1
-            continue
-        if not current_section:
-            i += 1
-            continue
-        prose_match = _PROSE_RECORD_RE.match(stripped)
-        if prose_match:
-            prefix, number, body = prose_match.groups()
-            prefix = prefix.upper()
-            is_expected_record = (
-                (prefix == "F" and current_section == 1 and current_subsection == "1.1")
-                or (prefix == "H" and current_section == 2)
-                or (prefix == "P" and current_section == 3)
-            )
-            if not is_expected_record:
-                i += 1
-                continue
-            fields, i = _parse_indented_fields(lines, i)
-            record_id = f"{prefix}{number}"
-            block_id = _block_id_from_fields(fields)
-            source = f"§{current_subsection}" if current_subsection else f"§{current_section}"
-            entry = {
-                "record_id": record_id,
-                "label": body,
-                "section": f"§{current_section}",
-                "block_id": block_id,
-                "source": source,
-                "proposed_text": body,
-            }
-            tier = _tier_for(current_subsection, current_section)
-            if tier:
-                entry["tier"] = tier
-            if fields.get("target"):
-                entry["hot_target"] = fields["target"]
-            if fields.get("valid_to"):
-                entry["valid_to"] = fields["valid_to"]
-            candidates.append(entry)
-            continue
-        if not stripped.startswith("- "):
-            i += 1
-            continue
-        body = stripped[2:].strip()
-        if body.casefold().startswith("defer"):
-            i += 1
-            continue
-
-        structured_key = body.split(":", 1)[0].strip().casefold()
-        if structured_key in _STRUCTURED_FIELD_KEYS:
-            fields, i = _parse_structured_fields(stripped, lines, i)
-            block_id = _block_id_from_fields(fields)
-            record_id = fields.get("record_id", "").strip() or block_id or _slugify(current_label or body)
-            label = fields.get("record_id", "").strip() or current_label or record_id
-            tier = _tier_for(current_subsection, current_section)
-            entry: dict[str, str] = {
-                "record_id": record_id,
-                "label": label,
-                "section": f"§{current_section}",
-                "block_id": block_id,
-                "source": f"§{current_section}"
-                + (f".{current_subsection}" if current_subsection else ""),
-            }
-            if tier:
-                entry["tier"] = tier
-            if fields.get("text"):
-                entry["proposed_text"] = fields["text"]
-            if fields.get("target"):
-                entry["hot_target"] = fields["target"]
-            if fields.get("valid_to"):
-                entry["valid_to"] = fields["valid_to"]
-            candidates.append(entry)
-            continue
-
-        block_match = BLOCK_ID_RE.search(body)
-        block_id = block_match.group(1) if block_match else ""
-        label = current_label or body.split(":", 1)[0].strip()
-        if not label:
-            label = body[:80]
-        record_id = block_id or _slugify(label)
-        entry = {
-            "record_id": record_id,
-            "label": label,
-            "section": f"§{current_section}",
-            "block_id": block_id,
-            "source": f"§{current_section}",
-        }
-        tier = _tier_for(current_subsection, current_section)
-        if tier:
-            entry["tier"] = tier
-        candidates.append(entry)
-        i += 1
-
-    return candidates
 
 
 def _load_sibling_module(module_name: str, filename: str) -> Any:

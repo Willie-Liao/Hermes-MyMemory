@@ -1474,42 +1474,6 @@ def _day_briefs_from_events(
     ]
 
 
-def _procedure_blocks_from_claims(
-    day_briefs: Sequence[DayBrief],
-    event_ids: Sequence[str],
-) -> list[dict[str, Any]]:
-    """Lift procedure claim sentences into Distill procedure blocks (legacy bridge)."""
-    if not event_ids:
-        return []
-    anchor = event_ids[0]
-    blocks: list[dict[str, Any]] = []
-    for day_brief in day_briefs:
-        for idx, sentence in enumerate(day_brief.sentences, start=1):
-            if sentence.kind != "procedure":
-                continue
-            related: list[Any] = [anchor]
-            if sentence.cite is not None:
-                # keep cite number only as body marker; related needs event id
-                pass
-            body = sentence.text.strip()
-            if sentence.cite is not None and f"[{sentence.cite}]" not in body:
-                body = f"{body} [{sentence.cite}]"
-            blocks.append(
-                {
-                    "frontmatter": {
-                        "id": f"w-proc-{day_brief.day.isoformat()}-{idx}",
-                        "type": "procedure",
-                        "confidence": "medium",
-                        "status": "candidate",
-                        "sources": [f"daily:{day_brief.day.isoformat()}"],
-                        "related": related,
-                    },
-                    "body": body,
-                }
-            )
-    return blocks
-
-
 def _daily_block_ids_for_days(
     by_day: dict[date, Path],
     days: Sequence[date],

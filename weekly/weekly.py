@@ -58,11 +58,9 @@ from worker_llm import run_worker_llm, run_worker_llm_tools
 from worker_llm import worker_llm_scope as _weekly_worker_llm_scope
 
 try:
-    from .weekly_brief_validate import format_brief_for_chat
     from . import hot_health
     from .weekly_cite import (
         clear_dig_in,
-        extract_brief,
         find_staging_block,
         get_dig_in,
         pop_staging_recall,
@@ -71,7 +69,6 @@ try:
     )
     from .weekly_event_schema import (
         WeeklyReviewPayload,
-        assign_typed_citations,
         known_week_mem_ids,
         _merge_sunday_evening_payload,
     )
@@ -82,11 +79,9 @@ try:
     )
     from . import weekly_json
 except ImportError:
-    from weekly_brief_validate import format_brief_for_chat  # type: ignore[no-redef]
     import hot_health  # type: ignore[no-redef]
     from weekly_cite import (  # type: ignore[no-redef]
         clear_dig_in,
-        extract_brief,
         find_staging_block,
         get_dig_in,
         pop_staging_recall,
@@ -95,7 +90,6 @@ except ImportError:
     )
     from weekly_event_schema import (  # type: ignore[no-redef]
         WeeklyReviewPayload,
-        assign_typed_citations,
         known_week_mem_ids,
         _merge_sunday_evening_payload,
     )
@@ -130,25 +124,10 @@ WEEKLY_ERROR_MARKERS = (
     "max retries",
 )
 SNOOZE_SECONDS = 3600
-# How long "Review proposed additions now" keeps the hot-promotion
-# window open so approved §-entries can be written via the memory tool.
+# How long a manual gate keeps hot promotion open so approved entries
+# can be written via the memory tool.
 HOT_PROMOTION_SECONDS = 7200
 WEEK_KEY_RE = re.compile(r"^(?P<year>\d{4})-W(?P<week>\d{2})$")
-CHECK_LATER_RESPONSES = ("2", "check later", "later", "稍后", "等一下")
-COMPLETE_WEEK_RESPONSES = (
-    "3",
-    "skip this week",
-    "skip week",
-    "skip",  # legacy; gated by WEEKLY_REVIEW_QUESTION on clarify
-    "close week",
-    "mark complete",
-    "review finished",
-    "完成了",
-    "本周完成",
-    "关闭本周",
-)
-SKIP_RESPONSES = COMPLETE_WEEK_RESPONSES  # backward-compat alias
-WEEKLY_REVIEW_QUESTION = "Staging memory review"
 # Slash /weekly update has no session_id from Hermes; bind on first chat turn.
 SLASH_STAGING_SESSION = "__slash__"
 WEEKLY_ACTION_EDIT = "Edit"
@@ -1166,17 +1145,8 @@ def _generate_weekly_content(
         cross_day_thread=w1.cross_day_thread or payload.cross_day_thread,
         entities=w1.entities or payload.entities,
     )
-    assigned = assign_typed_citations(payload)
-    assigned = replace(
-        assigned,
-        cross_day_thread=payload.cross_day_thread,
-        intra_day_thread=payload.intra_day_thread,
-        entities=payload.entities,
-        week_key=week_key,
-        summary=payload.summary,
-    )
-    _last_weekly_payload = assigned
-    return weekly_json.dump_yaml(assigned)
+    _last_weekly_payload = payload
+    return weekly_json.dump_yaml(payload)
 
 
 def _run_weekly(reason: str) -> None:
@@ -1308,70 +1278,26 @@ def _parse_clarify_result(result: Any) -> dict[str, Any]:
     return {}
 
 
-def _read_week_brief(path: Path) -> str:
-    try:
-        md = path.read_text(encoding="utf-8")
-    except OSError:
-        return ""
-    return extract_brief(md).strip()
-
-
-def _build_brief_paste_context(
-    week_key: str,
-    path: Path,
-    brief: str,
-    *,
-    force: bool,
-) -> str:
-    reason = (
-        "The user explicitly asked for weekly memory approval."
-        if force
-        else "A weekly memory review is pending presentation."
-    )
-    processed = format_brief_for_chat(brief)
-    return (
-        f"{reason}\n\n"
-        f"Paste the following processed Brief to the user (plain theme titles "
-        f"Events, Hypothesis, Conflict, Procedure — no # theme markers). "
-        f"Do not drop Hypothesis or Conflict. Do not include Distill YAML or "
-        f"frontmatter.\n\n"
-        f"{processed}\n\n"
-        f"Week key: `{week_key}`\n"
-        f"Staging review file: `{path}`\n\n"
-        "When the user asks for more detail on a Brief item, you may locate "
-        "evidence via: Brief [N] → Distill related \"[N] mem-…\" → daily "
-        "staging block body (and sources / session if needed). Do not dump "
-        "Distill YAML or frontmatter. Do not invent session content. This is "
-        "optional guidance — not a required tool pipeline."
-    )
-
-
 def _build_presentation_context(week_key: str, path: Path, *, force: bool) -> str:
+    """Point the model at the YAML week file so it cannot invent the old section headings.
+
+    The file has summary, threads, and outcomes. Asking for sections that are
+    not in the schema would make the model invent them.
+    """
     reason = (
-        "The user explicitly asked for staging memory approval."
+        "The user asked for the weekly memory review."
         if force
-        else "A staging memory review is pending presentation."
+        else "A weekly memory review is pending."
     )
     return (
         f"{reason}\n\n"
-        f"Staging review file: `{path}`\n"
-        f"Week key: `{week_key}`\n\n"
-        "Before answering the user's current request, read the staging review file "
-        "and briefly present the review for approval. Summarize Proposed additions, "
-        "Hypotheses awaiting confirmation, and Conflicts. Then call the `clarify` "
-        "tool with this exact question and choices:\n\n"
-        f"Question: {WEEKLY_REVIEW_QUESTION} for {week_key}\n"
-        "Choices:\n"
-        "- Review proposed additions now\n"
-        "- Check later (1 hour)\n"
-        "- Close week (mark complete)\n\n"
-        "If the user chooses Review proposed additions now, walk the proposed items "
-        "with them one at a time. The hot-promotion window is open for "
-        "this review: once the user approves an exact compact §-entry, write it with "
-        "the `memory` tool — it lands directly in MEMORY.md / USER.md. Never promote "
-        "hypotheses without explicit confirmation. Do not run the weekly worker again.\n"
-        "After the walkthrough and recap, call the same staging clarify again to close "
-        "the week, or the user may run `/weekly close`."
+        f"Weekly file: `{path}` (week `{week_key}`)\n\n"
+        "Before answering the user, read that file and send one very concise message "
+        "with three lines (skip any line that has nothing):\n"
+        "- Additions: settled facts or outcomes (`summary`, threads with an `outcome`).\n"
+        "- Hypotheses: open threads with no `outcome`.\n"
+        "- Conflicts: steps with `via: invalidates` (a later step overriding an earlier one).\n"
+        "Do not paste the file. Then answer the user's request."
     )
 
 
@@ -1912,7 +1838,7 @@ def on_pre_llm_call(
     pending = _weeks_needing_presentation(state=state)
 
     if pending:
-        # Auto-present Brief/legacy clarify only after unlock (slash / UI).
+        # Auto-present the week summary only after unlock (slash / UI).
         if not staging_unlocked:
             return None
 
@@ -1949,18 +1875,6 @@ def on_pre_llm_call(
             presentation.pop("snooze_session_id", None)
             presentation.pop("snooze_week", None)
         _mark_session_auto_presented(session_id, key, presentation)
-        brief = _read_week_brief(path)
-        if brief:
-            _save_state(state)
-            _log(
-                f"weekly brief paste injected {key} force={force} "
-                f"session={session_id}"
-            )
-            return {
-                "context": _build_brief_paste_context(
-                    key, path, brief, force=force
-                )
-            }
         _save_state(state)
         _log(f"weekly presentation injected {key} force={force} session={session_id}")
         return {"context": _build_presentation_context(key, path, force=force)}
@@ -1983,6 +1897,11 @@ def on_post_tool_call(
     session_id: str = "",
     **_: Any,
 ) -> None:
+    """Keep staging Edit / Delete / Recall answers; the week summary no longer asks clarify.
+
+    Leaving the weekly-review question branch here would snooze or close a week
+    from a prompt the model is no longer told to send.
+    """
     if tool_name != "clarify" or status == "error":
         return
 
@@ -1994,46 +1913,11 @@ def on_post_tool_call(
         return
 
     # Staging Edit / Delete / Something else… / Recall (Task 4b + 5).
-    if _handle_staging_action_clarify(
+    _handle_staging_action_clarify(
         question=question,
         response=response,
         session_id=session_id,
-    ):
-        return
-
-    if WEEKLY_REVIEW_QUESTION.casefold() not in question.casefold():
-        return
-
-    state = _load_state()
-    presentation = _presentation_state(state)
-    active_week = _week_key_from_text(question) or str(presentation.get("active_week") or "")
-    if _parse_week_key(active_week) is None:
-        return
-
-    if _response_matches(response, CHECK_LATER_RESPONSES):
-        until = _record_presentation_snooze(
-            presentation, active_week, session_id=session_id
-        )
-        _save_state(state)
-        _log(
-            f"weekly presentation snoozed {active_week} until {until} "
-            f"session={session_id}"
-        )
-        return
-
-    if _response_matches(response, COMPLETE_WEEK_RESPONSES):
-        _finalize_week_close(presentation, active_week, state=state)
-        _save_state(state)
-        _log(f"weekly presentation completed {active_week}")
-        return
-
-    if _response_matches(response, ("review proposed additions now", "review now", "1")):
-        now = _now()
-        presentation["active_week"] = active_week
-        _clear_snooze_tracking(presentation)
-        _open_hot_promotion_window(presentation, now=now)
-        _save_state(state)
-        _log(f"weekly presentation review started {active_week} (hot promotion window open)")
+    )
 
 
 def run_async(reason: str) -> None:

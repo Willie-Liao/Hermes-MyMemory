@@ -23,7 +23,6 @@ from memory_staging import (  # noqa: E402
     hermes_local_now,
     patch_daily_block_status,
     tidy_decisions_path,
-    weekly_staging_dir,
 )
 
 MARKER = "<!-- hermes-memory-review:v1 -->"
@@ -42,10 +41,6 @@ def _hermes_home() -> Path:
     if raw:
         return Path(raw).expanduser()
     return Path.home() / ".hermes"
-
-
-def weekly_html_path(hermes_home: Path, week_key: str) -> Path:
-    return weekly_staging_dir(hermes_home) / f"{week_key}.html"
 
 
 def daily_html_path(hermes_home: Path, date_str: str) -> Path:
@@ -438,93 +433,12 @@ def _render_daily_body(view: dict[str, Any]) -> str:
     return f"<h2>Daily candidates</h2>{''.join(cards) or '<p class=\"meta\">No blocks.</p>'}"
 
 
-def _load_weekly_tidy() -> Any:
-    import importlib.util
-
-    tidy_path = _plugins_root / "weekly" / "weekly_tidy.py"
-    spec = importlib.util.spec_from_file_location("memory_weekly_tidy_html", tidy_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("weekly_tidy.py not loadable")
-    weekly_tidy = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(weekly_tidy)
-    return weekly_tidy
-
-
-def build_weekly_payload(week_key: str, *, hermes_home: Path | None = None) -> dict[str, Any]:
-    home = hermes_home or _hermes_home()
-    weekly_tidy = _load_weekly_tidy()
-    candidates = weekly_tidy.parse_weekly_candidates(week_key)
-    remember = []
-    for cand in candidates:
-        remember.append(
-            {
-                "record_id": cand.get("record_id") or "",
-                "block_id": cand.get("block_id") or "",
-                "label": cand.get("label") or "",
-                "section": cand.get("section") or "",
-                "text": cand.get("label") or "",
-                "type": "",
-            }
-        )
-    story: list[str] = []
-    needs: list[str] = []
-    md_path = _weekly_md_path(home, week_key)
-    if md_path and md_path.exists():
-        story, needs = _extract_story_needs(md_path.read_text(encoding="utf-8"))
-
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "mode": "weekly",
-        "id": week_key,
-        "generated_at": hermes_local_now().isoformat(),
-        "status": "open",
-        "view": {"story": story[:5], "needs": needs[:5], "remember": remember[:20]},
-        "decisions": [],
-    }
-
-
-def _weekly_md_path(home: Path, week_key: str) -> Path | None:
-    from memory_staging import parse_week_key, resolve_weekly_path
-
-    if parse_week_key(week_key) is None:
-        return None
-    return resolve_weekly_path(home, week_key)
-
-
-def _extract_story_needs(text: str) -> tuple[list[str], list[str]]:
-    story: list[str] = []
-    needs: list[str] = []
-    section = ""
-    for line in text.splitlines():
-        stripped = line.strip()
-        if re.match(r"^##\s*0\.\s*Scope", stripped, re.I):
-            section = "scope"
-            continue
-        if re.match(r"^##\s*2\.\s*Hypotheses", stripped, re.I):
-            section = "hyp"
-            continue
-        if re.match(r"^##\s*4\.\s*Conflicts", stripped, re.I):
-            section = "conflict"
-            continue
-        if stripped.startswith("## "):
-            section = ""
-            continue
-        if not stripped.startswith("- "):
-            if section == "scope" and stripped and not stripped.startswith("#"):
-                story.append(stripped)
-            continue
-        body = stripped[2:].strip()
-        if section in ("hyp", "conflict"):
-            cf = body.casefold()
-            if "no other hypothesis" in cf or "no conflicts" in cf or "none this week" in cf:
-                continue
-            needs.append(body)
-        elif section == "scope":
-            story.append(body)
-    return story, needs
-
-
 def build_daily_payload(date_str: str, *, hermes_home: Path | None = None) -> dict[str, Any]:
+    """Read daily staging blocks so the review page can approve them without a week file.
+
+    Weekly HTML no longer builds a payload from numbered sections. Daily confirm
+    still needs these blocks.
+    """
     home = hermes_home or _hermes_home()
     path = daily_staging_path(home, date_str)
     blocks: list[dict[str, Any]] = []
@@ -571,17 +485,6 @@ def _load_digest() -> Any:
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
-
-
-def write_weekly_html(week_key: str, *, hermes_home: Path | None = None) -> Path | None:
-    home = hermes_home or _hermes_home()
-    if _weekly_md_path(home, week_key) is None:
-        return None
-    payload = build_weekly_payload(week_key, hermes_home=home)
-    path = weekly_html_path(home, week_key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render_review_html(payload), encoding="utf-8")
-    return path
 
 
 def write_daily_html(date_str: str, *, hermes_home: Path | None = None) -> Path | None:

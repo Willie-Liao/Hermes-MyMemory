@@ -120,11 +120,12 @@ echo ""
 rsync -a "${RSYNC_EXCLUDES[@]}" "$PACK_ROOT/" "$DEST/"
 # AppleDouble sidecars match *.py and are not UTF-8, so source scans fail after a Mac pack.
 find "$DEST" -name '._*' -delete
-# rsync does not delete a probe or debug script left on the gateway.
+# rsync does not delete a probe, debug script, or retired module left on the gateway.
 purge_retired_mymemory_harnesses() {
   local dest="$1"
   find "$dest/weekly" -maxdepth 1 -type f -name 'debug_*.py' -delete 2>/dev/null || true
   find "$dest" -type f -name 'probe_*.py' -delete 2>/dev/null || true
+  rm -f "$dest/weekly/weekly_brief_validate.py" "$dest/weekly/test_weekly_brief_validate.py"
 }
 purge_retired_mymemory_harnesses "$DEST"
 echo "installed: plugins/MyMemory"

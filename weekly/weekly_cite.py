@@ -105,16 +105,6 @@ def extract_brief(md: str) -> str:
     return rest.strip()
 
 
-def load_typed_cite_map(md: str) -> dict[int, dict[str, str]]:
-    """Non-event cite kinds are retired, so the map stays empty.
-
-    Event citations stay in ``load_cite_map``. Returning entries here would
-    reattach conflict, hypothesis, or span ids from old cite maps.
-    """
-    del md
-    return {}
-
-
 def _frontmatter_blocks(content: str) -> list[tuple[int, str, str]]:
     """Parse ``---`` YAML + body blocks (digest-compatible shape)."""
     lines = content.splitlines()

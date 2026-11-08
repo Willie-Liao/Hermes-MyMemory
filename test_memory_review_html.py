@@ -20,13 +20,6 @@ def _load(tmp_path, monkeypatch):
     return _mod("review_html", "memory_review_html.py")
 
 
-def _write_reviewed(tmp_path: Path, week: str, body: str) -> Path:
-    path = tmp_path / "memories" / "staging" / "weekly" / f"{week} reviewed.md"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(body, encoding="utf-8")
-    return path
-
-
 def test_render_contains_marker_and_payload_no_localhost(tmp_path, monkeypatch):
     html = _load(tmp_path, monkeypatch)
     payload = {
@@ -90,16 +83,16 @@ def test_confirm_payload_roundtrip_and_apply_weekly(tmp_path, monkeypatch):
         "sources: [session s1]\n---\nbody b\n",
         encoding="utf-8",
     )
-    _write_reviewed(
-        tmp_path,
-        "2026-W24",
-        "## 1. Proposed additions\n\n- mem-20260616-b: promote me\n",
-    )
-
-    path = review.write_weekly_html("2026-W24")
-    assert path is not None and path.exists()
-    page = path.read_text(encoding="utf-8")
-    payload = review.parse_review_html(page)
+    payload = {
+        "schema_version": 1,
+        "mode": "weekly",
+        "id": "2026-W24",
+        "generated_at": "2026-07-11T00:00:00+00:00",
+        "status": "open",
+        "view": {"story": [], "needs": [], "remember": []},
+        "decisions": [],
+    }
+    page = review.render_review_html(payload)
     payload["status"] = "confirmed"
     payload["decisions"] = [
         {
@@ -124,14 +117,17 @@ def test_confirm_payload_roundtrip_and_apply_weekly(tmp_path, monkeypatch):
 
 def test_unconfirmed_does_not_apply(tmp_path, monkeypatch):
     review = _load(tmp_path, monkeypatch)
-    _write_reviewed(
-        tmp_path,
-        "2026-W24",
-        "## 1. Proposed additions\n\n- mem-20260616-x: skip\n",
+    page = review.render_review_html(
+        {
+            "schema_version": 1,
+            "mode": "weekly",
+            "id": "2026-W24",
+            "status": "open",
+            "view": {"story": [], "needs": [], "remember": []},
+            "decisions": [],
+        }
     )
-    path = review.write_weekly_html("2026-W24")
-    assert path is not None
-    out = review.apply_review_html(path)
+    out = review.apply_review_html_text(page)
     assert out["outcome"] == "not_confirmed"
 
 

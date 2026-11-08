@@ -34,17 +34,6 @@ def _load_cite():
     return mod
 
 
-def _load_citations():
-    path = Path(__file__).with_name("weekly_citations.py")
-    spec = importlib.util.spec_from_file_location(
-        "memory_weekly_citations_four", path
-    )
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
 def _golden_payload(schema):
     """Monday 2026-07-27 .. Sunday matching fixtures/weekly_four_part_w31.md."""
     days = []
@@ -172,7 +161,7 @@ def test_old_brief_skips_retired_headings_and_keeps_days():
 
 def test_render_parse_round_trip_matches_golden():
     schema = _load_schema()
-    payload = schema.assign_typed_citations(_golden_payload(schema))
+    payload = _golden_payload(schema)
     rendered = schema.render_weekly_review_brief("2026-W31", payload)
     golden = (FIXTURES / "weekly_four_part_w31.md").read_text(encoding="utf-8")
     assert rendered.strip() == golden.strip()
@@ -183,36 +172,6 @@ def test_render_parse_round_trip_matches_golden():
     assert "Conflict\n" not in rendered
     assert "Hypothesis\n" not in rendered
     assert "Possible overdue report" not in rendered
-
-
-def test_assign_typed_citations_does_not_renumber_events():
-    schema = _load_schema()
-    citations = _load_citations()
-    payload = _golden_payload(schema)
-    before = dict(payload.legend)
-    assigned = schema.assign_typed_citations(payload)
-    assert assigned.summary == payload.summary
-    assert assigned.legend == before
-    assert assigned is payload
-    assert citations.next_cite_after_legend(before) == 6
-
-
-def test_assign_typed_citations_keeps_summary():
-    """Cite rebuild must not drop Worker-1 summary or Chronicle dumps []."""
-    schema = _load_schema()
-    payload = schema.WeeklyReviewPayload(
-        days=(),
-        week_key="2026-W35",
-        summary=(
-            schema.WeeklySummaryItem(
-                text="Monday wrap-up only",
-                weekdays=("Monday",),
-            ),
-        ),
-    )
-    assigned = schema.assign_typed_citations(payload)
-    assert assigned.summary == payload.summary
-    assert assigned.summary[0].text == "Monday wrap-up only"
 
 
 def test_empty_day_constant_exact():
@@ -248,7 +207,6 @@ def test_extract_brief_returns_four_part_from_wrapped_document():
     assert "Weekly Brief — 2026-W31" in brief
     assert "Monday — 2026-07-27 · Events [1] [2]" in brief
     assert "## Action ledger" not in brief
-    assert cite.load_typed_cite_map(md) == {}
 
 
 def test_empty_week_renders_days_and_cite_map():
