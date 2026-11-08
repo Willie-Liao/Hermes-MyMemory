@@ -1,11 +1,24 @@
 [project]
 name = "hermes-plugin-mymemory"
-version = "1.1.35"
+version = "1.1.37"
 requires-python = ">=3.11"
+# Gateway runtime. Recall, the 01:00 cache, monthly guidance,
+# and the digest Phase-2 gate share one GTE int8 session.
+# Opt-in worker wire: a dry-run against the Hermes venv (2026-11-07) left
+# openai 2.24.0 and pydantic 2.13.4 in place.
 dependencies = [
-    "PyYAML>=6.0",
+    "onnxruntime",
+    "tokenizers",
+    "numpy",
+    "pyyaml",
+    "openai",
+    "ruamel.yaml",
     "json5>=0.9",
+    "litellm==1.108.2",
 ]
+
+[dependency-groups]
+test = ["pytest", "tiktoken"]
 
 [build-system]
 requires = ["hatchling"]

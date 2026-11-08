@@ -14,8 +14,8 @@ import importlib.util
 import json
 import logging
 import os
-import shlex
 import shutil
+import tomllib
 import subprocess
 import sys
 import threading
@@ -26,7 +26,7 @@ logger = logging.getLogger("mymemory.runtime")
 
 # The file is the list. distribution() reads metadata only: importing
 # tokenizers here would load the GTE stack into the gateway before register().
-_REQUIREMENTS_FILE = Path(__file__).resolve().parent / "requirements.txt"
+_REQUIREMENTS_FILE = Path(__file__).resolve().parent / "pyproject.toml"
 _LOAD_STARTED = time.perf_counter()
 # Tests join this so a background install can be asserted without blocking load.
 _DEPS_INSTALL_THREAD: threading.Thread | None = None
@@ -35,6 +35,8 @@ _DEPS_INSTALL_THREAD: threading.Thread | None = None
 def ensure_runtime_deps(*, background: bool = True) -> None:
     """A missing wheel must not spend Hermes's 10s plugin-load deadline.
 
+    The list is pyproject.toml project.dependencies, the same file install.sh
+    and the cloud push install, so a second requirements file cannot drift.
     distribution() only reads metadata. The pip install and gateway restart
     run on a daemon thread so register() still happens this process; the next
     process imports the new packages. Tests pass background=False. Skip under
@@ -46,24 +48,28 @@ def ensure_runtime_deps(*, background: bool = True) -> None:
         return
     req = _REQUIREMENTS_FILE
     if not req.is_file():
-        logger.error("MyMemory requirements.txt missing at %s", req)
+        logger.error("MyMemory pyproject.toml missing at %s", req)
         return
     try:
         text = req.read_text(encoding="utf-8")
     except OSError as exc:
-        logger.error("MyMemory requirements.txt unreadable at %s: %s", req, exc)
+        logger.error("MyMemory pyproject.toml unreadable at %s: %s", req, exc)
+        return
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        logger.error("MyMemory pyproject.toml invalid at %s: %s", req, exc)
+        return
+    deps = data.get("project", {}).get("dependencies") if isinstance(data, dict) else None
+    if not isinstance(deps, list):
+        logger.error("MyMemory pyproject.toml has no project.dependencies at %s", req)
         return
     started = time.perf_counter()
-    index_args: list[str] = []
     wanted: list[tuple[str, str]] = []
-    for raw in text.splitlines():
-        line = raw.split("#", 1)[0].strip()
-        if not line:
+    for raw in deps:
+        if not isinstance(raw, str):
             continue
-        if line.startswith("-"):
-            index_args.extend(shlex.split(line))
-            continue
-        spec, _, marker = line.partition(";")
+        spec, _, marker = raw.partition(";")
         spec = spec.strip()
         marker = marker.strip()
         if not spec:
@@ -138,7 +144,7 @@ def ensure_runtime_deps(*, background: bool = True) -> None:
             ", ".join(missing_names),
         )
         if importlib.util.find_spec("pip") is not None:
-            cmd = [sys.executable, "-m", "pip", "install", *index_args, *missing_specs]
+            cmd = [sys.executable, "-m", "pip", "install", *missing_specs]
         else:
             uv = shutil.which("uv")
             if uv is None:
@@ -157,7 +163,6 @@ def ensure_runtime_deps(*, background: bool = True) -> None:
                 "install",
                 "--python",
                 sys.executable,
-                *index_args,
                 *missing_specs,
             ]
         try:

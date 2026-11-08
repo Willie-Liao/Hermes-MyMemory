@@ -318,25 +318,40 @@ ensure_gte_int8() {
   echo "ok: GTE int8 installed under ${GTE_CACHE_DIR}"
 }
 echo ""
-echo "MyMemory runtime (requirements.txt)…"
+echo "MyMemory runtime (pyproject.toml)…"
 if RUNTIME_PY="$(resolve_runtime_python)"; then
   export HERMES_PYTHON="$RUNTIME_PY"
   if [[ "${MYMEMORY_SKIP_GTE:-}" != "1" ]]; then
     # openai: worker oneshot imports it lazily. ruamel.yaml: Hermes hermes_yaml imports it.
-    req="${PACK_ROOT}/requirements.txt"
-    py_pkgs=(-r "$req")
+    pyproject="${PACK_ROOT}/pyproject.toml"
+    read_specs() {
+      # bash 3.2 has no mapfile. One spec per line, including environment markers.
+      local key="$1"
+      "$RUNTIME_PY" -c 'import tomllib,sys
+data=tomllib.load(open(sys.argv[1],"rb"))
+group, _, name = sys.argv[2].partition(".")
+table=data[group] if name else data["project"]
+rows=table[name] if name else table["dependencies"]
+print(*rows, sep="\n")' "$pyproject" "$key"
+    }
+    py_pkgs=()
+    while IFS= read -r spec; do
+      [[ -n "$spec" ]] && py_pkgs+=("$spec")
+    done < <(read_specs dependencies)
     if [[ "$SKIP_TESTS" != true ]]; then
       # recall/test_layer_compression.py imports tiktoken at collection time.
-      py_pkgs+=(pytest tiktoken)
+      while IFS= read -r spec; do
+        [[ -n "$spec" ]] && py_pkgs+=("$spec")
+      done < <(read_specs dependency-groups.test)
     fi
-    echo "Installing ${req} into ${RUNTIME_PY}"
+    echo "Installing ${pyproject} into ${RUNTIME_PY}"
     install_python_packages "$RUNTIME_PY" "${py_pkgs[@]}"
     echo "ok: ${RUNTIME_PY} can import onnxruntime, tokenizers, numpy"
   else
     echo "note: skipping runtime requirements (MYMEMORY_SKIP_GTE=1)"
   fi
 else
-  echo "note: no Python found — pip install -r requirements.txt into the Hermes interpreter" >&2
+  echo "note: no Python found — install project.dependencies from pyproject.toml into the Hermes interpreter" >&2
   RUNTIME_PY=""
 fi
 echo ""

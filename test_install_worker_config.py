@@ -136,10 +136,12 @@ def test_custom_worker_env_upserts_key_only(tmp_path: Path):
 
 
 def test_minimax_worker_without_base_url_uses_public_default(tmp_path: Path):
-    """A non-TTY MiniMax pin with no base URL must still finish.
+    """    A non-TTY MiniMax pin with no base URL must still finish.
 
     The documented cloud command sets provider and model only. A fresh Hermes
     chat provider is not minimax-cn, and aborting there blocks install.sh.
+    A MINIMAX_CN_BASE_URL left in the process by another test would hide that
+    public default, so this case clears it.
     """
     home = tmp_path / "hermes"
     home.mkdir()
@@ -163,6 +165,7 @@ def test_minimax_worker_without_base_url_uses_public_default(tmp_path: Path):
     env["MYMEMORY_WORKER_PROVIDER"] = "minimax-cn"
     env["MYMEMORY_WORKER_MODEL"] = "MiniMax-M2.5"
     env.pop("MYMEMORY_WORKER_BASE_URL", None)
+    env.pop("MINIMAX_CN_BASE_URL", None)
     proc = subprocess.run(
         ["bash", str(INSTALL_SH), "--skip-tests"],
         check=False,

@@ -1,4 +1,4 @@
-"""Plugin load must install missing requirements.txt lines without importing them.
+"""Plugin load must install missing pyproject.toml dependencies without importing them.
 
 A Hermes update creates an environment without these packages. Collection
 sets PYTEST_CURRENT_TEST so importing MyMemory does not run pip.
@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -24,13 +25,6 @@ if str(_HERE.parent) not in sys.path:
 import MyMemory  # noqa: E402
 
 
-_EXTRA_URL = "https://pypi.org/simple"
-_FILE_BODY = """--extra-index-url https://pypi.org/simple
-onnxruntime
-pyyaml
-pkg-mac; sys_platform == "darwin"
-pkg-other; sys_platform != "darwin"
-"""
 _HEAVY_IMPORTS = {
     "tokenizers",
     "yaml",
@@ -57,16 +51,22 @@ def _applicable_names() -> list[str]:
     return ["onnxruntime", "pyyaml", marked]
 
 
-def _index_args() -> list[str]:
-    return [
-        "--extra-index-url",
-        _EXTRA_URL,
+def _deps_toml(*extra: str) -> str:
+    """Stand-in pyproject so a test does not install the shipped runtime list."""
+    rows = [
+        "onnxruntime",
+        "pyyaml",
+        'pkg-mac; sys_platform == "darwin"',
+        'pkg-other; sys_platform != "darwin"',
+        *extra,
     ]
+    body = ",\n".join(f"    {json.dumps(row)}" for row in rows)
+    return f"[project]\ndependencies = [\n{body},\n]\n"
 
 
-def _point_requirements(monkeypatch, tmp_path, body: str = _FILE_BODY) -> None:
-    path = tmp_path / "requirements.txt"
-    path.write_text(body, encoding="utf-8")
+def _point_requirements(monkeypatch, tmp_path, body: str | None = None) -> None:
+    path = tmp_path / "pyproject.toml"
+    path.write_text(_deps_toml() if body is None else body, encoding="utf-8")
     monkeypatch.setattr(MyMemory, "_REQUIREMENTS_FILE", path)
 
 
@@ -113,7 +113,7 @@ def test_missing_imports_install_requirements_with_pip(monkeypatch, tmp_path):
 
     monkeypatch.setattr(MyMemory.subprocess, "Popen", fail_popen)
     MyMemory.ensure_runtime_deps(background=False)
-    assert calls == [[sys.executable, "-m", "pip", "install", *_index_args(), *_applicable_specs()]]
+    assert calls == [[sys.executable, "-m", "pip", "install", *_applicable_specs()]]
 
 
 def test_present_imports_do_not_spawn_pip(monkeypatch, tmp_path, caplog):
@@ -146,10 +146,10 @@ def test_present_imports_do_not_spawn_pip(monkeypatch, tmp_path, caplog):
 
 
 def test_only_extra_requirement_line_is_installed(monkeypatch, tmp_path):
-    """A line added to requirements.txt is installed when the others are already present."""
+    """A dependency added to pyproject.toml is installed when the others are already present."""
     _allow_install(monkeypatch)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    _point_requirements(monkeypatch, tmp_path, _FILE_BODY + "openai\n")
+    _point_requirements(monkeypatch, tmp_path, _deps_toml("openai"))
     _pip_present(monkeypatch)
     _distribution(monkeypatch, {"openai"})
     calls: list[list[str]] = []
@@ -165,7 +165,7 @@ def test_only_extra_requirement_line_is_installed(monkeypatch, tmp_path):
 
     monkeypatch.setattr(MyMemory.subprocess, "Popen", fail_popen)
     MyMemory.ensure_runtime_deps(background=False)
-    assert calls == [[sys.executable, "-m", "pip", "install", *_index_args(), "openai"]]
+    assert calls == [[sys.executable, "-m", "pip", "install", "openai"]]
 
 
 def _notice_path(home: Path) -> Path:
@@ -173,7 +173,7 @@ def _notice_path(home: Path) -> Path:
 
 
 def test_json5_missing_is_installed_from_real_requirements(monkeypatch, tmp_path):
-    """A fresh Hermes env must install the shipped json5 line, not a stand-in file."""
+    """A fresh Hermes env must install the shipped json5 spec, not a stand-in file."""
     _allow_install(monkeypatch)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _pip_present(monkeypatch)
@@ -212,12 +212,12 @@ def test_json5_missing_is_installed_from_real_requirements(monkeypatch, tmp_path
 
 def test_litellm_is_a_pinned_requirement():
     """The opt-in wire installs from the shipped file, pinned so Hermes deps stay put."""
-    text = (_HERE / "requirements.txt").read_text(encoding="utf-8")
-    pins = []
-    for raw in text.splitlines():
-        line = raw.split("#", 1)[0].strip()
-        if line.startswith("litellm=="):
-            pins.append(line)
+    data = tomllib.loads((_HERE / "pyproject.toml").read_text(encoding="utf-8"))
+    pins = [
+        spec
+        for spec in data["project"]["dependencies"]
+        if isinstance(spec, str) and spec.startswith("litellm==")
+    ]
     assert pins == ["litellm==1.108.2"]
 
 
@@ -266,7 +266,7 @@ def test_background_install_returns_before_pip_finishes(monkeypatch, tmp_path):
     assert thread.daemon is True
     thread.join(5)
     assert not thread.is_alive()
-    assert calls == [[sys.executable, "-m", "pip", "install", *_index_args(), *_applicable_specs()]]
+    assert calls == [[sys.executable, "-m", "pip", "install", *_applicable_specs()]]
     assert spawned == [["/usr/bin/hermes", "gateway", "restart"]]
 
 
@@ -325,7 +325,7 @@ def test_missing_imports_restart_gateway_after_install(monkeypatch, tmp_path):
 
     MyMemory.ensure_runtime_deps(background=False)
 
-    assert calls == [[sys.executable, "-m", "pip", "install", *_index_args(), *_applicable_specs()]]
+    assert calls == [[sys.executable, "-m", "pip", "install", *_applicable_specs()]]
     assert len(spawned) == 1
     cmd, kwargs = spawned[0]
     assert cmd == ["/usr/bin/hermes", "gateway", "restart"]
