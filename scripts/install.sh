@@ -1,0 +1,814 @@
+#!/usr/bin/env bash
+# Copy this MyMemory provider into HERMES_HOME/plugins/MyMemory and enable it.
+# Does not copy pack config.yaml, .env, memories, or any live Hermes home.
+# Does drop comparison_with_last_month.summary on month files already in that home.
+# After enable, pins digest/weekly/monthly workers (not chat model:) from TTY
+# choice or the current chat provider — so install does not leave Xiaomi YAML
+# as a required hand-merge.
+
+set -euo pipefail
+
+SKIP_TESTS=false
+FORCE=false
+SKIP_CONFIG=false
+WORKER_FROM_CHAT=false
+for arg in "$@"; do
+  case "$arg" in
+    --skip-tests) SKIP_TESTS=true ;;
+    --force) FORCE=true ;;
+    --skip-config) SKIP_CONFIG=true ;;
+    --worker-from-chat) WORKER_FROM_CHAT=true ;;
+    -h|--help)
+      echo "Usage: install.sh [--skip-tests] [--force] [--skip-config] [--worker-from-chat]"
+      echo "  --skip-tests         Copy plugin and restart without pytest"
+      echo "  --force              Continue even if tests fail"
+      echo "  --skip-config        Do not write worker lanes or .env"
+      echo "  --worker-from-chat   Pin MyMemory workers to config.yaml model: (no TTY menu)"
+      exit 0
+      ;;
+  esac
+done
+
+if [[ "${MYMEMORY_SKIP_CONFIG:-}" == "1" ]]; then
+  SKIP_CONFIG=true
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PACK_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+resolve_hermes_home() {
+  local target="${HERMES_HOME:-$HOME/.hermes}"
+  if [[ -L "$target" ]]; then
+    target="$(cd "$target" && pwd -P)"
+  elif [[ -d "$target" ]]; then
+    target="$(cd "$target" && pwd)"
+  fi
+  echo "$target"
+}
+
+resolve_hermes_bin() {
+  if [[ -n "${HERMES_BIN:-}" ]] && [[ -x "${HERMES_BIN}" ]]; then
+    echo "${HERMES_BIN}"
+    return 0
+  fi
+  if command -v hermes >/dev/null 2>&1; then
+    command -v hermes
+    return 0
+  fi
+  if [[ -x "${HOME}/.local/bin/hermes" ]]; then
+    echo "${HOME}/.local/bin/hermes"
+    return 0
+  fi
+  return 1
+}
+
+HERMES_HOME="$(resolve_hermes_home)"
+HERMES_BIN="$(resolve_hermes_bin)" || {
+  echo "error: hermes CLI not found (install Hermes first or set HERMES_BIN)" >&2
+  exit 1
+}
+
+if [[ ! -f "$PACK_ROOT/plugin.yaml" ]]; then
+  echo "error: plugin.yaml missing — this pack is not a MyMemory provider root" >&2
+  exit 1
+fi
+
+if [[ ! -d "$HERMES_HOME" ]]; then
+  echo "error: HERMES_HOME not found at $HERMES_HOME" >&2
+  echo "hint: install Hermes, then set HERMES_HOME" >&2
+  exit 1
+fi
+
+DEST="$HERMES_HOME/plugins/MyMemory"
+mkdir -p "$DEST" "$HERMES_HOME/agent-hooks"
+
+RSYNC_EXCLUDES=(
+  --exclude '.git/'
+  # Local GitNexus index. Copying it into the plugin fills a small test disk.
+  --exclude '.gitnexus/'
+  --exclude '.claude/'
+  --exclude '.test-hermes-home/'
+  --exclude 'probe_*.py'
+  --exclude 'Install MyMemory.command'
+  --exclude '__pycache__/'
+  --exclude '.pytest_cache/'
+  --exclude 'node_modules/'
+  --exclude 'weekly/ui/dist/'
+  --exclude '.vite/'
+  --exclude '*.pyc'
+  --exclude '.DS_Store'
+  --exclude '._*'
+  --exclude '.env'
+  --exclude '.env.*'
+  --exclude '!.env.example'
+  --exclude 'auth.json'
+  --exclude 'config.yaml'
+  --exclude 'memories/'
+  --exclude 'logs/'
+  --exclude 'sessions/'
+  --exclude '*.db'
+  --exclude '*.db-*'
+)
+
+echo "MyMemory — Hermes memory provider installer"
+echo "==========================================="
+echo "Pack: $PACK_ROOT"
+echo "HERMES_HOME: $HERMES_HOME"
+echo "hermes CLI: $HERMES_BIN"
+echo ""
+
+rsync -a "${RSYNC_EXCLUDES[@]}" "$PACK_ROOT/" "$DEST/"
+# AppleDouble sidecars match *.py and are not UTF-8, so source scans fail after a Mac pack.
+find "$DEST" -name '._*' -delete
+# rsync does not delete a probe, debug script, or retired module left on the gateway.
+purge_retired_mymemory_harnesses() {
+  local dest="$1"
+  find "$dest/weekly" -maxdepth 1 -type f -name 'debug_*.py' -delete 2>/dev/null || true
+  find "$dest" -type f -name 'probe_*.py' -delete 2>/dev/null || true
+  rm -f "$dest/weekly/weekly_brief_validate.py" "$dest/weekly/test_weekly_brief_validate.py"
+}
+purge_retired_mymemory_harnesses "$DEST"
+echo "installed: plugins/MyMemory"
+
+install_memory_health_skill() {
+  # Hermes loads skills from $HERMES_HOME/skills, not from the plugin tree.
+  # The script stores this skill so an install.sh that arrived without the
+  # rest of the MyMemory tree still writes memory-health-once.
+  local src="$PACK_ROOT/skills/memory-health-once/SKILL.md"
+  local dest="$HERMES_HOME/skills/memory-health-once"
+  mkdir -p "$dest"
+  if [[ -f "$src" ]]; then
+    cp "$src" "$dest/SKILL.md"
+  else
+    cat > "$dest/SKILL.md" <<'MEMORY_HEALTH_SKILL'
+---
+name: memory-health-once
+description: Use for any MyMemory check, like config or one part.
+version: 0.1.0
+author: Hermes Agent
+license: MIT
+platforms: [linux, macos]
+metadata:
+  hermes:
+    tags: [memory, digest, phase2, weekly, logs]
+---
+
+# Memory health once
+
+Check the memory pipeline from the log of a real session. Quote a line that is already there. Run an aspect only when that real log has no line for it, and run it once.
+
+## When to use
+
+Load this skill for any MyMemory check. That includes the whole pipeline or one part, such as prefetch, recall, expand, the config memory provider, the plugin manager, the batch, the clock, phase 2, wrap daily, or wrap weekly.
+
+- After a memory change, before claiming that part works.
+
+Do not create a virtual Hermes home, a fixture database, or a fake session. Do not look for `health-fixture`, `this is test`, or any other stand-in transcript. Do not copy `state.db`. Do not start a second run of an aspect that already has a real log line.
+
+## Log first
+
+Read `~/.hermes/logs/memory-digest.log` and `~/.hermes/logs/memory-weekly.log`. Search the phrases below in lines from a real session. A hit means that aspect already ran: quote the line and skip it. `Failed to export span batch code: 404` is a trace export, not a failed check.
+
+| Aspect | A real session shows it ran |
+|---|---|
+| Prefetch, recall, expand | a digest or agent line for prefetch, recall, and expand on this live session |
+| Config memory provider | `memory.provider` in `~/.hermes/config.yaml`. Quote the value. `""` means the provider is unset |
+| Manager | PluginManager has loaded MyMemory and registered `/digest`, `/weekly`, and `/monthly` |
+| Daily, weekly, monthly shape | the `digest-phase1` lane from `/digest` on the past day, and the `weekly` and `monthly` lanes from a real slash, using the provider and model already in config |
+| Batch | one extract of a real session in the digest log |
+| Clock, phase 2 | the live clock's noon merge, with the card count above the 25-card gate |
+| Wrap daily | `## Day wrap-up` in the real daily file for the last day |
+| Wrap weekly | the real week file for the last week |
+
+## Run once if the line is missing
+
+Stay on the live home and the live session. Use the provider and model already set in config for that lane. Do not swap in another model.
+
+- Config: if `memory.provider` is `""`, set it to `MyMemory` and restart the gateway. Quote the value after the restart. Leave every other config key as it is.
+- Manager: check once that PluginManager lists MyMemory and the three slash commands. Quote that result. Recall still follows `memory.provider`.
+- Shape: run the real slash once, in the background, and read the log it writes. Daily is `/digest` for the past day (`/digest YYYY-MM-DD`). Weekly is `/weekly update`. Monthly is `/monthly update`.
+- Batch or clock: create one cron that runs the real digest batch or the digest clock on the live session. Let that cron run once, then quote the new log line.
+- Wrap daily: open the real file for the last day, `memories/staging/daily/YYYY-MM-DD.md`, and quote `## Day wrap-up` when it is there. Do not write a test daily file.
+- Wrap weekly: open the real file for the last week, `memories/staging/weekly/YYYY-Www.md`, and quote what it contains. Do not write a test week file.
+
+After the single run, read the log again and quote the new line. For a wrap, quote the real file. Do not retry a failure in the same turn.
+MEMORY_HEALTH_SKILL
+  fi
+  echo "installed: skills/memory-health-once"
+}
+install_memory_health_skill
+
+resolve_runtime_python() {
+  # Packages in an older venv are invisible to the gateway when it loads a
+  # different environment under installs/.../environments/.../venv. Prefer that
+  # mapped interpreter, then the official tools Python, and only then a venv.
+  if [[ -n "${HERMES_PYTHON:-}" && -x "${HERMES_PYTHON}" ]]; then
+    echo "${HERMES_PYTHON}"
+    return 0
+  fi
+  local pid="" sp="" venv=""
+  if command -v systemctl >/dev/null 2>&1; then
+    pid="$(systemctl show -p MainPID --value hermes-gateway 2>/dev/null || true)"
+  fi
+  if [[ -n "$pid" && "$pid" != "0" && -r "/proc/${pid}/maps" ]]; then
+    sp="$(grep -oE '/[^[:space:]]+/installs/[^[:space:]]+/environments/[^[:space:]]+/venv/lib/python[0-9.]+/site-packages' "/proc/${pid}/maps" | head -n 1 || true)"
+    if [[ -z "$sp" ]]; then
+      sp="$(grep -oE '/[^[:space:]]+/venv/lib/python[0-9.]+/site-packages' "/proc/${pid}/maps" | head -n 1 || true)"
+    fi
+    if [[ -n "$sp" ]]; then
+      venv="${sp%/lib/python*/site-packages}"
+      if [[ -x "${venv}/bin/python" ]]; then
+        echo "${venv}/bin/python"
+        return 0
+      fi
+    fi
+  fi
+  local tools_py
+  tools_py="$(ls -1d "${HERMES_HOME}"/tools/python-*/bin/python3 2>/dev/null | tail -n 1 || true)"
+  if [[ -n "$tools_py" && -x "$tools_py" ]]; then
+    echo "$tools_py"
+    return 0
+  fi
+  local candidate
+  for candidate in \
+    "${HERMES_HOME}/hermes-agent/venv/bin/python" \
+    "${HERMES_HOME}/hermes-agent/venv/bin/python3" \
+    "${HERMES_HOME}/hermes-agent/.venv/bin/python" \
+    "${HERMES_HOME}/hermes-agent/.venv/bin/python3" \
+    "${HERMES_HOME}/.venv/bin/python" \
+    "/usr/local/lib/hermes-agent/venv/bin/python" \
+    "/usr/local/lib/hermes-agent/venv/bin/python3" \
+    "/usr/local/lib/hermes-agent/.venv/bin/python" \
+    "/usr/local/lib/hermes-agent/.venv/bin/python3"
+  do
+    if [[ -x "$candidate" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+    return 0
+  fi
+  return 1
+}
+
+install_python_packages() {
+  # Standalone Hermes pythons often have no pip module. uv is what the
+  # official installer already used to build that interpreter.
+  local py="$1"
+  shift
+  if "$py" -m pip --version >/dev/null 2>&1; then
+    "$py" -m pip install --quiet "$@"
+    return
+  fi
+  local uv_bin=""
+  if command -v uv >/dev/null 2>&1; then
+    uv_bin="$(command -v uv)"
+  elif [[ -x "${HOME}/.local/bin/uv" ]]; then
+    uv_bin="${HOME}/.local/bin/uv"
+  fi
+  if [[ -n "$uv_bin" ]]; then
+    "$uv_bin" pip install --python "$py" "$@"
+    return
+  fi
+  echo "error: ${py} has no pip and uv is not installed" >&2
+  return 1
+}
+
+# Pre-exported GTE int8 (no PyTorch on the gateway). GitHub Release, not git.
+GTE_CACHE_DIR="${MYMEMORY_GTE_CACHE:-$HOME/.cache/mymemory/gte-multilingual-base-int8}"
+GTE_BUNDLE_URL="${MYMEMORY_GTE_BUNDLE_URL:-https://github.com/Willie-Liao/Hermes-MyMemory/releases/download/gte-int8-v1/gte-multilingual-base-int8.tar.gz}"
+
+gte_int8_ready() {
+  local dir="$1"
+  [[ -f "${dir}/model_int8.onnx" || -f "${dir}/model.onnx" ]] && [[ -f "${dir}/tokenizer.json" ]]
+}
+
+ensure_gte_int8() {
+  # Download Channel 4 weights so double-click install does not need a Mac PyTorch export.
+  if [[ "${MYMEMORY_SKIP_GTE:-}" == "1" ]]; then
+    echo "note: skipping GTE int8 (MYMEMORY_SKIP_GTE=1)"
+    return 0
+  fi
+  if [[ -n "${MYMEMORY_GTE_ONNX:-}" && -f "${MYMEMORY_GTE_ONNX}" ]]; then
+    echo "ok: MYMEMORY_GTE_ONNX=${MYMEMORY_GTE_ONNX}"
+    return 0
+  fi
+  mkdir -p "$GTE_CACHE_DIR"
+  if gte_int8_ready "$GTE_CACHE_DIR"; then
+    echo "ok: GTE int8 weights under ${GTE_CACHE_DIR}"
+    return 0
+  fi
+  echo "Downloading Channel 4 GTE int8 (one-time, ~200 MB) from:"
+  echo "  ${GTE_BUNDLE_URL}"
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/mymemory-gte.XXXXXX.tar.gz")"
+  if ! curl -fL --retry 5 --retry-delay 2 -o "$tmp" "$GTE_BUNDLE_URL"; then
+    rm -f "$tmp"
+    echo "error: GTE int8 download failed. Set MYMEMORY_GTE_BUNDLE_URL or export locally:" >&2
+    echo "  python -c \"from recall.embed import export_gte_int8; export_gte_int8()\"" >&2
+    return 1
+  fi
+  tar -xzf "$tmp" -C "$GTE_CACHE_DIR"
+  rm -f "$tmp"
+  if ! gte_int8_ready "$GTE_CACHE_DIR"; then
+    echo "error: GTE bundle unpacked but model_int8.onnx or tokenizer.json is missing" >&2
+    return 1
+  fi
+  echo "ok: GTE int8 installed under ${GTE_CACHE_DIR}"
+}
+echo ""
+echo "MyMemory runtime (pyproject.toml)…"
+if RUNTIME_PY="$(resolve_runtime_python)"; then
+  export HERMES_PYTHON="$RUNTIME_PY"
+  if [[ "${MYMEMORY_SKIP_GTE:-}" != "1" ]]; then
+    # openai: worker oneshot imports it lazily. ruamel.yaml: Hermes hermes_yaml imports it.
+    pyproject="${PACK_ROOT}/pyproject.toml"
+    read_specs() {
+      # bash 3.2 has no mapfile. One spec per line, including environment markers.
+      local key="$1"
+      "$RUNTIME_PY" -c 'import tomllib,sys
+data=tomllib.load(open(sys.argv[1],"rb"))
+group, _, name = sys.argv[2].partition(".")
+table=data[group] if name else data["project"]
+rows=table[name] if name else table["dependencies"]
+print(*rows, sep="\n")' "$pyproject" "$key"
+    }
+    py_pkgs=()
+    while IFS= read -r spec; do
+      [[ -n "$spec" ]] && py_pkgs+=("$spec")
+    done < <(read_specs dependencies)
+    if [[ "$SKIP_TESTS" != true ]]; then
+      # recall/test_layer_compression.py imports tiktoken at collection time.
+      while IFS= read -r spec; do
+        [[ -n "$spec" ]] && py_pkgs+=("$spec")
+      done < <(read_specs dependency-groups.test)
+    fi
+    echo "Installing ${pyproject} into ${RUNTIME_PY}"
+    install_python_packages "$RUNTIME_PY" "${py_pkgs[@]}"
+    echo "ok: ${RUNTIME_PY} can import onnxruntime, tokenizers, numpy"
+  else
+    echo "note: skipping runtime requirements (MYMEMORY_SKIP_GTE=1)"
+  fi
+else
+  echo "note: no Python found — install project.dependencies from pyproject.toml into the Hermes interpreter" >&2
+  RUNTIME_PY=""
+fi
+echo ""
+echo "Channel 4 GTE int8 weights…"
+ensure_gte_int8
+
+drop_retired_comparison_summary() {
+  local py="${RUNTIME_PY:-}"
+  if [[ -z "$py" ]]; then
+    if command -v python3 >/dev/null 2>&1; then
+      py="$(command -v python3)"
+    else
+      echo "note: no Python — left comparison summary keys in place" >&2
+      return 0
+    fi
+  fi
+  "$py" - "$HERMES_HOME" "$DEST" <<'PY'
+"""Drop the retired comparison paragraph on month files already in this home."""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+home = Path(sys.argv[1])
+dest = Path(sys.argv[2])
+sys.path.insert(0, str(dest / "monthly"))
+from monthly_writer import drop_retired_comparison_summary
+
+folder = home / "memories" / "staging" / "monthly"
+if not folder.is_dir():
+    print(f"note: no month files under {folder}")
+    raise SystemExit(0)
+changed = 0
+for path in sorted(folder.glob("*.md")):
+    raw = path.read_text(encoding="utf-8")
+    cleaned = drop_retired_comparison_summary(raw)
+    if cleaned == raw:
+        continue
+    path.write_text(cleaned, encoding="utf-8")
+    changed += 1
+    print(f"dropped comparison summary: {path.name}")
+if changed == 0:
+    print("ok: month files have no comparison summary key")
+else:
+    print(f"ok: dropped comparison summary in {changed} month file(s)")
+PY
+}
+
+echo ""
+echo "Month files (drop retired comparison summary)…"
+drop_retired_comparison_summary
+
+if [[ -f "$PACK_ROOT/examples/agent-hooks/block-hermes-root-junk.sh" ]]; then
+  cp -p "$PACK_ROOT/examples/agent-hooks/block-hermes-root-junk.sh" \
+    "$HERMES_HOME/agent-hooks/block-hermes-root-junk.sh"
+  chmod +x "$HERMES_HOME/agent-hooks/block-hermes-root-junk.sh"
+  echo "installed: agent-hooks/block-hermes-root-junk.sh"
+fi
+
+echo ""
+echo "Enabling MyMemory…"
+if "${HERMES_BIN}" plugins enable MyMemory --no-allow-tool-override 2>/dev/null; then
+  echo "enabled: MyMemory"
+else
+  echo "note: enable skipped or already enabled — add MyMemory to plugins.enabled in config.yaml"
+fi
+
+# Pin workers in the live Hermes config. Chat model: stays untouched.
+apply_mymemory_workers() {
+  local py="${RUNTIME_PY:-}"
+  if [[ -z "$py" ]]; then
+    if command -v python3 >/dev/null 2>&1; then
+      py="$(command -v python3)"
+    else
+      echo "note: no Python — skip worker config; see README.md for YAML shape" >&2
+      return 0
+    fi
+  fi
+
+  local detect
+  detect="$("$py" - "$HERMES_HOME" <<'PY'
+"""Read chat model: and whether the matching .env key exists (never print secrets)."""
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+home = Path(sys.argv[1])
+cfg_path = home / "config.yaml"
+env_path = home / ".env"
+
+
+def provider_env_names(provider: str) -> tuple[str, str]:
+    plug = str(provider or "").strip().lower() or "xiaomi"
+    if plug == "kimi-coding":
+        return ("KIMI_API_KEY", "KIMI_BASE_URL")
+    prefix = plug.replace("-", "_").upper()
+    return f"{prefix}_API_KEY", f"{prefix}_BASE_URL"
+
+
+def dotenv_has(path: Path, key: str) -> bool:
+    if os.environ.get(key, "").strip():
+        return True
+    if not path.is_file():
+        return False
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        k, _, val = line.partition("=")
+        if k.strip() == key and val.strip().strip("\"'"):
+            return True
+    return False
+
+
+def load_mapping(path: Path) -> dict:
+    if not path.is_file():
+        return {}
+    text = path.read_text(encoding="utf-8")
+    try:
+        from ruamel.yaml import YAML
+
+        data = YAML(typ="safe").load(text)
+    except Exception:
+        import yaml
+
+        data = yaml.safe_load(text)
+    return data if isinstance(data, dict) else {}
+
+
+raw = load_mapping(cfg_path)
+model = raw.get("model") if isinstance(raw.get("model"), dict) else {}
+provider = str(model.get("provider") or "").strip()
+chat_model = str(model.get("default") or model.get("model") or "").strip()
+base_url = str(model.get("base_url") or "").strip()
+key_env, _url_env = provider_env_names(provider)
+print(
+    json.dumps(
+        {
+            "provider": provider,
+            "model": chat_model,
+            "base_url": base_url,
+            "key_env": key_env,
+            "key_set": dotenv_has(env_path, key_env),
+        }
+    )
+)
+PY
+)"
+
+  local chat_provider chat_model chat_url key_env key_set
+  chat_provider="$("$py" -c 'import json,sys; print(json.loads(sys.argv[1]).get("provider") or "")' "$detect")"
+  chat_model="$("$py" -c 'import json,sys; print(json.loads(sys.argv[1]).get("model") or "")' "$detect")"
+  chat_url="$("$py" -c 'import json,sys; print(json.loads(sys.argv[1]).get("base_url") or "")' "$detect")"
+  key_env="$("$py" -c 'import json,sys; print(json.loads(sys.argv[1]).get("key_env") or "")' "$detect")"
+  key_set="$("$py" -c 'import json,sys; print("yes" if json.loads(sys.argv[1]).get("key_set") else "no")' "$detect")"
+
+  echo ""
+  echo "MyMemory workers (digest / weekly / monthly) — Hermes chat model: is not changed."
+  if [[ -z "$chat_provider" || -z "$chat_model" ]]; then
+    echo "note: no model.provider / model.default in $HERMES_HOME/config.yaml — skip worker pin."
+    echo "See README.md for the plugins.entries.MyMemory YAML shape."
+    return 0
+  fi
+  echo "Current chat: provider=${chat_provider}  model=${chat_model}"
+  echo "  base_url=${chat_url:-"(none)"}"
+  echo "  ${key_env}: ${key_set}"
+
+  local mode="chat"
+  local w_provider="$chat_provider"
+  local w_model="$chat_model"
+  local w_url=""
+  local w_key=""
+
+  if [[ "$WORKER_FROM_CHAT" == true ]]; then
+    mode="chat"
+  elif [[ -n "${MYMEMORY_WORKER_PROVIDER:-}" && -n "${MYMEMORY_WORKER_MODEL:-}" ]]; then
+    mode="custom"
+    w_provider="${MYMEMORY_WORKER_PROVIDER}"
+    w_model="${MYMEMORY_WORKER_MODEL}"
+    w_url="${MYMEMORY_WORKER_BASE_URL:-}"
+    w_key="${MYMEMORY_WORKER_API_KEY:-}"
+    echo "Using MYMEMORY_WORKER_* env for a non-TTY custom pin."
+  elif [[ -t 0 ]]; then
+    echo ""
+    echo "  1) Use current chat model for workers"
+    echo "  2) Custom provider, model, API key, base URL"
+    local choice=""
+    read -r -p "Choice [1]: " choice || true
+    choice="${choice:-1}"
+    if [[ "$choice" == "2" ]]; then
+      mode="custom"
+      read -r -p "Provider id (e.g. minimax-cn): " w_provider
+      read -r -p "Model name: " w_model
+      read -r -p "Base URL (empty = inherit if same provider as chat): " w_url
+      read -r -s -p "API key (empty = leave .env unchanged): " w_key
+      echo ""
+    fi
+  else
+    echo "Non-TTY: pinning workers to the current chat model (--worker-from-chat)."
+  fi
+
+  if [[ "$mode" == "custom" ]]; then
+    w_provider="${w_provider// /}"
+    w_model="$(echo "$w_model" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    w_url="$(echo "$w_url" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [[ -z "$w_provider" || -z "$w_model" ]]; then
+      echo "error: custom provider and model are required" >&2
+      return 1
+    fi
+    local chat_lc w_lc
+    chat_lc="$(echo "$chat_provider" | tr '[:upper:]' '[:lower:]')"
+    w_lc="$(echo "$w_provider" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$w_lc" != "$chat_lc" && -z "$w_url" ]]; then
+      # The documented non-TTY command sets provider and model only. A fresh
+      # Hermes chat provider is not MiniMax, so the pin still needs a base URL.
+      local url_env
+      if [[ "$w_lc" == "kimi-coding" ]]; then
+        url_env="KIMI_BASE_URL"
+      else
+        url_env="$(echo "$w_provider" | tr '[:lower:]-' '[:upper:]_')_BASE_URL"
+      fi
+      if [[ -n "${!url_env:-}" ]]; then
+        w_url="${!url_env}"
+      elif [[ -f "$HERMES_HOME/.env" ]]; then
+        w_url="$("$py" - "$HERMES_HOME/.env" "$url_env" <<'PY'
+"""Read one base-URL assignment from .env. Print nothing when it is absent."""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+path, key = Path(sys.argv[1]), sys.argv[2]
+for raw in path.read_text(encoding="utf-8").splitlines():
+    line = raw.strip()
+    if line.startswith("export "):
+        line = line[7:].strip()
+    if line.startswith(f"{key}="):
+        print(line.split("=", 1)[1].strip().strip("\"'"))
+        break
+PY
+)"
+      fi
+      if [[ -z "$w_url" && "$w_lc" == "minimax-cn" ]]; then
+        w_url="https://api.minimax.chat/v1"
+      fi
+      if [[ -z "$w_url" ]]; then
+        echo "error: base URL is required when the worker provider differs from chat" >&2
+        return 1
+      fi
+      echo "Worker base URL: ${w_url}"
+    fi
+  fi
+
+  if [[ "$mode" == "chat" && "$key_set" != "yes" ]]; then
+    echo "warn: ${key_env} is missing — workers are pinned but ingest will fail closed until the key is in $HERMES_HOME/.env" >&2
+  fi
+
+  if [[ "$mode" == "custom" && -n "$w_key" ]]; then
+    "$py" - "$HERMES_HOME" "$w_provider" "$w_key" <<'PY'
+"""Upsert PROVIDER_API_KEY in .env without printing the value."""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+home = Path(sys.argv[1])
+provider = sys.argv[2]
+secret = sys.argv[3]
+plug = str(provider or "").strip().lower() or "xiaomi"
+if plug == "kimi-coding":
+    key_env = "KIMI_API_KEY"
+else:
+    key_env = f"{plug.replace('-', '_').upper()}_API_KEY"
+path = home / ".env"
+lines: list[str] = []
+if path.is_file():
+    lines = path.read_text(encoding="utf-8").splitlines()
+found = False
+out: list[str] = []
+prefix = f"{key_env}="
+export_prefix = f"export {key_env}="
+for line in lines:
+    stripped = line.strip()
+    if stripped.startswith(prefix) or stripped.startswith(export_prefix):
+        out.append(f"{key_env}={secret}")
+        found = True
+    else:
+        out.append(line)
+if not found:
+    if out and out[-1] != "":
+        out.append("")
+    out.append(f"{key_env}={secret}")
+path.write_text("\n".join(out) + "\n", encoding="utf-8")
+path.chmod(0o600)
+print(f"ok: wrote {key_env} in {path} (value hidden)")
+PY
+  fi
+
+  "$py" - "$HERMES_HOME" "$w_provider" "$w_model" "$w_url" "$chat_provider" <<'PY'
+"""Merge MyMemory digest/weekly/monthly worker lanes; leave chat model: and extra keys."""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+home = Path(sys.argv[1])
+provider = sys.argv[2].strip()
+model = sys.argv[3].strip()
+base_url = sys.argv[4].strip()
+chat_provider = sys.argv[5].strip().lower()
+cfg_path = home / "config.yaml"
+if not cfg_path.is_file():
+    print(f"note: no {cfg_path} — skip YAML merge", file=sys.stderr)
+    sys.exit(0)
+
+text = cfg_path.read_text(encoding="utf-8")
+engine = "pyyaml"
+ruamel_yaml = None
+data = None
+try:
+    from ruamel.yaml import YAML
+
+    ruamel_yaml = YAML()
+    ruamel_yaml.preserve_quotes = True
+    data = ruamel_yaml.load(text)
+    engine = "ruamel"
+except Exception:
+    import yaml
+
+    data = yaml.safe_load(text)
+
+if not isinstance(data, dict):
+    print("error: config.yaml is not a mapping", file=sys.stderr)
+    sys.exit(1)
+
+bak = cfg_path.with_name("config.yaml.bak-mymemory-install")
+bak.write_text(text, encoding="utf-8")
+
+same_as_chat = provider.strip().lower() == chat_provider
+lane_url = "" if same_as_chat else base_url
+
+
+def as_dict(node):
+    return node if isinstance(node, dict) else {}
+
+
+def set_lane(bag: dict, *, lanes: list[str]) -> None:
+    bag["provider"] = provider
+    bag["model"] = model
+    if lane_url:
+        bag["base_url"] = lane_url
+    wl = as_dict(bag.get("worker_llm"))
+    bag["worker_llm"] = wl
+    for name in lanes:
+        row = as_dict(wl.get(name))
+        row["provider"] = provider
+        row["model"] = model
+        if lane_url:
+            row["base_url"] = lane_url
+        wl[name] = row
+
+
+data["memory"] = as_dict(data.get("memory"))
+data["memory"]["provider"] = "MyMemory"
+
+plugins = as_dict(data.get("plugins"))
+data["plugins"] = plugins
+enabled = plugins.get("enabled")
+if not isinstance(enabled, list):
+    enabled = []
+    plugins["enabled"] = enabled
+if "MyMemory" not in [str(x) for x in enabled]:
+    enabled.append("MyMemory")
+
+entries = as_dict(plugins.get("entries"))
+plugins["entries"] = entries
+mm = as_dict(entries.get("MyMemory"))
+entries["MyMemory"] = mm
+
+digest = as_dict(mm.get("digest"))
+mm["digest"] = digest
+set_lane(digest, lanes=["phase1", "phase2", "wrapup"])
+
+weekly = as_dict(mm.get("weekly"))
+mm["weekly"] = weekly
+set_lane(weekly, lanes=["weekly"])
+
+monthly = as_dict(mm.get("monthly"))
+mm["monthly"] = monthly
+set_lane(monthly, lanes=["monthly"])
+
+retention = as_dict(mm.get("retention"))
+mm["retention"] = retention
+if "allow_tool_override" not in retention:
+    retention["allow_tool_override"] = False
+
+if engine == "ruamel" and ruamel_yaml is not None:
+    with cfg_path.open("w", encoding="utf-8") as fh:
+        ruamel_yaml.dump(data, fh)
+    print(f"ok: worker lanes → {provider} / {model} (round-trip YAML). Backup: {bak}")
+else:
+    import yaml
+
+    dumped = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
+    cfg_path.write_text(dumped, encoding="utf-8")
+    print(
+        f"ok: worker lanes → {provider} / {model} (PyYAML dump may reformat). Backup: {bak}"
+    )
+PY
+}
+
+if [[ "$SKIP_CONFIG" == true ]]; then
+  echo ""
+  echo "Skipping worker config (--skip-config)."
+else
+  apply_mymemory_workers
+fi
+
+if [[ "$SKIP_TESTS" == true ]]; then
+  echo ""
+  echo "Skipping tests (--skip-tests)."
+else
+  echo ""
+  echo "Running tests against installed copy…"
+  set +e
+  "$SCRIPT_DIR/run-tests.sh" "$HERMES_HOME"
+  test_rc=$?
+  set -e
+  if [[ $test_rc -ne 0 ]]; then
+    if [[ "$FORCE" == true ]]; then
+      echo ""
+      echo "warn: tests failed (exit $test_rc) — continuing because --force was set" >&2
+    else
+      echo ""
+      echo "error: tests failed — install aborted. Re-run with --force to continue" >&2
+      exit "$test_rc"
+    fi
+  fi
+fi
+
+echo ""
+echo "Restarting Hermes gateway…"
+"${HERMES_BIN}" gateway restart
+
+echo ""
+echo "Gateway status:"
+status_out="$("${HERMES_BIN}" gateway status 2>&1)" || true
+printf '%s\n' "$status_out"
+
+echo ""
+echo "Installer applied MyMemory worker lanes (backup: $HERMES_HOME/config.yaml.bak-mymemory-install when YAML was written)."
+echo "Chat model: was not changed. Secrets stay in $HERMES_HOME/.env — never in git."
+echo "Optional: wire hooks.pre_tool_call to agent-hooks/block-hermes-root-junk.sh"
+echo "Then: ${HERMES_BIN} doctor"

@@ -1,0 +1,14 @@
+{
+  "final_response": "",
+  "messages": [
+    {
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "name": "submit_tighten_fact",
+          "arguments": "{\"kind\": \"Factual\", \"content\": \"kept\"}"
+        }
+      ]
+    }
+  ]
+}
