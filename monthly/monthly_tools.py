@@ -119,6 +119,10 @@ def submit_month_synthesis_schema() -> dict[str, Any]:
                     "goal_alignment": _evidence_text_props(),
                     "cognition_change": {
                         "type": "array",
+                        "description": (
+                            "Only set from and to when the prompt lists a supersedes pair. "
+                            "Otherwise omit them; empty is allowed."
+                        ),
                         "items": {
                             "type": "object",
                             "properties": {

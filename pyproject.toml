@@ -1,6 +1,6 @@
 [project]
 name = "hermes-plugin-mymemory"
-version = "1.1.38"
+version = "1.2.4"
 requires-python = ">=3.11"
 # Gateway runtime. Recall, the 01:00 cache, monthly guidance,
 # and the digest Phase-2 gate share one GTE int8 session.

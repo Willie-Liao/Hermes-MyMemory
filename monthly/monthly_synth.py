@@ -183,7 +183,9 @@ def _cognition_case_line(month_key: str, facts: MechanicalFacts) -> str:
     """Tell this call whether cognition is code-filled or must be a real sentence.
 
     The static prefix cannot know if last month exists. Without this line the model
-    sends an empty string and the month file stays unwritten.
+    sends an empty string and the month file stays unwritten. With no supersedes
+    pair an empty list is valid: code writes the placeholder, so from and to must
+    not be sent back for another try.
     """
     portrait_first = (
         "In this tool call, user_image.goal_alignment, user_image.decision_preference, and "
@@ -216,8 +218,10 @@ def _cognition_case_line(month_key: str, facts: MechanicalFacts) -> str:
         )
     return (
         portrait_first
-        + " Previous month has a judgment. Write cognition_change as text plus evidence only. "
-        "Do not send an empty string and do not send the phrase no information from last month. "
+        + " Previous month has a judgment and no supersedes pair. "
+        "Write cognition_change as text plus evidence only when the understanding actually changed. "
+        "Otherwise leave cognition_change empty. Code writes no cognition change found yet. "
+        "Never send from or to. "
         + comparison_rule
     )
 
@@ -401,6 +405,8 @@ def payload_from_synthesis(
     """Bind synthesis args onto mechanical facts so a blank or cross-type key row cannot land in the month file.
 
     Bilingual aliases stay on the entity roster. Key order is the model's order.
+    With no supersedes pair, from and to are dropped and an empty cognition list
+    becomes the code placeholder, so that case is not sent back to the worker.
     """
     from monthly_slice import calendar_range
 
@@ -423,7 +429,7 @@ def payload_from_synthesis(
             if not isinstance(row, dict):
                 continue
             text = str(row.get("text") or "").strip()
-            if not text or text == _NO_LAST_MONTH:
+            if not text or text in (_NO_LAST_MONTH, _NO_COGNITION_CHANGE):
                 continue
             frm = str(row.get("from") or "")
             to = str(row.get("to") or "")
@@ -444,7 +450,7 @@ def payload_from_synthesis(
                     )
                 )
                 continue
-            if frm or to or not evidence:
+            if not evidence:
                 continue
             cognition.append(
                 MonthlyCognitionChange(
@@ -455,6 +461,8 @@ def payload_from_synthesis(
                     evidence=evidence,
                 )
             )
+        if not pair_set and not cognition:
+            cognition_empty_reason = _NO_COGNITION_CHANGE
 
     progress: list[MonthlyProgress] = []
     for row in args.get("core_progress") or []:
@@ -733,6 +741,7 @@ _TEXT_FIELDS = (
     "state",
 )
 _NO_LAST_MONTH = "no information from last month"
+_NO_COGNITION_CHANGE = "no cognition change found yet"
 
 
 def _string_list(value: Any) -> list[str]:
@@ -775,6 +784,8 @@ def normalize_synthesis_args(
     Map notes put decision and procedure ids in one evidence array. One leftover
     foreign id fails the whole key row even when a same-type id is already there.
     A core_progress or problems row with one unknown id fails the same way.
+    With no supersedes pair, from and to are not a gap: leaving them on the row
+    used to send the whole user_image back to the worker.
     """
     fixes: list[str] = []
     normalized = _normalize_node(dict(args), fixes, "")
@@ -790,6 +801,23 @@ def normalize_synthesis_args(
     if isinstance(behavior, dict) and "metrics" not in behavior:
         behavior["metrics"] = dict(facts.behavior)
         fixes.append("behavior_pattern.metrics filled from mechanical facts")
+    if not facts.supersedes_pairs:
+        rows = image.get("cognition_change")
+        if isinstance(rows, list):
+            for index, row in enumerate(rows):
+                if not isinstance(row, dict):
+                    continue
+                dropped = False
+                if str(row.get("from") or "").strip():
+                    row.pop("from", None)
+                    dropped = True
+                if str(row.get("to") or "").strip():
+                    row.pop("to", None)
+                    dropped = True
+                if dropped:
+                    fixes.append(
+                        f"cognition_change[{index}] from/to dropped (no supersedes pair)"
+                    )
     decision_ids = {block.id for block in facts.all_dpe if block.type == "decision"}
     procedure_ids = {block.id for block in facts.all_dpe if block.type == "procedure"}
     for key, keep in (("key_decisions", decision_ids), ("key_procedures", procedure_ids)):
@@ -892,6 +920,8 @@ def judgment_gaps(
     """Name every required section that still lacks a user judgment.
 
     An empty list is the only signal that the month file may be written.
+    With no supersedes pair, cognition_change is not a gap: code strips from
+    and to and writes the placeholder when the list is empty.
     """
     allowed = allowed_ids_from_facts(facts, list(args.get("_notes") or []))
     decision_ids = {block.id for block in facts.all_dpe if block.type == "decision"}
@@ -941,30 +971,6 @@ def judgment_gaps(
                     ok = True
                 if not ok:
                     gaps.append("user_image.cognition_change has no valid row")
-        elif not changes:
-            gaps.append("user_image.cognition_change is empty")
-        else:
-            ok = False
-            for index, row in enumerate(changes):
-                if not isinstance(row, dict):
-                    gaps.append(f"user_image.cognition_change[{index}] is not an object")
-                    continue
-                if str(row.get("from") or "").strip() or str(row.get("to") or "").strip():
-                    gaps.append(f"user_image.cognition_change[{index}] must omit from and to")
-                    continue
-                text = str(row.get("text") or "").strip()
-                if not text:
-                    gaps.append(f"user_image.cognition_change[{index}] text is empty")
-                    continue
-                if text == _NO_LAST_MONTH:
-                    gaps.append(f"user_image.cognition_change[{index}] is the placeholder phrase")
-                    continue
-                if _bad_evidence(row.get("evidence"), allowed):
-                    gaps.append(f"user_image.cognition_change[{index}].evidence is missing")
-                    continue
-                ok = True
-            if not ok:
-                gaps.append("user_image.cognition_change has no valid row")
     for key, fields, id_set, foreign, foreign_kind in (
         (
             "core_progress",
@@ -1112,7 +1118,10 @@ def synthesize_month(
     A second full submit dropped the first payload. Format mistakes are fixed here
     so they never spend another model call. A resume store skips the submit and
     patches only the sections that failed last time, so a next-day retry does not
-    rebuild sections that already passed. A transport failure is not a judgment:
+    rebuild sections that already passed. Stored gaps are rechecked first: a
+    no-pair cognition gap disappears after from and to are stripped, and that
+    month is not sent back to the worker. That cleared resume is not a transport
+    failure: wiping every section would put the month back to pending. A transport failure is not a judgment:
     with no tool args, every section stays a gap so the caller does not replace
     the month file. Reasoning models spend the output cap before the tool JSON,
     so the cap is an argument rather than a fixed constant.
@@ -1130,6 +1139,9 @@ def synthesize_month(
     resuming = bool(stored.get("gaps"))
     merged: dict[str, Any] = dict(stored.get("merged") or {}) if resuming else {}
     gaps = [str(line) for line in stored.get("gaps") or []] if resuming else ["user_image is empty"]
+    if resuming:
+        merged, _resume_fixes = normalize_synthesis_args(merged, facts)
+        gaps = judgment_gaps(merged, facts, comparison_exempt=comparison_exempt)
     attempts: list[dict[str, Any]] = []
     last_model = "MiniMax-M2.5"
     token_cap = int(reduce_max_tokens or REDUCE_MAX_TOKENS)
@@ -1233,7 +1245,7 @@ def synthesize_month(
         )
         if not gaps:
             break
-    if not received:
+    if not received and not resuming:
         gaps = [
             "user_image is empty",
             "core_progress is empty",

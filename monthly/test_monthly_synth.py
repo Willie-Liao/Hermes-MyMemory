@@ -164,6 +164,11 @@ def test_reduce_drops_invented_ids_and_keeps_verbatim():
 
 
 def test_cognition_change_requires_supersedes_pair():
+    """August has no supersedes pair, so invented from/to must not be stored as ids.
+
+    Dropping the whole row used to leave the month pending and send it back.
+    The sentence stays; from and to are cleared.
+    """
     facts = mechanical_facts("2026-08")
     real = next(b for b in facts.all_dpe if b.type == "decision")
     args = {
@@ -190,7 +195,10 @@ def test_cognition_change_requires_supersedes_pair():
         reduce_tokens=10,
         generated_at="2026-09-01T08:00:00+08:00",
     )
-    assert payload.user_image.cognition_change == ()
+    row = payload.user_image.cognition_change[0]
+    assert row.text == "invented reversal"
+    assert row.from_id == ""
+    assert row.to == ""
 
 
 def test_reduce_prompt_is_same_rule_lines_and_blank_why_is_dropped():
@@ -529,6 +537,128 @@ def test_previous_month_blank_cognition_is_not_written(tmp_path, monkeypatch):
     assert "user_image" in result["pending_sections"]
     failed = " ".join(result["usage"]["attempts"][-1]["failed"])
     assert "cognition_change" in failed
+
+
+def _write_june_portrait() -> None:
+    """June has a real portrait so July is not comparison-exempt and has no supersedes pair."""
+    from monthly_schema import MonthlyEvidenceText, MonthlyPayload, MonthlyRange, MonthlyUserImage
+    from monthly_writer import write_month
+
+    write_month(
+        MonthlyPayload(
+            key="2026-06",
+            range=MonthlyRange(start="2026-06-01", end="2026-06-30"),
+            user_image=MonthlyUserImage(
+                goal_alignment=MonthlyEvidenceText(
+                    text="June already held a goal.",
+                    evidence=("mem-2026-06-15-decision-a",),
+                )
+            ),
+        )
+    )
+
+
+def test_no_supersedes_pair_strips_from_to_without_a_gap():
+    """A from/to row with no pair used to fail the month and retry the worker."""
+    from monthly_synth import synthesize_month
+
+    _write_june_portrait()
+    facts = mechanical_facts("2026-07")
+    assert not facts.supersedes_pairs
+    decision = next(block for block in facts.all_dpe if block.type == "decision")
+    args = _filled_args(facts)
+    args["user_image"]["cognition_change"] = [
+        {
+            "text": "July kept the same understanding.",
+            "from": "mem-not-a-pair",
+            "to": "mem-also-not",
+            "evidence": [decision.id],
+        }
+    ]
+
+    def call(prompt, **kwargs):
+        return {
+            "failed": False,
+            "tool_name": kwargs.get("force_tool_name"),
+            "tool_args": args,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "model": "MiniMax-M2.5",
+        }
+
+    payload, usage = synthesize_month("2026-07", [], call_oneshot=call, carry="", facts=facts)
+    failed = " ".join(usage["attempts"][0]["failed"])
+    assert "cognition_change" not in failed
+    assert any(
+        "from/to dropped (no supersedes pair)" in fix
+        for fix in usage["attempts"][0]["format_fixes"]
+    )
+    row = payload.user_image.cognition_change[0]
+    assert row.text == "July kept the same understanding."
+    assert row.from_id == ""
+    assert row.to == ""
+    assert usage["valid"] is True
+
+
+def test_no_supersedes_pair_empty_cognition_is_written(tmp_path, monkeypatch):
+    """An empty cognition list with no pair is a written placeholder, not a pending section."""
+    from monthly_actions import generate_month
+    from monthly_writer import load_month
+
+    _write_june_portrait()
+    facts = mechanical_facts("2026-07")
+    args = _filled_args(facts)
+    args["user_image"]["cognition_change"] = []
+
+    def call(prompt, **kwargs):
+        if kwargs.get("force_tool_name") == "submit_month_note":
+            return {
+                "failed": False,
+                "tool_name": "submit_month_note",
+                "tool_args": {"items": []},
+                "input_tokens": 1,
+                "output_tokens": 1,
+            }
+        return {
+            "failed": False,
+            "tool_name": kwargs.get("force_tool_name"),
+            "tool_args": args,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "model": "MiniMax-M2.5",
+        }
+
+    result = generate_month("2026-07", call_oneshot=call, force_refresh=True)
+    assert result["outcome"] == "ok"
+    assert result["pending_sections"] == []
+    loaded = load_month("2026-07")
+    assert loaded.user_image.cognition_change == ()
+    assert loaded.user_image.cognition_empty_reason == "no cognition change found yet"
+
+
+def test_resume_drops_stale_cognition_gap_without_llm():
+    """A stored cognition gap from the old rule must not spend another worker call."""
+    from monthly_synth import synthesize_month
+
+    _write_june_portrait()
+    facts = mechanical_facts("2026-07")
+    args = _filled_args(facts)
+    args["user_image"]["cognition_change"] = []
+
+    def call(prompt, **kwargs):
+        raise AssertionError("resume recheck should not call the worker")
+
+    payload, usage = synthesize_month(
+        "2026-07",
+        [],
+        call_oneshot=call,
+        carry="",
+        facts=facts,
+        resume={"gaps": ["user_image.cognition_change is empty"], "merged": args},
+    )
+    assert usage["valid"] is True
+    assert usage["attempts"] == []
+    assert payload.user_image.cognition_empty_reason == "no cognition change found yet"
 
 
 def test_sentinel_cognition_phrase_is_a_gap():

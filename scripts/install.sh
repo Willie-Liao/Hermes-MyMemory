@@ -127,7 +127,7 @@ purge_retired_mymemory_harnesses() {
   find "$dest" -type f -name 'probe_*.py' -delete 2>/dev/null || true
   rm -f "$dest/weekly/weekly_brief_validate.py" "$dest/weekly/test_weekly_brief_validate.py"
   local note
-  for note in 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36; do
+  for note in 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37; do
     rm -f "$dest/RELEASE_NOTES_1.1.${note}.md"
   done
 }
