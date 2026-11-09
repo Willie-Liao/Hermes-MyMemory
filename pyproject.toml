@@ -1,0 +1,32 @@
+[project]
+name = "hermes-plugin-mymemory"
+version = "1.2.4"
+requires-python = ">=3.11"
+# Gateway runtime. Recall, the 01:00 cache, monthly guidance,
+# and the digest Phase-2 gate share one GTE int8 session.
+# Opt-in worker wire: a dry-run against the Hermes venv (2026-11-07) left
+# openai 2.24.0 and pydantic 2.13.4 in place.
+dependencies = [
+    "onnxruntime",
+    "tokenizers",
+    "numpy",
+    "pyyaml",
+    "openai",
+    "ruamel.yaml",
+    "json5>=0.9",
+    # 1.106.2 is the last release whose core requirement is still boto3>=1.43.1,<2.0.
+    # 1.106.3+ and 1.108.x require boto3>=1.43.117, and Hermes bedrock locks
+    # boto3==1.43.115 through v0.23.0. A higher pin fails the workspace resolve,
+    # and hermes update then disables the plugin.
+    "litellm==1.106.2",
+]
+
+[dependency-groups]
+test = ["pytest", "tiktoken"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["MyMemory"]

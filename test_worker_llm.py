@@ -1,0 +1,2355 @@
+"""Tests for shared helper-LLM reentry guard."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import sys
+import types
+from pathlib import Path
+
+
+def _load_worker_llm():
+    path = Path(__file__).with_name("worker_llm.py")
+    spec = importlib.util.spec_from_file_location("worker_llm_test", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _install_fake_openai(monkeypatch, *, seen: dict, message):
+    class FakeMessage:
+        def __init__(self):
+            self.content = message.get("content")
+            self.tool_calls = message.get("tool_calls")
+
+    class FakeChoice:
+        def __init__(self):
+            self.message = FakeMessage()
+            self.finish_reason = "tool_calls"
+
+    class FakeUsage:
+        prompt_tokens = 12
+        completion_tokens = 8
+        total_tokens = 20
+        prompt_tokens_details = types.SimpleNamespace(cached_tokens=4)
+        completion_tokens_details = types.SimpleNamespace(reasoning_tokens=1)
+
+    class FakeResponse:
+        choices = [FakeChoice()]
+        usage = FakeUsage()
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            seen["create"] = kwargs
+            return FakeResponse()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            seen["client"] = kwargs
+            self.chat = FakeChat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = FakeClient
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+
+
+def test_worker_llm_scope_sets_and_clears_flag(monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_WORKER_LLM_DEPTH", "9")
+    assert wl.in_worker_llm() is False
+    with wl.worker_llm_scope():
+        assert wl.in_worker_llm() is True
+    assert wl.in_worker_llm() is False
+
+
+def test_worker_llm_scope_nests():
+    wl = _load_worker_llm()
+    with wl.worker_llm_scope():
+        assert wl.in_worker_llm() is True
+        with wl.worker_llm_scope():
+            assert wl.in_worker_llm() is True
+        assert wl.in_worker_llm() is True
+    assert wl.in_worker_llm() is False
+
+
+def test_worker_llm_scope_does_not_silence_another_thread():
+    """A background digest must not make the live chat look like a worker turn."""
+    import threading
+
+    wl = _load_worker_llm()
+    seen: dict[str, bool] = {}
+
+    def other() -> None:
+        seen["flag"] = wl.in_worker_llm()
+
+    with wl.worker_llm_scope():
+        thread = threading.Thread(target=other)
+        thread.start()
+        thread.join()
+        assert wl.in_worker_llm() is True
+    assert seen["flag"] is False
+
+
+def test_run_worker_llm_records_usage(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.model = kwargs.get("model") or "fake-model"
+            self.session_input_tokens = 11
+            self.session_output_tokens = 7
+            self.session_cache_read_tokens = 2
+            self.session_cache_write_tokens = 1
+            self.session_reasoning_tokens = 3
+            self.session_total_tokens = 24
+            self.session_estimated_cost_usd = 0.0123
+            self.session_api_calls = 1
+
+        def run_conversation(self, prompt):
+            assert wl.in_worker_llm() is True
+            return {"final_response": f"echo:{prompt}"}
+
+    fake_gateway_pkg = types.ModuleType("gateway")
+    fake_gateway_run = types.ModuleType("gateway.run")
+    fake_gateway_run._resolve_gateway_model = lambda: "fake-model"
+    fake_gateway_run._resolve_runtime_agent_kwargs = lambda: {}
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+
+    monkeypatch.setitem(sys.modules, "gateway", fake_gateway_pkg)
+    monkeypatch.setitem(sys.modules, "gateway.run", fake_gateway_run)
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    out = wl.run_worker_llm("hi", plugin="memory-digest", purpose="digest")
+    assert out == "echo:hi"
+    assert wl.in_worker_llm() is False
+
+    ledger = tmp_path / "metrics" / "llm-usage.jsonl"
+    assert ledger.is_file()
+    line = ledger.read_text(encoding="utf-8").strip().splitlines()[-1]
+    rec = json.loads(line)
+    assert rec["plugin"] == "memory-digest"
+    assert rec["purpose"] == "digest"
+    assert rec["input_tokens"] == 11
+    assert rec["output_tokens"] == 7
+    assert rec["total_tokens"] == 24
+    assert abs(rec["cost_usd"] - 0.0123) < 1e-9
+
+
+def test_run_worker_llm_pops_model_from_runtime_kwargs(tmp_path, monkeypatch):
+    """Match gateway: fallback kwargs may include model; never pass it twice."""
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    seen: dict = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            seen["kwargs"] = dict(kwargs)
+            self.model = kwargs.get("model")
+            self.session_input_tokens = 0
+            self.session_output_tokens = 0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self.session_reasoning_tokens = 0
+            self.session_total_tokens = 0
+            self.session_estimated_cost_usd = 0.0
+            self.session_api_calls = 0
+
+        def run_conversation(self, prompt):
+            seen["suppress"] = getattr(self, "suppress_status_output", None)
+            return {"final_response": "ok"}
+
+    fake_gateway_pkg = types.ModuleType("gateway")
+    fake_gateway_run = types.ModuleType("gateway.run")
+    fake_gateway_run._resolve_gateway_model = lambda: "primary-model"
+    fake_gateway_run._resolve_runtime_agent_kwargs = lambda: {
+        "api_key": "k",
+        "provider": "minimax-cn",
+        "model": "fallback-model",
+    }
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+
+    monkeypatch.setitem(sys.modules, "gateway", fake_gateway_pkg)
+    monkeypatch.setitem(sys.modules, "gateway.run", fake_gateway_run)
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    assert wl.run_worker_llm("hi", plugin="memory-digest", purpose="digest") == "ok"
+    kwargs = seen["kwargs"]
+    assert kwargs["model"] == "fallback-model"
+    assert seen.get("suppress") is True
+    assert "api_key" in kwargs
+    assert kwargs.get("provider") == "minimax-cn"
+
+
+def test_plugin_config_model_overrides_gateway(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("XIAOMI_API_KEY", raising=False)
+    monkeypatch.delenv("XIAOMI_BASE_URL", raising=False)
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-digest:\n      provider: xiaomi\n      model: mimo-v2.5\n",
+        encoding="utf-8",
+    )
+    seen: dict = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            seen["kwargs"] = dict(kwargs)
+            self.model = kwargs.get("model")
+            self.session_input_tokens = 0
+            self.session_output_tokens = 0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self.session_reasoning_tokens = 0
+            self.session_total_tokens = 0
+            self.session_estimated_cost_usd = 0.0
+            self.session_api_calls = 0
+
+        def run_conversation(self, prompt):
+            return {"final_response": "ok"}
+
+    fake_gateway_pkg = types.ModuleType("gateway")
+    fake_gateway_run = types.ModuleType("gateway.run")
+    fake_gateway_run._resolve_gateway_model = lambda: "primary-model"
+    fake_gateway_run._resolve_runtime_agent_kwargs = lambda: {
+        "api_key": "kimi-key",
+        "provider": "kimi-coding",
+        "model": "kimi-k2.6",
+        "base_url": "https://api.kimi.com/coding/v1",
+    }
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+
+    monkeypatch.setitem(sys.modules, "gateway", fake_gateway_pkg)
+    monkeypatch.setitem(sys.modules, "gateway.run", fake_gateway_run)
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    assert wl.run_worker_llm("hi", plugin="memory-digest", purpose="digest") == "ok"
+    kwargs = seen["kwargs"]
+    assert kwargs["model"] == "mimo-v2.5"
+    assert kwargs.get("provider") == "xiaomi"
+    assert "api_key" not in kwargs
+    assert "base_url" not in kwargs
+
+
+def test_worker_llm_lanes_override_by_purpose(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "\n".join(
+            [
+                "plugins:",
+                "  entries:",
+                "    memory-digest:",
+                "      provider: xiaomi",
+                "      model: mimo-v2.5",
+                "      worker_llm:",
+                "        phase1:",
+                "          provider: xiaomi",
+                "          model: mimo-v2.5",
+                "        phase2:",
+                "          provider: kimi-coding",
+                "          model: kimi-k2.6",
+                "        wrapup:",
+                "          provider: xiaomi",
+                "          model: mimo-v2.5",
+                "    memory-weekly:",
+                "      provider: xiaomi",
+                "      model: mimo-v2.5",
+                "      worker_llm:",
+                "        weekly:",
+                "          provider: minimax-cn",
+                "          model: MiniMax-M3",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    seen: dict = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            seen["kwargs"] = dict(kwargs)
+            self.model = kwargs.get("model")
+            self.session_input_tokens = 0
+            self.session_output_tokens = 0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self.session_reasoning_tokens = 0
+            self.session_total_tokens = 0
+            self.session_estimated_cost_usd = 0.0
+            self.session_api_calls = 0
+
+        def run_conversation(self, prompt):
+            return {"final_response": "ok"}
+
+    fake_gateway_pkg = types.ModuleType("gateway")
+    fake_gateway_run = types.ModuleType("gateway.run")
+    fake_gateway_run._resolve_gateway_model = lambda: "primary-model"
+    fake_gateway_run._resolve_runtime_agent_kwargs = lambda: {}
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+
+    monkeypatch.setitem(sys.modules, "gateway", fake_gateway_pkg)
+    monkeypatch.setitem(sys.modules, "gateway.run", fake_gateway_run)
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    wl.run_worker_llm("hi", plugin="memory-digest", purpose="digest-phase1")
+    assert seen["kwargs"]["model"] == "mimo-v2.5"
+    assert seen["kwargs"]["provider"] == "xiaomi"
+
+    wl.run_worker_llm("hi", plugin="memory-digest", purpose="digest-dedup-patch")
+    assert seen["kwargs"]["model"] == "kimi-k2.6"
+    assert seen["kwargs"]["provider"] == "kimi-coding"
+
+    wl.run_worker_llm("hi", plugin="memory-digest", purpose="digest-wrapup")
+    assert seen["kwargs"]["model"] == "mimo-v2.5"
+    assert seen["kwargs"]["provider"] == "xiaomi"
+
+    wl.run_worker_llm("hi", plugin="memory-digest", purpose="recall_router")
+    assert seen["kwargs"]["model"] == "mimo-v2.5"
+    assert seen["kwargs"]["provider"] == "xiaomi"
+
+    wl.run_worker_llm("hi", plugin="memory-weekly", purpose="ui_tighten")
+    assert seen["kwargs"]["model"] == "MiniMax-M3"
+    assert seen["kwargs"]["provider"] == "minimax-cn"
+
+
+def test_record_worker_usage_fail_open(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+
+    monkeypatch.setattr(wl, "_ledger_path", lambda: tmp_path / "nope" / "x.jsonl")
+
+    def boom(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("builtins.open", boom)
+    wl.record_worker_usage({"plugin": "x", "purpose": "y"})  # must not raise
+
+
+def test_allowed_forced_worker_tool_names_includes_skips():
+    wl = _load_worker_llm()
+    catalog = [
+        {"function": {"name": "submit_fact_block"}},
+        {"function": {"name": "submit_event_block"}},
+        {"function": {"name": "skip_digest_worker"}},
+        {"function": {"name": "tool_search"}},
+    ]
+    allowed = wl.allowed_forced_worker_tool_names("submit_fact_block", catalog)
+    assert allowed == {"submit_fact_block", "skip_digest_worker"}
+
+
+def test_run_worker_llm_tools_binds_forced_tool_only(tmp_path, monkeypatch):
+    """Forced workers must oneshot with one schema, not construct AIAgent."""
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("XIAOMI_API_KEY", "test-key")
+    monkeypatch.setenv("XIAOMI_BASE_URL", "https://example.test/v1")
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-digest:\n      provider: xiaomi\n      model: mimo-v2.5\n",
+        encoding="utf-8",
+    )
+    seen: dict = {}
+    catalog = [
+        {"type": "function", "function": {"name": "submit_fact_block", "parameters": {"type": "object"}}},
+        {"type": "function", "function": {"name": "submit_event_block", "parameters": {"type": "object"}}},
+        {"type": "function", "function": {"name": "skip_digest_worker", "parameters": {"type": "object"}}},
+        {"type": "function", "function": {"name": "tool_search", "parameters": {"type": "object"}}},
+    ]
+
+    fake_model_tools = types.ModuleType("model_tools")
+
+    def fake_get_tool_definitions(*, enabled_toolsets=None, quiet_mode=False, skip_tool_search_assembly=False):
+        seen["skip_tool_search_assembly"] = skip_tool_search_assembly
+        seen["enabled_toolsets"] = list(enabled_toolsets or [])
+        return list(catalog)
+
+    fake_model_tools.get_tool_definitions = fake_get_tool_definitions
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    def boom(*_a, **_k):
+        raise AssertionError("AIAgent must not be constructed for forced tools")
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = boom
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    tool_call = types.SimpleNamespace(
+        function=types.SimpleNamespace(
+            name="submit_fact_block",
+            arguments='{"body":"x"}',
+        )
+    )
+    _install_fake_openai(
+        monkeypatch,
+        seen=seen,
+        message={"content": "", "tool_calls": [tool_call]},
+    )
+
+    out = wl.run_worker_llm_tools(
+        "prompt",
+        plugin="memory-digest",
+        purpose="digest-fact-submit",
+        enabled_toolsets=["memory_digest"],
+        force_tool_name="submit_fact_block",
+    )
+    assert seen["skip_tool_search_assembly"] is True
+    create = seen["create"]
+    names = [(t.get("function") or {}).get("name") for t in create["tools"]]
+    assert names == ["submit_fact_block"]
+    assert create["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "submit_fact_block"},
+    }
+    assert out["tool_name"] == "submit_fact_block"
+
+
+def _phase1_catalog():
+    return [
+        {
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object"}},
+        }
+        for name in (
+            "submit_digest_blocks",
+            "patch_digest_blocks",
+            "skip_digest_worker",
+        )
+    ]
+
+
+def _install_phase1_catalog(monkeypatch):
+    fake_model_tools = types.ModuleType("model_tools")
+
+    def fake_get_tool_definitions(**_k):
+        return _phase1_catalog()
+
+    fake_model_tools.get_tool_definitions = fake_get_tool_definitions
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+
+def test_openai_phase1_allowlist_still_uses_nested_agent(tmp_path, monkeypatch):
+    """OpenAI-format workers already copy tool_choice; do not leave that path."""
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-digest:\n      provider: xiaomi\n      model: mimo-v2.5\n",
+        encoding="utf-8",
+    )
+    seen: dict = {}
+
+    def fake_conv(*_a, **kwargs):
+        seen["conv"] = kwargs
+        return {"final_response": "", "messages": [], "failed": False}
+
+    monkeypatch.setattr(wl, "_run_worker_conversation", fake_conv)
+    monkeypatch.setattr(
+        wl,
+        "_run_anthropic_phase1_loop",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("OpenAI phase-1 must not use the Anthropic loop")
+        ),
+    )
+    wl.run_worker_llm_tools(
+        "prompt",
+        plugin="memory-digest",
+        purpose="digest-phase1",
+        enabled_toolsets=["memory_digest"],
+        allowed_tool_names=[
+            "submit_digest_blocks",
+            "patch_digest_blocks",
+            "skip_digest_worker",
+        ],
+    )
+    assert seen["conv"]["request_overrides"]["tool_choice"] == "required"
+    assert seen["conv"]["allowed_tool_names"] == [
+        "submit_digest_blocks",
+        "patch_digest_blocks",
+        "skip_digest_worker",
+    ]
+
+
+def test_anthropic_phase1_skips_nested_agent_and_retries_wrong_tool(
+    tmp_path, monkeypatch
+):
+    """MiniMax phase-1 must send tool_choice required and teach a non-digest name."""
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MINIMAX_CN_API_KEY", "test-key")
+    monkeypatch.setenv("MINIMAX_CN_BASE_URL", "https://example.test/anthropic")
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-digest:\n"
+        "      provider: minimax-cn\n      model: MiniMax-M2.5\n",
+        encoding="utf-8",
+    )
+    _install_phase1_catalog(monkeypatch)
+    seen: dict = {"builds": [], "handlers": []}
+
+    def boom(*_a, **_k):
+        raise AssertionError("AIAgent path must not run for Anthropic phase-1")
+
+    monkeypatch.setattr(wl, "_run_worker_conversation", boom)
+
+    fake_adapter = types.ModuleType("agent.anthropic_adapter")
+
+    def build_anthropic_kwargs(**kwargs):
+        seen["builds"].append(kwargs)
+        return {"model": kwargs["model"], "messages": list(kwargs["messages"])}
+
+    fake_adapter.build_anthropic_kwargs = build_anthropic_kwargs
+    monkeypatch.setitem(sys.modules, "agent", types.ModuleType("agent"))
+    monkeypatch.setitem(sys.modules, "agent.anthropic_adapter", fake_adapter)
+
+    class _Usage:
+        input_tokens = 3
+        output_tokens = 2
+
+    responses = [
+        types.SimpleNamespace(
+            content=[
+                types.SimpleNamespace(
+                    type="tool_use", id="t1", name="terminal", input={}
+                )
+            ],
+            usage=_Usage(),
+        ),
+        types.SimpleNamespace(
+            content=[
+                types.SimpleNamespace(
+                    type="tool_use",
+                    id="t2",
+                    name="submit_digest_blocks",
+                    input={"blocks": []},
+                )
+            ],
+            usage=_Usage(),
+        ),
+    ]
+
+    def fake_create(kwargs, *, api_key, base_url):
+        seen.setdefault("creates", []).append(
+            {"api_key": api_key, "base_url": base_url, "messages": kwargs["messages"]}
+        )
+        return responses.pop(0)
+
+    monkeypatch.setattr(wl, "_anthropic_messages_create", fake_create)
+
+    fake_digest_tools = types.ModuleType("digest_tools")
+
+    def _handler_for_tool(name):
+        def wrapped(args, **_k):
+            seen["handlers"].append(name)
+            return json.dumps({"ok": True})
+
+        return wrapped
+
+    fake_digest_tools._handler_for_tool = _handler_for_tool
+    monkeypatch.setitem(sys.modules, "digest_tools", fake_digest_tools)
+
+    out = wl.run_worker_llm_tools(
+        "prompt",
+        plugin="memory-digest",
+        purpose="digest-phase1",
+        max_iterations=3,
+        enabled_toolsets=["memory_digest"],
+        allowed_tool_names=[
+            "submit_digest_blocks",
+            "patch_digest_blocks",
+            "skip_digest_worker",
+        ],
+    )
+    assert seen["builds"][0]["tool_choice"] == "required"
+    assert seen["builds"][0]["tools"]
+    assert all(
+        (t.get("function") or {}).get("name")
+        in {"submit_digest_blocks", "patch_digest_blocks", "skip_digest_worker"}
+        for t in seen["builds"][0]["tools"]
+    )
+    teach = seen["creates"][1]["messages"][-1]["content"]
+    assert "submit_digest_blocks" in teach
+    assert "patch_digest_blocks" in teach
+    assert "skip_digest_worker" in teach
+    assert seen["handlers"] == ["submit_digest_blocks"]
+    assert out["tool_name"] == "submit_digest_blocks"
+    assert out["failed"] is False
+
+
+def test_run_worker_llm_text_path_does_not_rebind_tools(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    seen: dict = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.tools = [{"function": {"name": "should_stay"}}]
+            self.valid_tool_names = {"should_stay"}
+            self.model = "fake-model"
+            self.session_input_tokens = 0
+            self.session_output_tokens = 0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self.session_reasoning_tokens = 0
+            self.session_total_tokens = 0
+            self.session_estimated_cost_usd = 0.0
+            self.session_api_calls = 0
+
+        def run_conversation(self, prompt):
+            seen["tools"] = list(self.tools)
+            return {"final_response": "ok"}
+
+    fake_gateway_pkg = types.ModuleType("gateway")
+    fake_gateway_run = types.ModuleType("gateway.run")
+    fake_gateway_run._resolve_gateway_model = lambda: "fake-model"
+    fake_gateway_run._resolve_runtime_agent_kwargs = lambda: {}
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+    monkeypatch.setitem(sys.modules, "gateway", fake_gateway_pkg)
+    monkeypatch.setitem(sys.modules, "gateway.run", fake_gateway_run)
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    assert wl.run_worker_llm("hi", plugin="memory-weekly", purpose="text") == "ok"
+    assert seen["tools"] == [{"function": {"name": "should_stay"}}]
+
+
+def test_extract_tool_calls_from_fenced_json_in_content():
+    """MiMo v2.5 often dumps tool JSON in assistant text instead of tool_calls."""
+    wl = _load_worker_llm()
+    result = {
+        "final_response": "",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": (
+                    "```json\n"
+                    '{"beginning": "a", "course": "b", "outcome": "c"}\n'
+                    "```"
+                ),
+            }
+        ],
+    }
+    found = wl.extract_tool_calls_from_result(
+        result, default_tool_name="submit_tighten_event"
+    )
+    assert found == [
+        ("submit_tighten_event", {"beginning": "a", "course": "b", "outcome": "c"})
+    ]
+
+
+def test_extract_tool_calls_ignores_thinking_json_keeps_body():
+    """CoT JSON with a text key must not steal the rewritten hot-file body."""
+    wl = _load_worker_llm()
+    result = {
+        "final_response": "",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": (
+                    "<thinking>{\"text\": \"I will shorten this.\"}</thinking>\n"
+                    '{"text": "## Path\\nKeep the gates."}'
+                ),
+            }
+        ],
+    }
+    found = wl.extract_tool_calls_from_result(
+        result, default_tool_name="submit_tighten_text"
+    )
+    assert found == [
+        ("submit_tighten_text", {"text": "## Path\nKeep the gates."})
+    ]
+
+
+def test_capture_strips_thinking_from_final_response():
+    wl = _load_worker_llm()
+    msg = types.SimpleNamespace(
+        content=(
+            "<thinking>plan the rewrite</thinking>\n"
+            "## USER.md\nPrefers concise notes."
+        ),
+        tool_calls=None,
+    )
+    captured = wl._capture_from_oneshot_message(
+        msg, force_tool_name="submit_tighten_text"
+    )
+    assert "thinking" not in captured["final_response"].lower()
+    assert "Prefers concise notes." in captured["final_response"]
+
+
+def test_extract_tool_calls_accepts_json5_slips():
+    wl = _load_worker_llm()
+    samples = [
+        "{kind: 'Factual', content: 'x',}",
+        "{'kind': 'Factual', 'content': 'x'}",
+        "{kind: 'Factual', content: 'x', // slip\n}",
+        "{kind: 'Factual', /* note */ content: 'x'}",
+    ]
+    for raw in samples:
+        result = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [{"name": "submit_tighten_fact", "arguments": raw}],
+                }
+            ]
+        }
+        found = wl.extract_tool_calls_from_result(result)
+        assert found == [("submit_tighten_fact", {"kind": "Factual", "content": "x"})]
+
+
+def test_json_object_slice_keeps_brace_inside_single_quotes():
+    wl = _load_worker_llm()
+    raw = "{'note': 'a } b', kind: 'Factual'}"
+    assert wl._json_object_slices(raw) == [raw]
+    assert wl._parse_json_mapping(raw) == {"note": "a } b", "kind": "Factual"}
+
+
+def test_trailing_comma_parses_when_json5_import_fails(monkeypatch):
+    monkeypatch.setitem(sys.modules, "json5", None)
+    wl = _load_worker_llm()
+    found = wl.extract_tool_calls_from_result(
+        {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "name": "submit_tighten_fact",
+                            "arguments": '{"kind": "Factual", "content": "x",}',
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    assert found == [("submit_tighten_fact", {"kind": "Factual", "content": "x"})]
+
+
+def test_extract_tool_calls_flat_shape_and_broken_arguments_string():
+    wl = _load_worker_llm()
+    result = {
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "name": "submit_tighten_fact",
+                        "arguments": '{"kind": "Factual", "content": "x",}',
+                    }
+                ],
+            }
+        ]
+    }
+    found = wl.extract_tool_calls_from_result(result)
+    assert found == [("submit_tighten_fact", {"kind": "Factual", "content": "x"})]
+
+
+def test_month_submit_keeps_outer_object_not_last_nested_field():
+    """A nested text/evidence field must not replace the month the model submitted."""
+    wl = _load_worker_llm()
+    raw = (
+        '{"user_image": {"goal_alignment": {"text": "keep briefs short", '
+        '"evidence": ["mem-b"]}}, '
+        '"key_decisions": [{"text": "short briefs", "why_it_matters": "next time", '
+        '"context": "briefs", "exceptions": "none", "evidence": ["mem-b"]}], '
+        '"next_month_focus": [{"content": "keep the index", "target": "July", '
+        '"priority": "high", "depends_on": []}]}'
+    )
+    result = {
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"function": {"name": "submit_month_synthesis", "arguments": raw}}
+                ],
+            }
+        ]
+    }
+    found = wl.extract_tool_calls_from_result(result)
+    assert found[0][0] == "submit_month_synthesis"
+    assert "user_image" in found[0][1]
+    assert found[0][1]["user_image"]["goal_alignment"]["text"] == "keep briefs short"
+    assert found[0][1]["key_decisions"][0]["text"] == "short briefs"
+
+
+def test_truncated_submit_keeps_finished_key_rows():
+    wl = _load_worker_llm()
+    raw = (
+        '{"key_decisions": [{"id": "mem-a", "why_it_matters": "still matters", "evidence": ["mem-a"]}], '
+        '"key_procedures": [{"id": "mem-b", "insight": "check first", "evidence": ["mem-b"]}], '
+        '"summary": [{"text": "cut'
+    )
+    result = {
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"function": {"name": "submit_month_synthesis", "arguments": raw}}
+                ],
+            }
+        ]
+    }
+    found = wl.extract_tool_calls_from_result(result)
+    assert found[0][0] == "submit_month_synthesis"
+    assert found[0][1]["key_decisions"][0]["id"] == "mem-a"
+    assert found[0][1]["key_procedures"][0]["id"] == "mem-b"
+
+
+def test_extract_tool_calls_drops_tool_describe_keeps_submit():
+    """Gateway disclosure hops must not become worker1_summary's recorded tool."""
+    wl = _load_worker_llm()
+    result = {
+        "messages": [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "function": {
+                            "name": "tool_describe",
+                            "arguments": '{"name": "submit_weekly_summary"}',
+                        }
+                    },
+                    {
+                        "function": {
+                            "name": "submit_weekly_summary",
+                            "arguments": '{"summary": [{"text": "Shipped wrap-up", "weekdays": ["Monday"]}]}',
+                        }
+                    },
+                ],
+            }
+        ]
+    }
+    found = wl.extract_tool_calls_from_result(result)
+    assert found == [
+        (
+            "submit_weekly_summary",
+            {"summary": [{"text": "Shipped wrap-up", "weekdays": ["Monday"]}]},
+        )
+    ]
+
+
+def test_run_worker_llm_tools_falls_back_when_callback_args_empty(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("XIAOMI_API_KEY", "test-key")
+    monkeypatch.setenv("XIAOMI_BASE_URL", "https://example.test/v1")
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-weekly:\n      provider: xiaomi\n      model: mimo-v2.5\n",
+        encoding="utf-8",
+    )
+    seen: dict = {}
+    fake_model_tools = types.ModuleType("model_tools")
+    fake_model_tools.get_tool_definitions = lambda **_k: [
+        {"type": "function", "function": {"name": "submit_tighten_event"}},
+    ]
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+    _install_fake_openai(
+        monkeypatch,
+        seen=seen,
+        message={
+            "content": '{"beginning": "a", "course": "b", "outcome": "c"}',
+            "tool_calls": None,
+        },
+    )
+    out = wl.run_worker_llm_tools(
+        "prompt",
+        plugin="memory-weekly",
+        purpose="ui_tighten",
+        enabled_toolsets=["memory_weekly"],
+        force_tool_name="submit_tighten_event",
+    )
+    assert out["tool_name"] == "submit_tighten_event"
+    assert out["tool_args"] == {"beginning": "a", "course": "b", "outcome": "c"}
+
+
+def test_run_worker_llm_oneshot_skips_aiagent(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("XIAOMI_API_KEY", "test-key")
+    monkeypatch.setenv("XIAOMI_BASE_URL", "https://example.test/v1")
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-weekly:\n      provider: xiaomi\n      model: mimo-v2.5\n",
+        encoding="utf-8",
+    )
+    seen: dict = {}
+    tool_call = types.SimpleNamespace(
+        function=types.SimpleNamespace(
+            name="submit_tighten_event",
+            arguments='{"beginning": "a", "course": "b", "outcome": "c"}',
+        )
+    )
+    _install_fake_openai(
+        monkeypatch,
+        seen=seen,
+        message={"content": "", "tool_calls": [tool_call]},
+    )
+
+    def boom(*_a, **_k):
+        raise AssertionError("AIAgent must not be constructed for oneshot polish")
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = boom
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    out = wl.run_worker_llm_oneshot(
+        "CURRENT_JSON:\n{}",
+        plugin="memory-weekly",
+        purpose="ui_tighten",
+        force_tool_name="submit_tighten_event",
+        tool_schema={
+            "name": "submit_tighten_event",
+            "description": "slots",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    )
+    assert "run_agent" not in sys.modules or sys.modules["run_agent"].AIAgent is boom
+    assert seen["client"]["api_key"] == "test-key"
+    assert seen["client"]["base_url"] == "https://example.test/v1"
+    create = seen["create"]
+    assert create["model"] == "mimo-v2.5"
+    assert create["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "submit_tighten_event"},
+    }
+    assert create["extra_body"]["thinking"] == {"type": "disabled"}
+    assert create["tools"][0]["type"] == "function"
+    assert create["tools"][0]["function"]["name"] == "submit_tighten_event"
+    assert create["messages"][0]["role"] == "system"
+    assert "text polisher" in create["messages"][0]["content"].lower()
+    assert create["messages"][1]["role"] == "user"
+    assert create["messages"][1]["content"] == "CURRENT_JSON:\n{}"
+    assert out["tool_name"] == "submit_tighten_event"
+    assert out["tool_args"] == {"beginning": "a", "course": "b", "outcome": "c"}
+    assert out["failed"] is False
+    ledger = tmp_path / "metrics" / "llm-usage.jsonl"
+    rec = json.loads(ledger.read_text(encoding="utf-8").strip().splitlines()[-1])
+    assert rec["purpose"] == "ui_tighten"
+    assert rec["api_calls"] == 1
+    assert rec["input_tokens"] == 12
+    assert rec["cache_read_tokens"] == 4
+
+
+def test_run_worker_llm_oneshot_falls_back_to_k2_on_quota(tmp_path, monkeypatch):
+    """MiMo 429/quota must retry the same tool call on Kimi HighSpeed, not fail ingest."""
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("XIAOMI_API_KEY", "mi-key")
+    monkeypatch.setenv("XIAOMI_BASE_URL", "https://mimo.example/v1")
+    monkeypatch.setenv("KIMI_API_KEY", "kimi-key")
+    monkeypatch.setenv("KIMI_BASE_URL", "https://kimi.example/v1")
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-digest:\n      provider: xiaomi\n      model: mimo-v2.5\n",
+        encoding="utf-8",
+    )
+    seen: dict = {"models": [], "keys": []}
+
+    class QuotaErr(Exception):
+        status_code = 429
+
+    class FakeMessage:
+        content = ""
+        tool_calls = [
+            types.SimpleNamespace(
+                function=types.SimpleNamespace(
+                    name="submit_digest",
+                    arguments='{"ok": true}',
+                )
+            )
+        ]
+
+    class FakeChoice:
+        message = FakeMessage()
+        finish_reason = "tool_calls"
+
+    class FakeUsage:
+        prompt_tokens = 3
+        completion_tokens = 2
+        total_tokens = 5
+        prompt_tokens_details = types.SimpleNamespace(cached_tokens=0)
+        completion_tokens_details = types.SimpleNamespace(reasoning_tokens=0)
+
+    class FakeResponse:
+        choices = [FakeChoice()]
+        usage = FakeUsage()
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            seen["models"].append(kwargs.get("model"))
+            if len(seen["models"]) == 1:
+                raise QuotaErr("insufficient quota")
+            return FakeResponse()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            seen["keys"].append(kwargs.get("api_key"))
+            self.chat = FakeChat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = FakeClient
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+
+    out = wl.run_worker_llm_oneshot(
+        "digest this",
+        plugin="memory-digest",
+        purpose="digest-phase1",
+        force_tool_name="submit_digest",
+        tool_schema={"name": "submit_digest", "parameters": {"type": "object", "properties": {}}},
+    )
+    assert seen["models"] == ["mimo-v2.5", "kimi-for-coding-highspeed"]
+    assert seen["keys"] == ["mi-key", "kimi-key"]
+    assert out["failed"] is False
+    assert out["tool_name"] == "submit_digest"
+    rec = json.loads(
+        (tmp_path / "metrics" / "llm-usage.jsonl").read_text(encoding="utf-8").strip().splitlines()[-1]
+    )
+    assert rec["model"] == "kimi-for-coding-highspeed"
+    health = json.loads((tmp_path / "metrics" / "llm-health.json").read_text(encoding="utf-8"))
+    assert health["kind"] == "quota"
+    assert health["model"] == "mimo-v2.5"
+
+
+def test_oneshot_inherits_chat_base_url_for_minimax(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    assert not hasattr(wl, "_ONESHOT_PROVIDERS")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MINIMAX_CN_API_KEY", "mm-key")
+    monkeypatch.delenv("MINIMAX_CN_BASE_URL", raising=False)
+    (tmp_path / "config.yaml").write_text(
+        "model:\n"
+        "  provider: minimax-cn\n"
+        "  default: MiniMax-M3\n"
+        "  base_url: https://api.minimax.chat/v1\n"
+        "plugins:\n"
+        "  entries:\n"
+        "    MyMemory:\n"
+        "      digest:\n"
+        "        provider: minimax-cn\n"
+        "        model: MiniMax-M2.5\n",
+        encoding="utf-8",
+    )
+    seen: dict = {}
+    _install_fake_openai(
+        monkeypatch,
+        seen=seen,
+        message={"content": "", "tool_calls": None},
+    )
+    out = wl.run_worker_llm_oneshot(
+        "hi",
+        plugin="memory-digest",
+        purpose="digest-phase1",
+    )
+    assert out["failed"] is False
+    assert seen["client"]["base_url"] == "https://api.minimax.chat/v1"
+    assert seen["create"]["model"] == "MiniMax-M2.5"
+
+
+def test_oneshot_lane_base_url_wins_over_chat(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MINIMAX_CN_API_KEY", "mm-key")
+    monkeypatch.delenv("MINIMAX_CN_BASE_URL", raising=False)
+    (tmp_path / "config.yaml").write_text(
+        "model:\n"
+        "  provider: minimax-cn\n"
+        "  base_url: https://api.minimax.chat/v1\n"
+        "plugins:\n"
+        "  entries:\n"
+        "    MyMemory:\n"
+        "      digest:\n"
+        "        provider: minimax-cn\n"
+        "        model: MiniMax-M2.5\n"
+        "        worker_llm:\n"
+        "          phase1:\n"
+        "            provider: minimax-cn\n"
+        "            model: MiniMax-M2.5\n"
+        "            base_url: https://lane.example/v1\n",
+        encoding="utf-8",
+    )
+    seen: dict = {}
+    _install_fake_openai(
+        monkeypatch,
+        seen=seen,
+        message={"content": "", "tool_calls": None},
+    )
+    wl.run_worker_llm_oneshot(
+        "hi",
+        plugin="memory-digest",
+        purpose="digest-phase1",
+    )
+    assert seen["client"]["base_url"] == "https://lane.example/v1"
+
+
+def test_oneshot_missing_base_url_records_connection(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MINIMAX_CN_API_KEY", "mm-key")
+    monkeypatch.delenv("MINIMAX_CN_BASE_URL", raising=False)
+    (tmp_path / "config.yaml").write_text(
+        "model:\n"
+        "  provider: xiaomi\n"
+        "  base_url: https://api.xiaomimimo.com/v1\n"
+        "plugins:\n"
+        "  entries:\n"
+        "    MyMemory:\n"
+        "      digest:\n"
+        "        provider: minimax-cn\n"
+        "        model: MiniMax-M2.5\n",
+        encoding="utf-8",
+    )
+    out = wl.run_worker_llm_oneshot(
+        "hi",
+        plugin="memory-digest",
+        purpose="digest-phase1",
+    )
+    assert out["failed"] is True
+    assert out["llm_issue"] == "connection"
+    assert out["model"] == "MiniMax-M2.5"
+    health = json.loads((tmp_path / "metrics" / "llm-health.json").read_text(encoding="utf-8"))
+    assert health["kind"] == "connection"
+    assert health["model"] == "MiniMax-M2.5"
+
+
+def test_llm_issue_kind_and_quota_bool():
+    wl = _load_worker_llm()
+
+    class QuotaErr(Exception):
+        status_code = 429
+
+    class ConnErr(Exception):
+        pass
+
+    quota = QuotaErr("insufficient quota")
+    conn = ConnErr("connection error")
+    assert wl._llm_issue_kind(quota) == "quota"
+    assert wl._quota_exhausted(quota) is True
+    assert isinstance(wl._quota_exhausted(quota), bool)
+    assert wl._llm_issue_kind(conn) == "connection"
+    assert wl._quota_exhausted(conn) is False
+
+
+def test_run_worker_llm_oneshot_parses_fenced_json_content(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("XIAOMI_API_KEY", "test-key")
+    monkeypatch.setenv("XIAOMI_BASE_URL", "https://example.test/v1")
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-weekly:\n      provider: xiaomi\n      model: mimo-v2.5\n",
+        encoding="utf-8",
+    )
+    seen: dict = {}
+    _install_fake_openai(
+        monkeypatch,
+        seen=seen,
+        message={
+            "content": '```json\n{"text": "Keep this."}\n```',
+            "tool_calls": None,
+        },
+    )
+    out = wl.run_worker_llm_oneshot(
+        "CURRENT_JSON:\n{}",
+        plugin="memory-weekly",
+        purpose="ui_tighten",
+        force_tool_name="submit_tighten_text",
+        tool_schema={
+            "name": "submit_tighten_text",
+            "description": "text",
+            "parameters": {"type": "object", "properties": {"text": {"type": "string"}}},
+        },
+    )
+    assert out["tool_name"] == "submit_tighten_text"
+    assert out["tool_args"] == {"text": "Keep this."}
+
+
+def _install_fake_nested(monkeypatch, seen: dict) -> None:
+    """Stub nested AIAgent so tests can assert model/url without Hermes."""
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            seen["kwargs"] = dict(kwargs)
+            self.model = kwargs.get("model")
+            self.session_input_tokens = 0
+            self.session_output_tokens = 0
+            self.session_cache_read_tokens = 0
+            self.session_cache_write_tokens = 0
+            self.session_reasoning_tokens = 0
+            self.session_total_tokens = 0
+            self.session_estimated_cost_usd = 0.0
+            self.session_api_calls = 1
+
+        def run_conversation(self, prompt):
+            return {"final_response": "ok"}
+
+    fake_gateway_pkg = types.ModuleType("gateway")
+    fake_gateway_run = types.ModuleType("gateway.run")
+    fake_gateway_run._resolve_gateway_model = lambda: "gateway-model"
+    fake_gateway_run._resolve_runtime_agent_kwargs = lambda: {
+        "api_key": "chat-key",
+        "provider": "kimi-coding",
+        "base_url": "https://api.kimi.com/coding/v1",
+    }
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+    monkeypatch.setitem(sys.modules, "gateway", fake_gateway_pkg)
+    monkeypatch.setitem(sys.modules, "gateway.run", fake_gateway_run)
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+
+def test_undeclared_plugin_model_follows_chat_oneshot_and_nested(tmp_path, monkeypatch):
+    """Background workers use chat model: when MyMemory lanes omit model."""
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MINIMAX_CN_API_KEY", "mm-key")
+    monkeypatch.setenv("MINIMAX_CN_BASE_URL", "https://api.minimax.chat/v1")
+    (tmp_path / "config.yaml").write_text(
+        "model:\n"
+        "  provider: minimax-cn\n"
+        "  default: MiniMax-M3\n"
+        "plugins:\n"
+        "  entries:\n"
+        "    MyMemory:\n"
+        "      digest:\n"
+        "        allow_tool_override: false\n"
+        "      weekly:\n"
+        "        allow_tool_override: false\n",
+        encoding="utf-8",
+    )
+    seen: dict = {}
+    _install_fake_openai(
+        monkeypatch,
+        seen=seen,
+        message={"content": "", "tool_calls": None},
+    )
+    for purpose in ("digest-dedup", "digest-wrapup"):
+        seen.pop("create", None)
+        out = wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose=purpose)
+        assert out["failed"] is False
+        assert seen["create"]["model"] == "MiniMax-M3"
+        assert seen["client"]["base_url"] == "https://api.minimax.chat/v1"
+    nested: dict = {}
+    _install_fake_nested(monkeypatch, nested)
+    assert wl.run_worker_llm("hi", plugin="memory-digest", purpose="digest-phase1") == "ok"
+    assert nested["kwargs"]["model"] == "MiniMax-M3"
+    assert nested["kwargs"]["base_url"] == "https://api.minimax.chat/anthropic"
+    assert nested["kwargs"]["api_mode"] == "anthropic_messages"
+    assert nested["kwargs"]["api_key"] == "mm-key"
+    nested.clear()
+    _install_fake_nested(monkeypatch, nested)
+    assert wl.run_worker_llm("hi", plugin="memory-weekly", purpose="ui_tighten") == "ok"
+    assert nested["kwargs"]["model"] == "MiniMax-M3"
+
+
+def test_declared_phase2_overlay_does_not_move_phase1(tmp_path, monkeypatch):
+    """A worker_llm.phase2 model overrides only digest-dedup oneshot."""
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MINIMAX_CN_API_KEY", "mm-key")
+    monkeypatch.setenv("MINIMAX_CN_BASE_URL", "https://api.minimax.chat/v1")
+    monkeypatch.setenv("KIMI_API_KEY", "kimi-key")
+    monkeypatch.setenv("KIMI_BASE_URL", "https://api.kimi.com/coding/v1")
+    (tmp_path / "config.yaml").write_text(
+        "model:\n"
+        "  provider: minimax-cn\n"
+        "  default: MiniMax-M3\n"
+        "plugins:\n"
+        "  entries:\n"
+        "    MyMemory:\n"
+        "      digest:\n"
+        "        worker_llm:\n"
+        "          phase2:\n"
+        "            provider: kimi-coding\n"
+        "            model: other-model\n",
+        encoding="utf-8",
+    )
+    seen: dict = {}
+    _install_fake_openai(
+        monkeypatch,
+        seen=seen,
+        message={"content": "", "tool_calls": None},
+    )
+    wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose="digest-dedup")
+    assert seen["create"]["model"] == "other-model"
+    assert seen["client"]["base_url"] == "https://api.kimi.com/coding/v1"
+    nested: dict = {}
+    _install_fake_nested(monkeypatch, nested)
+    wl.run_worker_llm("hi", plugin="memory-digest", purpose="digest-phase1")
+    assert nested["kwargs"]["model"] == "MiniMax-M3"
+
+
+def test_nested_overlay_reads_worker_env_url_not_chat(tmp_path, monkeypatch):
+    """Popped chat Kimi URL must not ride along when the worker is Xiaomi."""
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("XIAOMI_API_KEY", "mi-key")
+    monkeypatch.setenv("XIAOMI_BASE_URL", "https://mimo.example/v1")
+    (tmp_path / "config.yaml").write_text(
+        "model:\n"
+        "  provider: kimi-coding\n"
+        "  default: kimi-k2.6\n"
+        "plugins:\n"
+        "  entries:\n"
+        "    MyMemory:\n"
+        "      digest:\n"
+        "        provider: xiaomi\n"
+        "        model: mimo-v2.5\n",
+        encoding="utf-8",
+    )
+    nested: dict = {}
+    _install_fake_nested(monkeypatch, nested)
+    wl.run_worker_llm("hi", plugin="memory-digest", purpose="digest-phase1")
+    assert nested["kwargs"]["base_url"] == "https://mimo.example/v1"
+    assert nested["kwargs"]["api_key"] == "mi-key"
+    assert nested["kwargs"].get("provider") == "xiaomi"
+
+
+def test_oneshot_records_duration_ms(tmp_path, monkeypatch):
+    """Usage ledger needs wall time so prefetch vs digest timeout can be split."""
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MINIMAX_CN_API_KEY", "mm-key")
+    monkeypatch.setenv("MINIMAX_CN_BASE_URL", "https://api.minimax.chat/v1")
+    (tmp_path / "config.yaml").write_text(
+        "model:\n  provider: minimax-cn\n  default: MiniMax-M3\n",
+        encoding="utf-8",
+    )
+    seen: dict = {}
+    _install_fake_openai(
+        monkeypatch,
+        seen=seen,
+        message={"content": "", "tool_calls": None},
+    )
+    wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose="digest-dedup")
+    rec = json.loads(
+        (tmp_path / "metrics" / "llm-usage.jsonl").read_text(encoding="utf-8").strip().splitlines()[-1]
+    )
+    assert rec["api_calls"] == 1
+    assert rec["duration_ms"] >= 0
+
+
+_WORKER_YAML = (
+    "model:\n"
+    "  provider: minimax-cn\n"
+    "  default: MiniMax-M3\n"
+    "  base_url: https://api.minimax.chat/v1\n"
+    "plugins:\n"
+    "  entries:\n"
+    "    MyMemory:\n"
+    "      digest:\n"
+    "        provider: minimax-cn\n"
+    "        model: MiniMax-M2.5\n"
+    "      weekly:\n"
+    "        provider: minimax-cn\n"
+    "        model: MiniMax-M2.5\n"
+    "      monthly:\n"
+    "        provider: minimax-cn\n"
+    "        model: MiniMax-M2.5\n"
+)
+
+
+def _pin_minimax_worker(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MINIMAX_CN_API_KEY", "mm-key")
+    monkeypatch.delenv("MINIMAX_CN_BASE_URL", raising=False)
+    (tmp_path / "config.yaml").write_text(_WORKER_YAML, encoding="utf-8")
+
+
+def test_oneshot_uses_openai_v1_surface(tmp_path, monkeypatch):
+    _pin_minimax_worker(monkeypatch, tmp_path)
+    wl = _load_worker_llm()
+    seen: dict = {}
+    _install_fake_openai(
+        monkeypatch,
+        seen=seen,
+        message={"content": "ok", "tool_calls": None},
+    )
+    out = wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose="digest-dedup")
+    assert out["failed"] is False
+    assert seen["client"]["base_url"] == "https://api.minimax.chat/v1"
+    rec = json.loads(
+        (tmp_path / "metrics" / "llm-usage.jsonl").read_text(encoding="utf-8").strip().splitlines()[-1]
+    )
+    assert rec["input_tokens"] > 0 or rec["output_tokens"] > 0 or rec["api_calls"] == 1
+
+
+def test_nested_uses_anthropic_surface_and_api_mode(tmp_path, monkeypatch):
+    _pin_minimax_worker(monkeypatch, tmp_path)
+    wl = _load_worker_llm()
+    nested: dict = {}
+    _install_fake_nested(monkeypatch, nested)
+    assert wl.run_worker_llm("hi", plugin="memory-digest", purpose="digest-phase1") == "ok"
+    assert nested["kwargs"]["base_url"] == "https://api.minimax.chat/anthropic"
+    assert nested["kwargs"]["api_mode"] == "anthropic_messages"
+
+
+def test_oneshot_lanes_share_openai_v1(tmp_path, monkeypatch):
+    _pin_minimax_worker(monkeypatch, tmp_path)
+    wl = _load_worker_llm()
+    seen: dict = {}
+    _install_fake_openai(
+        monkeypatch,
+        seen=seen,
+        message={"content": "ok", "tool_calls": None},
+    )
+    lanes = (
+        ("memory-digest", "digest-dedup"),
+        ("memory-digest", "digest-wrapup"),
+        ("memory-monthly", "monthly-map"),
+        ("memory-monthly", "monthly-reduce"),
+        ("memory-weekly", "ui_tighten"),
+    )
+    for plugin, purpose in lanes:
+        seen.pop("create", None)
+        out = wl.run_worker_llm_oneshot("hi", plugin=plugin, purpose=purpose)
+        assert out["failed"] is False, purpose
+        assert seen["client"]["base_url"] == "https://api.minimax.chat/v1", purpose
+
+
+def test_nested_lanes_share_anthropic_surface(tmp_path, monkeypatch):
+    _pin_minimax_worker(monkeypatch, tmp_path)
+    wl = _load_worker_llm()
+    nested: dict = {}
+    lanes = (
+        ("memory-digest", "digest-phase1"),
+        ("memory-weekly", "weekly_llm"),
+        ("memory-weekly", "chronicle"),
+        ("memory-weekly", "hot_health"),
+        ("MyMemory", "recall-plan"),
+    )
+    for plugin, purpose in lanes:
+        nested.clear()
+        _install_fake_nested(monkeypatch, nested)
+        assert wl.run_worker_llm("hi", plugin=plugin, purpose=purpose) == "ok", purpose
+        assert nested["kwargs"]["base_url"] == "https://api.minimax.chat/anthropic", purpose
+        assert nested["kwargs"]["api_mode"] == "anthropic_messages", purpose
+
+
+def test_yaml_v1_still_reshapes_nested_to_anthropic(tmp_path, monkeypatch):
+    _pin_minimax_worker(monkeypatch, tmp_path)
+    wl = _load_worker_llm()
+    seen: dict = {}
+    _install_fake_openai(
+        monkeypatch,
+        seen=seen,
+        message={"content": "ok", "tool_calls": None},
+    )
+    wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose="digest-dedup")
+    assert seen["client"]["base_url"] == "https://api.minimax.chat/v1"
+    nested: dict = {}
+    _install_fake_nested(monkeypatch, nested)
+    wl.run_worker_llm("hi", plugin="memory-digest", purpose="digest-phase1")
+    assert nested["kwargs"]["base_url"] == "https://api.minimax.chat/anthropic"
+    assert nested["kwargs"]["api_mode"] == "anthropic_messages"
+    assert nested["kwargs"]["reasoning_config"] == {"enabled": False}
+
+
+def test_sum_usage_after_keeps_boundary_line_only_when_asked(tmp_path, monkeypatch):
+    """The default drop skips a finished row at a newline offset; callers opt in to keep it.
+
+    A file-size offset already sits on a finished row. Dropping it makes a
+    one-call reply print zero tokens. Digest and weekly pass keep_boundary_line.
+    """
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ledger = tmp_path / "metrics" / "llm-usage.jsonl"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text('{"input_tokens": 1, "output_tokens": 1}\n', encoding="utf-8")
+    offset = wl.usage_ledger_offset()
+    with ledger.open("a", encoding="utf-8") as fh:
+        fh.write('{"input_tokens": 6913, "output_tokens": 2072}\n')
+    assert wl.sum_usage_after(offset) == {"input_tokens": 0, "output_tokens": 0}
+    assert wl.sum_usage_after(offset, keep_boundary_line=True) == {
+        "input_tokens": 6913,
+        "output_tokens": 2072,
+    }
+
+
+def _oneshot_success():
+    message = types.SimpleNamespace(
+        content="",
+        tool_calls=[
+            types.SimpleNamespace(
+                function=types.SimpleNamespace(
+                    name="submit_digest",
+                    arguments='{"ok": true}',
+                )
+            )
+        ],
+    )
+    choice = types.SimpleNamespace(message=message, finish_reason="tool_calls")
+    usage = types.SimpleNamespace(
+        prompt_tokens=3,
+        completion_tokens=2,
+        total_tokens=5,
+        prompt_tokens_details=types.SimpleNamespace(cached_tokens=0),
+        completion_tokens_details=types.SimpleNamespace(reasoning_tokens=0),
+    )
+    return types.SimpleNamespace(choices=[choice], usage=usage)
+
+
+def test_oneshot_no_profile_sends_thinking_disabled(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("BOX_API_KEY", "box-key")
+    monkeypatch.setenv("BOX_BASE_URL", "https://box.example/v1")
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-digest:\n      provider: box\n      model: box-1\n",
+        encoding="utf-8",
+    )
+    fake = types.ModuleType("providers")
+    fake.get_provider_profile = lambda name: None
+    monkeypatch.setitem(sys.modules, "providers", fake)
+    seen: dict = {}
+    _install_fake_openai(monkeypatch, seen=seen, message={"content": "", "tool_calls": None})
+    wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose="digest-phase1")
+    assert seen["create"].get("reasoning_effort") == "none"
+    assert (seen["create"].get("extra_body") or {}).get("thinking") != {"type": "disabled"}
+
+
+def test_oneshot_profile_disable_and_k2_does_not_keep_the_first_lane(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("XIAOMI_API_KEY", "mi-key")
+    monkeypatch.setenv("XIAOMI_BASE_URL", "https://mimo.example/v1")
+    monkeypatch.setenv("KIMI_API_KEY", "kimi-key")
+    monkeypatch.setenv("KIMI_BASE_URL", "https://kimi.example/v1")
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-digest:\n      provider: xiaomi\n      model: mimo-v2.5\n",
+        encoding="utf-8",
+    )
+
+    class Profile:
+        def __init__(self, name):
+            self.name = name
+
+        def build_api_kwargs_extras(self, **kwargs):
+            assert kwargs["reasoning_config"] == {"enabled": False}
+            if self.name == "kimi-coding":
+                return {"thinking": {"type": "disabled"}, "lane": "kimi"}, {"reasoning_effort": "none"}
+            return {}, {}
+
+    fake = types.ModuleType("providers")
+    fake.get_provider_profile = lambda name: Profile(str(name))
+    monkeypatch.setitem(sys.modules, "providers", fake)
+
+    class QuotaErr(Exception):
+        status_code = 429
+
+    bodies: list[dict] = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            bodies.append(dict(kwargs))
+            if len(bodies) == 1:
+                raise QuotaErr("insufficient quota")
+            return _oneshot_success()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.chat = FakeChat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = FakeClient
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    out = wl.run_worker_llm_oneshot(
+        "digest this",
+        plugin="memory-digest",
+        purpose="digest-phase1",
+        force_tool_name="submit_digest",
+        tool_schema={"name": "submit_digest", "parameters": {"type": "object", "properties": {}}},
+    )
+    assert out["failed"] is False
+    assert "lane" not in (bodies[0].get("extra_body") or {})
+    assert bodies[0]["extra_body"]["thinking"] == {"type": "disabled"}
+    assert bodies[0]["model"] == "mimo-v2.5"
+    assert bodies[1]["extra_body"]["lane"] == "kimi"
+    assert bodies[1]["reasoning_effort"] == "none"
+    assert bodies[1]["model"] == "kimi-for-coding-highspeed"
+
+
+def test_oneshot_drops_thinking_after_a_field_rejection(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("BOX_API_KEY", "box-key")
+    monkeypatch.setenv("BOX_BASE_URL", "https://box.example/v1")
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-digest:\n      provider: box\n      model: box-1\n",
+        encoding="utf-8",
+    )
+    fake = types.ModuleType("providers")
+    fake.get_provider_profile = lambda name: None
+    monkeypatch.setitem(sys.modules, "providers", fake)
+
+    class Reject(Exception):
+        status_code = 400
+
+        def __str__(self):
+            return "Unrecognized request argument supplied: thinking"
+
+    bodies: list[dict] = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            bodies.append(dict(kwargs))
+            if "extra_body" in kwargs or "reasoning_effort" in kwargs:
+                raise Reject()
+            return _oneshot_success()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.chat = FakeChat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = FakeClient
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    out = wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose="digest-phase1")
+    assert out["failed"] is False
+    assert "extra_body" not in bodies[1]
+    rec = json.loads(
+        (tmp_path / "metrics" / "llm-usage.jsonl").read_text(encoding="utf-8").strip().splitlines()[-1]
+    )
+    assert rec["thinking_off"] is False
+
+
+def test_phase1_anthropic_kwargs_disable_thinking_except_claude(monkeypatch):
+    wl = _load_worker_llm()
+    captured: dict = {}
+
+    def fake_build(**kwargs):
+        captured.update(kwargs)
+        return {"model": kwargs["model"], "max_tokens": kwargs["max_tokens"]}
+
+    adapter = types.ModuleType("agent.anthropic_adapter")
+    adapter.build_anthropic_kwargs = fake_build
+    monkeypatch.setitem(sys.modules, "agent.anthropic_adapter", adapter)
+    built = wl._build_phase1_anthropic_kwargs(
+        model="MiniMax-M2.5",
+        messages=[],
+        tools=[],
+        max_tokens=100,
+        base_url="https://api.minimax.chat/anthropic",
+    )
+    assert captured["reasoning_config"] == {"enabled": False}
+    assert built["thinking"] == {"type": "disabled"}
+    claude = wl._build_phase1_anthropic_kwargs(
+        model="claude-sonnet-4-6",
+        messages=[],
+        tools=[],
+        max_tokens=100,
+        base_url="https://api.anthropic.com",
+    )
+    assert "thinking" not in claude
+
+
+def test_anthropic_create_retries_without_thinking(monkeypatch):
+    wl = _load_worker_llm()
+    calls: list[dict] = []
+
+    class Reject(Exception):
+        def __str__(self):
+            return "Unrecognized request argument supplied: thinking"
+
+    class Messages:
+        def create(self, **kwargs):
+            calls.append(dict(kwargs))
+            if "thinking" in kwargs:
+                raise Reject()
+            return "ok"
+
+    class Client:
+        messages = Messages()
+
+    adapter = types.ModuleType("agent.anthropic_adapter")
+    adapter.build_anthropic_client = lambda *_a, **_k: Client()
+    monkeypatch.setitem(sys.modules, "agent.anthropic_adapter", adapter)
+    out = wl._anthropic_messages_create(
+        {"model": "MiniMax-M2.5", "thinking": {"type": "disabled"}},
+        api_key="k",
+        base_url="https://api.minimax.chat/anthropic",
+    )
+    assert out == "ok"
+    assert "thinking" not in calls[1]
+
+
+def test_nested_chat_fallback_puts_thinking_on_overrides(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    MyMemory:\n      weekly:\n"
+        "        provider: box\n        model: box-1\n",
+        encoding="utf-8",
+    )
+    fake = types.ModuleType("providers")
+    fake.get_provider_profile = lambda name: None
+    monkeypatch.setitem(sys.modules, "providers", fake)
+    seen: dict = {}
+    _install_fake_nested(monkeypatch, seen)
+    assert wl.run_worker_llm("hi", plugin="memory-weekly", purpose="ui_tighten") == "ok"
+    assert seen["kwargs"]["reasoning_config"] == {"enabled": False}
+    assert seen["kwargs"]["request_overrides"]["reasoning_effort"] == "none"
+    assert "thinking" not in (seen["kwargs"]["request_overrides"].get("extra_body") or {})
+
+
+def test_oneshot_schema_retries_once_then_fails(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("XIAOMI_API_KEY", "test-key")
+    monkeypatch.setenv("XIAOMI_BASE_URL", "https://example.test/v1")
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-weekly:\n      provider: xiaomi\n      model: mimo-v2.5\n",
+        encoding="utf-8",
+    )
+    calls: list[dict] = []
+
+    class FakeMessage:
+        def __init__(self, arguments: str):
+            self.content = ""
+            self.tool_calls = [
+                types.SimpleNamespace(
+                    function=types.SimpleNamespace(name="submit", arguments=arguments)
+                )
+            ]
+
+    class FakeChoice:
+        def __init__(self, arguments: str):
+            self.message = FakeMessage(arguments)
+            self.finish_reason = "tool_calls"
+
+    class FakeUsage:
+        prompt_tokens = 1
+        completion_tokens = 1
+        total_tokens = 2
+        prompt_tokens_details = None
+        completion_tokens_details = None
+
+    class FakeResponse:
+        def __init__(self, arguments: str):
+            self.choices = [FakeChoice(arguments)]
+            self.usage = FakeUsage()
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return FakeResponse("{}")
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.chat = FakeChat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = FakeClient
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    schema = {
+        "name": "submit",
+        "parameters": {
+            "type": "object",
+            "properties": {"title": {"type": "string"}},
+            "required": ["title"],
+        },
+    }
+    out = wl.run_worker_llm_oneshot(
+        "write",
+        plugin="memory-weekly",
+        purpose="ui_tighten",
+        force_tool_name="submit",
+        tool_schema=schema,
+    )
+    assert len(calls) == 2
+    assert "missing required field title" in calls[1]["messages"][-1]["content"]
+    assert out["failed"] is True
+    assert "missing required field title" in out["final_response"]
+
+
+def test_oneshot_uses_caller_system_prompt(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("XIAOMI_API_KEY", "test-key")
+    monkeypatch.setenv("XIAOMI_BASE_URL", "https://example.test/v1")
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-weekly:\n      provider: xiaomi\n      model: mimo-v2.5\n",
+        encoding="utf-8",
+    )
+    seen: dict = {}
+    tool_call = types.SimpleNamespace(
+        function=types.SimpleNamespace(name="submit", arguments='{"title": "a"}')
+    )
+    _install_fake_openai(monkeypatch, seen=seen, message={"content": "", "tool_calls": [tool_call]})
+    wl.run_worker_llm_oneshot(
+        "dynamic body",
+        plugin="memory-weekly",
+        purpose="ui_tighten",
+        force_tool_name="submit",
+        tool_schema={"name": "submit", "parameters": {"type": "object", "properties": {}}},
+        system_prompt="Stable monthly instructions.",
+    )
+    assert seen["create"]["messages"][0]["content"] == "Stable monthly instructions."
+    assert seen["create"]["messages"][1]["content"] == "dynamic body"
+
+
+def test_quota_dead_window_expires():
+    wl = _load_worker_llm()
+    wl._mark_xiaomi_quota_dead()
+    assert wl._xiaomi_quota_is_dead() is True
+    wl._xiaomi_quota_dead_until = 1
+    assert wl._xiaomi_quota_is_dead() is False
+
+
+def test_provider_caps_row_overrides_builtin(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    MyMemory:\n      provider_capabilities:\n"
+        "        xiaomi:\n          wire: anthropic\n"
+        "          fallback_provider: box\n          fallback_model: box-1\n"
+        "        gemini:\n          wire: litellm\n          litellm_prefix: gemini\n",
+        encoding="utf-8",
+    )
+    assert wl._worker_wire("xiaomi") == "anthropic"
+    assert wl._fallback_lane("xiaomi") == ("box", "box-1")
+    assert wl._worker_wire("minimax-cn") == "anthropic"
+    assert wl._worker_wire("gemini") == "litellm"
+    assert wl._worker_wire("unknown-vendor") == "openai"
+
+
+def test_length_finish_retries_with_more_tokens(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("XIAOMI_API_KEY", "test-key")
+    monkeypatch.setenv("XIAOMI_BASE_URL", "https://example.test/v1")
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-weekly:\n      provider: xiaomi\n      model: mimo-v2.5\n",
+        encoding="utf-8",
+    )
+    limits: list[int] = []
+
+    class Msg:
+        content = ""
+        tool_calls = [
+            types.SimpleNamespace(
+                function=types.SimpleNamespace(name="submit", arguments='{"title": "ok"}')
+            )
+        ]
+
+    class Choice:
+        def __init__(self, reason: str):
+            self.message = Msg()
+            self.finish_reason = reason
+
+    class Usage:
+        prompt_tokens = 1
+        completion_tokens = 1
+        total_tokens = 2
+        prompt_tokens_details = None
+        completion_tokens_details = None
+
+    class Resp:
+        def __init__(self, reason: str):
+            self.choices = [Choice(reason)]
+            self.usage = Usage()
+
+    class Completions:
+        def create(self, **kwargs):
+            limits.append(kwargs["max_tokens"])
+            reason = "length" if len(limits) == 1 else "tool_calls"
+            return Resp(reason)
+
+    class Chat:
+        completions = Completions()
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.chat = Chat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    out = wl.run_worker_llm_oneshot(
+        "hi",
+        plugin="memory-weekly",
+        purpose="ui_tighten",
+        force_tool_name="submit",
+        tool_schema={"name": "submit", "parameters": {"type": "object", "properties": {}}},
+        max_tokens=100,
+    )
+    assert limits == [100, 200]
+    assert out["failed"] is False
+    assert out["tool_args"] == {"title": "ok"}
+
+
+def _gemini_litellm_config() -> str:
+    return (
+        "plugins:\n  entries:\n    MyMemory:\n      provider_capabilities:\n"
+        "        gemini:\n          wire: litellm\n          litellm_prefix: gemini\n"
+        "    memory-weekly:\n      provider: gemini\n      model: gemma-3\n"
+    )
+
+
+def _litellm_tool_response():
+    message = types.SimpleNamespace(
+        content="",
+        tool_calls=[
+            types.SimpleNamespace(
+                function=types.SimpleNamespace(
+                    name="submit",
+                    arguments='{"title": "from-gemini"}',
+                )
+            )
+        ],
+    )
+    choice = types.SimpleNamespace(message=message, finish_reason="tool_calls")
+    usage = types.SimpleNamespace(
+        prompt_tokens=4,
+        completion_tokens=3,
+        total_tokens=7,
+        prompt_tokens_details=types.SimpleNamespace(cached_tokens=0),
+        completion_tokens_details=types.SimpleNamespace(reasoning_tokens=0),
+    )
+    return types.SimpleNamespace(choices=[choice], usage=usage)
+
+
+def test_litellm_wire_parses_tool_args_and_prefixes_model(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("GEMINI_API_KEY", "gem-key")
+    monkeypatch.delenv("GEMINI_BASE_URL", raising=False)
+    monkeypatch.delenv("LITELLM_LOCAL_MODEL_COST_MAP", raising=False)
+    (tmp_path / "config.yaml").write_text(_gemini_litellm_config(), encoding="utf-8")
+    seen: dict = {}
+
+    def completion(**kwargs):
+        seen["kwargs"] = kwargs
+        return _litellm_tool_response()
+
+    fake = types.ModuleType("litellm")
+    fake.completion = completion
+    monkeypatch.setitem(sys.modules, "litellm", fake)
+    out = wl.run_worker_llm_oneshot(
+        "write",
+        plugin="memory-weekly",
+        purpose="ui_tighten",
+        force_tool_name="submit",
+        tool_schema={"name": "submit", "parameters": {"type": "object", "properties": {}}},
+    )
+    assert out["failed"] is False
+    assert out["tool_name"] == "submit"
+    assert out["tool_args"] == {"title": "from-gemini"}
+    assert seen["kwargs"]["model"] == "gemini/gemma-3"
+    assert seen["kwargs"]["api_key"] == "gem-key"
+    assert "api_base" not in seen["kwargs"]
+    assert "extra_body" not in seen["kwargs"]
+    assert os.environ.get("LITELLM_LOCAL_MODEL_COST_MAP") == "True"
+
+
+def test_litellm_wire_429_is_quota(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("GEMINI_API_KEY", "gem-key")
+    (tmp_path / "config.yaml").write_text(_gemini_litellm_config(), encoding="utf-8")
+
+    def completion(**_kwargs):
+        err = Exception("rate limit")
+        err.status_code = 429
+        raise err
+
+    fake = types.ModuleType("litellm")
+    fake.completion = completion
+    monkeypatch.setitem(sys.modules, "litellm", fake)
+    out = wl.run_worker_llm_oneshot(
+        "write",
+        plugin="memory-weekly",
+        purpose="ui_tighten",
+        force_tool_name="submit",
+        tool_schema={"name": "submit", "parameters": {"type": "object", "properties": {}}},
+    )
+    assert out["failed"] is True
+    assert out["llm_issue"] == "quota"
+
+
+def test_litellm_wire_missing_import_fails_closed(tmp_path, monkeypatch):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("GEMINI_API_KEY", "gem-key")
+    (tmp_path / "config.yaml").write_text(_gemini_litellm_config(), encoding="utf-8")
+    sys.modules.pop("litellm", None)
+    import builtins
+
+    real_import = builtins.__import__
+
+    def guarded(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "litellm" or name.startswith("litellm."):
+            raise ImportError("litellm not installed")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded)
+    out = wl.run_worker_llm_oneshot(
+        "write",
+        plugin="memory-weekly",
+        purpose="ui_tighten",
+    )
+    assert out["failed"] is True
+    assert "litellm not installed" in out["final_response"]
+
+
+def _box_home(tmp_path, monkeypatch, *, caps="", providers=""):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("BOX_API_KEY", "box-key")
+    monkeypatch.setenv("BOX_BASE_URL", "https://box.example/v1")
+    wl._openai_clients.clear()
+    try:
+        import agent.auxiliary_reasoning_floor as floor
+
+        floor._FLOORED_ROUTES.clear()
+    except Exception:
+        pass
+    text = "plugins:\n  entries:\n    MyMemory:\n"
+    if caps:
+        text += "      provider_capabilities:\n" + caps
+    text += (
+        "    memory-digest:\n      provider: box\n      model: box-1\n"
+        "    memory-monthly:\n      provider: box\n      model: box-1\n"
+    )
+    if providers:
+        text += providers
+    (tmp_path / "config.yaml").write_text(text, encoding="utf-8")
+    fake = types.ModuleType("providers")
+    fake.get_provider_profile = lambda name: None
+    monkeypatch.setitem(sys.modules, "providers", fake)
+    return wl
+
+
+def test_custom_provider_resolves_to_custom_profile(tmp_path, monkeypatch):
+    """Inferway is a providers: entry, so the worker must send top-level reasoning_effort."""
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("INFERWAY_API_KEY", "iw-key")
+    monkeypatch.setenv("INFERWAY_BASE_URL", "https://api.inferway.ai/v1")
+    wl._openai_clients.clear()
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n  inferway:\n    api: https://api.inferway.ai/v1\n"
+        "plugins:\n  entries:\n    memory-weekly:\n"
+        "      provider: inferway\n      model: z-ai/glm-5.3-uncensored\n",
+        encoding="utf-8",
+    )
+    seen: dict = {"names": []}
+
+    class Profile:
+        def build_api_kwargs_extras(self, **kwargs):
+            assert kwargs["reasoning_config"] == {"enabled": False}
+            return {}, {"reasoning_effort": "none"}
+
+    fake = types.ModuleType("providers")
+
+    def get_profile(name):
+        seen["names"].append(name)
+        return Profile()
+
+    fake.get_provider_profile = get_profile
+    monkeypatch.setitem(sys.modules, "providers", fake)
+    captured: dict = {}
+    _install_fake_openai(monkeypatch, seen=captured, message={"content": "", "tool_calls": None})
+    wl.run_worker_llm_oneshot("hi", plugin="memory-weekly", purpose="ui_tighten")
+    assert seen["names"] == ["custom:inferway"]
+    assert captured["create"]["reasoning_effort"] == "none"
+    assert (captured["create"].get("extra_body") or {}).get("thinking") != {"type": "disabled"}
+
+
+def test_does_not_allow_steps_up_to_low_and_is_remembered(tmp_path, monkeypatch):
+    wl = _box_home(tmp_path, monkeypatch)
+    bodies: list[dict] = []
+
+    class Reject(Exception):
+        status_code = 400
+
+        def __str__(self):
+            return "This model does not allow reasoning off"
+
+    class Completions:
+        def create(self, **kwargs):
+            bodies.append(dict(kwargs))
+            if kwargs.get("reasoning_effort") == "none":
+                raise Reject()
+            return _oneshot_success()
+
+    class Chat:
+        completions = Completions()
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.chat = Chat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    out = wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose="digest-phase1")
+    assert out["failed"] is False
+    assert [row.get("reasoning_effort") for row in bodies] == ["none", "low"]
+    assert wl._known_reasoning_floor("box", "box-1", "https://box.example/v1") == "memo"
+
+
+def test_invalid_request_controls_strips_reasoning_fields(tmp_path, monkeypatch):
+    wl = _box_home(tmp_path, monkeypatch)
+    bodies: list[dict] = []
+
+    class Reject(Exception):
+        status_code = 400
+
+        def __str__(self):
+            return "Invalid request controls."
+
+    class Completions:
+        def create(self, **kwargs):
+            bodies.append(dict(kwargs))
+            if "reasoning_effort" in kwargs or "extra_body" in kwargs:
+                raise Reject()
+            return _oneshot_success()
+
+    class Chat:
+        completions = Completions()
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.chat = Chat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    out = wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose="digest-phase1")
+    assert out["failed"] is False
+    assert "reasoning_effort" not in bodies[-1]
+    assert "extra_body" not in bodies[-1]
+
+
+def test_must_be_one_of_steps_up_to_low(tmp_path, monkeypatch):
+    wl = _box_home(tmp_path, monkeypatch)
+    bodies: list[dict] = []
+
+    class Reject(Exception):
+        status_code = 400
+
+        def __str__(self):
+            return "'reasoning_effort' must be one of: 'low', 'medium', 'high'"
+
+    class Completions:
+        def create(self, **kwargs):
+            bodies.append(dict(kwargs))
+            if kwargs.get("reasoning_effort") == "none":
+                raise Reject()
+            return _oneshot_success()
+
+    class Chat:
+        completions = Completions()
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.chat = Chat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    out = wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose="digest-phase1")
+    assert out["failed"] is False
+    assert bodies[-1]["reasoning_effort"] == "low"
+
+
+def test_config_reasoning_floor_starts_at_low(tmp_path, monkeypatch):
+    wl = _box_home(
+        tmp_path,
+        monkeypatch,
+        caps="        box:\n          wire: openai\n          reasoning_floor: low\n",
+    )
+    seen: dict = {}
+    _install_fake_openai(monkeypatch, seen=seen, message={"content": "ok", "tool_calls": None})
+    out = wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose="digest-phase1")
+    assert out["failed"] is False
+    assert seen["create"]["reasoning_effort"] == "low"
+    assert out["floor_source"] == "config"
+    assert out["wire"] == "openai"
+    assert out["api_calls"] == 1
+
+
+def test_stripped_request_falls_back_to_litellm_and_goes_bare(tmp_path, monkeypatch):
+    wl = _box_home(tmp_path, monkeypatch)
+    openai_calls = {"n": 0}
+    lite_calls: list[dict] = []
+
+    class Reject(Exception):
+        status_code = 400
+
+        def __str__(self):
+            return "Invalid request controls."
+
+    class Completions:
+        def create(self, **kwargs):
+            openai_calls["n"] += 1
+            raise Reject()
+
+    class Chat:
+        completions = Completions()
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.chat = Chat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+
+    def completion(**kwargs):
+        lite_calls.append(dict(kwargs))
+        if "reasoning_effort" in kwargs:
+            raise Reject("This model does not allow reasoning off")
+        return _oneshot_success()
+
+    fake = types.ModuleType("litellm")
+    fake.completion = completion
+    monkeypatch.setitem(sys.modules, "litellm", fake)
+    out = wl.run_worker_llm_oneshot(
+        "hi",
+        plugin="memory-digest",
+        purpose="digest-phase1",
+        force_tool_name="submit_digest",
+        tool_schema={"name": "submit_digest", "parameters": {"type": "object", "properties": {}}},
+    )
+    assert out["failed"] is False
+    assert openai_calls["n"] >= 2
+    assert lite_calls[0]["model"] == "openai/box-1"
+    assert lite_calls[0]["reasoning_effort"] == "none"
+    assert lite_calls[0]["allowed_openai_params"] == ["reasoning_effort"]
+    assert "reasoning_effort" not in lite_calls[1]
+    assert out["fallback_wire"] == "litellm"
+    assert out["wire"] == "litellm"
+    assert out["tool_args"] == {"ok": True}
+
+
+def test_length_bump_respects_lane_ceiling(tmp_path, monkeypatch):
+    wl = _box_home(tmp_path, monkeypatch)
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-monthly:\n"
+        "      provider: box\n      model: box-1\n      max_tokens_ceiling: 300\n",
+        encoding="utf-8",
+    )
+    limits: list[int] = []
+
+    class Msg:
+        content = ""
+        tool_calls = [
+            types.SimpleNamespace(
+                function=types.SimpleNamespace(name="submit", arguments='{"title": "ok"}')
+            )
+        ]
+
+    class Choice:
+        def __init__(self, reason: str):
+            self.message = Msg()
+            self.finish_reason = reason
+
+    class Usage:
+        prompt_tokens = 1
+        completion_tokens = 1
+        total_tokens = 2
+        prompt_tokens_details = None
+        completion_tokens_details = None
+
+    class Resp:
+        def __init__(self, reason: str):
+            self.choices = [Choice(reason)]
+            self.usage = Usage()
+
+    class Completions:
+        def create(self, **kwargs):
+            limits.append(kwargs["max_tokens"])
+            reason = "length" if len(limits) == 1 else "tool_calls"
+            return Resp(reason)
+
+    class Chat:
+        completions = Completions()
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.chat = Chat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    fake = types.ModuleType("providers")
+    fake.get_provider_profile = lambda name: None
+    monkeypatch.setitem(sys.modules, "providers", fake)
+    out = wl.run_worker_llm_oneshot(
+        "hi",
+        plugin="memory-monthly",
+        purpose="monthly-reduce",
+        force_tool_name="submit",
+        tool_schema={"name": "submit", "parameters": {"type": "object", "properties": {}}},
+        max_tokens=200,
+    )
+    assert limits == [200, 300]
+    assert out["failed"] is False
+    assert out["max_tokens"] == 300
+
+
+def test_shared_parser_reads_null_content_tool_calls():
+    wl = _load_worker_llm()
+    captured = wl._capture_from_oneshot_message(
+        {
+            "content": None,
+            "tool_calls": [
+                {"function": {"name": "submit_month", "arguments": '{"text": "kept"}'}}
+            ],
+            "reasoning_content": "short thought",
+        },
+        force_tool_name="submit_month",
+    )
+    assert captured["tool_name"] == "submit_month"
+    assert captured["tool_args"] == {"text": "kept"}
+    assert captured["reasoning_text"] == "short thought"
+    assert captured["final_response"] == ""
+
+
+def test_request_400_is_an_issue(tmp_path, monkeypatch):
+    wl = _box_home(tmp_path, monkeypatch)
+
+    class Reject(Exception):
+        status_code = 400
+
+        def __str__(self):
+            return "bad payload"
+
+    class Completions:
+        def create(self, **kwargs):
+            raise Reject()
+
+    class Chat:
+        completions = Completions()
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.chat = Chat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    out = wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose="digest-phase1")
+    assert out["failed"] is True
+    assert out["llm_issue"] == "request"
+    rec = json.loads(
+        (tmp_path / "metrics" / "llm-usage.jsonl").read_text(encoding="utf-8").strip().splitlines()[-1]
+    )
+    assert rec["wire"] == "openai"

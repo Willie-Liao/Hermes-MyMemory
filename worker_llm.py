@@ -1,0 +1,2784 @@
+"""Shared helper-LLM reentry guard for memory plugins.
+
+Nested ``AIAgent.run_conversation`` still fires ``pre_llm_call`` hooks.
+Callers wrap helper LLM turns in ``worker_llm_scope()``; hooks bail via
+``in_worker_llm()`` so urgency / relatedness / digest classifiers do not nest.
+
+Forced tool-call workers (daily digest + weekly distill)
+--------------------------------------------------------
+``run_worker_llm_tools`` with ``force_tool_name`` uses ``run_worker_llm_oneshot``
+so the HTTP ``tools`` array is only that function. Nested ``AIAgent`` still
+runs Hermes ``tool_describe``. Digest Phase-1 ``allowed_tool_names`` keeps the
+nested agent only for OpenAI-format providers. Anthropic-format providers
+(MiniMax, Anthropic) call ``build_anthropic_kwargs`` directly so ``tool_choice``
+is not dropped by ``build_api_kwargs``.
+
+Also sets ``tool_choice`` to that function name on oneshot. Main chat agents never call
+this module — no effect on interactive tool catalogs.
+
+Default ``run_worker_llm`` remains text-only (``enabled_toolsets=[]``).
+
+UI Tighten / Rephrase / Merge use ``run_worker_llm_oneshot``: one
+OpenAI-compatible ``chat.completions`` call, no nested ``AIAgent``.
+``resolve_worker_endpoint`` maps that call onto the provider ``/v1`` surface.
+"""
+
+from __future__ import annotations
+
+import contextvars
+import json
+import os
+import re
+import threading
+import time
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from llm_json import loads_lenient
+from llm_json import parse_path as _llm_parse_path
+from llm_wire import resolve_worker_endpoint
+
+_worker_llm_depth: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "mymemory_worker_llm_depth", default=0
+)
+# Gateway progressive disclosure — never the weekly/digest submit/patch payload.
+_PROGRESSIVE_DISCLOSURE_TOOLS = frozenset({"tool_search", "tool_describe", "tool_call"})
+# Default wire facts. config.yaml plugins.entries.MyMemory.provider_capabilities
+# overrides a row. fallback_* is the chain used after a quota error.
+_DEFAULT_PROVIDER_CAPS: dict[str, dict[str, str]] = {
+    "xiaomi": {
+        "wire": "openai",
+        "tool_choice": "named",
+        "fallback_provider": "kimi-coding",
+        "fallback_model": "kimi-for-coding-highspeed",
+    },
+    "minimax-cn": {"wire": "anthropic", "tool_choice": "none"},
+    "minimax": {"wire": "anthropic", "tool_choice": "none"},
+    "anthropic": {"wire": "anthropic", "tool_choice": "named"},
+    "kimi-coding": {"wire": "openai", "tool_choice": "named"},
+}
+_QUOTA_DEAD_TTL_S = 3600
+_USD_PER_MILLION = {"default": (0.2, 0.6)}
+_openai_clients: dict[tuple[str, str, float, int], Any] = {}
+_PHASE1_TOOL_NAMES = (
+    "submit_digest_blocks",
+    "patch_digest_blocks",
+    "skip_digest_worker",
+)
+_WRONG_PHASE1_TOOL_TEACH = (
+    "Call one of submit_digest_blocks, patch_digest_blocks, or "
+    "skip_digest_worker. Do not call any other tool."
+)
+
+
+@contextmanager
+def worker_llm_scope() -> Iterator[None]:
+    """Keep the helper-LLM flag on this context so a background job cannot silence live-chat hooks.
+
+    A process-wide counter made digest, weekly, and monthly workers look active
+    on the main chat thread, so recall, urgency, and relatedness skipped a real turn.
+    """
+    token = _worker_llm_depth.set(_worker_llm_depth.get() + 1)
+    try:
+        yield
+    finally:
+        _worker_llm_depth.reset(token)
+
+
+def in_worker_llm() -> bool:
+    """True only inside worker_llm_scope on this context, not on other threads."""
+    return _worker_llm_depth.get() > 0
+
+
+def _hermes_home() -> Path:
+    """Prefer HERMES_HOME env; else ~/.hermes."""
+    val = (os.environ.get("HERMES_HOME") or "").strip()
+    return Path(val).resolve() if val else (Path.home() / ".hermes").resolve()
+
+
+def _ledger_path() -> Path:
+    return _hermes_home() / "metrics" / "llm-usage.jsonl"
+
+
+def usage_ledger_offset() -> int:
+    """Byte offset before a slash run so later lines are that run's model calls.
+
+    Summing the whole ledger would bill earlier digests to this reply.
+    """
+    try:
+        return _ledger_path().stat().st_size
+    except OSError:
+        return 0
+
+
+def sum_usage_after(offset: int, *, keep_boundary_line: bool = False) -> dict[str, int]:
+    """Avoid billing earlier runs, without dropping this run's first finished ledger row.
+
+    A file-size offset already sits on a newline, so the next line is a complete
+    bill. The default skip treats it as partial and a one-call reply prints zero
+    tokens. Digest and the weekly slash pass ``keep_boundary_line``. Monthly uses
+    the default only when the result has no usage dict.
+    """
+    path = _ledger_path()
+    totals = {"input_tokens": 0, "output_tokens": 0}
+    try:
+        with path.open(encoding="utf-8") as fh:
+            start = max(0, int(offset))
+            fh.seek(start)
+            drop = bool(offset)
+            if drop and keep_boundary_line:
+                fh.seek(start - 1)
+                drop = fh.read(1) != "\n"
+                fh.seek(start)
+            if drop:
+                fh.readline()
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                totals["input_tokens"] += int(rec.get("input_tokens") or 0)
+                totals["output_tokens"] += int(rec.get("output_tokens") or 0)
+    except OSError:
+        return totals
+    return totals
+
+
+def format_token_line(usage: Mapping[str, Any], seconds: float) -> str:
+    """One reply line so digest, weekly, and monthly runs report the same three numbers."""
+    return (
+        f"input_tokens={int(usage.get('input_tokens') or 0)} "
+        f"output_tokens={int(usage.get('output_tokens') or 0)} "
+        f"seconds={max(0.0, float(seconds)):.1f}"
+    )
+
+
+def _runtime_from_mapping(bag: Mapping[str, Any] | None) -> dict[str, str]:
+    """Copy lane/entry/chat endpoint fields so workers are not a hardcoded provider table.
+
+    Chat YAML uses ``default`` for the model id; lanes use ``model``. Read both so
+    undeclared plugin lanes can inherit ``config.yaml`` ``model:`` without a second pin.
+    """
+    if not isinstance(bag, Mapping):
+        return {}
+    out: dict[str, str] = {}
+    model = str(bag.get("model") or bag.get("default") or "").strip()
+    provider = str(bag.get("provider") or "").strip()
+    base_url = str(bag.get("base_url") or "").strip()
+    key_env = str(bag.get("key_env") or "").strip()
+    if model:
+        out["model"] = model
+    if provider:
+        out["provider"] = provider
+    if base_url:
+        out["base_url"] = base_url
+    if key_env:
+        out["key_env"] = key_env
+    # Lane ceilings ride with the endpoint so a length retry cannot invent its own cap.
+    for key in ("max_tokens_ceiling", "reduce_max_tokens"):
+        raw = bag.get(key)
+        if raw is None or raw == "":
+            continue
+        out[key] = str(raw).strip()
+    return out
+
+
+def _provider_env_names(provider: str) -> tuple[str, str]:
+    """Map provider id to .env names (minimax-cn → MINIMAX_CN_*). kimi-coding keeps KIMI_* used by k2 failover."""
+    plug = str(provider or "").strip().lower() or "xiaomi"
+    if plug == "kimi-coding":
+        return ("KIMI_API_KEY", "KIMI_BASE_URL")
+    prefix = plug.replace("-", "_").upper()
+    return f"{prefix}_API_KEY", f"{prefix}_BASE_URL"
+
+
+def _inherit_provider_endpoint(raw: Mapping[str, Any], out: dict[str, str]) -> None:
+    """Fill missing base_url/key_env from chat model: or a matching fallback_providers row.
+
+    Plugin lanes that share the chat provider should not repeat the OpenAI /v1 URL.
+    """
+    provider = str(out.get("provider") or "").strip().lower()
+    if not provider or (out.get("base_url") and out.get("key_env")):
+        return
+
+    def _take(bag: Mapping[str, Any] | None) -> None:
+        if not isinstance(bag, Mapping):
+            return
+        if not out.get("base_url"):
+            url = str(bag.get("base_url") or "").strip()
+            if url:
+                out["base_url"] = url
+        if not out.get("key_env"):
+            key_env = str(bag.get("key_env") or "").strip()
+            if key_env:
+                out["key_env"] = key_env
+
+    model_bag = raw.get("model") if isinstance(raw, Mapping) else None
+    if isinstance(model_bag, Mapping):
+        chat_prov = str(model_bag.get("provider") or "").strip().lower()
+        if chat_prov == provider:
+            _take(model_bag)
+    fallbacks = raw.get("fallback_providers") if isinstance(raw, Mapping) else None
+    if isinstance(fallbacks, list):
+        for row in fallbacks:
+            if not isinstance(row, Mapping):
+                continue
+            if str(row.get("provider") or "").strip().lower() == provider:
+                _take(row)
+                break
+
+
+def _worker_llm_lane(plugin: str, purpose: str) -> str | None:
+    """Map ledger purpose → config.yaml worker_llm.<lane>."""
+    plug = str(plugin or "").strip()
+    why = str(purpose or "").strip()
+    if plug == "memory-digest":
+        if why.startswith("digest-phase1"):
+            return "phase1"
+        if why.startswith("digest-wrapup"):
+            return "wrapup"
+        if why.startswith("digest-dedup"):
+            return "phase2"
+        return None
+    if plug == "memory-weekly":
+        return "weekly"
+    if plug == "memory-monthly":
+        return "monthly"
+    return None
+
+
+def _plugin_worker_runtime(plugin: str, purpose: str = "") -> dict[str, str]:
+    """Resolve worker model from chat ``model:``, then optional plugin/lane overlay.
+
+    Background digest/weekly/monthly must follow the user's chat model unless
+    config declares a lane. Returning {} used to make oneshot resurrect MiMo.
+    """
+    name = str(plugin or "").strip()
+    if not name:
+        return {}
+    path = _hermes_home() / "config.yaml"
+    try:
+        import yaml
+
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    chat = _runtime_from_mapping(
+        raw.get("model") if isinstance(raw.get("model"), Mapping) else None
+    )
+    out = dict(chat)
+    overlay: dict[str, str] = {}
+    plugins = raw.get("plugins")
+    table = plugins.get("entries") if isinstance(plugins, dict) else None
+    entry: Any = table.get(name) if isinstance(table, dict) else None
+    if not isinstance(entry, dict) and isinstance(table, dict):
+        nested_key = {
+            "memory-digest": "digest",
+            "memory-weekly": "weekly",
+            "memory-retention": "retention",
+            "memory-monthly": "monthly",
+        }.get(name)
+        my_memory = table.get("MyMemory")
+        if nested_key and isinstance(my_memory, dict):
+            entry = my_memory.get(nested_key)
+    if isinstance(entry, dict):
+        overlay.update(_runtime_from_mapping(entry))
+        lanes = entry.get("worker_llm")
+        if isinstance(lanes, dict):
+            overlay.update(_runtime_from_mapping(lanes.get("default")))
+            lane = _worker_llm_lane(name, purpose)
+            if lane:
+                overlay.update(_runtime_from_mapping(lanes.get(lane)))
+    if overlay:
+        overlay_prov = str(overlay.get("provider") or "").strip()
+        chat_prov = str(out.get("provider") or "").strip()
+        if overlay_prov and overlay_prov != chat_prov:
+            # Overlay switched providers: chat YAML URL must not ride along.
+            out.pop("base_url", None)
+            out.pop("key_env", None)
+        out.update(overlay)
+    _inherit_provider_endpoint(raw, out)
+    return out
+
+
+def _health_path() -> Path:
+    """Sibling of llm-usage.jsonl so the UI can poll the current issue without parsing the ledger."""
+    return _hermes_home() / "metrics" / "llm-health.json"
+
+
+def _write_llm_health(payload: Mapping[str, Any]) -> None:
+    """Overwrite the one-record snapshot; fail-open so a disk error cannot abort ingest."""
+    try:
+        path = _health_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(dict(payload), ensure_ascii=False) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def read_llm_health() -> dict[str, Any] | None:
+    """Return the last worker issue snapshot, or None if missing/unreadable."""
+    try:
+        raw = json.loads(_health_path().read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _sync_llm_health(record: Mapping[str, Any]) -> None:
+    """Keep one current-issue file: set on quota/connection, clear only on config-model success."""
+    issue = record.get("issue")
+    config_model = str(record.get("config_model") or "").strip()
+    used_model = str(record.get("model") or "").strip()
+    ts = str(record.get("ts") or datetime.now(timezone.utc).isoformat())
+    if issue in ("quota", "connection"):
+        _write_llm_health(
+            {
+                "kind": issue,
+                "model": config_model or used_model,
+                "plugin": record.get("plugin"),
+                "purpose": record.get("purpose"),
+                "ts": ts,
+            }
+        )
+        return
+    try:
+        calls = int(record.get("api_calls") or 0)
+    except (TypeError, ValueError):
+        calls = 0
+    if calls >= 1 and used_model != _K2_WORKER[1]:
+        _write_llm_health(
+            {
+                "kind": None,
+                "model": config_model or used_model,
+                "ts": ts,
+            }
+        )
+
+
+def _emit_langfuse_usage(record: dict[str, Any]) -> None:
+    """Copy a worker oneshot into Langfuse; the agent hook never sees this HTTP call.
+
+    Without this, monthly-reduce token counts stay on the local ledger and never become a trace.
+    """
+    try:
+        from langfuse import Langfuse
+    except Exception:
+        return
+    public = (os.environ.get("HERMES_LANGFUSE_PUBLIC_KEY") or os.environ.get("LANGFUSE_PUBLIC_KEY") or "").strip()
+    secret = (os.environ.get("HERMES_LANGFUSE_SECRET_KEY") or os.environ.get("LANGFUSE_SECRET_KEY") or "").strip()
+    if not public.startswith("pk-lf-") or not secret.startswith("sk-lf-"):
+        return
+    base = (
+        os.environ.get("HERMES_LANGFUSE_BASE_URL")
+        or os.environ.get("LANGFUSE_BASE_URL")
+        or "http://localhost:3000"
+    ).strip()
+    try:
+        input_tokens = int(record.get("input_tokens") or 0)
+        output_tokens = int(record.get("output_tokens") or 0)
+        total = int(record.get("total_tokens") or (input_tokens + output_tokens))
+        client = Langfuse(public_key=public, secret_key=secret, base_url=base)
+        obs = client.start_observation(
+            name=str(record.get("purpose") or "worker-llm"),
+            as_type="generation",
+            model=str(record.get("model") or "") or None,
+            metadata={
+                "plugin": record.get("plugin"),
+                "purpose": record.get("purpose"),
+                "duration_ms": int(record.get("duration_ms") or 0),
+            },
+            usage_details={"input": input_tokens, "output": output_tokens, "total": total},
+        )
+        obs.end()
+        client.flush()
+    except Exception:
+        return
+
+
+def _cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Fill the ledger so two models can be compared. A missing price stays on the default row."""
+    rates = _USD_PER_MILLION.get(str(model or "").strip(), _USD_PER_MILLION["default"])
+    return (int(input_tokens) * rates[0] + int(output_tokens) * rates[1]) / 1_000_000
+
+
+def _usage_record(
+    *,
+    plugin: str,
+    purpose: str,
+    model: str,
+    config_model: str,
+    duration_ms: int,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    reasoning_tokens: int = 0,
+    total_tokens: int | None = None,
+    api_calls: int = 0,
+    issue: str | None = None,
+    thinking_off: bool | None = None,
+    cost_usd: float | None = None,
+    parse_path: str = "",
+    effort_sent: str = "",
+    floor_source: str = "",
+    fallback_wire: str = "",
+    max_tokens: int | None = None,
+    wire: str = "",
+) -> dict[str, Any]:
+    """One usage shape so oneshot, the nested agent, and Anthropic cannot drift apart.
+
+    ``wire`` is always written when known. An omitted field used to mean either
+    the normal path or a row that never recorded the path.
+    """
+    total = input_tokens + output_tokens if total_tokens is None else total_tokens
+    rec: dict[str, Any] = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "plugin": plugin,
+        "purpose": purpose,
+        "model": model,
+        "config_model": config_model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "total_tokens": total,
+        "cost_usd": (
+            _cost_usd(model, input_tokens, output_tokens) if cost_usd is None else cost_usd
+        ),
+        "api_calls": api_calls,
+        "duration_ms": duration_ms,
+    }
+    if issue:
+        rec["issue"] = issue
+    if thinking_off is not None:
+        rec["thinking_off"] = thinking_off
+    if parse_path:
+        rec["parse_path"] = parse_path
+    if effort_sent:
+        rec["effort_sent"] = effort_sent
+    if floor_source:
+        rec["floor_source"] = floor_source
+    if fallback_wire:
+        rec["fallback_wire"] = fallback_wire
+    if wire:
+        rec["wire"] = wire
+    if max_tokens is not None:
+        rec["max_tokens"] = int(max_tokens)
+    return rec
+
+
+def record_worker_usage(record: dict[str, Any]) -> None:
+    """Append one JSONL usage record and refresh llm-health. Fail-open — never raise to callers.
+
+    Callers pass ``duration_ms`` so timeout vs LLM retry can be split without guessing.
+    """
+    try:
+        path = _ledger_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        _sync_llm_health(record)
+    except Exception:
+        pass  # fail-open
+    _emit_langfuse_usage(record)
+
+
+_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.I)
+_THINK_RE = re.compile(r"<(thinking|think)>.*?</\1>", re.DOTALL | re.I)
+
+
+def _strip_think_blocks(text: str) -> str:
+    """Drop model CoT tags so JSON/body after </thinking> is what tighten renders.
+
+    Without this, a JSON object inside <thinking> can win as tool_args.text and
+    the rewritten MEMORY/USER/HERMES body never reaches the Weekly UI.
+    """
+    return _THINK_RE.sub("", str(text or "")).strip()
+
+
+def _json_object_slices(text: str) -> list[str]:
+    """Keep each top-level `{...}` so a nested field cannot replace the tool payload.
+
+    The last slice is the payload that follows any earlier CoT object. Stepping
+    back inside the object made the month's final `{text, evidence}` the winner.
+    Single quotes are strings too: a `}` inside `'...'` must not end the slice
+    before json5 can parse the object.
+    """
+    slices: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        start = text.find("{", i)
+        if start < 0:
+            break
+        depth = 0
+        quote = ""
+        escape = False
+        end: int | None = None
+        for j in range(start, n):
+            ch = text[j]
+            if quote:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == quote:
+                    quote = ""
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        if end is None:
+            break
+        slices.append(text[start : end + 1])
+        i = end + 1
+    return slices
+
+
+def _parse_json_mapping(blob: str) -> dict[str, Any] | None:
+    """Parse one model JSON object, including JSON5 slips, without a second model call."""
+    try:
+        val = loads_lenient(blob)
+    except ValueError:
+        return None
+    if isinstance(val, Mapping):
+        return dict(val)
+    if isinstance(val, str):
+        nested = _loads_json_object(val)
+        if nested is not None:
+            return nested
+    return None
+
+
+def _loads_json_object(raw: Any) -> dict[str, Any] | None:
+    """Parse a JSON object from a dict, JSON string, fence, or trailing-comma blob.
+
+    MiMo v2.5 often returns tool payloads as fenced / slightly-invalid JSON in
+    assistant text instead of OpenAI ``tool_calls``. Weekly UI tighten needs a
+    dict it can render. Prefer the last object so CoT JSON is not the winner.
+    """
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    if not isinstance(raw, str):
+        return None
+    text = _strip_think_blocks(raw)
+    if not text:
+        return None
+    fences = [m.group(1).strip() for m in _FENCE_RE.finditer(text) if m.group(1).strip()]
+    slices = _json_object_slices(text)
+    candidates: list[str] = []
+    for blob in [*fences, *slices, text]:
+        if blob and blob not in candidates:
+            candidates.append(blob)
+    parsed: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for c in candidates:
+        if c in seen:
+            continue
+        seen.add(c)
+        obj = _parse_json_mapping(c)
+        if obj is not None:
+            parsed.append(obj)
+    if not parsed:
+        return None
+    return parsed[-1]
+
+
+def _array_objects(text: str, start: int) -> list[dict[str, Any]]:
+    """Read finished objects from an array that the model cut off before the closing bracket.
+
+    A truncated submit still holds complete key rows; dropping the whole payload leaves Band D empty.
+    """
+    if start < 0 or start >= len(text) or text[start] != "[":
+        return []
+    objs: list[dict[str, Any]] = []
+    i = start + 1
+    n = len(text)
+    while i < n:
+        while i < n and text[i] in " \n\t\r,":
+            i += 1
+        if i >= n or text[i] == "]":
+            break
+        if text[i] != "{":
+            break
+        slices = _json_object_slices(text[i:])
+        if not slices:
+            break
+        obj = _parse_json_mapping(slices[0])
+        if obj is None:
+            break
+        objs.append(obj)
+        i += len(slices[0])
+    return objs
+
+
+def _salvage_truncated_tool_args(raw: str) -> dict[str, Any]:
+    """Keep key rows when MiniMax stops inside the submit JSON before the object closes."""
+    out: dict[str, Any] = {}
+    for key in ("key_decisions", "key_procedures"):
+        marker = f'"{key}"'
+        idx = raw.find(marker)
+        if idx < 0:
+            continue
+        bracket = raw.find("[", idx)
+        if bracket < 0:
+            continue
+        rows = _array_objects(raw, bracket)
+        if rows:
+            out[key] = rows
+    return out
+
+
+def _pair_from_tool_call(
+    tc: Mapping[str, Any],
+    default_tool_name: str | None,
+) -> tuple[str, dict[str, Any]] | None:
+    fn = tc.get("function") if isinstance(tc.get("function"), Mapping) else {}
+    name = str(
+        (fn.get("name") if fn else None) or tc.get("name") or default_tool_name or ""
+    ).strip()
+    raw_args: Any = None
+    for key in ("arguments", "parameters", "input"):
+        if fn and key in fn:
+            raw_args = fn.get(key)
+            break
+        if key in tc:
+            raw_args = tc.get(key)
+            break
+    args = _loads_json_object(raw_args) or {}
+    if isinstance(raw_args, str) and not (
+        isinstance(args.get("key_decisions"), list) and args.get("key_decisions")
+        or isinstance(args.get("key_procedures"), list) and args.get("key_procedures")
+    ):
+        salvaged = _salvage_truncated_tool_args(raw_args)
+        if salvaged:
+            args = {**args, **salvaged}
+            _llm_parse_path.set("salvage")
+    if not name:
+        return None
+    return (name, args)
+
+
+def _pair_from_json_blob(
+    blob: Any,
+    default_tool_name: str | None,
+) -> tuple[str, dict[str, Any]] | None:
+    obj = _loads_json_object(blob)
+    if not obj:
+        return None
+    nested_name = str(obj.get("name") or "").strip()
+    nested_raw = obj.get("arguments")
+    if nested_raw is None:
+        nested_raw = obj.get("parameters")
+    if nested_raw is None:
+        nested_raw = obj.get("input")
+    nested_args = _loads_json_object(nested_raw) if nested_raw is not None else None
+    if nested_name and nested_args is not None:
+        return (nested_name, nested_args)
+    name = nested_name or str(default_tool_name or "").strip()
+    if not name:
+        return None
+    return (name, obj)
+
+
+def extract_tool_calls_from_result(
+    result: Mapping[str, Any],
+    default_tool_name: str | None = None,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Return ``(tool_name, args_dict)`` pairs from ``run_conversation`` messages.
+
+    Accepts OpenAI nested ``function`` calls, flat ``name``/``arguments``,
+    trailing-comma JSON, and JSON dumped into assistant content / final_response
+    (MiMo v2.5). Drops ``tool_search`` / ``tool_describe`` / ``tool_call`` so a
+    disclosure hop cannot replace submit/patch as the worker payload.
+    """
+    found: list[tuple[str, dict[str, Any]]] = []
+    default = str(default_tool_name or "").strip() or None
+    messages = result.get("messages") or []
+    if isinstance(messages, Sequence):
+        for msg in messages:
+            if not isinstance(msg, Mapping):
+                packed = _capture_from_oneshot_message(
+                    msg, force_tool_name=default
+                ).get("messages") or []
+                msg = packed[0] if packed else None
+            if not isinstance(msg, Mapping):
+                continue
+            if str(msg.get("role", "")).strip() != "assistant":
+                continue
+            for tc in msg.get("tool_calls") or []:
+                if not isinstance(tc, Mapping):
+                    continue
+                pair = _pair_from_tool_call(tc, default)
+                if pair and pair[0] not in _PROGRESSIVE_DISCLOSURE_TOOLS:
+                    found.append(pair)
+            if not any(args for _name, args in found):
+                pair = _pair_from_json_blob(msg.get("content"), default)
+                if pair and pair[0] not in _PROGRESSIVE_DISCLOSURE_TOOLS:
+                    found.append(pair)
+    if not any(args for _name, args in found):
+        pair = _pair_from_json_blob(result.get("final_response"), default)
+        if pair and pair[0] not in _PROGRESSIVE_DISCLOSURE_TOOLS:
+            found.append(pair)
+    return found
+
+
+def _normalize_callback_tool_args(args: Any) -> dict[str, Any]:
+    """Accept Mapping or JSON-string tool args (MiMo often sends a string)."""
+    if isinstance(args, Mapping):
+        bag = dict(args)
+    else:
+        bag = _loads_json_object(args) or {}
+    if not isinstance(bag, Mapping):
+        return {}
+    bag = dict(bag)
+    known = (
+        "beginning",
+        "course",
+        "outcome",
+        "obstacle",
+        "solution",
+        "kind",
+        "subject",
+        "ruling",
+        "content",
+        "text",
+        "events",
+        "conflicts",
+        "hypotheses",
+        "operations",
+    )
+    if any(key in bag for key in known):
+        return bag
+    for wrap in ("arguments", "parameters", "input"):
+        inner = _loads_json_object(bag.get(wrap))
+        if inner:
+            return inner
+    return bag
+
+
+def _tool_args_have_values(args: Mapping[str, Any] | None) -> bool:
+    """True when args carry a real value (empty strings do not count)."""
+    if not isinstance(args, Mapping) or not args:
+        return False
+    for value in args.values():
+        if isinstance(value, str) and value.strip():
+            return True
+        if isinstance(value, Mapping) and _tool_args_have_values(value):
+            return True
+        if isinstance(value, list) and value:
+            return True
+        if isinstance(value, (int, float, bool)):
+            return True
+    return False
+
+
+def _tool_def_name(tool_def: Mapping[str, Any]) -> str:
+    fn = tool_def.get("function") if isinstance(tool_def, Mapping) else None
+    if not isinstance(fn, Mapping):
+        return ""
+    return str(fn.get("name") or "").strip()
+
+
+def allowed_forced_worker_tool_names(force_tool_name: str, catalog: Sequence[Mapping[str, Any]]) -> set[str]:
+    """Forced submit/patch name plus any ``skip_*`` tools already in the catalog."""
+    allowed = {str(force_tool_name).strip()}
+    for tool_def in catalog:
+        name = _tool_def_name(tool_def)
+        if name.startswith("skip_"):
+            allowed.add(name)
+    return {n for n in allowed if n}
+
+
+def bind_worker_tools(
+    enabled_toolsets: Sequence[str],
+    allowed_tool_names: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Load real schemas and keep only the named tools (no auto skip inject)."""
+    from model_tools import get_tool_definitions
+
+    catalog = get_tool_definitions(
+        enabled_toolsets=list(enabled_toolsets),
+        quiet_mode=True,
+        skip_tool_search_assembly=True,
+    )
+    allowed = {str(n).strip() for n in allowed_tool_names if str(n).strip()}
+    return [dict(td) for td in catalog if _tool_def_name(td) in allowed]
+
+
+def bind_forced_worker_tools(
+    enabled_toolsets: Sequence[str],
+    force_tool_name: str,
+) -> list[dict[str, Any]]:
+    """Load real schemas (no tool_search bridge) and keep only the forced tool + skips.
+
+    Main-agent ``tool_search`` config is untouched; this only rebuilds the nested
+    worker agent's ``tools`` array for one turn.
+    """
+    from model_tools import get_tool_definitions
+
+    catalog = get_tool_definitions(
+        enabled_toolsets=list(enabled_toolsets),
+        quiet_mode=True,
+        skip_tool_search_assembly=True,
+    )
+    allowed = allowed_forced_worker_tool_names(force_tool_name, catalog)
+    return [dict(td) for td in catalog if _tool_def_name(td) in allowed]
+
+
+def _apply_worker_tools(
+    agent: Any,
+    *,
+    enabled_toolsets: Sequence[str],
+    force_tool_name: str | None = None,
+    allowed_tool_names: Sequence[str] | None = None,
+) -> None:
+    """Replace ``agent.tools`` / ``valid_tool_names`` with the bound subset."""
+    if allowed_tool_names:
+        bound = bind_worker_tools(enabled_toolsets, allowed_tool_names)
+    elif force_tool_name:
+        bound = bind_forced_worker_tools(enabled_toolsets, force_tool_name)
+    else:
+        return
+    agent.tools = bound
+    names = {_tool_def_name(td) for td in bound}
+    names.discard("")
+    agent.valid_tool_names = names
+
+
+def _apply_forced_worker_tools(
+    agent: Any,
+    *,
+    enabled_toolsets: Sequence[str],
+    force_tool_name: str,
+) -> None:
+    """Replace ``agent.tools`` / ``valid_tool_names`` with the bound subset."""
+    _apply_worker_tools(
+        agent,
+        enabled_toolsets=enabled_toolsets,
+        force_tool_name=force_tool_name,
+    )
+
+
+def run_worker_llm(
+    prompt: str,
+    *,
+    plugin: str,
+    purpose: str,
+    platform: str = "cli",
+    max_iterations: int = 10,
+    enabled_toolsets: list[str] | None = None,
+    request_overrides: Mapping[str, Any] | None = None,
+) -> str:
+    """Quiet worker AIAgent turn + JSONL usage ledger under Hermes home."""
+    result = _run_worker_conversation(
+        prompt,
+        plugin=plugin,
+        purpose=purpose,
+        platform=platform,
+        max_iterations=max_iterations,
+        enabled_toolsets=enabled_toolsets if enabled_toolsets is not None else [],
+        request_overrides=request_overrides,
+    )
+    return str(result.get("final_response") or "").strip()
+
+
+def _anthropic_format_worker(plugin: str, purpose: str) -> bool:
+    """True when this worker provider speaks Anthropic Messages.
+
+    Those nested agents build requests in ``build_api_kwargs``, which never
+    copies ``tool_choice``. Phase-1 would otherwise be free to answer in text.
+    """
+    runtime = _plugin_worker_runtime(plugin, purpose)
+    provider = str(runtime.get("provider") or "").strip().lower()
+    return _worker_wire(provider) == "anthropic"
+
+
+def _build_phase1_anthropic_kwargs(
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    max_tokens: int,
+    base_url: str,
+) -> dict[str, Any]:
+    """Build an Anthropic body that requires one of the phase-1 tools.
+
+    Calling this from MyMemory, not from ``AIAgent``, is what puts
+    ``tool_choice='required'`` on the wire. ``build_api_kwargs`` drops it.
+    Thinking stays off so the output budget is the tool JSON. Adaptive Claude
+    accepts an explicit disable; other Anthropic-format models (MiniMax) omit
+    it unless the toggle is added, and a 400 drops it on retry.
+    """
+    from agent.anthropic_adapter import build_anthropic_kwargs
+
+    built = build_anthropic_kwargs(
+        model=model,
+        messages=messages,
+        tools=tools,
+        max_tokens=max_tokens,
+        reasoning_config={"enabled": False},
+        tool_choice="required",
+        base_url=base_url or None,
+    )
+    if "thinking" not in built and "claude" not in str(model or "").lower():
+        built["thinking"] = {"type": "disabled"}
+    return built
+
+
+def _anthropic_messages_create(
+    kwargs: Mapping[str, Any],
+    *,
+    api_key: str,
+    base_url: str,
+) -> Any:
+    """POST one Anthropic Messages call. Tests replace this so Hermes stays unedited.
+
+    A thinking-disable 400 is retried once without that field so a route that
+    cannot turn thinking off still returns the tool call.
+    """
+    from agent.anthropic_adapter import build_anthropic_client
+
+    client = build_anthropic_client(api_key, base_url=base_url or None)
+    try:
+        return client.messages.create(**dict(kwargs))
+    except Exception as exc:
+        if "thinking" in kwargs and _reasoning_wire_rejection(exc):
+            bare = dict(kwargs)
+            bare.pop("thinking", None)
+            return client.messages.create(**bare)
+        raise
+
+
+def _anthropic_tool_uses(response: Any) -> list[tuple[str, str, dict[str, Any]]]:
+    """Pull tool_use blocks off an Anthropic message. Text-only replies yield [].
+
+    An OpenAI-shaped body (content null, tool_calls) goes through the shared
+    parser so a relay that answers chat-completions JSON is not read as blocks.
+    """
+    if _msg_field(response, "tool_calls"):
+        captured = _capture_from_oneshot_message(response, force_tool_name=None)
+        return [
+            ("", str(name), dict(args))
+            for name, args in (captured.get("tool_calls") or [])
+        ]
+    blocks = _msg_field(response, "content")
+    if blocks is None and isinstance(response, Mapping):
+        blocks = response.get("content")
+    found: list[tuple[str, str, dict[str, Any]]] = []
+    for block in blocks or []:
+        if isinstance(block, Mapping):
+            typ = block.get("type")
+            name = str(block.get("name") or "").strip()
+            raw_input = block.get("input")
+            call_id = str(block.get("id") or "").strip()
+        else:
+            typ = getattr(block, "type", None)
+            name = str(getattr(block, "name", "") or "").strip()
+            raw_input = getattr(block, "input", None)
+            call_id = str(getattr(block, "id", "") or "").strip()
+        if typ != "tool_use" or not name:
+            continue
+        args = dict(raw_input) if isinstance(raw_input, Mapping) else {}
+        found.append((call_id, name, args))
+    return found
+
+
+def _load_digest_tools() -> Any:
+    """Import digest tool handlers from either the plugin root or the digest package.
+
+    ``worker_llm`` is loaded with MyMemory on ``sys.path``. ``digest_tools``
+    is sometimes a top-level module (digest runner) and sometimes
+    ``digest.digest_tools`` (package import). Missing either one would skip
+    validation teach and accept a bad submit.
+    """
+    import importlib
+
+    last: Exception | None = None
+    for name in ("digest_tools", "digest.digest_tools"):
+        try:
+            return importlib.import_module(name)
+        except ImportError as exc:
+            last = exc
+    raise ImportError("digest_tools") from last
+
+
+def _phase1_handler_text(tool_name: str, args: Mapping[str, Any]) -> str:
+    """Run the digest submit/patch handler. Validation failures come back as teach text."""
+    handler = _load_digest_tools()._handler_for_tool(tool_name)
+    return str(handler(dict(args)) or "")
+
+
+def _phase1_handler_accepted(text: str) -> bool:
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(data, Mapping) and bool(data.get("ok"))
+
+
+def _append_phase1_tool_result(
+    messages: list[dict[str, Any]],
+    *,
+    call_id: str,
+    name: str,
+    args: Mapping[str, Any],
+    content: str,
+) -> None:
+    """Keep OpenAI-shaped history so ``build_anthropic_kwargs`` can convert the next turn."""
+    messages.append(
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(dict(args), ensure_ascii=False),
+                    },
+                }
+            ],
+        }
+    )
+    messages.append(
+        {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": content,
+        }
+    )
+
+
+def _run_anthropic_phase1_loop(
+    prompt: str,
+    *,
+    plugin: str,
+    purpose: str,
+    max_iterations: int,
+    enabled_toolsets: Sequence[str],
+    allowed_tool_names: Sequence[str],
+) -> dict[str, Any]:
+    """Phase-1 allow-list without AIAgent so Anthropic receives tool_choice required.
+
+    A nested agent would drop that field and could finish on plain text or
+    ``terminal``. Wrong names are not executed; the next call is taught the
+    three digest tools. Submit/patch validation teach stays on the existing
+    handlers.
+    """
+    started = time.perf_counter()
+
+    def _elapsed_ms() -> int:
+        return max(0, int((time.perf_counter() - started) * 1000))
+
+    def _fail(exc: BaseException) -> dict[str, Any]:
+        kind = _llm_issue_kind(exc)
+        rec: dict[str, Any] = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "plugin": plugin,
+            "purpose": purpose,
+            "model": "",
+            "config_model": "",
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+            "total_tokens": 0,
+            "cost_usd": 0.0,
+            "api_calls": 0,
+            "duration_ms": _elapsed_ms(),
+            "wire": "anthropic",
+        }
+        if kind:
+            rec["issue"] = kind
+        record_worker_usage(rec)
+        return {
+            "final_response": str(exc),
+            "tool_name": None,
+            "tool_args": None,
+            "tool_calls": [],
+            "messages": [],
+            "failed": True,
+            "error": str(exc),
+        }
+
+    runtime = _plugin_worker_runtime(plugin, purpose)
+    model = str(runtime.get("model") or "").strip()
+    try:
+        api_key, base_url = _oneshot_credentials(runtime)
+        base_url, _used = resolve_worker_endpoint(base_url, "anthropic_messages")
+    except Exception as exc:
+        return _fail(exc)
+    tools = bind_worker_tools(list(enabled_toolsets), allowed_tool_names)
+    allowed = {str(n).strip() for n in allowed_tool_names if str(n).strip()}
+    messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+    tool_calls: list[tuple[str, dict[str, Any]]] = []
+    input_tokens = 0
+    output_tokens = 0
+    cache_read_tokens = 0
+    cache_write_tokens = 0
+    api_calls = 0
+    budget = max(1, int(max_iterations))
+    try:
+        for turn in range(budget):
+            kwargs = _build_phase1_anthropic_kwargs(
+                model=model,
+                messages=messages,
+                tools=tools,
+                max_tokens=8192,
+                base_url=base_url,
+            )
+            response = _anthropic_messages_create(
+                kwargs, api_key=api_key, base_url=base_url
+            )
+            api_calls += 1
+            usage = getattr(response, "usage", None)
+            input_tokens += _usage_int(usage, "input_tokens", "prompt_tokens")
+            output_tokens += _usage_int(usage, "output_tokens", "completion_tokens")
+            cache_read_tokens += _usage_int(usage, "cache_read_input_tokens")
+            cache_write_tokens += _usage_int(usage, "cache_creation_input_tokens")
+            uses = _anthropic_tool_uses(response)
+            if not uses:
+                text = ""
+                content = getattr(response, "content", None) or []
+                for block in content:
+                    piece = (
+                        block.get("text")
+                        if isinstance(block, Mapping)
+                        else getattr(block, "text", None)
+                    )
+                    if piece:
+                        text += str(piece)
+                record_worker_usage(
+                    {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "plugin": plugin,
+                        "purpose": purpose,
+                        "model": model,
+                        "config_model": model,
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "cache_read_tokens": cache_read_tokens,
+                        "cache_write_tokens": cache_write_tokens,
+                        "reasoning_tokens": 0,
+                        "total_tokens": input_tokens + output_tokens,
+                        "cost_usd": _cost_usd(model, input_tokens, output_tokens),
+                        "api_calls": api_calls,
+                        "duration_ms": _elapsed_ms(),
+                        "parse_path": _llm_parse_path.get(),
+                        "wire": "anthropic",
+                    }
+                )
+                return {
+                    "final_response": text.strip(),
+                    "tool_name": None,
+                    "tool_args": None,
+                    "tool_calls": tool_calls,
+                    "messages": messages,
+                    "failed": False,
+                    "api_calls": api_calls,
+                    "duration_ms": _elapsed_ms(),
+                }
+            call_id, name, args = uses[0]
+            call_id = call_id or f"phase1-{turn}"
+            if name not in allowed or name not in _PHASE1_TOOL_NAMES:
+                if turn + 1 >= budget:
+                    break
+                messages.append(
+                    {"role": "user", "content": _WRONG_PHASE1_TOOL_TEACH}
+                )
+                continue
+            if name == "skip_digest_worker":
+                tool_calls.append((name, args))
+                break
+            teach = _phase1_handler_text(name, args)
+            tool_calls.append((name, args))
+            if _phase1_handler_accepted(teach):
+                break
+            if turn + 1 >= budget:
+                break
+            _append_phase1_tool_result(
+                messages,
+                call_id=call_id,
+                name=name,
+                args=args,
+                content=teach,
+            )
+    except Exception as exc:
+        return _fail(exc)
+    record_worker_usage(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "plugin": plugin,
+            "purpose": purpose,
+            "model": model,
+            "config_model": model,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_write_tokens": cache_write_tokens,
+            "reasoning_tokens": 0,
+            "total_tokens": input_tokens + output_tokens,
+            "cost_usd": _cost_usd(model, input_tokens, output_tokens),
+            "api_calls": api_calls,
+            "duration_ms": _elapsed_ms(),
+            "parse_path": _llm_parse_path.get(),
+            "wire": "anthropic",
+        }
+    )
+    tool_name: str | None = None
+    tool_args: dict[str, Any] | None = None
+    if tool_calls:
+        tool_name, tool_args = tool_calls[-1]
+    return {
+        "final_response": "",
+        "tool_name": tool_name,
+        "tool_args": tool_args,
+        "tool_calls": tool_calls,
+        "messages": messages,
+        "failed": False,
+        "api_calls": api_calls,
+        "duration_ms": _elapsed_ms(),
+    }
+
+
+def run_worker_llm_tools(
+    prompt: str,
+    *,
+    plugin: str,
+    purpose: str,
+    platform: str = "cli",
+    max_iterations: int = 2,
+    enabled_toolsets: list[str],
+    request_overrides: Mapping[str, Any] | None = None,
+    force_tool_name: str | None = None,
+    allowed_tool_names: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Run a worker turn that must emit a tool call; return structured capture.
+
+    When ``force_tool_name`` is set, this is one OpenAI-compatible completion
+    with only that function schema — nested ``AIAgent`` would still run Hermes
+    ``tool_describe``. OpenAI-format Phase-1 ``allowed_tool_names`` keeps the
+    nested agent, because that transport already copies ``tool_choice``.
+    Anthropic-format providers skip the agent: ``build_api_kwargs`` would drop
+    ``tool_choice`` and the model could finish on text or ``terminal``.
+    """
+    overrides: dict[str, Any] = dict(request_overrides or {})
+    force = str(force_tool_name or "").strip() or None
+    allowed = (
+        [str(n).strip() for n in allowed_tool_names if str(n).strip()]
+        if allowed_tool_names
+        else None
+    )
+    if force and not allowed:
+        bound = bind_forced_worker_tools(list(enabled_toolsets), force)
+        schema = next((td for td in bound if _tool_def_name(td) == force), None)
+        if schema is None and bound:
+            schema = bound[0]
+        try:
+            return run_worker_llm_oneshot(
+                prompt,
+                plugin=plugin,
+                purpose=purpose,
+                force_tool_name=force,
+                tool_schema=schema or {"name": force},
+                max_tokens=8192,
+            )
+        except Exception as exc:
+            return {
+                "final_response": str(exc),
+                "tool_name": None,
+                "tool_args": None,
+                "tool_calls": [],
+                "messages": [],
+                "failed": True,
+                "error": str(exc),
+            }
+    if allowed and "tool_choice" not in overrides:
+        # Require a tool call but do not force a single name (same-turn repair).
+        overrides["tool_choice"] = "required"
+    if allowed and _anthropic_format_worker(plugin, purpose):
+        return _run_anthropic_phase1_loop(
+            prompt,
+            plugin=plugin,
+            purpose=purpose,
+            max_iterations=max_iterations,
+            enabled_toolsets=list(enabled_toolsets),
+            allowed_tool_names=allowed,
+        )
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    def _on_tool_start(_tool_call_id: str, name: str, args: Any) -> None:
+        parsed = _normalize_callback_tool_args(args)
+        if name:
+            captured.append((str(name), parsed))
+
+    result = _run_worker_conversation(
+        prompt,
+        plugin=plugin,
+        purpose=purpose,
+        platform=platform,
+        max_iterations=max_iterations,
+        enabled_toolsets=list(enabled_toolsets),
+        request_overrides=overrides or None,
+        tool_start_callback=_on_tool_start,
+        force_tool_name=force if not allowed else None,
+        allowed_tool_names=allowed,
+    )
+    from_messages = extract_tool_calls_from_result(result, default_tool_name=force)
+    def _usable(calls: list[tuple[str, dict[str, Any]]]) -> list[tuple[str, dict[str, Any]]]:
+        return [
+            (n, a)
+            for n, a in calls
+            if n
+            and n not in _PROGRESSIVE_DISCLOSURE_TOOLS
+            and _tool_args_have_values(a)
+        ]
+    tool_calls = _usable(captured) or _usable(from_messages) or from_messages or captured
+    tool_name: str | None = None
+    tool_args: dict[str, Any] | None = None
+    if tool_calls:
+        tool_name, tool_args = tool_calls[-1]
+    return {
+        "final_response": str(result.get("final_response") or "").strip(),
+        "tool_name": tool_name,
+        "tool_args": tool_args,
+        "tool_calls": tool_calls,
+        "messages": result.get("messages") or [],
+        "failed": bool(result.get("failed")),
+    }
+
+
+ONESHOT_SYSTEM = (
+    "You are a text polisher. Reply with exactly one function tool call. "
+    "Do not start an agent. Do not load memory, SOUL, plugins, or any other tools."
+)
+
+_K2_WORKER = ("kimi-coding", "kimi-for-coding-highspeed")
+_xiaomi_quota_dead_until = 0.0
+_xiaomi_quota_lock = threading.Lock()
+
+
+def _provider_caps(provider: str) -> dict[str, str]:
+    """Wire format and fallback for one provider. A config row wins over the built-in table.
+
+    New models should be a row, not another ``if provider ==`` branch in the transport.
+    ``reasoning_floor`` on that row is the offline hint that skips a wasted ``off`` 400.
+    """
+    plug = str(provider or "").strip().lower()
+    caps = dict(_DEFAULT_PROVIDER_CAPS.get(plug) or {"wire": "openai", "tool_choice": "named"})
+    path = _hermes_home() / "config.yaml"
+    try:
+        import yaml
+
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return caps
+    plugins = raw.get("plugins") if isinstance(raw, dict) else None
+    entries = plugins.get("entries") if isinstance(plugins, dict) else None
+    mine = entries.get("MyMemory") if isinstance(entries, dict) else None
+    table = mine.get("provider_capabilities") if isinstance(mine, dict) else None
+    row = table.get(plug) if isinstance(table, dict) else None
+    if isinstance(row, dict):
+        for key, value in row.items():
+            if value is not None:
+                caps[str(key)] = str(value)
+    return caps
+
+
+def _worker_wire(provider: str) -> str:
+    """Keep an unknown wire from silently pretending to be OpenAI.
+
+    openai and anthropic are native. litellm is opt-in and translated by LiteLLM
+    back into the same chat.completions reply shape. Anything else stays openai.
+    """
+    wire = str(_provider_caps(provider).get("wire") or "openai").strip().lower()
+    return wire if wire in {"openai", "anthropic", "litellm"} else "openai"
+
+
+def _fallback_lane(provider: str) -> tuple[str, str]:
+    """Next provider after quota death. Xiaomi defaults to Kimi when the table has no row."""
+    caps = _provider_caps(provider)
+    nxt = str(caps.get("fallback_provider") or "").strip()
+    model = str(caps.get("fallback_model") or "").strip()
+    if nxt and model:
+        return nxt, model
+    return _K2_WORKER
+
+
+def _xiaomi_worker_lane(provider: str, model: str) -> bool:
+    """True when this worker would hit Xiaomi MiMo (the lane that can burn quota)."""
+    plug = str(provider or "").strip().lower()
+    mdl = str(model or "").strip().lower()
+    if plug == "xiaomi" or mdl.startswith("mimo"):
+        return True
+    return False
+
+
+def _reasoning_wire_rejection(
+    exc: BaseException | None,
+    *,
+    controls_sent: bool = True,
+) -> str | None:
+    """Tell the ladder to step up, strip, or stop. A bool hid Inferway's two different 400s.
+
+    ``floor`` means the route understood the field and refused ``off``. ``strip``
+    means the field itself is illegal, including a bare ``Invalid request controls``
+    that names nothing. ``None`` is some other failure and must not be retried as effort.
+    """
+    if exc is None:
+        return None
+    text = str(exc)
+    low = text.lower()
+    try:
+        from agent.error_classifier import (
+            is_reasoning_field_rejection,
+            is_reasoning_level_rejection,
+            is_reasoning_required_rejection,
+        )
+    except Exception:
+        is_reasoning_field_rejection = lambda _msg: False  # noqa: E731
+        is_reasoning_level_rejection = lambda _msg: False  # noqa: E731
+        is_reasoning_required_rejection = lambda _msg: False  # noqa: E731
+    if is_reasoning_required_rejection(text) or is_reasoning_level_rejection(text):
+        return "floor"
+    if _worker_floor_marker(low):
+        return "floor"
+    if controls_sent and _bare_control_rejection(low, exc):
+        return "strip"
+    if is_reasoning_field_rejection(text):
+        return "strip"
+    return None
+
+
+def _worker_floor_marker(low: str) -> bool:
+    """Inferway says 'does not allow reasoning off', which core's required-markers miss."""
+    if not re.search(r"reasoning|thinking|think", low):
+        return False
+    if "does not allow" in low or "not allowed" in low:
+        return True
+    return bool(re.search(r"can(?:not|'t)\b.{0,40}\boff\b", low))
+
+
+def _bare_control_rejection(low: str, exc: BaseException) -> bool:
+    """A 400 that names no parameter while reasoning controls were on the wire.
+
+    Inferway answers ``Invalid request controls.`` for ``extra_body.thinking`` and
+    for the OpenRouter ``reasoning`` object. Treating that as a field rejection
+    strips the controls instead of failing the worker call.
+    """
+    if "invalid request controls" in low:
+        return True
+    code = getattr(exc, "status_code", None)
+    if code is None:
+        resp = getattr(exc, "response", None)
+        code = getattr(resp, "status_code", None)
+    try:
+        is_400 = int(code) == 400
+    except (TypeError, ValueError):
+        is_400 = False
+    if not is_400:
+        return False
+    if "invalid_request" not in low and "invalid request" not in low:
+        return False
+    return re.search(r"reasoning_effort|thinking|param['\"]", low) is None
+
+
+def _configured_provider_names() -> set[str]:
+    """Names under ``providers:`` so a custom route is not looked up as a builtin."""
+    path = _hermes_home() / "config.yaml"
+    try:
+        import yaml
+
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return set()
+    if not isinstance(raw, dict):
+        return set()
+    names: set[str] = set()
+    for key in ("providers", "custom_providers"):
+        table = raw.get(key)
+        if isinstance(table, dict):
+            names.update(str(item).strip().lower() for item in table if str(item).strip())
+        elif isinstance(table, list):
+            for row in table:
+                if isinstance(row, Mapping) and str(row.get("name") or "").strip():
+                    names.add(str(row.get("name")).strip().lower())
+    return names
+
+
+def _worker_profile_name(provider: str) -> str:
+    """Resolve ``providers:`` entries as ``custom:<name>`` so CustomProfile sends reasoning_effort.
+
+    A bare ``inferway`` lookup misses the registry and used to fall through to
+    ``extra_body.thinking``, which Inferway rejects as invalid request controls.
+    """
+    plug = str(provider or "").strip()
+    if not plug or plug.lower().startswith("custom:"):
+        return plug
+    if plug.lower() in _configured_provider_names():
+        return f"custom:{plug}"
+    return plug
+
+
+def _effort_is_off(effort: str | None) -> bool:
+    return str(effort or "").strip().lower() in {"", "off", "none", "disabled", "false"}
+
+
+def _strip_reasoning_controls(kwargs: dict[str, Any]) -> None:
+    """Remove every reasoning encoding so a retry is the route default, not a second off."""
+    kwargs.pop("reasoning_effort", None)
+    kwargs.pop("thinking", None)
+    extra = dict(kwargs.get("extra_body") or {})
+    extra.pop("thinking", None)
+    extra.pop("reasoning", None)
+    extra.pop("think", None)
+    if extra:
+        kwargs["extra_body"] = extra
+    else:
+        kwargs.pop("extra_body", None)
+
+
+def _known_reasoning_floor(provider: str, model: str, base_url: str) -> str:
+    """Where we learned this route refuses ``off``: config, memo, catalog, or empty.
+
+    Empty means start at ``off``. Config is offline. Core's catalog check is
+    cache-only, so a cold worker never blocks on a model listing.
+    """
+    hint = str(_provider_caps(provider).get("reasoning_floor") or "").strip().lower()
+    if hint in {"low", "minimal"}:
+        return "config"
+    try:
+        import agent.auxiliary_reasoning_floor as floor
+    except Exception:
+        return ""
+    try:
+        lifted = floor.known_reasoning_floor(
+            {"enabled": False},
+            provider,
+            base_url or None,
+            model,
+            task="worker",
+        )
+    except Exception:
+        return ""
+    if not (
+        isinstance(lifted, dict)
+        and lifted.get("enabled") is True
+        and str(lifted.get("effort") or "") == floor.REASONING_FLOOR_EFFORT
+    ):
+        return ""
+    try:
+        key = (floor._route_key(provider, base_url), str(model or ""))
+        if key in floor._FLOORED_ROUTES:
+            return "memo"
+    except Exception:
+        return "memo"
+    return "catalog"
+
+
+def _remember_worker_floor(
+    provider: str,
+    base_url: str,
+    model: str,
+    exc: BaseException,
+) -> None:
+    """Memo the route so the next worker call starts at low instead of burning another 400."""
+    try:
+        from agent.auxiliary_reasoning_floor import remember_reasoning_floor
+
+        remember_reasoning_floor(
+            provider,
+            base_url or None,
+            {"model": model},
+            exc,
+        )
+    except Exception:
+        return
+
+
+def _status_is_400(exc: BaseException) -> bool:
+    """True for an HTTP 400, including ones that only mention invalid_request in the text."""
+    code = getattr(exc, "status_code", None)
+    if code is None:
+        resp = getattr(exc, "response", None)
+        code = getattr(resp, "status_code", None)
+    try:
+        if int(code) == 400:
+            return True
+    except (TypeError, ValueError):
+        pass
+    low = str(exc).lower()
+    return "invalid_request" in low or "invalid request" in low
+
+
+def _first_reply_choice(resp: Any) -> Any | None:
+    """First choice that actually carries a message. A bare 200 with no choices is unusable."""
+    choices = _msg_field(resp, "choices")
+    if not choices:
+        return None
+    choice = choices[0]
+    if _msg_field(choice, "message") is None:
+        return None
+    return choice
+
+
+def _lane_token_ceiling(runtime: Mapping[str, Any], purpose: str) -> int:
+    """Stop flexible bumps at the lane ceiling so a salvage loop cannot request unbounded output.
+
+    ``max_tokens_ceiling`` wins. Monthly without that key uses ``reduce_max_tokens``.
+    Every other lane stops at 16384.
+    """
+    raw = str(runtime.get("max_tokens_ceiling") or "").strip()
+    if not raw and "monthly" in str(purpose or "").lower():
+        raw = str(runtime.get("reduce_max_tokens") or "").strip()
+    if raw:
+        try:
+            return max(1, int(float(raw)))
+        except (TypeError, ValueError):
+            pass
+    return 16384
+
+
+def _apply_worker_thinking_off(
+    kwargs: dict[str, Any],
+    provider: str,
+    model: str,
+    base_url: str = "",
+    *,
+    effort: str | None = "off",
+) -> str:
+    """Put the lowest effort this route should try onto one chat.completions body.
+
+    ``off`` is the profile disable. ``low`` is the core floor. ``None`` strips the
+    fields so the route default applies. A silent Xiaomi profile keeps the shared
+    thinking toggle; a missing profile uses top-level ``reasoning_effort`` and never
+    ``thinking: disabled``, which custom relays reject. Returns the source used.
+    """
+    _strip_reasoning_controls(kwargs)
+    if effort is None:
+        return "strip"
+    reasoning_config = (
+        {"enabled": False}
+        if _effort_is_off(effort)
+        else {"enabled": True, "effort": str(effort).strip().lower() or "low"}
+    )
+    profile = None
+    applied = False
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(_worker_profile_name(provider))
+        if profile is not None:
+            extra_add, top_add = profile.build_api_kwargs_extras(
+                reasoning_config=reasoning_config,
+                model=model,
+                base_url=base_url or None,
+            )
+            extra = dict(kwargs.get("extra_body") or {})
+            if isinstance(extra_add, Mapping) and extra_add:
+                extra.update(dict(extra_add))
+                applied = True
+            if isinstance(top_add, Mapping) and top_add:
+                kwargs.update(dict(top_add))
+                applied = True
+            if extra:
+                kwargs["extra_body"] = extra
+            if applied:
+                return "profile"
+    except Exception:
+        profile = None
+        applied = False
+    plug = str(provider or "").strip().lower()
+    # Xiaomi's profile is silent. Keep today's toggle so those lanes stay on off.
+    if _effort_is_off(effort) and plug in {"xiaomi", "mimo", "xiaomi-mimo"}:
+        extra = dict(kwargs.get("extra_body") or {})
+        extra["thinking"] = {"type": "disabled"}
+        kwargs["extra_body"] = extra
+        return "fallback"
+    kwargs["reasoning_effort"] = "none" if _effort_is_off(effort) else str(effort).strip().lower()
+    return "top"
+
+
+def _llm_issue_kind(exc: BaseException | None) -> str | None:
+    """Classify worker failures so Week Review can name quota vs connection without changing bool callers."""
+    if exc is None:
+        return None
+    code = getattr(exc, "status_code", None)
+    if code is None:
+        resp = getattr(exc, "response", None)
+        code = getattr(resp, "status_code", None)
+    try:
+        if int(code) in (402, 403, 429):
+            return "quota"
+    except (TypeError, ValueError):
+        pass
+    text = str(exc).lower()
+    quota_needles = (
+        "quota",
+        "rate limit",
+        "rate_limit",
+        "insufficient",
+        "balance",
+        "used up",
+        "exceeded",
+        "too many requests",
+        "billing",
+        "resource exhausted",
+    )
+    if any(n in text for n in quota_needles):
+        return "quota"
+    try:
+        if int(code) == 400:
+            return "request"
+    except (TypeError, ValueError):
+        pass
+    if "invalid_request" in text or "invalid request" in text:
+        return "request"
+    conn_needles = (
+        "connection error",
+        "api call failed",
+        "max retries",
+        "econnreset",
+        "timed out",
+        "timeout",
+        "client has been closed",
+        "cannot send a request",
+        "connection refused",
+        "nodename nor servname",
+        "name or service not known",
+        "missing ",
+    )
+    if any(n in text for n in conn_needles):
+        return "connection"
+    return None
+
+
+def _quota_exhausted(exc: BaseException) -> bool:
+    """Treat billing/rate-limit failures as 'MiMo used up' so ingest can finish on k2."""
+    return _llm_issue_kind(exc) == "quota"
+
+
+def _mark_xiaomi_quota_dead() -> None:
+    """Pin the fallback lane for one hour, then try the primary again.
+
+    A flag that never cleared left a long-running gateway on K2 after one quota error.
+    """
+    global _xiaomi_quota_dead_until
+    with _xiaomi_quota_lock:
+        _xiaomi_quota_dead_until = time.time() + _QUOTA_DEAD_TTL_S
+
+
+def _xiaomi_quota_is_dead() -> bool:
+    with _xiaomi_quota_lock:
+        return time.time() < _xiaomi_quota_dead_until
+
+
+def _maybe_k2_worker(provider: str, model: str) -> tuple[str, str]:
+    """Stay on the primary until its quota window is open; then use that row's fallback.
+
+    Empty provider/model stay empty so undeclared workers inherit chat instead
+    of resurrecting Xiaomi when ``config.yaml`` ``model:`` is MiniMax or Kimi.
+    """
+    if _xiaomi_worker_lane(provider, model) and _xiaomi_quota_is_dead():
+        return _fallback_lane(provider)
+    return (str(provider or "").strip(), str(model or "").strip())
+
+
+def _ensure_hermes_dotenv() -> None:
+    try:
+        from hermes_cli.env_loader import load_hermes_dotenv
+
+        load_hermes_dotenv(hermes_home=_hermes_home())
+    except Exception:
+        pass
+
+
+def openai_function_tool(schema: Mapping[str, Any]) -> dict[str, Any]:
+    """Wrap a Hermes {name, description, parameters} schema as an OpenAI tool."""
+    if str(schema.get("type") or "") == "function" and isinstance(
+        schema.get("function"), Mapping
+    ):
+        return dict(schema)
+    return {
+        "type": "function",
+        "function": {
+            "name": str(schema.get("name") or "").strip(),
+            "description": str(schema.get("description") or ""),
+            "parameters": schema.get("parameters")
+            or {"type": "object", "properties": {}},
+        },
+    }
+
+
+def _oneshot_runtime(plugin_runtime: Mapping[str, str], provider: str) -> dict[str, str]:
+    """Credentials bag for this attempt: same-provider YAML URL, else inherit for failover (k2)."""
+    plug = str(provider or "").strip().lower() or "xiaomi"
+    out: dict[str, str] = {"provider": plug}
+    same = str(plugin_runtime.get("provider") or "").strip().lower() == plug
+    if same:
+        if plugin_runtime.get("base_url"):
+            out["base_url"] = plugin_runtime["base_url"]
+        if plugin_runtime.get("key_env"):
+            out["key_env"] = plugin_runtime["key_env"]
+        return out
+    path = _hermes_home() / "config.yaml"
+    try:
+        import yaml
+
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        raw = {}
+    if isinstance(raw, dict):
+        _inherit_provider_endpoint(raw, out)
+    return out
+
+
+def _oneshot_credentials(runtime: Mapping[str, Any] | str) -> tuple[str, str]:
+    """Read API key from .env and base_url from YAML then env.
+
+    OpenAI and Anthropic wires fail closed on an empty key or URL so a blank
+    host cannot be called. The litellm wire allows both empty because LiteLLM
+    reads its own provider env (GEMINI_API_KEY, AWS credentials).
+    """
+    if isinstance(runtime, str):
+        bag: dict[str, Any] = {"provider": runtime}
+    else:
+        bag = dict(runtime or {})
+    plug = str(bag.get("provider") or "").strip().lower() or "xiaomi"
+    derived_key, url_env = _provider_env_names(plug)
+    key_env = str(bag.get("key_env") or "").strip() or derived_key
+    api_key = (os.environ.get(key_env) or "").strip()
+    litellm_wire = _worker_wire(plug) == "litellm"
+    if not api_key and not litellm_wire:
+        raise ValueError(f"missing {key_env} for oneshot worker provider {plug}")
+    env_url = (os.environ.get(url_env) or "").strip()
+    yaml_url = str(bag.get("base_url") or "").strip()
+    base_url = env_url or yaml_url
+    if not base_url and not litellm_wire:
+        raise ValueError(f"missing {url_env} for oneshot worker provider {plug}")
+    return api_key, base_url
+
+
+def _usage_int(usage: Any, *names: str) -> int:
+    if usage is None:
+        return 0
+    for name in names:
+        val = getattr(usage, name, None)
+        if val is None and isinstance(usage, Mapping):
+            val = usage.get(name)
+        try:
+            if val is not None:
+                return int(val)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _msg_field(message: Any, name: str, default: Any = None) -> Any:
+    """Read one reply field from an SDK object, a dict, or a LiteLLM model dump.
+
+    Thinking-on routes often return ``content: null`` plus ``tool_calls``. Attribute
+    access alone dropped those dict replies and the worker saw an empty tool call.
+    """
+    if isinstance(message, Mapping):
+        return message.get(name, default)
+    value = getattr(message, name, default)
+    if value is None and callable(getattr(message, "model_dump", None)):
+        try:
+            bag = message.model_dump()
+        except Exception:
+            bag = None
+        if isinstance(bag, Mapping) and name in bag:
+            return bag.get(name, default)
+    return value
+
+
+def _reasoning_text(message: Any, raw_content: str) -> str:
+    """Keep the model's own reasoning beside the tool call so a failed field can be explained.
+
+    Tool arguments stay parsed from the text after the think block. Without this
+    split, the only record of a retry is the gap name, not why the model left it blank.
+    """
+    parts: list[str] = []
+    for attr in ("reasoning_content", "reasoning"):
+        value = _msg_field(message, attr)
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+    dump = getattr(message, "model_dump", None)
+    if callable(dump):
+        try:
+            bag = dump()
+        except Exception:
+            bag = {}
+        if isinstance(bag, dict):
+            for key in ("reasoning_content", "reasoning"):
+                value = bag.get(key)
+                if isinstance(value, str) and value.strip() and value.strip() not in parts:
+                    parts.append(value.strip())
+    for match in _THINK_RE.finditer(raw_content):
+        body = match.group(0)
+        inner = re.sub(r"^<(thinking|think)>|</(thinking|think)>$", "", body, flags=re.I).strip()
+        if inner and inner not in parts:
+            parts.append(inner)
+    return "\n\n".join(parts)
+
+
+def _capture_from_oneshot_message(
+    message: Any,
+    *,
+    force_tool_name: str | None,
+) -> dict[str, Any]:
+    """Shared reply parser for OpenAI SDK objects, dicts, and LiteLLM messages.
+
+    A thinking-on body is ``content: null`` with ``tool_calls`` and
+    ``reasoning_content``. Treating null content as a missing reply dropped the
+    tool call. JSON lenient parsing stays in ``extract_tool_calls_from_result``.
+    """
+    raw = _msg_field(message, "content")
+    raw_content = "" if raw is None else str(raw)
+    content = _strip_think_blocks(raw_content)
+    raw_calls = _msg_field(message, "tool_calls") or []
+    packed: list[dict[str, Any]] = []
+    for tc in raw_calls:
+        fn = _msg_field(tc, "function")
+        name = str(
+            _msg_field(fn, "name") or _msg_field(tc, "name") or force_tool_name or ""
+        ).strip()
+        arguments = _msg_field(fn, "arguments")
+        if arguments is None:
+            arguments = _msg_field(tc, "arguments")
+        packed.append({"function": {"name": name, "arguments": arguments}})
+    assistant: dict[str, Any] = {"role": "assistant", "content": content}
+    if packed:
+        assistant["tool_calls"] = packed
+    result = {
+        "final_response": content.strip(),
+        "messages": [assistant],
+        "failed": False,
+    }
+    found = extract_tool_calls_from_result(result, default_tool_name=force_tool_name)
+    usable = [(n, a) for n, a in found if n and _tool_args_have_values(a)]
+    tool_calls = usable or found
+    tool_name: str | None = None
+    tool_args: dict[str, Any] | None = None
+    if tool_calls:
+        tool_name, tool_args = tool_calls[-1]
+    return {
+        "final_response": content.strip(),
+        "reasoning_text": _reasoning_text(message, raw_content),
+        "tool_name": tool_name,
+        "tool_args": tool_args,
+        "tool_calls": tool_calls,
+        "messages": [assistant],
+        "failed": False,
+    }
+
+
+_SCHEMA_TYPES = {
+    "object": lambda v: isinstance(v, Mapping),
+    "array": lambda v: isinstance(v, list),
+    "string": lambda v: isinstance(v, str),
+    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+    "boolean": lambda v: isinstance(v, bool),
+}
+
+
+def _parameters_of(schema: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    if not isinstance(schema, Mapping) or not schema:
+        return {}
+    params = schema.get("parameters")
+    if isinstance(params, Mapping):
+        return params
+    fn = schema.get("function")
+    if isinstance(fn, Mapping) and isinstance(fn.get("parameters"), Mapping):
+        return fn["parameters"]
+    if schema.get("type") == "object" or "properties" in schema or "required" in schema:
+        return schema
+    return {}
+
+
+def _tool_schema_error(args: Any, schema: Mapping[str, Any] | None) -> str:
+    """Name the shape mistakes so one teach retry can fix them. Empty means the args match.
+
+    json5 already accepted the text. This is missing fields, wrong types, and bad enums.
+    """
+    params = _parameters_of(schema)
+    if not params:
+        return ""
+    if not isinstance(args, Mapping):
+        return "tool arguments must be an object"
+    errors: list[str] = []
+    required = params.get("required") or []
+    props = params.get("properties") if isinstance(params.get("properties"), Mapping) else {}
+    for key in required:
+        if key not in args:
+            errors.append(f"missing required field {key}")
+    if isinstance(props, Mapping):
+        for key, spec in props.items():
+            if key not in args or not isinstance(spec, Mapping):
+                continue
+            value = args[key]
+            typ = spec.get("type")
+            if isinstance(typ, str) and typ in _SCHEMA_TYPES and not _SCHEMA_TYPES[typ](value):
+                errors.append(f"{key} must be {typ}")
+            enum = spec.get("enum")
+            if isinstance(enum, list) and value not in enum:
+                errors.append(f"{key} must be one of {enum}")
+    return "; ".join(errors)
+
+
+def _purpose_limits(purpose: str) -> tuple[float, int]:
+    """Short recall calls must not sit on the SDK's 600s timeout and hidden retries."""
+    why = str(purpose or "").lower()
+    if "recall" in why or "prefetch" in why:
+        return 20.0, 0
+    if "monthly" in why:
+        return 300.0, 1
+    return 120.0, 0
+
+
+def _cached_openai_client(
+    api_key: str,
+    base_url: str,
+    timeout: float,
+    max_retries: int,
+    wire: str = "openai",
+) -> Any:
+    """Reuse one client per endpoint so each worker call does not build a new pool.
+
+    litellm is imported only on that wire so plugin load stays inside Hermes's
+    10s cap. Callers still use chat.completions.create.
+    """
+    key = (wire, base_url, api_key, float(timeout), int(max_retries))
+    client = _openai_clients.get(key)
+    if client is not None:
+        return client
+    if wire == "litellm":
+        os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+        import functools
+        import types
+
+        import litellm
+
+        bound: dict[str, Any] = {
+            "timeout": timeout,
+            "num_retries": max_retries,
+        }
+        if api_key:
+            bound["api_key"] = api_key
+        if base_url:
+            bound["api_base"] = base_url
+        create = functools.partial(litellm.completion, **bound)
+        client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create))
+        )
+    else:
+        from openai import OpenAI
+
+        kwargs: dict[str, Any] = {
+            "api_key": api_key,
+            "timeout": timeout,
+            "max_retries": max_retries,
+        }
+        if base_url:
+            kwargs["base_url"] = base_url
+        client = OpenAI(**kwargs)
+    _openai_clients[key] = client
+    return client
+
+
+def run_worker_llm_oneshot(
+    prompt: str,
+    *,
+    plugin: str,
+    purpose: str,
+    force_tool_name: str | None = None,
+    tool_schema: Mapping[str, Any] | None = None,
+    max_tokens: int = 2048,
+    temperature: float = 0.2,
+    system_prompt: str | None = None,
+    teach_schema: bool = True,
+    timeout_s: float | None = None,
+    max_retries: int | None = None,
+) -> dict[str, Any]:
+    """One chat.completions call. No nested Hermes AIAgent.
+
+    OpenAI and Anthropic-compatible providers use the OpenAI SDK on the
+    provider /v1 surface. wire litellm calls litellm.completion so Gemini,
+    Bedrock, and Codex come back in that same reply shape. Records
+    ``duration_ms`` on the usage ledger so prefetch wall time and digest LLM
+    retries are not guessed from a single timeout.
+    A schema miss gets one teach retry. Callers that already teach pass
+    ``teach_schema=False``.
+    """
+    _ensure_hermes_dotenv()
+    started = time.perf_counter()
+    plugin_runtime = _plugin_worker_runtime(plugin, purpose)
+    provider = str(plugin_runtime.get("provider") or "").strip()
+    model = str(plugin_runtime.get("model") or "").strip()
+    provider, model = _maybe_k2_worker(provider, model)
+    force = str(force_tool_name or "").strip() or None
+    schema = dict(tool_schema or {})
+    if force and not str(schema.get("name") or "").strip():
+        fn = schema.get("function") if isinstance(schema.get("function"), Mapping) else None
+        if not (fn and str(fn.get("name") or "").strip()):
+            schema["name"] = force
+    wrapped = openai_function_tool(schema) if schema else None
+    tool_name = ""
+    if wrapped:
+        fn = wrapped.get("function") if isinstance(wrapped.get("function"), Mapping) else {}
+        tool_name = str((fn or {}).get("name") or "").strip()
+    messages = [
+        {"role": "system", "content": system_prompt or ONESHOT_SYSTEM},
+        {"role": "user", "content": prompt},
+    ]
+    limit_timeout, limit_retries = _purpose_limits(purpose)
+    if timeout_s is not None:
+        limit_timeout = float(timeout_s)
+    if max_retries is not None:
+        limit_retries = int(max_retries)
+    create_kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if wrapped and tool_name:
+        create_kwargs["tools"] = [wrapped]
+        if force:
+            create_kwargs["tool_choice"] = {
+                "type": "function",
+                "function": {"name": force},
+            }
+    config_model = str(plugin_runtime.get("model") or model or "").strip()
+    last_exc: BaseException | None = None
+
+    def _elapsed_ms() -> int:
+        return max(0, int((time.perf_counter() - started) * 1000))
+
+    path_wire = _worker_wire(provider) if provider else "openai"
+
+    def _fail_record(exc: BaseException | None, used_model: str) -> dict[str, Any]:
+        kind = _llm_issue_kind(exc)
+        record_worker_usage(
+            _usage_record(
+                plugin=plugin,
+                purpose=purpose,
+                model=used_model,
+                config_model=config_model,
+                duration_ms=_elapsed_ms(),
+                issue=kind,
+                wire=path_wire,
+            )
+        )
+        return {
+            "final_response": str(exc or "oneshot failed"),
+            "tool_name": None,
+            "tool_args": None,
+            "tool_calls": [],
+            "messages": [],
+            "failed": True,
+            "llm_issue": kind,
+            "model": config_model,
+        }
+
+    schema_taught = False
+    ceiling = _lane_token_ceiling(plugin_runtime, purpose)
+    with worker_llm_scope():
+        for attempt in (0, 1):
+            try:
+                api_key, base_url = _oneshot_credentials(
+                    _oneshot_runtime(plugin_runtime, provider)
+                )
+            except Exception as exc:
+                last_exc = exc
+                return _fail_record(exc, model)
+            wire = _worker_wire(provider)
+            path_wire = wire
+            if wire != "litellm":
+                try:
+                    base_url, _used_gw = resolve_worker_endpoint(
+                        base_url, "chat_completions"
+                    )
+                except Exception:
+                    pass
+            try:
+                client = _cached_openai_client(
+                    api_key,
+                    base_url or "",
+                    limit_timeout,
+                    limit_retries,
+                    wire=wire,
+                )
+            except ImportError as exc:
+                last_exc = exc
+                return _fail_record(exc, model)
+            http_calls = 0
+            token_bumps = 0
+            fallback_wire = ""
+            floor_source = ""
+            effort: str | None = None
+            if wire != "litellm":
+                floor_source = _known_reasoning_floor(provider, model, base_url or "")
+                effort = "low" if floor_source else "off"
+            active = client
+
+            def _prepare(current: str | None) -> dict[str, Any]:
+                body = {
+                    key: value
+                    for key, value in create_kwargs.items()
+                    if key not in {"extra_body", "reasoning_effort", "allowed_openai_params"}
+                }
+                body["model"] = model
+                if wire == "litellm":
+                    prefix = str(_provider_caps(provider).get("litellm_prefix") or "").strip()
+                    if prefix and "/" not in str(body["model"]):
+                        body["model"] = f"{prefix}/{body['model']}"
+                    return body
+                _apply_worker_thinking_off(
+                    body, provider, model, base_url or "", effort=current
+                )
+                return body
+
+            def _post(http_client: Any, body: Mapping[str, Any]) -> Any:
+                nonlocal http_calls
+                http_calls += 1
+                return http_client.chat.completions.create(**dict(body))
+
+            def _litellm_once(current_cap: int) -> tuple[Any, dict[str, Any], str | None]:
+                """One OpenAI-shaped LiteLLM call at the lowest effort, then bare if that 400s.
+
+                The native client already failed with reasoning fields removed. LiteLLM
+                keeps ``reasoning_effort`` only when it is listed in allowed_openai_params.
+                """
+                lite = _cached_openai_client(
+                    api_key,
+                    base_url or "",
+                    limit_timeout,
+                    limit_retries,
+                    wire="litellm",
+                )
+                raw_model = str(model or "")
+                lite_model = raw_model if raw_model.startswith("openai/") else f"openai/{raw_model}"
+                send = "low" if floor_source else "off"
+                body = _prepare(None)
+                body["model"] = lite_model
+                body["max_tokens"] = current_cap
+                body["reasoning_effort"] = "none" if send == "off" else "low"
+                body["allowed_openai_params"] = ["reasoning_effort"]
+                try:
+                    return _post(lite, body), body, send
+                except Exception as exc:
+                    if _reasoning_wire_rejection(exc, controls_sent=True) is None:
+                        raise
+                    bare = {
+                        key: value
+                        for key, value in body.items()
+                        if key not in {"reasoning_effort", "allowed_openai_params"}
+                    }
+                    return _post(lite, bare), bare, None
+
+            sent = _prepare(effort)
+            resp = None
+            transport_exc: BaseException | None = None
+            while True:
+                try:
+                    resp = _post(active, sent)
+                    transport_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    transport_exc = exc
+                    if wire == "litellm" or _quota_exhausted(exc):
+                        break
+                    verdict = _reasoning_wire_rejection(exc, controls_sent=effort is not None)
+                    if verdict == "floor" and effort == "off":
+                        _remember_worker_floor(provider, base_url or "", model, exc)
+                        effort = "low"
+                        floor_source = "learned"
+                        sent = _prepare(effort)
+                        continue
+                    if effort == "low" and (verdict is not None or _status_is_400(exc)):
+                        if verdict == "floor":
+                            _remember_worker_floor(provider, base_url or "", model, exc)
+                            floor_source = floor_source or "learned"
+                        effort = None
+                        sent = _prepare(None)
+                        continue
+                    if verdict == "strip" and effort is not None:
+                        effort = None
+                        sent = _prepare(None)
+                        continue
+                    if effort is None:
+                        break
+                    break
+            if resp is None:
+                if (
+                    attempt == 0
+                    and _xiaomi_worker_lane(provider, model)
+                    and transport_exc is not None
+                    and _quota_exhausted(transport_exc)
+                ):
+                    _mark_xiaomi_quota_dead()
+                    record_worker_usage(
+                        {
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "plugin": plugin,
+                            "purpose": purpose,
+                            "model": model,
+                            "config_model": config_model,
+                            "issue": "quota",
+                            "thinking_off": False,
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "cache_read_tokens": 0,
+                            "cache_write_tokens": 0,
+                            "reasoning_tokens": 0,
+                            "total_tokens": 0,
+                            "cost_usd": 0.0,
+                            "api_calls": 0,
+                            "duration_ms": _elapsed_ms(),
+                            "wire": path_wire,
+                        }
+                    )
+                    provider, model = _fallback_lane(provider)
+                    print(
+                        f"worker_llm: MiMo quota/rate-limit; switching ingest to {model}",
+                        flush=True,
+                    )
+                    continue
+                if (
+                    wire != "litellm"
+                    and effort is None
+                    and transport_exc is not None
+                    and not _quota_exhausted(transport_exc)
+                ):
+                    try:
+                        resp, sent, effort = _litellm_once(
+                            int(sent.get("max_tokens") or max_tokens)
+                        )
+                        fallback_wire = "litellm"
+                        active = _cached_openai_client(
+                            api_key,
+                            base_url or "",
+                            limit_timeout,
+                            limit_retries,
+                            wire="litellm",
+                        )
+                    except Exception as exc2:
+                        last_exc = exc2
+                        path_wire = "litellm"
+                        return _fail_record(exc2, model)
+                else:
+                    return _fail_record(transport_exc, model)
+
+            def _usable(captured_row: Mapping[str, Any]) -> bool:
+                return any(
+                    name and _tool_args_have_values(args)
+                    for name, args in (captured_row.get("tool_calls") or [])
+                )
+
+            def _needs_bump(choice: Any, captured_row: Mapping[str, Any], body: Mapping[str, Any]) -> bool:
+                if token_bumps >= 2:
+                    return False
+                current = int(body.get("max_tokens") or max_tokens)
+                nxt = min(current * 2, ceiling)
+                if nxt <= current:
+                    return False
+                if _msg_field(choice, "finish_reason") == "length":
+                    return True
+                if _llm_parse_path.get() == "salvage":
+                    return True
+                if create_kwargs.get("tools") and not _usable(captured_row):
+                    completion = _usage_int(_msg_field(resp, "usage"), "completion_tokens")
+                    if current and completion >= int(0.9 * current):
+                        return True
+                return False
+
+            choice = _first_reply_choice(resp)
+            if choice is None and wire != "litellm" and not fallback_wire:
+                try:
+                    resp, sent, effort = _litellm_once(int(sent.get("max_tokens") or max_tokens))
+                    fallback_wire = "litellm"
+                    active = _cached_openai_client(
+                        api_key, base_url or "", limit_timeout, limit_retries, wire="litellm"
+                    )
+                    choice = _first_reply_choice(resp)
+                except Exception as exc:
+                    path_wire = "litellm"
+                    return _fail_record(exc, model)
+            if choice is None:
+                return _fail_record(last_exc or RuntimeError("oneshot reply had no message"), model)
+            captured = _capture_from_oneshot_message(
+                _msg_field(choice, "message"), force_tool_name=force
+            )
+            while _needs_bump(choice, captured, sent):
+                token_bumps += 1
+                current = int(sent.get("max_tokens") or max_tokens)
+                sent["max_tokens"] = min(current * 2, ceiling)
+                try:
+                    resp = _post(active, sent)
+                except Exception as exc:
+                    return _fail_record(exc, model)
+                choice = _first_reply_choice(resp)
+                if choice is None:
+                    return _fail_record(last_exc or RuntimeError("oneshot reply had no message"), model)
+                captured = _capture_from_oneshot_message(
+                    _msg_field(choice, "message"), force_tool_name=force
+                )
+            schema_error = (
+                _tool_schema_error(captured.get("tool_args") or {}, schema)
+                if teach_schema
+                else ""
+            )
+            if schema_error and not schema_taught:
+                schema_taught = True
+                sent["messages"] = [
+                    *list(sent.get("messages") or messages),
+                    {"role": "assistant", "content": captured.get("final_response") or ""},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Schema validation failed: "
+                            + schema_error
+                            + ". Call the tool again with arguments that match the schema."
+                        ),
+                    },
+                ]
+                try:
+                    resp = _post(active, sent)
+                except Exception as exc:
+                    return _fail_record(exc, model)
+                choice = _first_reply_choice(resp)
+                if choice is None:
+                    return _fail_record(RuntimeError("oneshot reply had no message"), model)
+                captured = _capture_from_oneshot_message(
+                    _msg_field(choice, "message"), force_tool_name=force
+                )
+                schema_error = _tool_schema_error(captured.get("tool_args") or {}, schema)
+            if schema_error and teach_schema:
+                captured["failed"] = True
+                captured["final_response"] = schema_error
+            elif (
+                create_kwargs.get("tools")
+                and not _usable(captured)
+                and not fallback_wire
+                and wire != "litellm"
+            ):
+                # No tool call survived the cap rule. Schema misses already had their teach.
+                try:
+                    resp, sent, effort = _litellm_once(int(sent.get("max_tokens") or max_tokens))
+                    fallback_wire = "litellm"
+                    active = _cached_openai_client(
+                        api_key, base_url or "", limit_timeout, limit_retries, wire="litellm"
+                    )
+                    choice = _first_reply_choice(resp)
+                    if choice is None:
+                        return _fail_record(RuntimeError("litellm reply had no message"), model)
+                    captured = _capture_from_oneshot_message(
+                        _msg_field(choice, "message"), force_tool_name=force
+                    )
+                except Exception as exc:
+                    path_wire = "litellm"
+                    return _fail_record(exc, model)
+            if fallback_wire == "litellm":
+                path_wire = "litellm"
+            usage = _msg_field(resp, "usage")
+            details = _msg_field(usage, "prompt_tokens_details") if usage is not None else None
+            reasoning = (
+                _msg_field(usage, "completion_tokens_details") if usage is not None else None
+            )
+            usage_fields = {
+                "input_tokens": _usage_int(usage, "prompt_tokens"),
+                "output_tokens": _usage_int(usage, "completion_tokens"),
+                "cache_read_tokens": _usage_int(details, "cached_tokens"),
+                "cache_write_tokens": 0,
+                "reasoning_tokens": _usage_int(reasoning, "reasoning_tokens"),
+                "total_tokens": _usage_int(usage, "total_tokens"),
+            }
+            effort_sent = "off" if effort == "off" else ("low" if effort == "low" else "default")
+            record_worker_usage(
+                _usage_record(
+                    plugin=plugin,
+                    purpose=purpose,
+                    model=model,
+                    config_model=config_model,
+                    duration_ms=_elapsed_ms(),
+                    thinking_off=(effort == "off"),
+                    api_calls=http_calls,
+                    parse_path=_llm_parse_path.get(),
+                    effort_sent=effort_sent,
+                    floor_source=floor_source,
+                    fallback_wire=fallback_wire,
+                    max_tokens=int(sent.get("max_tokens") or max_tokens),
+                    wire=path_wire,
+                    **usage_fields,
+                )
+            )
+            captured.update(usage_fields)
+            captured["finish_reason"] = _msg_field(choice, "finish_reason")
+            captured["max_tokens"] = sent.get("max_tokens", max_tokens)
+            captured["api_calls"] = http_calls
+            captured["failed"] = bool(captured.get("failed"))
+            captured["duration_ms"] = _elapsed_ms()
+            captured["model"] = model or config_model
+            captured["effort_sent"] = effort_sent
+            captured["floor_source"] = floor_source
+            captured["fallback_wire"] = fallback_wire
+            captured["wire"] = path_wire
+            return captured
+    return _fail_record(last_exc, model)
+
+
+def _run_worker_conversation(
+    prompt: str,
+    *,
+    plugin: str,
+    purpose: str,
+    platform: str,
+    max_iterations: int,
+    enabled_toolsets: list[str],
+    request_overrides: Mapping[str, Any] | None = None,
+    tool_start_callback: Any = None,
+    force_tool_name: str | None = None,
+    allowed_tool_names: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Nested worker AIAgent after popping chat gateway creds.
+
+    Refills key/URL from ``.env`` for the effective provider so MiniMax/Xiaomi
+    workers cannot inherit a Kimi Anthropic base_url from the chat gateway.
+    MiniMax nested is Anthropic Messages even when env still has ``/v1``.
+    Xiaomi/Kimi OpenAI workers keep ``/v1`` and must not inherit ``api_mode``.
+    Thinking starts at off, or at low when this route is already known to refuse off.
+    A custom route must not also get ``extra_body.thinking``: that field is what
+    Inferway rejects. A reasoning 400 retries once at low, or with no reasoning config.
+    """
+    try:
+        from hermes_cli.env_loader import load_hermes_dotenv
+
+        load_hermes_dotenv(hermes_home=_hermes_home())
+    except Exception:
+        pass
+    from gateway.run import _resolve_gateway_model, _resolve_runtime_agent_kwargs
+    from run_agent import AIAgent
+
+    started = time.perf_counter()
+
+    def _elapsed_ms() -> int:
+        return max(0, int((time.perf_counter() - started) * 1000))
+
+    with worker_llm_scope():
+        runtime_kwargs = dict(_resolve_runtime_agent_kwargs() or {})
+        runtime_model = runtime_kwargs.pop("model", None)
+        runtime_kwargs.pop("enabled_toolsets", None)
+        runtime_kwargs.pop("disabled_toolsets", None)
+        runtime_kwargs.pop("request_overrides", None)
+        runtime_kwargs.pop("tool_start_callback", None)
+        plugin_runtime = _plugin_worker_runtime(plugin, purpose)
+        plugin_provider = str(plugin_runtime.get("provider") or "").strip()
+        config_model = str(plugin_runtime.get("model") or "").strip()
+        model = (
+            plugin_runtime.get("model")
+            or (
+                str(runtime_model).strip()
+                if runtime_model is not None and str(runtime_model).strip()
+                else ""
+            )
+            or _resolve_gateway_model()
+        )
+        if not config_model:
+            config_model = str(model or "").strip()
+        if plugin_provider:
+            provider, model = _maybe_k2_worker(plugin_provider, str(model or ""))
+        elif _xiaomi_quota_is_dead():
+            provider, model = _fallback_lane("xiaomi")
+        else:
+            provider = ""
+        result: Any = None
+        agent: Any = None
+        nest_effort: str | None = "off"
+        for attempt in (0, 1):
+            nest_mode = "chat_completions"
+            base_url = ""
+            if provider:
+                runtime_kwargs["provider"] = provider
+                runtime_kwargs["requested_provider"] = provider
+                # Gateway kwargs are for the chat provider (e.g. Kimi Anthropic).
+                # Mixing them with a plugin worker provider (Xiaomi OpenAI) drops
+                # the worker into the wrong client with no API key.
+                for key in (
+                    "api_key",
+                    "base_url",
+                    "api_base",
+                    "api_mode",
+                    "credential_pool",
+                ):
+                    runtime_kwargs.pop(key, None)
+                try:
+                    api_key, base_url = _oneshot_credentials(
+                        _oneshot_runtime(plugin_runtime, provider)
+                    )
+                    nest_mode = (
+                        "anthropic_messages"
+                        if _worker_wire(str(provider)) == "anthropic"
+                        else "chat_completions"
+                    )
+                    try:
+                        base_url, _used_gw = resolve_worker_endpoint(
+                            base_url, nest_mode
+                        )
+                    except Exception:
+                        pass
+                    runtime_kwargs["api_key"] = api_key
+                    runtime_kwargs["base_url"] = base_url
+                    if nest_mode == "anthropic_messages":
+                        runtime_kwargs["api_mode"] = nest_mode
+                except Exception:
+                    # Fail closed: no chat URL mix. Missing .env leaves creds unset
+                    # so test_plugin_config_model_overrides_gateway still holds.
+                    pass
+            if attempt == 0 and provider:
+                known = _known_reasoning_floor(str(provider), str(model or ""), base_url)
+                if known:
+                    nest_effort = "low"
+            if nest_effort == "off":
+                reasoning_config: dict[str, Any] | None = {"enabled": False}
+            elif nest_effort == "low":
+                reasoning_config = {"enabled": True, "effort": "low"}
+            else:
+                reasoning_config = None
+            agent_kwargs: dict[str, Any] = {
+                "model": model,
+                **runtime_kwargs,
+                "platform": platform or "cli",
+                "quiet_mode": True,
+                "skip_context_files": True,
+                "skip_memory": True,
+                "enabled_toolsets": list(enabled_toolsets),
+                "max_iterations": max_iterations,
+            }
+            if reasoning_config is not None:
+                agent_kwargs["reasoning_config"] = reasoning_config
+            overrides = dict(request_overrides or {})
+            if nest_mode == "chat_completions" and nest_effort is not None:
+                scratch: dict[str, Any] = {}
+                _apply_worker_thinking_off(
+                    scratch,
+                    str(provider or ""),
+                    str(model or ""),
+                    base_url,
+                    effort=nest_effort,
+                )
+                custom_route = _worker_profile_name(str(provider or "")).startswith("custom:")
+                # Custom relays reject thinking objects. reasoning_config is the wire.
+                if not custom_route and scratch.get("extra_body"):
+                    extra = dict(overrides.get("extra_body") or {})
+                    extra.update(scratch["extra_body"])
+                    overrides["extra_body"] = extra
+                if not custom_route and scratch.get("reasoning_effort"):
+                    overrides["reasoning_effort"] = scratch["reasoning_effort"]
+            if overrides:
+                agent_kwargs["request_overrides"] = overrides
+            if tool_start_callback is not None:
+                agent_kwargs["tool_start_callback"] = tool_start_callback
+            try:
+                agent = AIAgent(**agent_kwargs)
+                agent.suppress_status_output = True
+                # Worker-only: re-equip after init so tool_search cannot strip schemas.
+                # Text-only workers (force_tool_name=None, no allow-list) stay untouched.
+                if force_tool_name or allowed_tool_names:
+                    try:
+                        _apply_worker_tools(
+                            agent,
+                            enabled_toolsets=enabled_toolsets,
+                            force_tool_name=force_tool_name,
+                            allowed_tool_names=allowed_tool_names,
+                        )
+                    except Exception:
+                        # Fail open to init-time tools rather than abort the digest/weekly run.
+                        pass
+                result = agent.run_conversation(prompt)
+                break
+            except Exception as exc:
+                verdict = _reasoning_wire_rejection(exc, controls_sent=nest_effort is not None)
+                if attempt == 0 and verdict == "floor":
+                    _remember_worker_floor(str(provider or ""), base_url, str(model or ""), exc)
+                    nest_effort = "low"
+                    continue
+                if attempt == 0 and verdict == "strip":
+                    nest_effort = None
+                    continue
+                kind = _llm_issue_kind(exc)
+                if kind:
+                    record_worker_usage(
+                        {
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "plugin": plugin,
+                            "purpose": purpose,
+                            "model": model,
+                            "config_model": config_model,
+                            "issue": kind,
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "cache_read_tokens": 0,
+                            "cache_write_tokens": 0,
+                            "reasoning_tokens": 0,
+                            "total_tokens": 0,
+                            "cost_usd": 0.0,
+                            "api_calls": 0,
+                            "duration_ms": _elapsed_ms(),
+                            "wire": "anthropic" if nest_mode == "anthropic_messages" else "openai",
+                        }
+                    )
+                if (
+                    attempt == 0
+                    and _xiaomi_worker_lane(provider, model)
+                    and _quota_exhausted(exc)
+                ):
+                    _mark_xiaomi_quota_dead()
+                    provider, model = _fallback_lane(provider)
+                    print(
+                        f"worker_llm: MiMo quota/rate-limit; switching ingest to {model}",
+                        flush=True,
+                    )
+                    continue
+                raise
+        record_worker_usage({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "plugin": plugin,
+            "purpose": purpose,
+            "model": getattr(agent, "model", "") or model or "",
+            "config_model": config_model,
+            "input_tokens": int(getattr(agent, "session_input_tokens", 0) or 0),
+            "output_tokens": int(getattr(agent, "session_output_tokens", 0) or 0),
+            "cache_read_tokens": int(getattr(agent, "session_cache_read_tokens", 0) or 0),
+            "cache_write_tokens": int(getattr(agent, "session_cache_write_tokens", 0) or 0),
+            "reasoning_tokens": int(getattr(agent, "session_reasoning_tokens", 0) or 0),
+            "total_tokens": int(getattr(agent, "session_total_tokens", 0) or 0),
+            "cost_usd": float(getattr(agent, "session_estimated_cost_usd", 0.0) or 0.0),
+            "api_calls": int(getattr(agent, "session_api_calls", 0) or 0),
+            "duration_ms": _elapsed_ms(),
+            "wire": "anthropic" if nest_mode == "anthropic_messages" else "openai",
+        })
+        return result if isinstance(result, dict) else {"final_response": str(result or "")}

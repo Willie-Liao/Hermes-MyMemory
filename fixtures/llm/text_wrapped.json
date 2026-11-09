@@ -1,0 +1,9 @@
+{
+  "final_response": "",
+  "messages": [
+    {
+      "role": "assistant",
+      "content": "```json\n{\"beginning\": \"a\", \"course\": \"b\", \"outcome\": \"c\"}\n```"
+    }
+  ]
+}
