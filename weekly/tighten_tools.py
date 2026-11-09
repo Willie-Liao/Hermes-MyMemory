@@ -245,7 +245,10 @@ def coerce_tighten_args(
     *,
     extra_text: str = "",
 ) -> dict[str, Any]:
-    """Accept nested JSON, capitalized keys, or a prefixed body string."""
+    """Accept nested JSON or a body string without letting a think block become the text.
+
+    A private think regex here drifted from the worker parser and kept CoT in the Weekly UI.
+    """
     bag = dict(args or {})
     events = bag.get("events")
     if isinstance(events, list) and events and isinstance(events[0], Mapping):
@@ -277,12 +280,9 @@ def coerce_tighten_args(
                 if value and not str(bag.get(key) or "").strip():
                     bag[key] = value
     elif extra_text and not str(bag.get("text") or "").strip():
-        cleaned = re.sub(
-            r"<(thinking|think)>.*?</\1>",
-            "",
-            extra_text,
-            flags=re.DOTALL | re.I,
-        ).strip()
+        from worker_llm import _strip_think_blocks
+
+        cleaned = _strip_think_blocks(extra_text)
         if cleaned:
             bag["text"] = cleaned
     return bag

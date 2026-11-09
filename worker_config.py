@@ -22,6 +22,7 @@ _LANES = {
 _MONTHLY_EXTRAS = (
     "map_batch_tokens",
     "reduce_max_tokens",
+    "max_tokens_ceiling",
     "write_at",
     "checkpoint_days",
     "retry_days",

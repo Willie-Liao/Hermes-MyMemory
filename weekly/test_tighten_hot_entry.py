@@ -442,9 +442,11 @@ def test_merge_mode_multi_peer_hermes_heading_levels():
 
 
 def test_tighten_default_path_uses_oneshot_not_hermes(monkeypatch):
+    """The oneshot path still strips think tags, so the fake worker module must provide that helper."""
     wa = _load()
     seen: dict = {}
     fake = types.ModuleType("worker_llm")
+    fake._strip_think_blocks = lambda text: str(text or "").strip()
 
     def oneshot(prompt: str, **kwargs):
         seen["prompt"] = prompt
@@ -470,9 +472,11 @@ def test_tighten_default_path_uses_oneshot_not_hermes(monkeypatch):
 
 
 def test_merge_default_path_uses_oneshot_not_hermes(monkeypatch):
+    """Merge uses the same think-tag strip, so the fake worker module must provide that helper."""
     wa = _load()
     seen: dict = {}
     fake = types.ModuleType("worker_llm")
+    fake._strip_think_blocks = lambda text: str(text or "").strip()
 
     def oneshot(prompt: str, **kwargs):
         seen["prompt"] = prompt

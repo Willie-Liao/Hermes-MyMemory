@@ -89,28 +89,6 @@ def test_leftover_comparison_summary_is_ignored():
     assert "summary" not in payload_to_dict(loaded)["comparison_with_last_month"]
 
 
-def test_drop_retired_comparison_summary_keeps_month_summary():
-    from monthly_writer import drop_retired_comparison_summary
-
-    raw = (
-        "summary:\n"
-        "- text: month story\n"
-        "  weeks: []\n"
-        "comparison_with_last_month:\n"
-        "  unchanged: []\n"
-        "  changed: []\n"
-        "  suggestion: ''\n"
-        "  summary: Goal alignment remains focused\n"
-        "    on skill creation.\n"
-        "  empty_reason: ''\n"
-    )
-    cleaned = drop_retired_comparison_summary(raw)
-    assert "month story" in cleaned
-    assert "Goal alignment" not in cleaned
-    assert "empty_reason:" in cleaned
-    assert drop_retired_comparison_summary(cleaned) == cleaned
-
-
 def test_month_file_without_cognition_reason_still_loads():
     dumped = dump_yaml(_payload())
     legacy = "\n".join(line for line in dumped.splitlines() if "cognition_empty_reason" not in line) + "\n"

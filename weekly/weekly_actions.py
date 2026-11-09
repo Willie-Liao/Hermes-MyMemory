@@ -8,7 +8,6 @@ or state-machine logic that the lifecycle hooks already own.
 from __future__ import annotations
 
 import importlib.util
-import re
 import threading
 from datetime import date, timedelta
 from pathlib import Path
@@ -284,9 +283,9 @@ def tighten_hot_entry(
     if not isinstance(tool_args, dict):
         tool_args = {}
     extra_text = str((captured or {}).get("final_response") or "").strip()
-    extra_text = re.sub(
-        r"<(thinking|think)>.*?</\1>", "", extra_text, flags=re.DOTALL | re.I
-    ).strip()
+    from worker_llm import _strip_think_blocks
+
+    extra_text = _strip_think_blocks(extra_text)
     if not extra_text:
         extras: list[str] = []
         for msg in (captured or {}).get("messages") or []:

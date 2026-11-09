@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 
+import pytest
 from recall.conftest import HOP1, HOP2, SEED
 from recall.edges import extract_edges
 from recall.ids import BlockIndex
@@ -91,7 +92,13 @@ def test_load_edges_rewrites_when_a_daily_card_is_newer(staging, monkeypatch):
 
 
 def test_load_edges_falls_back_when_staging_is_read_only(staging):
-    """A read-only staging dir must still return edges instead of failing prefetch."""
+    """A read-only staging dir must still return edges instead of failing prefetch.
+
+    Root ignores the directory mode, so the fallback never runs there and the
+    assertion would see a file that root was allowed to write.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root can write a mode-0555 directory")
     import recall.edges as edges
 
     edges.load_edges(staging)

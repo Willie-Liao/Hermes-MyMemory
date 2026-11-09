@@ -1,6 +1,6 @@
 [project]
 name = "hermes-plugin-mymemory"
-version = "1.1.37"
+version = "1.1.38"
 requires-python = ">=3.11"
 # Gateway runtime. Recall, the 01:00 cache, monthly guidance,
 # and the digest Phase-2 gate share one GTE int8 session.
@@ -14,7 +14,11 @@ dependencies = [
     "openai",
     "ruamel.yaml",
     "json5>=0.9",
-    "litellm==1.108.2",
+    # 1.106.2 is the last release whose core requirement is still boto3>=1.43.1,<2.0.
+    # 1.106.3+ and 1.108.x require boto3>=1.43.117, and Hermes bedrock locks
+    # boto3==1.43.115 through v0.23.0. A higher pin fails the workspace resolve,
+    # and hermes update then disables the plugin.
+    "litellm==1.106.2",
 ]
 
 [dependency-groups]

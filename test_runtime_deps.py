@@ -211,14 +211,14 @@ def test_json5_missing_is_installed_from_real_requirements(monkeypatch, tmp_path
 
 
 def test_litellm_is_a_pinned_requirement():
-    """The opt-in wire installs from the shipped file, pinned so Hermes deps stay put."""
+    """The pin must resolve beside Hermes bedrock's boto3==1.43.115, or hermes update disables the plugin."""
     data = tomllib.loads((_HERE / "pyproject.toml").read_text(encoding="utf-8"))
     pins = [
         spec
         for spec in data["project"]["dependencies"]
         if isinstance(spec, str) and spec.startswith("litellm==")
     ]
-    assert pins == ["litellm==1.108.2"]
+    assert pins == ["litellm==1.106.2"]
 
 
 def test_background_install_returns_before_pip_finishes(monkeypatch, tmp_path):

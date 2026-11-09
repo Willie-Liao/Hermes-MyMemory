@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Copy this MyMemory provider into HERMES_HOME/plugins/MyMemory and enable it.
 # Does not copy pack config.yaml, .env, memories, or any live Hermes home.
-# Does drop comparison_with_last_month.summary on month files already in that home.
+# Does not rewrite month files. Dated release notes are deleted from the gateway copy.
 # After enable, pins digest/weekly/monthly workers (not chat model:) from TTY
 # choice or the current chat provider — so install does not leave Xiaomi YAML
 # as a required hand-merge.
@@ -126,6 +126,10 @@ purge_retired_mymemory_harnesses() {
   find "$dest/weekly" -maxdepth 1 -type f -name 'debug_*.py' -delete 2>/dev/null || true
   find "$dest" -type f -name 'probe_*.py' -delete 2>/dev/null || true
   rm -f "$dest/weekly/weekly_brief_validate.py" "$dest/weekly/test_weekly_brief_validate.py"
+  local note
+  for note in 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36; do
+    rm -f "$dest/RELEASE_NOTES_1.1.${note}.md"
+  done
 }
 purge_retired_mymemory_harnesses "$DEST"
 echo "installed: plugins/MyMemory"
@@ -358,52 +362,6 @@ fi
 echo ""
 echo "Channel 4 GTE int8 weights…"
 ensure_gte_int8
-
-drop_retired_comparison_summary() {
-  local py="${RUNTIME_PY:-}"
-  if [[ -z "$py" ]]; then
-    if command -v python3 >/dev/null 2>&1; then
-      py="$(command -v python3)"
-    else
-      echo "note: no Python — left comparison summary keys in place" >&2
-      return 0
-    fi
-  fi
-  "$py" - "$HERMES_HOME" "$DEST" <<'PY'
-"""Drop the retired comparison paragraph on month files already in this home."""
-from __future__ import annotations
-
-import sys
-from pathlib import Path
-
-home = Path(sys.argv[1])
-dest = Path(sys.argv[2])
-sys.path.insert(0, str(dest / "monthly"))
-from monthly_writer import drop_retired_comparison_summary
-
-folder = home / "memories" / "staging" / "monthly"
-if not folder.is_dir():
-    print(f"note: no month files under {folder}")
-    raise SystemExit(0)
-changed = 0
-for path in sorted(folder.glob("*.md")):
-    raw = path.read_text(encoding="utf-8")
-    cleaned = drop_retired_comparison_summary(raw)
-    if cleaned == raw:
-        continue
-    path.write_text(cleaned, encoding="utf-8")
-    changed += 1
-    print(f"dropped comparison summary: {path.name}")
-if changed == 0:
-    print("ok: month files have no comparison summary key")
-else:
-    print(f"ok: dropped comparison summary in {changed} month file(s)")
-PY
-}
-
-echo ""
-echo "Month files (drop retired comparison summary)…"
-drop_retired_comparison_summary
 
 if [[ -f "$PACK_ROOT/examples/agent-hooks/block-hermes-root-junk.sh" ]]; then
   cp -p "$PACK_ROOT/examples/agent-hooks/block-hermes-root-junk.sh" \

@@ -180,6 +180,12 @@ def _runtime_from_mapping(bag: Mapping[str, Any] | None) -> dict[str, str]:
         out["base_url"] = base_url
     if key_env:
         out["key_env"] = key_env
+    # Lane ceilings ride with the endpoint so a length retry cannot invent its own cap.
+    for key in ("max_tokens_ceiling", "reduce_max_tokens"):
+        raw = bag.get(key)
+        if raw is None or raw == "":
+            continue
+        out[key] = str(raw).strip()
     return out
 
 
@@ -422,8 +428,17 @@ def _usage_record(
     thinking_off: bool | None = None,
     cost_usd: float | None = None,
     parse_path: str = "",
+    effort_sent: str = "",
+    floor_source: str = "",
+    fallback_wire: str = "",
+    max_tokens: int | None = None,
+    wire: str = "",
 ) -> dict[str, Any]:
-    """One usage shape so oneshot, the nested agent, and Anthropic cannot drift apart."""
+    """One usage shape so oneshot, the nested agent, and Anthropic cannot drift apart.
+
+    ``wire`` is always written when known. An omitted field used to mean either
+    the normal path or a row that never recorded the path.
+    """
     total = input_tokens + output_tokens if total_tokens is None else total_tokens
     rec: dict[str, Any] = {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -449,6 +464,16 @@ def _usage_record(
         rec["thinking_off"] = thinking_off
     if parse_path:
         rec["parse_path"] = parse_path
+    if effort_sent:
+        rec["effort_sent"] = effort_sent
+    if floor_source:
+        rec["floor_source"] = floor_source
+    if fallback_wire:
+        rec["fallback_wire"] = fallback_wire
+    if wire:
+        rec["wire"] = wire
+    if max_tokens is not None:
+        rec["max_tokens"] = int(max_tokens)
     return rec
 
 
@@ -689,6 +714,11 @@ def extract_tool_calls_from_result(
     messages = result.get("messages") or []
     if isinstance(messages, Sequence):
         for msg in messages:
+            if not isinstance(msg, Mapping):
+                packed = _capture_from_oneshot_message(
+                    msg, force_tool_name=default
+                ).get("messages") or []
+                msg = packed[0] if packed else None
             if not isinstance(msg, Mapping):
                 continue
             if str(msg.get("role", "")).strip() != "assistant":
@@ -938,8 +968,18 @@ def _anthropic_messages_create(
 
 
 def _anthropic_tool_uses(response: Any) -> list[tuple[str, str, dict[str, Any]]]:
-    """Pull tool_use blocks off an Anthropic message. Text-only replies yield []."""
-    blocks = getattr(response, "content", None)
+    """Pull tool_use blocks off an Anthropic message. Text-only replies yield [].
+
+    An OpenAI-shaped body (content null, tool_calls) goes through the shared
+    parser so a relay that answers chat-completions JSON is not read as blocks.
+    """
+    if _msg_field(response, "tool_calls"):
+        captured = _capture_from_oneshot_message(response, force_tool_name=None)
+        return [
+            ("", str(name), dict(args))
+            for name, args in (captured.get("tool_calls") or [])
+        ]
+    blocks = _msg_field(response, "content")
     if blocks is None and isinstance(response, Mapping):
         blocks = response.get("content")
     found: list[tuple[str, str, dict[str, Any]]] = []
@@ -1066,6 +1106,7 @@ def _run_anthropic_phase1_loop(
             "cost_usd": 0.0,
             "api_calls": 0,
             "duration_ms": _elapsed_ms(),
+            "wire": "anthropic",
         }
         if kind:
             rec["issue"] = kind
@@ -1144,6 +1185,7 @@ def _run_anthropic_phase1_loop(
                         "api_calls": api_calls,
                         "duration_ms": _elapsed_ms(),
                         "parse_path": _llm_parse_path.get(),
+                        "wire": "anthropic",
                     }
                 )
                 return {
@@ -1200,6 +1242,7 @@ def _run_anthropic_phase1_loop(
             "api_calls": api_calls,
             "duration_ms": _elapsed_ms(),
             "parse_path": _llm_parse_path.get(),
+            "wire": "anthropic",
         }
     )
     tool_name: str | None = None
@@ -1339,6 +1382,7 @@ def _provider_caps(provider: str) -> dict[str, str]:
     """Wire format and fallback for one provider. A config row wins over the built-in table.
 
     New models should be a row, not another ``if provider ==`` branch in the transport.
+    ``reasoning_floor`` on that row is the offline hint that skips a wasted ``off`` 400.
     """
     plug = str(provider or "").strip().lower()
     caps = dict(_DEFAULT_PROVIDER_CAPS.get(plug) or {"wire": "openai", "tool_choice": "named"})
@@ -1390,25 +1434,229 @@ def _xiaomi_worker_lane(provider: str, model: str) -> bool:
     return False
 
 
-def _reasoning_wire_rejection(exc: BaseException | None) -> bool:
-    """A 400 that names the thinking field means this route will not accept the disable.
+def _reasoning_wire_rejection(
+    exc: BaseException | None,
+    *,
+    controls_sent: bool = True,
+) -> str | None:
+    """Tell the ladder to step up, strip, or stop. A bool hid Inferway's two different 400s.
 
-    Retrying once without that field keeps a model that cannot turn thinking off
-    from failing the whole worker call.
+    ``floor`` means the route understood the field and refused ``off``. ``strip``
+    means the field itself is illegal, including a bare ``Invalid request controls``
+    that names nothing. ``None`` is some other failure and must not be retried as effort.
     """
     if exc is None:
-        return False
+        return None
+    text = str(exc)
+    low = text.lower()
     try:
         from agent.error_classifier import (
             is_reasoning_field_rejection,
+            is_reasoning_level_rejection,
             is_reasoning_required_rejection,
         )
     except Exception:
+        is_reasoning_field_rejection = lambda _msg: False  # noqa: E731
+        is_reasoning_level_rejection = lambda _msg: False  # noqa: E731
+        is_reasoning_required_rejection = lambda _msg: False  # noqa: E731
+    if is_reasoning_required_rejection(text) or is_reasoning_level_rejection(text):
+        return "floor"
+    if _worker_floor_marker(low):
+        return "floor"
+    if controls_sent and _bare_control_rejection(low, exc):
+        return "strip"
+    if is_reasoning_field_rejection(text):
+        return "strip"
+    return None
+
+
+def _worker_floor_marker(low: str) -> bool:
+    """Inferway says 'does not allow reasoning off', which core's required-markers miss."""
+    if not re.search(r"reasoning|thinking|think", low):
         return False
-    text = str(exc)
-    return bool(
-        is_reasoning_field_rejection(text) or is_reasoning_required_rejection(text)
-    )
+    if "does not allow" in low or "not allowed" in low:
+        return True
+    return bool(re.search(r"can(?:not|'t)\b.{0,40}\boff\b", low))
+
+
+def _bare_control_rejection(low: str, exc: BaseException) -> bool:
+    """A 400 that names no parameter while reasoning controls were on the wire.
+
+    Inferway answers ``Invalid request controls.`` for ``extra_body.thinking`` and
+    for the OpenRouter ``reasoning`` object. Treating that as a field rejection
+    strips the controls instead of failing the worker call.
+    """
+    if "invalid request controls" in low:
+        return True
+    code = getattr(exc, "status_code", None)
+    if code is None:
+        resp = getattr(exc, "response", None)
+        code = getattr(resp, "status_code", None)
+    try:
+        is_400 = int(code) == 400
+    except (TypeError, ValueError):
+        is_400 = False
+    if not is_400:
+        return False
+    if "invalid_request" not in low and "invalid request" not in low:
+        return False
+    return re.search(r"reasoning_effort|thinking|param['\"]", low) is None
+
+
+def _configured_provider_names() -> set[str]:
+    """Names under ``providers:`` so a custom route is not looked up as a builtin."""
+    path = _hermes_home() / "config.yaml"
+    try:
+        import yaml
+
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return set()
+    if not isinstance(raw, dict):
+        return set()
+    names: set[str] = set()
+    for key in ("providers", "custom_providers"):
+        table = raw.get(key)
+        if isinstance(table, dict):
+            names.update(str(item).strip().lower() for item in table if str(item).strip())
+        elif isinstance(table, list):
+            for row in table:
+                if isinstance(row, Mapping) and str(row.get("name") or "").strip():
+                    names.add(str(row.get("name")).strip().lower())
+    return names
+
+
+def _worker_profile_name(provider: str) -> str:
+    """Resolve ``providers:`` entries as ``custom:<name>`` so CustomProfile sends reasoning_effort.
+
+    A bare ``inferway`` lookup misses the registry and used to fall through to
+    ``extra_body.thinking``, which Inferway rejects as invalid request controls.
+    """
+    plug = str(provider or "").strip()
+    if not plug or plug.lower().startswith("custom:"):
+        return plug
+    if plug.lower() in _configured_provider_names():
+        return f"custom:{plug}"
+    return plug
+
+
+def _effort_is_off(effort: str | None) -> bool:
+    return str(effort or "").strip().lower() in {"", "off", "none", "disabled", "false"}
+
+
+def _strip_reasoning_controls(kwargs: dict[str, Any]) -> None:
+    """Remove every reasoning encoding so a retry is the route default, not a second off."""
+    kwargs.pop("reasoning_effort", None)
+    kwargs.pop("thinking", None)
+    extra = dict(kwargs.get("extra_body") or {})
+    extra.pop("thinking", None)
+    extra.pop("reasoning", None)
+    extra.pop("think", None)
+    if extra:
+        kwargs["extra_body"] = extra
+    else:
+        kwargs.pop("extra_body", None)
+
+
+def _known_reasoning_floor(provider: str, model: str, base_url: str) -> str:
+    """Where we learned this route refuses ``off``: config, memo, catalog, or empty.
+
+    Empty means start at ``off``. Config is offline. Core's catalog check is
+    cache-only, so a cold worker never blocks on a model listing.
+    """
+    hint = str(_provider_caps(provider).get("reasoning_floor") or "").strip().lower()
+    if hint in {"low", "minimal"}:
+        return "config"
+    try:
+        import agent.auxiliary_reasoning_floor as floor
+    except Exception:
+        return ""
+    try:
+        lifted = floor.known_reasoning_floor(
+            {"enabled": False},
+            provider,
+            base_url or None,
+            model,
+            task="worker",
+        )
+    except Exception:
+        return ""
+    if not (
+        isinstance(lifted, dict)
+        and lifted.get("enabled") is True
+        and str(lifted.get("effort") or "") == floor.REASONING_FLOOR_EFFORT
+    ):
+        return ""
+    try:
+        key = (floor._route_key(provider, base_url), str(model or ""))
+        if key in floor._FLOORED_ROUTES:
+            return "memo"
+    except Exception:
+        return "memo"
+    return "catalog"
+
+
+def _remember_worker_floor(
+    provider: str,
+    base_url: str,
+    model: str,
+    exc: BaseException,
+) -> None:
+    """Memo the route so the next worker call starts at low instead of burning another 400."""
+    try:
+        from agent.auxiliary_reasoning_floor import remember_reasoning_floor
+
+        remember_reasoning_floor(
+            provider,
+            base_url or None,
+            {"model": model},
+            exc,
+        )
+    except Exception:
+        return
+
+
+def _status_is_400(exc: BaseException) -> bool:
+    """True for an HTTP 400, including ones that only mention invalid_request in the text."""
+    code = getattr(exc, "status_code", None)
+    if code is None:
+        resp = getattr(exc, "response", None)
+        code = getattr(resp, "status_code", None)
+    try:
+        if int(code) == 400:
+            return True
+    except (TypeError, ValueError):
+        pass
+    low = str(exc).lower()
+    return "invalid_request" in low or "invalid request" in low
+
+
+def _first_reply_choice(resp: Any) -> Any | None:
+    """First choice that actually carries a message. A bare 200 with no choices is unusable."""
+    choices = _msg_field(resp, "choices")
+    if not choices:
+        return None
+    choice = choices[0]
+    if _msg_field(choice, "message") is None:
+        return None
+    return choice
+
+
+def _lane_token_ceiling(runtime: Mapping[str, Any], purpose: str) -> int:
+    """Stop flexible bumps at the lane ceiling so a salvage loop cannot request unbounded output.
+
+    ``max_tokens_ceiling`` wins. Monthly without that key uses ``reduce_max_tokens``.
+    Every other lane stops at 16384.
+    """
+    raw = str(runtime.get("max_tokens_ceiling") or "").strip()
+    if not raw and "monthly" in str(purpose or "").lower():
+        raw = str(runtime.get("reduce_max_tokens") or "").strip()
+    if raw:
+        try:
+            return max(1, int(float(raw)))
+        except (TypeError, ValueError):
+            pass
+    return 16384
 
 
 def _apply_worker_thinking_off(
@@ -1416,41 +1664,59 @@ def _apply_worker_thinking_off(
     provider: str,
     model: str,
     base_url: str = "",
+    *,
+    effort: str | None = "off",
 ) -> str:
-    """Worker reasoning is discarded and spends max_tokens before the tool JSON arrives.
+    """Put the lowest effort this route should try onto one chat.completions body.
 
-    The provider profile's own disable goes on first. A silent profile gets the
-    shared thinking-disabled toggle. Returns ``profile`` or ``fallback``.
+    ``off`` is the profile disable. ``low`` is the core floor. ``None`` strips the
+    fields so the route default applies. A silent Xiaomi profile keeps the shared
+    thinking toggle; a missing profile uses top-level ``reasoning_effort`` and never
+    ``thinking: disabled``, which custom relays reject. Returns the source used.
     """
-    extra = dict(kwargs.get("extra_body") or {})
-    if extra.get("thinking") == {"type": "disabled"}:
-        extra.pop("thinking", None)
-    from_profile = False
+    _strip_reasoning_controls(kwargs)
+    if effort is None:
+        return "strip"
+    reasoning_config = (
+        {"enabled": False}
+        if _effort_is_off(effort)
+        else {"enabled": True, "effort": str(effort).strip().lower() or "low"}
+    )
+    profile = None
+    applied = False
     try:
         from providers import get_provider_profile
 
-        profile = get_provider_profile(str(provider or ""))
+        profile = get_provider_profile(_worker_profile_name(provider))
         if profile is not None:
             extra_add, top_add = profile.build_api_kwargs_extras(
-                reasoning_config={"enabled": False},
+                reasoning_config=reasoning_config,
                 model=model,
                 base_url=base_url or None,
             )
+            extra = dict(kwargs.get("extra_body") or {})
             if isinstance(extra_add, Mapping) and extra_add:
                 extra.update(dict(extra_add))
-                from_profile = True
+                applied = True
             if isinstance(top_add, Mapping) and top_add:
                 kwargs.update(dict(top_add))
-                from_profile = True
+                applied = True
+            if extra:
+                kwargs["extra_body"] = extra
+            if applied:
+                return "profile"
     except Exception:
-        from_profile = False
-    if not from_profile:
+        profile = None
+        applied = False
+    plug = str(provider or "").strip().lower()
+    # Xiaomi's profile is silent. Keep today's toggle so those lanes stay on off.
+    if _effort_is_off(effort) and plug in {"xiaomi", "mimo", "xiaomi-mimo"}:
+        extra = dict(kwargs.get("extra_body") or {})
         extra["thinking"] = {"type": "disabled"}
-    if extra:
         kwargs["extra_body"] = extra
-    else:
-        kwargs.pop("extra_body", None)
-    return "profile" if from_profile else "fallback"
+        return "fallback"
+    kwargs["reasoning_effort"] = "none" if _effort_is_off(effort) else str(effort).strip().lower()
+    return "top"
 
 
 def _llm_issue_kind(exc: BaseException | None) -> str | None:
@@ -1481,6 +1747,13 @@ def _llm_issue_kind(exc: BaseException | None) -> str | None:
     )
     if any(n in text for n in quota_needles):
         return "quota"
+    try:
+        if int(code) == 400:
+            return "request"
+    except (TypeError, ValueError):
+        pass
+    if "invalid_request" in text or "invalid request" in text:
+        return "request"
     conn_needles = (
         "connection error",
         "api call failed",
@@ -1621,6 +1894,25 @@ def _usage_int(usage: Any, *names: str) -> int:
     return 0
 
 
+def _msg_field(message: Any, name: str, default: Any = None) -> Any:
+    """Read one reply field from an SDK object, a dict, or a LiteLLM model dump.
+
+    Thinking-on routes often return ``content: null`` plus ``tool_calls``. Attribute
+    access alone dropped those dict replies and the worker saw an empty tool call.
+    """
+    if isinstance(message, Mapping):
+        return message.get(name, default)
+    value = getattr(message, name, default)
+    if value is None and callable(getattr(message, "model_dump", None)):
+        try:
+            bag = message.model_dump()
+        except Exception:
+            bag = None
+        if isinstance(bag, Mapping) and name in bag:
+            return bag.get(name, default)
+    return value
+
+
 def _reasoning_text(message: Any, raw_content: str) -> str:
     """Keep the model's own reasoning beside the tool call so a failed field can be explained.
 
@@ -1629,7 +1921,7 @@ def _reasoning_text(message: Any, raw_content: str) -> str:
     """
     parts: list[str] = []
     for attr in ("reasoning_content", "reasoning"):
-        value = getattr(message, attr, None)
+        value = _msg_field(message, attr)
         if isinstance(value, str) and value.strip():
             parts.append(value.strip())
     dump = getattr(message, "model_dump", None)
@@ -1656,18 +1948,25 @@ def _capture_from_oneshot_message(
     *,
     force_tool_name: str | None,
 ) -> dict[str, Any]:
-    raw_content = str(getattr(message, "content", None) or "")
+    """Shared reply parser for OpenAI SDK objects, dicts, and LiteLLM messages.
+
+    A thinking-on body is ``content: null`` with ``tool_calls`` and
+    ``reasoning_content``. Treating null content as a missing reply dropped the
+    tool call. JSON lenient parsing stays in ``extract_tool_calls_from_result``.
+    """
+    raw = _msg_field(message, "content")
+    raw_content = "" if raw is None else str(raw)
     content = _strip_think_blocks(raw_content)
-    raw_calls = getattr(message, "tool_calls", None) or []
+    raw_calls = _msg_field(message, "tool_calls") or []
     packed: list[dict[str, Any]] = []
     for tc in raw_calls:
-        fn = getattr(tc, "function", None)
+        fn = _msg_field(tc, "function")
         name = str(
-            getattr(fn, "name", None) or getattr(tc, "name", None) or force_tool_name or ""
+            _msg_field(fn, "name") or _msg_field(tc, "name") or force_tool_name or ""
         ).strip()
-        arguments = getattr(fn, "arguments", None)
+        arguments = _msg_field(fn, "arguments")
         if arguments is None:
-            arguments = getattr(tc, "arguments", None)
+            arguments = _msg_field(tc, "arguments")
         packed.append({"function": {"name": name, "arguments": arguments}})
     assistant: dict[str, Any] = {"role": "assistant", "content": content}
     if packed:
@@ -1878,6 +2177,8 @@ def run_worker_llm_oneshot(
     def _elapsed_ms() -> int:
         return max(0, int((time.perf_counter() - started) * 1000))
 
+    path_wire = _worker_wire(provider) if provider else "openai"
+
     def _fail_record(exc: BaseException | None, used_model: str) -> dict[str, Any]:
         kind = _llm_issue_kind(exc)
         record_worker_usage(
@@ -1888,6 +2189,7 @@ def run_worker_llm_oneshot(
                 config_model=config_model,
                 duration_ms=_elapsed_ms(),
                 issue=kind,
+                wire=path_wire,
             )
         )
         return {
@@ -1902,7 +2204,7 @@ def run_worker_llm_oneshot(
         }
 
     schema_taught = False
-    length_bumped = False
+    ceiling = _lane_token_ceiling(plugin_runtime, purpose)
     with worker_llm_scope():
         for attempt in (0, 1):
             try:
@@ -1913,6 +2215,7 @@ def run_worker_llm_oneshot(
                 last_exc = exc
                 return _fail_record(exc, model)
             wire = _worker_wire(provider)
+            path_wire = wire
             if wire != "litellm":
                 try:
                     base_url, _used_gw = resolve_worker_endpoint(
@@ -1931,84 +2234,218 @@ def run_worker_llm_oneshot(
             except ImportError as exc:
                 last_exc = exc
                 return _fail_record(exc, model)
-            sent = {
-                key: value
-                for key, value in create_kwargs.items()
-                if key not in {"extra_body", "reasoning_effort"}
-            }
-            sent["model"] = model
-            if wire == "litellm":
-                prefix = str(_provider_caps(provider).get("litellm_prefix") or "").strip()
-                if prefix and "/" not in sent["model"]:
-                    sent["model"] = f"{prefix}/{sent['model']}"
-            else:
-                _apply_worker_thinking_off(sent, provider, model, base_url or "")
-            thinking_sent = "extra_body" in sent or "reasoning_effort" in sent
-            resp = None
-            try:
-                resp = client.chat.completions.create(**sent)
-            except Exception as exc:
-                last_exc = exc
-                if thinking_sent and _reasoning_wire_rejection(exc):
+            http_calls = 0
+            token_bumps = 0
+            fallback_wire = ""
+            floor_source = ""
+            effort: str | None = None
+            if wire != "litellm":
+                floor_source = _known_reasoning_floor(provider, model, base_url or "")
+                effort = "low" if floor_source else "off"
+            active = client
+
+            def _prepare(current: str | None) -> dict[str, Any]:
+                body = {
+                    key: value
+                    for key, value in create_kwargs.items()
+                    if key not in {"extra_body", "reasoning_effort", "allowed_openai_params"}
+                }
+                body["model"] = model
+                if wire == "litellm":
+                    prefix = str(_provider_caps(provider).get("litellm_prefix") or "").strip()
+                    if prefix and "/" not in str(body["model"]):
+                        body["model"] = f"{prefix}/{body['model']}"
+                    return body
+                _apply_worker_thinking_off(
+                    body, provider, model, base_url or "", effort=current
+                )
+                return body
+
+            def _post(http_client: Any, body: Mapping[str, Any]) -> Any:
+                nonlocal http_calls
+                http_calls += 1
+                return http_client.chat.completions.create(**dict(body))
+
+            def _litellm_once(current_cap: int) -> tuple[Any, dict[str, Any], str | None]:
+                """One OpenAI-shaped LiteLLM call at the lowest effort, then bare if that 400s.
+
+                The native client already failed with reasoning fields removed. LiteLLM
+                keeps ``reasoning_effort`` only when it is listed in allowed_openai_params.
+                """
+                lite = _cached_openai_client(
+                    api_key,
+                    base_url or "",
+                    limit_timeout,
+                    limit_retries,
+                    wire="litellm",
+                )
+                raw_model = str(model or "")
+                lite_model = raw_model if raw_model.startswith("openai/") else f"openai/{raw_model}"
+                send = "low" if floor_source else "off"
+                body = _prepare(None)
+                body["model"] = lite_model
+                body["max_tokens"] = current_cap
+                body["reasoning_effort"] = "none" if send == "off" else "low"
+                body["allowed_openai_params"] = ["reasoning_effort"]
+                try:
+                    return _post(lite, body), body, send
+                except Exception as exc:
+                    if _reasoning_wire_rejection(exc, controls_sent=True) is None:
+                        raise
                     bare = {
                         key: value
-                        for key, value in sent.items()
-                        if key not in {"extra_body", "reasoning_effort"}
+                        for key, value in body.items()
+                        if key not in {"reasoning_effort", "allowed_openai_params"}
                     }
+                    return _post(lite, bare), bare, None
+
+            sent = _prepare(effort)
+            resp = None
+            transport_exc: BaseException | None = None
+            while True:
+                try:
+                    resp = _post(active, sent)
+                    transport_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    transport_exc = exc
+                    if wire == "litellm" or _quota_exhausted(exc):
+                        break
+                    verdict = _reasoning_wire_rejection(exc, controls_sent=effort is not None)
+                    if verdict == "floor" and effort == "off":
+                        _remember_worker_floor(provider, base_url or "", model, exc)
+                        effort = "low"
+                        floor_source = "learned"
+                        sent = _prepare(effort)
+                        continue
+                    if effort == "low" and (verdict is not None or _status_is_400(exc)):
+                        if verdict == "floor":
+                            _remember_worker_floor(provider, base_url or "", model, exc)
+                            floor_source = floor_source or "learned"
+                        effort = None
+                        sent = _prepare(None)
+                        continue
+                    if verdict == "strip" and effort is not None:
+                        effort = None
+                        sent = _prepare(None)
+                        continue
+                    if effort is None:
+                        break
+                    break
+            if resp is None:
+                if (
+                    attempt == 0
+                    and _xiaomi_worker_lane(provider, model)
+                    and transport_exc is not None
+                    and _quota_exhausted(transport_exc)
+                ):
+                    _mark_xiaomi_quota_dead()
+                    record_worker_usage(
+                        {
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "plugin": plugin,
+                            "purpose": purpose,
+                            "model": model,
+                            "config_model": config_model,
+                            "issue": "quota",
+                            "thinking_off": False,
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "cache_read_tokens": 0,
+                            "cache_write_tokens": 0,
+                            "reasoning_tokens": 0,
+                            "total_tokens": 0,
+                            "cost_usd": 0.0,
+                            "api_calls": 0,
+                            "duration_ms": _elapsed_ms(),
+                            "wire": path_wire,
+                        }
+                    )
+                    provider, model = _fallback_lane(provider)
+                    print(
+                        f"worker_llm: MiMo quota/rate-limit; switching ingest to {model}",
+                        flush=True,
+                    )
+                    continue
+                if (
+                    wire != "litellm"
+                    and effort is None
+                    and transport_exc is not None
+                    and not _quota_exhausted(transport_exc)
+                ):
                     try:
-                        resp = client.chat.completions.create(**bare)
-                        thinking_sent = False
+                        resp, sent, effort = _litellm_once(
+                            int(sent.get("max_tokens") or max_tokens)
+                        )
+                        fallback_wire = "litellm"
+                        active = _cached_openai_client(
+                            api_key,
+                            base_url or "",
+                            limit_timeout,
+                            limit_retries,
+                            wire="litellm",
+                        )
                     except Exception as exc2:
                         last_exc = exc2
-                        exc = exc2
-                if resp is None:
-                    if (
-                        attempt == 0
-                        and _xiaomi_worker_lane(provider, model)
-                        and _quota_exhausted(exc)
-                    ):
-                        _mark_xiaomi_quota_dead()
-                        record_worker_usage(
-                            {
-                                "ts": datetime.now(timezone.utc).isoformat(),
-                                "plugin": plugin,
-                                "purpose": purpose,
-                                "model": model,
-                                "config_model": config_model,
-                                "issue": "quota",
-                                "thinking_off": False,
-                                "input_tokens": 0,
-                                "output_tokens": 0,
-                                "cache_read_tokens": 0,
-                                "cache_write_tokens": 0,
-                                "reasoning_tokens": 0,
-                                "total_tokens": 0,
-                                "cost_usd": 0.0,
-                                "api_calls": 0,
-                                "duration_ms": _elapsed_ms(),
-                            }
-                        )
-                        provider, model = _fallback_lane(provider)
-                        print(
-                            f"worker_llm: MiMo quota/rate-limit; switching ingest to {model}",
-                            flush=True,
-                        )
-                        continue
-                    return _fail_record(exc, model)
-            choice = resp.choices[0]
-            captured = _capture_from_oneshot_message(
-                choice.message, force_tool_name=force
-            )
-            if getattr(choice, "finish_reason", None) == "length" and not length_bumped:
-                length_bumped = True
-                sent["max_tokens"] = int(sent.get("max_tokens") or max_tokens) * 2
+                        path_wire = "litellm"
+                        return _fail_record(exc2, model)
+                else:
+                    return _fail_record(transport_exc, model)
+
+            def _usable(captured_row: Mapping[str, Any]) -> bool:
+                return any(
+                    name and _tool_args_have_values(args)
+                    for name, args in (captured_row.get("tool_calls") or [])
+                )
+
+            def _needs_bump(choice: Any, captured_row: Mapping[str, Any], body: Mapping[str, Any]) -> bool:
+                if token_bumps >= 2:
+                    return False
+                current = int(body.get("max_tokens") or max_tokens)
+                nxt = min(current * 2, ceiling)
+                if nxt <= current:
+                    return False
+                if _msg_field(choice, "finish_reason") == "length":
+                    return True
+                if _llm_parse_path.get() == "salvage":
+                    return True
+                if create_kwargs.get("tools") and not _usable(captured_row):
+                    completion = _usage_int(_msg_field(resp, "usage"), "completion_tokens")
+                    if current and completion >= int(0.9 * current):
+                        return True
+                return False
+
+            choice = _first_reply_choice(resp)
+            if choice is None and wire != "litellm" and not fallback_wire:
                 try:
-                    resp = client.chat.completions.create(**sent)
+                    resp, sent, effort = _litellm_once(int(sent.get("max_tokens") or max_tokens))
+                    fallback_wire = "litellm"
+                    active = _cached_openai_client(
+                        api_key, base_url or "", limit_timeout, limit_retries, wire="litellm"
+                    )
+                    choice = _first_reply_choice(resp)
+                except Exception as exc:
+                    path_wire = "litellm"
+                    return _fail_record(exc, model)
+            if choice is None:
+                return _fail_record(last_exc or RuntimeError("oneshot reply had no message"), model)
+            captured = _capture_from_oneshot_message(
+                _msg_field(choice, "message"), force_tool_name=force
+            )
+            while _needs_bump(choice, captured, sent):
+                token_bumps += 1
+                current = int(sent.get("max_tokens") or max_tokens)
+                sent["max_tokens"] = min(current * 2, ceiling)
+                try:
+                    resp = _post(active, sent)
                 except Exception as exc:
                     return _fail_record(exc, model)
-                choice = resp.choices[0]
+                choice = _first_reply_choice(resp)
+                if choice is None:
+                    return _fail_record(last_exc or RuntimeError("oneshot reply had no message"), model)
                 captured = _capture_from_oneshot_message(
-                    choice.message, force_tool_name=force
+                    _msg_field(choice, "message"), force_tool_name=force
                 )
             schema_error = (
                 _tool_schema_error(captured.get("tool_args") or {}, schema)
@@ -2030,21 +2467,47 @@ def run_worker_llm_oneshot(
                     },
                 ]
                 try:
-                    resp = client.chat.completions.create(**sent)
+                    resp = _post(active, sent)
                 except Exception as exc:
                     return _fail_record(exc, model)
-                choice = resp.choices[0]
+                choice = _first_reply_choice(resp)
+                if choice is None:
+                    return _fail_record(RuntimeError("oneshot reply had no message"), model)
                 captured = _capture_from_oneshot_message(
-                    choice.message, force_tool_name=force
+                    _msg_field(choice, "message"), force_tool_name=force
                 )
                 schema_error = _tool_schema_error(captured.get("tool_args") or {}, schema)
             if schema_error and teach_schema:
                 captured["failed"] = True
                 captured["final_response"] = schema_error
-            usage = getattr(resp, "usage", None)
-            details = getattr(usage, "prompt_tokens_details", None) if usage is not None else None
+            elif (
+                create_kwargs.get("tools")
+                and not _usable(captured)
+                and not fallback_wire
+                and wire != "litellm"
+            ):
+                # No tool call survived the cap rule. Schema misses already had their teach.
+                try:
+                    resp, sent, effort = _litellm_once(int(sent.get("max_tokens") or max_tokens))
+                    fallback_wire = "litellm"
+                    active = _cached_openai_client(
+                        api_key, base_url or "", limit_timeout, limit_retries, wire="litellm"
+                    )
+                    choice = _first_reply_choice(resp)
+                    if choice is None:
+                        return _fail_record(RuntimeError("litellm reply had no message"), model)
+                    captured = _capture_from_oneshot_message(
+                        _msg_field(choice, "message"), force_tool_name=force
+                    )
+                except Exception as exc:
+                    path_wire = "litellm"
+                    return _fail_record(exc, model)
+            if fallback_wire == "litellm":
+                path_wire = "litellm"
+            usage = _msg_field(resp, "usage")
+            details = _msg_field(usage, "prompt_tokens_details") if usage is not None else None
             reasoning = (
-                getattr(usage, "completion_tokens_details", None) if usage is not None else None
+                _msg_field(usage, "completion_tokens_details") if usage is not None else None
             )
             usage_fields = {
                 "input_tokens": _usage_int(usage, "prompt_tokens"),
@@ -2054,6 +2517,7 @@ def run_worker_llm_oneshot(
                 "reasoning_tokens": _usage_int(reasoning, "reasoning_tokens"),
                 "total_tokens": _usage_int(usage, "total_tokens"),
             }
+            effort_sent = "off" if effort == "off" else ("low" if effort == "low" else "default")
             record_worker_usage(
                 _usage_record(
                     plugin=plugin,
@@ -2061,19 +2525,28 @@ def run_worker_llm_oneshot(
                     model=model,
                     config_model=config_model,
                     duration_ms=_elapsed_ms(),
-                    thinking_off=thinking_sent,
-                    api_calls=1 + int(schema_taught) + int(length_bumped),
+                    thinking_off=(effort == "off"),
+                    api_calls=http_calls,
                     parse_path=_llm_parse_path.get(),
+                    effort_sent=effort_sent,
+                    floor_source=floor_source,
+                    fallback_wire=fallback_wire,
+                    max_tokens=int(sent.get("max_tokens") or max_tokens),
+                    wire=path_wire,
                     **usage_fields,
                 )
             )
             captured.update(usage_fields)
-            captured["finish_reason"] = getattr(choice, "finish_reason", None)
+            captured["finish_reason"] = _msg_field(choice, "finish_reason")
             captured["max_tokens"] = sent.get("max_tokens", max_tokens)
-            captured["api_calls"] = 1 + int(schema_taught) + int(length_bumped)
+            captured["api_calls"] = http_calls
             captured["failed"] = bool(captured.get("failed"))
             captured["duration_ms"] = _elapsed_ms()
             captured["model"] = model or config_model
+            captured["effort_sent"] = effort_sent
+            captured["floor_source"] = floor_source
+            captured["fallback_wire"] = fallback_wire
+            captured["wire"] = path_wire
             return captured
     return _fail_record(last_exc, model)
 
@@ -2097,8 +2570,9 @@ def _run_worker_conversation(
     workers cannot inherit a Kimi Anthropic base_url from the chat gateway.
     MiniMax nested is Anthropic Messages even when env still has ``/v1``.
     Xiaomi/Kimi OpenAI workers keep ``/v1`` and must not inherit ``api_mode``.
-    Thinking is off on every worker turn: core applies the profile disable, and
-    a chat-completions lane whose profile is silent gets the shared toggle.
+    Thinking starts at off, or at low when this route is already known to refuse off.
+    A custom route must not also get ``extra_body.thinking``: that field is what
+    Inferway rejects. A reasoning 400 retries once at low, or with no reasoning config.
     """
     try:
         from hermes_cli.env_loader import load_hermes_dotenv
@@ -2143,6 +2617,7 @@ def _run_worker_conversation(
             provider = ""
         result: Any = None
         agent: Any = None
+        nest_effort: str | None = "off"
         for attempt in (0, 1):
             nest_mode = "chat_completions"
             base_url = ""
@@ -2183,6 +2658,16 @@ def _run_worker_conversation(
                     # Fail closed: no chat URL mix. Missing .env leaves creds unset
                     # so test_plugin_config_model_overrides_gateway still holds.
                     pass
+            if attempt == 0 and provider:
+                known = _known_reasoning_floor(str(provider), str(model or ""), base_url)
+                if known:
+                    nest_effort = "low"
+            if nest_effort == "off":
+                reasoning_config: dict[str, Any] | None = {"enabled": False}
+            elif nest_effort == "low":
+                reasoning_config = {"enabled": True, "effort": "low"}
+            else:
+                reasoning_config = None
             agent_kwargs: dict[str, Any] = {
                 "model": model,
                 **runtime_kwargs,
@@ -2192,18 +2677,27 @@ def _run_worker_conversation(
                 "skip_memory": True,
                 "enabled_toolsets": list(enabled_toolsets),
                 "max_iterations": max_iterations,
-                "reasoning_config": {"enabled": False},
             }
+            if reasoning_config is not None:
+                agent_kwargs["reasoning_config"] = reasoning_config
             overrides = dict(request_overrides or {})
-            if nest_mode == "chat_completions":
+            if nest_mode == "chat_completions" and nest_effort is not None:
                 scratch: dict[str, Any] = {}
-                kind = _apply_worker_thinking_off(
-                    scratch, str(provider or ""), str(model or ""), base_url
+                _apply_worker_thinking_off(
+                    scratch,
+                    str(provider or ""),
+                    str(model or ""),
+                    base_url,
+                    effort=nest_effort,
                 )
-                if kind == "fallback" and scratch.get("extra_body"):
+                custom_route = _worker_profile_name(str(provider or "")).startswith("custom:")
+                # Custom relays reject thinking objects. reasoning_config is the wire.
+                if not custom_route and scratch.get("extra_body"):
                     extra = dict(overrides.get("extra_body") or {})
                     extra.update(scratch["extra_body"])
                     overrides["extra_body"] = extra
+                if not custom_route and scratch.get("reasoning_effort"):
+                    overrides["reasoning_effort"] = scratch["reasoning_effort"]
             if overrides:
                 agent_kwargs["request_overrides"] = overrides
             if tool_start_callback is not None:
@@ -2227,6 +2721,14 @@ def _run_worker_conversation(
                 result = agent.run_conversation(prompt)
                 break
             except Exception as exc:
+                verdict = _reasoning_wire_rejection(exc, controls_sent=nest_effort is not None)
+                if attempt == 0 and verdict == "floor":
+                    _remember_worker_floor(str(provider or ""), base_url, str(model or ""), exc)
+                    nest_effort = "low"
+                    continue
+                if attempt == 0 and verdict == "strip":
+                    nest_effort = None
+                    continue
                 kind = _llm_issue_kind(exc)
                 if kind:
                     record_worker_usage(
@@ -2246,6 +2748,7 @@ def _run_worker_conversation(
                             "cost_usd": 0.0,
                             "api_calls": 0,
                             "duration_ms": _elapsed_ms(),
+                            "wire": "anthropic" if nest_mode == "anthropic_messages" else "openai",
                         }
                     )
                 if (
@@ -2276,5 +2779,6 @@ def _run_worker_conversation(
             "cost_usd": float(getattr(agent, "session_estimated_cost_usd", 0.0) or 0.0),
             "api_calls": int(getattr(agent, "session_api_calls", 0) or 0),
             "duration_ms": _elapsed_ms(),
+            "wire": "anthropic" if nest_mode == "anthropic_messages" else "openai",
         })
         return result if isinstance(result, dict) else {"final_response": str(result or "")}

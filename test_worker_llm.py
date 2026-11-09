@@ -1510,7 +1510,8 @@ def test_oneshot_no_profile_sends_thinking_disabled(tmp_path, monkeypatch):
     seen: dict = {}
     _install_fake_openai(monkeypatch, seen=seen, message={"content": "", "tool_calls": None})
     wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose="digest-phase1")
-    assert seen["create"]["extra_body"]["thinking"] == {"type": "disabled"}
+    assert seen["create"].get("reasoning_effort") == "none"
+    assert (seen["create"].get("extra_body") or {}).get("thinking") != {"type": "disabled"}
 
 
 def test_oneshot_profile_disable_and_k2_does_not_keep_the_first_lane(tmp_path, monkeypatch):
@@ -1699,7 +1700,8 @@ def test_nested_chat_fallback_puts_thinking_on_overrides(tmp_path, monkeypatch):
     _install_fake_nested(monkeypatch, seen)
     assert wl.run_worker_llm("hi", plugin="memory-weekly", purpose="ui_tighten") == "ok"
     assert seen["kwargs"]["reasoning_config"] == {"enabled": False}
-    assert seen["kwargs"]["request_overrides"]["extra_body"]["thinking"] == {"type": "disabled"}
+    assert seen["kwargs"]["request_overrides"]["reasoning_effort"] == "none"
+    assert "thinking" not in (seen["kwargs"]["request_overrides"].get("extra_body") or {})
 
 
 def test_oneshot_schema_retries_once_then_fails(tmp_path, monkeypatch):
@@ -2003,3 +2005,351 @@ def test_litellm_wire_missing_import_fails_closed(tmp_path, monkeypatch):
     )
     assert out["failed"] is True
     assert "litellm not installed" in out["final_response"]
+
+
+def _box_home(tmp_path, monkeypatch, *, caps="", providers=""):
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("BOX_API_KEY", "box-key")
+    monkeypatch.setenv("BOX_BASE_URL", "https://box.example/v1")
+    wl._openai_clients.clear()
+    try:
+        import agent.auxiliary_reasoning_floor as floor
+
+        floor._FLOORED_ROUTES.clear()
+    except Exception:
+        pass
+    text = "plugins:\n  entries:\n    MyMemory:\n"
+    if caps:
+        text += "      provider_capabilities:\n" + caps
+    text += (
+        "    memory-digest:\n      provider: box\n      model: box-1\n"
+        "    memory-monthly:\n      provider: box\n      model: box-1\n"
+    )
+    if providers:
+        text += providers
+    (tmp_path / "config.yaml").write_text(text, encoding="utf-8")
+    fake = types.ModuleType("providers")
+    fake.get_provider_profile = lambda name: None
+    monkeypatch.setitem(sys.modules, "providers", fake)
+    return wl
+
+
+def test_custom_provider_resolves_to_custom_profile(tmp_path, monkeypatch):
+    """Inferway is a providers: entry, so the worker must send top-level reasoning_effort."""
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("INFERWAY_API_KEY", "iw-key")
+    monkeypatch.setenv("INFERWAY_BASE_URL", "https://api.inferway.ai/v1")
+    wl._openai_clients.clear()
+    (tmp_path / "config.yaml").write_text(
+        "providers:\n  inferway:\n    api: https://api.inferway.ai/v1\n"
+        "plugins:\n  entries:\n    memory-weekly:\n"
+        "      provider: inferway\n      model: z-ai/glm-5.3-uncensored\n",
+        encoding="utf-8",
+    )
+    seen: dict = {"names": []}
+
+    class Profile:
+        def build_api_kwargs_extras(self, **kwargs):
+            assert kwargs["reasoning_config"] == {"enabled": False}
+            return {}, {"reasoning_effort": "none"}
+
+    fake = types.ModuleType("providers")
+
+    def get_profile(name):
+        seen["names"].append(name)
+        return Profile()
+
+    fake.get_provider_profile = get_profile
+    monkeypatch.setitem(sys.modules, "providers", fake)
+    captured: dict = {}
+    _install_fake_openai(monkeypatch, seen=captured, message={"content": "", "tool_calls": None})
+    wl.run_worker_llm_oneshot("hi", plugin="memory-weekly", purpose="ui_tighten")
+    assert seen["names"] == ["custom:inferway"]
+    assert captured["create"]["reasoning_effort"] == "none"
+    assert (captured["create"].get("extra_body") or {}).get("thinking") != {"type": "disabled"}
+
+
+def test_does_not_allow_steps_up_to_low_and_is_remembered(tmp_path, monkeypatch):
+    wl = _box_home(tmp_path, monkeypatch)
+    bodies: list[dict] = []
+
+    class Reject(Exception):
+        status_code = 400
+
+        def __str__(self):
+            return "This model does not allow reasoning off"
+
+    class Completions:
+        def create(self, **kwargs):
+            bodies.append(dict(kwargs))
+            if kwargs.get("reasoning_effort") == "none":
+                raise Reject()
+            return _oneshot_success()
+
+    class Chat:
+        completions = Completions()
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.chat = Chat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    out = wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose="digest-phase1")
+    assert out["failed"] is False
+    assert [row.get("reasoning_effort") for row in bodies] == ["none", "low"]
+    assert wl._known_reasoning_floor("box", "box-1", "https://box.example/v1") == "memo"
+
+
+def test_invalid_request_controls_strips_reasoning_fields(tmp_path, monkeypatch):
+    wl = _box_home(tmp_path, monkeypatch)
+    bodies: list[dict] = []
+
+    class Reject(Exception):
+        status_code = 400
+
+        def __str__(self):
+            return "Invalid request controls."
+
+    class Completions:
+        def create(self, **kwargs):
+            bodies.append(dict(kwargs))
+            if "reasoning_effort" in kwargs or "extra_body" in kwargs:
+                raise Reject()
+            return _oneshot_success()
+
+    class Chat:
+        completions = Completions()
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.chat = Chat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    out = wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose="digest-phase1")
+    assert out["failed"] is False
+    assert "reasoning_effort" not in bodies[-1]
+    assert "extra_body" not in bodies[-1]
+
+
+def test_must_be_one_of_steps_up_to_low(tmp_path, monkeypatch):
+    wl = _box_home(tmp_path, monkeypatch)
+    bodies: list[dict] = []
+
+    class Reject(Exception):
+        status_code = 400
+
+        def __str__(self):
+            return "'reasoning_effort' must be one of: 'low', 'medium', 'high'"
+
+    class Completions:
+        def create(self, **kwargs):
+            bodies.append(dict(kwargs))
+            if kwargs.get("reasoning_effort") == "none":
+                raise Reject()
+            return _oneshot_success()
+
+    class Chat:
+        completions = Completions()
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.chat = Chat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    out = wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose="digest-phase1")
+    assert out["failed"] is False
+    assert bodies[-1]["reasoning_effort"] == "low"
+
+
+def test_config_reasoning_floor_starts_at_low(tmp_path, monkeypatch):
+    wl = _box_home(
+        tmp_path,
+        monkeypatch,
+        caps="        box:\n          wire: openai\n          reasoning_floor: low\n",
+    )
+    seen: dict = {}
+    _install_fake_openai(monkeypatch, seen=seen, message={"content": "ok", "tool_calls": None})
+    out = wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose="digest-phase1")
+    assert out["failed"] is False
+    assert seen["create"]["reasoning_effort"] == "low"
+    assert out["floor_source"] == "config"
+    assert out["wire"] == "openai"
+    assert out["api_calls"] == 1
+
+
+def test_stripped_request_falls_back_to_litellm_and_goes_bare(tmp_path, monkeypatch):
+    wl = _box_home(tmp_path, monkeypatch)
+    openai_calls = {"n": 0}
+    lite_calls: list[dict] = []
+
+    class Reject(Exception):
+        status_code = 400
+
+        def __str__(self):
+            return "Invalid request controls."
+
+    class Completions:
+        def create(self, **kwargs):
+            openai_calls["n"] += 1
+            raise Reject()
+
+    class Chat:
+        completions = Completions()
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.chat = Chat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+
+    def completion(**kwargs):
+        lite_calls.append(dict(kwargs))
+        if "reasoning_effort" in kwargs:
+            raise Reject("This model does not allow reasoning off")
+        return _oneshot_success()
+
+    fake = types.ModuleType("litellm")
+    fake.completion = completion
+    monkeypatch.setitem(sys.modules, "litellm", fake)
+    out = wl.run_worker_llm_oneshot(
+        "hi",
+        plugin="memory-digest",
+        purpose="digest-phase1",
+        force_tool_name="submit_digest",
+        tool_schema={"name": "submit_digest", "parameters": {"type": "object", "properties": {}}},
+    )
+    assert out["failed"] is False
+    assert openai_calls["n"] >= 2
+    assert lite_calls[0]["model"] == "openai/box-1"
+    assert lite_calls[0]["reasoning_effort"] == "none"
+    assert lite_calls[0]["allowed_openai_params"] == ["reasoning_effort"]
+    assert "reasoning_effort" not in lite_calls[1]
+    assert out["fallback_wire"] == "litellm"
+    assert out["wire"] == "litellm"
+    assert out["tool_args"] == {"ok": True}
+
+
+def test_length_bump_respects_lane_ceiling(tmp_path, monkeypatch):
+    wl = _box_home(tmp_path, monkeypatch)
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-monthly:\n"
+        "      provider: box\n      model: box-1\n      max_tokens_ceiling: 300\n",
+        encoding="utf-8",
+    )
+    limits: list[int] = []
+
+    class Msg:
+        content = ""
+        tool_calls = [
+            types.SimpleNamespace(
+                function=types.SimpleNamespace(name="submit", arguments='{"title": "ok"}')
+            )
+        ]
+
+    class Choice:
+        def __init__(self, reason: str):
+            self.message = Msg()
+            self.finish_reason = reason
+
+    class Usage:
+        prompt_tokens = 1
+        completion_tokens = 1
+        total_tokens = 2
+        prompt_tokens_details = None
+        completion_tokens_details = None
+
+    class Resp:
+        def __init__(self, reason: str):
+            self.choices = [Choice(reason)]
+            self.usage = Usage()
+
+    class Completions:
+        def create(self, **kwargs):
+            limits.append(kwargs["max_tokens"])
+            reason = "length" if len(limits) == 1 else "tool_calls"
+            return Resp(reason)
+
+    class Chat:
+        completions = Completions()
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.chat = Chat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    fake = types.ModuleType("providers")
+    fake.get_provider_profile = lambda name: None
+    monkeypatch.setitem(sys.modules, "providers", fake)
+    out = wl.run_worker_llm_oneshot(
+        "hi",
+        plugin="memory-monthly",
+        purpose="monthly-reduce",
+        force_tool_name="submit",
+        tool_schema={"name": "submit", "parameters": {"type": "object", "properties": {}}},
+        max_tokens=200,
+    )
+    assert limits == [200, 300]
+    assert out["failed"] is False
+    assert out["max_tokens"] == 300
+
+
+def test_shared_parser_reads_null_content_tool_calls():
+    wl = _load_worker_llm()
+    captured = wl._capture_from_oneshot_message(
+        {
+            "content": None,
+            "tool_calls": [
+                {"function": {"name": "submit_month", "arguments": '{"text": "kept"}'}}
+            ],
+            "reasoning_content": "short thought",
+        },
+        force_tool_name="submit_month",
+    )
+    assert captured["tool_name"] == "submit_month"
+    assert captured["tool_args"] == {"text": "kept"}
+    assert captured["reasoning_text"] == "short thought"
+    assert captured["final_response"] == ""
+
+
+def test_request_400_is_an_issue(tmp_path, monkeypatch):
+    wl = _box_home(tmp_path, monkeypatch)
+
+    class Reject(Exception):
+        status_code = 400
+
+        def __str__(self):
+            return "bad payload"
+
+    class Completions:
+        def create(self, **kwargs):
+            raise Reject()
+
+    class Chat:
+        completions = Completions()
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.chat = Chat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    out = wl.run_worker_llm_oneshot("hi", plugin="memory-digest", purpose="digest-phase1")
+    assert out["failed"] is True
+    assert out["llm_issue"] == "request"
+    rec = json.loads(
+        (tmp_path / "metrics" / "llm-usage.jsonl").read_text(encoding="utf-8").strip().splitlines()[-1]
+    )
+    assert rec["wire"] == "openai"
