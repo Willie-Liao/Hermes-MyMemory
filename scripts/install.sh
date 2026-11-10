@@ -87,7 +87,11 @@ RSYNC_EXCLUDES=(
   # Local GitNexus index. Copying it into the plugin fills a small test disk.
   --exclude '.gitnexus/'
   --exclude '.claude/'
+  --exclude '.cursor/'
   --exclude '.test-hermes-home/'
+  # Week-numbered harnesses (test_w38_…) are one-off date tests, not the suite.
+  --exclude 'test_w[0-9]*_*.py'
+  --exclude 'debug_w[0-9]*_*.py'
   --exclude 'probe_*.py'
   --exclude 'Install MyMemory.command'
   --exclude '__pycache__/'
@@ -121,10 +125,13 @@ rsync -a "${RSYNC_EXCLUDES[@]}" "$PACK_ROOT/" "$DEST/"
 # AppleDouble sidecars match *.py and are not UTF-8, so source scans fail after a Mac pack.
 find "$DEST" -name '._*' -delete
 # rsync does not delete a probe, debug script, or retired module left on the gateway.
+# .cursor holds local agent tests and dated fixtures (2026-07-11.md). Week-numbered
+# test_wNN_ / debug_wNN_ files are the same kind of leftover and must not stay installed.
 purge_retired_mymemory_harnesses() {
   local dest="$1"
+  rm -rf "$dest/.cursor"
   find "$dest/weekly" -maxdepth 1 -type f -name 'debug_*.py' -delete 2>/dev/null || true
-  find "$dest" -type f -name 'probe_*.py' -delete 2>/dev/null || true
+  find "$dest" -type f \( -name 'probe_*.py' -o -name 'test_w[0-9]*_*.py' -o -name 'debug_w[0-9]*_*.py' -o -name 'test_*20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]*' -o -name 'debug_*20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]*' \) -delete 2>/dev/null || true
   rm -f "$dest/weekly/weekly_brief_validate.py" "$dest/weekly/test_weekly_brief_validate.py"
   local note
   for note in 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37; do

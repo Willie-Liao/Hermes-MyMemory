@@ -1,3 +1,12 @@
+# Local agent indexes and editor trees. They are this machine's setup and must not ship with the plugin.
+/.cursor/
+/.gitnexus/
+/.claude/
+
+# Local cloud sync scripts. They talk to this machine's Hermes home and must not ship with the plugin.
+/pull-plugins-from-cloud-to-local.sh
+/push-customization-to-cloud.sh
+
 # Secrets and local runtime
 .env
 .env.*

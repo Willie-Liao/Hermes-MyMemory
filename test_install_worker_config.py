@@ -40,6 +40,35 @@ def test_install_sh_bash_n():
     subprocess.run(["bash", "-n", str(INSTALL_SH)], check=True)
 
 
+def test_install_drops_cursor_tree_and_dated_test_files(tmp_path: Path):
+    """A gateway copy must not keep agent test trees or week/calendar date tests.
+
+    rsync will not delete those if an older install already left them behind.
+    """
+    home = tmp_path / "hermes"
+    plugin = home / "plugins" / "MyMemory"
+    dated = plugin / "weekly" / "test_w38_sunday_evening_patch.py"
+    calendar_test = plugin / "digest" / "test_2026-07-11_once.py"
+    calendar = plugin / ".cursor" / "skills" / "real-llm-test" / "assets" / "daily" / "2026-07-11.md"
+    dated.parent.mkdir(parents=True)
+    dated.write_text("raise SystemExit('stale week harness')\n", encoding="utf-8")
+    calendar_test.parent.mkdir(parents=True)
+    calendar_test.write_text("raise SystemExit('stale calendar harness')\n", encoding="utf-8")
+    calendar.parent.mkdir(parents=True)
+    calendar.write_text("# stale dated fixture\n", encoding="utf-8")
+    (tmp_path / "bin").mkdir(exist_ok=True)
+    hermes = _stub_hermes(tmp_path / "bin")
+
+    proc = _run_install(home, hermes, ["--skip-config"])
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 0, combined
+    assert not dated.exists()
+    assert not calendar_test.exists()
+    assert not calendar.exists()
+    assert not (plugin / ".cursor").exists()
+    assert (plugin / "weekly" / "test_weekly_tidy.py").is_file()
+
+
 def test_worker_from_chat_pins_lanes_and_keeps_chat_model(tmp_path: Path):
     home = tmp_path / "hermes"
     home.mkdir()
