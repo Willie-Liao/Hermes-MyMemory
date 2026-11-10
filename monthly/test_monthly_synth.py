@@ -336,7 +336,7 @@ def test_synthesize_month_forced_tool(monkeypatch):
 
     def call(prompt, **kwargs):
         calls["n"] += 1
-        assert kwargs.get("force_tool_name") == "submit_month_synthesis"
+        calls.setdefault("names", []).append(kwargs.get("force_tool_name"))
         return {
             "failed": False,
             "tool_name": kwargs.get("force_tool_name"),
@@ -353,44 +353,115 @@ def test_synthesize_month_forced_tool(monkeypatch):
         carry="",
         facts=facts,
     )
-    assert calls["n"] == 1
+    assert calls["names"] == [
+        "patch_month_synthesis_g1",
+        "patch_month_synthesis_g2",
+        "patch_month_synthesis_g3",
+        "patch_month_synthesis_g4",
+    ]
     assert payload.summary[0].text == "June start"
     assert payload.key_decisions[0].id == _mint_month_key_id(
         "2026-06", "decision", (real.id,)
     )
     assert payload.key_decisions[0].text == "June goal stays a standing rule"
     assert usage["valid"] is True
-    assert usage["input_tokens"] == 50
+    assert usage["input_tokens"] == 200
 
 
-def test_failed_section_is_patched_not_resubmitted():
+def test_reduce_groups_share_one_menu_and_drop_off_group_keys(monkeypatch):
+    """Later groups must see earlier JSON, and every call must send the same tool list.
+
+    A different tool list on each call misses the provider prompt cache. Keys
+    outside the forced group must not overwrite a section an earlier group wrote.
+    """
+    monkeypatch.setattr("monthly_synth._previous_has_judgment", lambda _month: True)
     facts = mechanical_facts("2026-06")
-    real = next(b for b in facts.all_dpe if b.type == "decision")
-    calls = {"n": 0}
+    seen: list[tuple[str, dict]] = []
 
     def call(prompt, **kwargs):
-        calls["n"] += 1
-        name = kwargs.get("force_tool_name")
-        if calls["n"] == 1:
-            assert name == "submit_month_synthesis"
-            return {
-                "failed": False,
-                "tool_name": name,
-                "tool_args": {"summary": "June start"},
-                "input_tokens": 10,
-                "output_tokens": 1,
-                "model": "MiniMax-M2.5",
-            }
-        assert name == "patch_month_synthesis"
-        props = set(kwargs["tool_schema"]["parameters"]["properties"])
-        assert "summary" not in props
-        assert "key_decisions" in props
+        seen.append((prompt, kwargs))
+        name = str(kwargs.get("force_tool_name") or "")
+        filled = _filled_args(facts)
+        keys = list(kwargs["tool_schema"]["parameters"]["properties"])
+        args = {key: filled[key] for key in keys if key in filled}
+        if name.endswith("_g2"):
+            args["user_image"] = {"goal_alignment": {"text": "POISON", "evidence": []}}
         return {
             "failed": False,
             "tool_name": name,
-            "tool_args": _filled_args(facts),
-            "input_tokens": 50,
-            "output_tokens": 20,
+            "tool_args": args,
+            "input_tokens": 1,
+            "output_tokens": 1,
+            "model": "MiniMax-M2.5",
+        }
+
+    payload, usage = synthesize_month(
+        "2026-06",
+        [],
+        call_oneshot=call,
+        carry="",
+        facts=facts,
+        reduce_max_tokens=4096,
+    )
+    names = [kwargs.get("force_tool_name") for _prompt, kwargs in seen]
+    assert names == [
+        "patch_month_synthesis_g1",
+        "patch_month_synthesis_g2",
+        "patch_month_synthesis_g3",
+        "patch_month_synthesis_g4",
+    ]
+    menus = [
+        tuple(item["name"] for item in kwargs["tool_menu"]) for _prompt, kwargs in seen
+    ]
+    assert menus == [menus[0]] * 4
+    assert menus[0] == tuple(names)
+    assert all(kwargs.get("max_tokens") == 4096 for _prompt, kwargs in seen)
+    assert "Write only: key_decisions." in seen[1][0]
+    assert "Willie kept one standing goal." in seen[1][0]
+    assert payload.user_image.goal_alignment.text == "Willie kept one standing goal."
+    assert usage["valid"] is True
+
+
+def test_cut_off_group_is_patched_on_retry(monkeypatch):
+    """A group that returns nothing stays a gap, and the retry patches only that group.
+
+    The other groups keep the sections they already wrote, so one cut-off reply
+    does not spend a retry on the whole month.
+    """
+    monkeypatch.setattr("monthly_synth._previous_has_judgment", lambda _month: True)
+    facts = mechanical_facts("2026-06")
+
+    def call(prompt, **kwargs):
+        name = str(kwargs.get("force_tool_name") or "")
+        if name.endswith("_g2"):
+            return {
+                "failed": True,
+                "tool_name": name,
+                "tool_args": None,
+                "input_tokens": 1,
+                "output_tokens": 0,
+                "model": "MiniMax-M2.5",
+            }
+        if name == "patch_month_synthesis":
+            assert "tool_menu" not in kwargs
+            props = kwargs["tool_schema"]["parameters"]["properties"]
+            assert "key_decisions" in props
+            return {
+                "failed": False,
+                "tool_name": name,
+                "tool_args": {"key_decisions": _filled_args(facts)["key_decisions"]},
+                "input_tokens": 4,
+                "output_tokens": 1,
+                "model": "MiniMax-M2.5",
+            }
+        filled = _filled_args(facts)
+        keys = list(kwargs["tool_schema"]["parameters"]["properties"])
+        return {
+            "failed": False,
+            "tool_name": name,
+            "tool_args": {key: filled[key] for key in keys if key in filled},
+            "input_tokens": 1,
+            "output_tokens": 1,
             "model": "MiniMax-M2.5",
         }
 
@@ -401,11 +472,54 @@ def test_failed_section_is_patched_not_resubmitted():
         carry="",
         facts=facts,
     )
-    assert calls["n"] == 2
-    assert payload.key_decisions[0].id.startswith("mem-2026-06-key-decision-")
-    assert usage["input_tokens"] == 60
+    assert usage["attempts"][1]["group"] == "g2"
+    assert usage["attempts"][1]["reason"] == "transport failed"
+    assert payload.key_decisions[0].text == "June goal stays a standing rule"
     assert usage["valid"] is True
-    assert usage["attempts"][1]["retired"]
+
+
+def test_failed_section_is_patched_not_resubmitted():
+    facts = mechanical_facts("2026-06")
+    real = next(b for b in facts.all_dpe if b.type == "decision")
+    calls = {"n": 0}
+
+    def call(prompt, **kwargs):
+        calls["n"] += 1
+        name = kwargs.get("force_tool_name")
+        if name == "patch_month_synthesis":
+            props = set(kwargs["tool_schema"]["parameters"]["properties"])
+            assert "summary" not in props
+            assert "key_decisions" in props
+            return {
+                "failed": False,
+                "tool_name": name,
+                "tool_args": _filled_args(facts),
+                "input_tokens": 50,
+                "output_tokens": 20,
+                "model": "MiniMax-M2.5",
+            }
+        assert str(name).startswith("patch_month_synthesis_g")
+        return {
+            "failed": False,
+            "tool_name": name,
+            "tool_args": {"summary": "June start"},
+            "input_tokens": 10,
+            "output_tokens": 1,
+            "model": "MiniMax-M2.5",
+        }
+
+    payload, usage = synthesize_month(
+        "2026-06",
+        [],
+        call_oneshot=call,
+        carry="",
+        facts=facts,
+    )
+    assert calls["n"] == 5
+    assert payload.key_decisions[0].id.startswith("mem-2026-06-key-decision-")
+    assert usage["input_tokens"] == 90
+    assert usage["valid"] is True
+    assert usage["attempts"][-1]["retired"]
     assert real.id
 
 
@@ -427,8 +541,8 @@ def test_evidence_string_does_not_call_the_model_again():
         }
 
     _payload, usage = synthesize_month("2026-06", [], call_oneshot=call, carry="", facts=facts)
-    assert calls["n"] == 1
-    assert any("string -> list" in fix for fix in usage["attempts"][0]["format_fixes"])
+    assert calls["n"] == 4
+    assert any("string -> list" in fix for fix in usage["attempts"][3]["format_fixes"])
     assert usage["valid"] is True
 
 
@@ -487,8 +601,8 @@ def test_no_previous_month_sets_cognition_reason():
     assert payload.user_image.cognition_change == ()
     assert payload.user_image.cognition_empty_reason == "no information from last month"
     assert usage["valid"] is True
-    assert not any("cognition_change" in line for line in usage["attempts"][0]["failed"])
-    assert any("cognition_change empty_reason" in fix for fix in usage["attempts"][0]["format_fixes"])
+    assert not any("cognition_change" in line for line in usage["attempts"][3]["failed"])
+    assert any("cognition_change empty_reason" in fix for fix in usage["attempts"][3]["format_fixes"])
 
 
 def test_previous_month_blank_cognition_is_not_written(tmp_path, monkeypatch):
@@ -587,11 +701,12 @@ def test_no_supersedes_pair_strips_from_to_without_a_gap():
         }
 
     payload, usage = synthesize_month("2026-07", [], call_oneshot=call, carry="", facts=facts)
-    failed = " ".join(usage["attempts"][0]["failed"])
+    judged = usage["attempts"][3]
+    failed = " ".join(judged["failed"])
     assert "cognition_change" not in failed
     assert any(
         "from/to dropped (no supersedes pair)" in fix
-        for fix in usage["attempts"][0]["format_fixes"]
+        for fix in judged["format_fixes"]
     )
     row = payload.user_image.cognition_change[0]
     assert row.text == "July kept the same understanding."

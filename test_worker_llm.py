@@ -1777,6 +1777,106 @@ def test_oneshot_schema_retries_once_then_fails(tmp_path, monkeypatch):
     assert "missing required field title" in out["final_response"]
 
 
+def test_oneshot_tool_menu_keeps_every_tool_and_checks_the_forced_schema(tmp_path, monkeypatch):
+    """A swapped tool list misses the prompt cache, so the menu stays put and only the forced schema is checked.
+
+    Without a menu the body stays the single forced tool, which is what every existing caller sends.
+    """
+    wl = _load_worker_llm()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("XIAOMI_API_KEY", "test-key")
+    monkeypatch.setenv("XIAOMI_BASE_URL", "https://example.test/v1")
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    memory-weekly:\n      provider: xiaomi\n      model: mimo-v2.5\n",
+        encoding="utf-8",
+    )
+    replies = iter(['{"body": "x"}', '{"body": "x"}', '{"title": "a"}'])
+    calls: list[dict] = []
+
+    class FakeMessage:
+        def __init__(self, arguments: str):
+            self.content = ""
+            self.tool_calls = [
+                types.SimpleNamespace(
+                    function=types.SimpleNamespace(name="patch_g1", arguments=arguments)
+                )
+            ]
+
+    class FakeChoice:
+        def __init__(self, arguments: str):
+            self.message = FakeMessage(arguments)
+            self.finish_reason = "tool_calls"
+
+    class FakeUsage:
+        prompt_tokens = 1
+        completion_tokens = 1
+        total_tokens = 2
+        prompt_tokens_details = None
+        completion_tokens_details = None
+
+    class FakeResponse:
+        def __init__(self, arguments: str):
+            self.choices = [FakeChoice(arguments)]
+            self.usage = FakeUsage()
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return FakeResponse(next(replies))
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.chat = FakeChat()
+
+    fake_openai = types.ModuleType("openai")
+    fake_openai.OpenAI = FakeClient
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    forced = {
+        "name": "patch_g1",
+        "description": "group 1",
+        "parameters": {
+            "type": "object",
+            "properties": {"title": {"type": "string"}},
+            "required": ["title"],
+        },
+    }
+    other = {
+        "name": "patch_g2",
+        "description": "group 2",
+        "parameters": {
+            "type": "object",
+            "properties": {"body": {"type": "string"}},
+            "required": ["body"],
+        },
+    }
+    menu = wl.run_worker_llm_oneshot(
+        "write",
+        plugin="memory-weekly",
+        purpose="ui_tighten",
+        force_tool_name="patch_g1",
+        tool_schema=forced,
+        tool_menu=[forced, other],
+    )
+    names = [tool["function"]["name"] for tool in calls[0]["tools"]]
+    assert names == ["patch_g1", "patch_g2"]
+    assert calls[0]["tool_choice"] == {"type": "function", "function": {"name": "patch_g1"}}
+    assert [tool["function"]["name"] for tool in calls[1]["tools"]] == names
+    assert "missing required field title" in calls[1]["messages"][-1]["content"]
+    assert menu["failed"] is True
+    alone = wl.run_worker_llm_oneshot(
+        "write",
+        plugin="memory-weekly",
+        purpose="ui_tighten",
+        force_tool_name="patch_g1",
+        tool_schema=forced,
+    )
+    assert [tool["function"]["name"] for tool in calls[2]["tools"]] == ["patch_g1"]
+    assert alone["failed"] is False
+
+
 def test_oneshot_uses_caller_system_prompt(tmp_path, monkeypatch):
     wl = _load_worker_llm()
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

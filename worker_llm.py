@@ -2115,6 +2115,7 @@ def run_worker_llm_oneshot(
     purpose: str,
     force_tool_name: str | None = None,
     tool_schema: Mapping[str, Any] | None = None,
+    tool_menu: Sequence[Mapping[str, Any]] | None = None,
     max_tokens: int = 2048,
     temperature: float = 0.2,
     system_prompt: str | None = None,
@@ -2124,13 +2125,16 @@ def run_worker_llm_oneshot(
 ) -> dict[str, Any]:
     """One chat.completions call. No nested Hermes AIAgent.
 
+    A changing tool list misses the provider prompt cache, so a caller that
+    repeats one prompt can pass ``tool_menu`` and vary only ``force_tool_name``.
+    ``None`` keeps today's single-tool body.
     OpenAI and Anthropic-compatible providers use the OpenAI SDK on the
     provider /v1 surface. wire litellm calls litellm.completion so Gemini,
     Bedrock, and Codex come back in that same reply shape. Records
     ``duration_ms`` on the usage ledger so prefetch wall time and digest LLM
     retries are not guessed from a single timeout.
     A schema miss gets one teach retry. Callers that already teach pass
-    ``teach_schema=False``.
+    ``teach_schema=False``. Schema checks stay on ``tool_schema``, not the menu.
     """
     _ensure_hermes_dotenv()
     started = time.perf_counter()
@@ -2149,6 +2153,19 @@ def run_worker_llm_oneshot(
     if wrapped:
         fn = wrapped.get("function") if isinstance(wrapped.get("function"), Mapping) else {}
         tool_name = str((fn or {}).get("name") or "").strip()
+    menu_tools: list[dict[str, Any]] = []
+    if tool_menu is not None:
+        for item in tool_menu:
+            if not isinstance(item, Mapping):
+                continue
+            wrapped_item = openai_function_tool(item)
+            item_fn = (
+                wrapped_item.get("function")
+                if isinstance(wrapped_item.get("function"), Mapping)
+                else {}
+            )
+            if str((item_fn or {}).get("name") or "").strip():
+                menu_tools.append(wrapped_item)
     messages = [
         {"role": "system", "content": system_prompt or ONESHOT_SYSTEM},
         {"role": "user", "content": prompt},
@@ -2164,7 +2181,14 @@ def run_worker_llm_oneshot(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-    if wrapped and tool_name:
+    if menu_tools:
+        create_kwargs["tools"] = menu_tools
+        if force:
+            create_kwargs["tool_choice"] = {
+                "type": "function",
+                "function": {"name": force},
+            }
+    elif wrapped and tool_name:
         create_kwargs["tools"] = [wrapped]
         if force:
             create_kwargs["tool_choice"] = {

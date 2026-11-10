@@ -61,11 +61,27 @@ from monthly_slice import (  # noqa: E402
 from monthly_tools import (  # noqa: E402
     merge_field_patch,
     patch_month_synthesis_schema,
-    submit_month_synthesis_schema,
 )
 
 CallOneshot = Callable[..., dict[str, Any]]
 MAX_ATTEMPTS = 3
+# Later groups read the JSON the earlier groups wrote. Every call sends this
+# same tool list, so only the forced name and the message tail change.
+REDUCE_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("patch_month_synthesis_g1", ("user_image", "comparison_with_last_month")),
+    ("patch_month_synthesis_g2", ("key_decisions",)),
+    ("patch_month_synthesis_g3", ("key_procedures",)),
+    (
+        "patch_month_synthesis_g4",
+        (
+            "core_progress",
+            "problems_and_risks",
+            "next_month_focus",
+            "summary",
+            "cross_week_items",
+        ),
+    ),
+)
 REDUCE_PREFIX = (
     "Same-rule paraphrase ranks above every singleton. "
     "Same topic is not the same rule. "
@@ -107,6 +123,7 @@ REDUCE_PREFIX = (
 
 
 def _default_oneshot(prompt: str, **kwargs: Any) -> dict[str, Any]:
+    """Forward the group tool menu so the live reduce keeps one cached tool list."""
     from worker_llm import run_worker_llm_oneshot
 
     return run_worker_llm_oneshot(
@@ -115,6 +132,7 @@ def _default_oneshot(prompt: str, **kwargs: Any) -> dict[str, Any]:
         purpose=kwargs.get("purpose") or "monthly-reduce",
         force_tool_name=kwargs.get("force_tool_name"),
         tool_schema=kwargs.get("tool_schema"),
+        tool_menu=kwargs.get("tool_menu"),
         max_tokens=int(kwargs.get("max_tokens") or REDUCE_MAX_TOKENS),
     )
 
@@ -1113,10 +1131,13 @@ def synthesize_month(
     reduce_max_tokens: int = REDUCE_MAX_TOKENS,
     resume: Mapping[str, Any] | None = None,
 ) -> tuple[MonthlyPayload, dict[str, Any]]:
-    """Submit the month once, then patch only sections that still lack a judgment.
+    """Write the month as four ordered group calls, then patch sections that still lack a judgment.
 
+    One full submit put every section under one output cap, so a long month was
+    cut off and the retries were spent rebuilding it. Each group has its own cap,
+    and every group call sends the same tool list so the prompt cache can hit.
     A second full submit dropped the first payload. Format mistakes are fixed here
-    so they never spend another model call. A resume store skips the submit and
+    so they never spend another model call. A resume store skips the groups and
     patches only the sections that failed last time, so a next-day retry does not
     rebuild sections that already passed. Stored gaps are rechecked first: a
     no-pair cognition gap disappears after from and to are stripped, and that
@@ -1149,10 +1170,74 @@ def synthesize_month(
     for attempt in range(1, MAX_ATTEMPTS + 1):
         if resuming and not gaps:
             break
+        judged_row: dict[str, Any] | None = None
         if attempt == 1 and not resuming:
-            schema = submit_month_synthesis_schema()
-            call_prompt = prompt
-            reason = ""
+            menu: list[dict[str, Any]] = []
+            for name, keys in REDUCE_GROUPS:
+                chosen = [
+                    key
+                    for key in keys
+                    if not (comparison_exempt and key == "comparison_with_last_month")
+                ]
+                if not chosen:
+                    continue
+                menu.append(
+                    patch_month_synthesis_schema(
+                        chosen,
+                        name=name,
+                        description="Write only these sections: " + ", ".join(chosen) + ".",
+                    )
+                )
+            rows: list[dict[str, Any]] = []
+            for schema in menu:
+                group_keys = list(schema["parameters"]["properties"])
+                call_prompt = (
+                    f"{prompt}\n\nPrevious JSON:\n"
+                    f"{json.dumps(merged, ensure_ascii=False)}\n\n"
+                    f"Write only: {', '.join(group_keys)}."
+                )
+                started = time.perf_counter()
+                result = caller(
+                    call_prompt,
+                    purpose="monthly-reduce",
+                    force_tool_name=schema["name"],
+                    tool_schema=schema,
+                    tool_menu=menu,
+                    max_tokens=token_cap,
+                )
+                duration_ms = int((time.perf_counter() - started) * 1000)
+                last_model = str(result.get("model") or last_model)
+                input_tokens = int(result.get("input_tokens") or 0)
+                output_tokens = int(result.get("output_tokens") or 0)
+                failed = bool(result.get("failed"))
+                row = {
+                    "n": attempt,
+                    "tool": schema["name"],
+                    "group": str(schema["name"]).rsplit("_", 1)[-1],
+                    "purpose": "monthly-reduce",
+                    "reason": "transport failed" if failed else "",
+                    "format_fixes": [],
+                    "failed": [],
+                    "retired": [],
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": input_tokens + output_tokens,
+                    "duration_ms": duration_ms,
+                }
+                if not failed:
+                    received = True
+                    incoming = (
+                        result.get("tool_args")
+                        if isinstance(result.get("tool_args"), dict)
+                        else {}
+                    )
+                    kept = {key: incoming[key] for key in group_keys if key in incoming}
+                    merged = merge_field_patch(merged, kept)
+                rows.append(row)
+            attempts.extend(rows)
+            if not received or not rows:
+                continue
+            judged_row = rows[-1]
         else:
             sections = _section_keys(gaps)
             schema = patch_month_synthesis_schema(sections)
@@ -1161,57 +1246,51 @@ def synthesize_month(
                 f"{prompt}\n\nPrevious JSON:\n"
                 f"{json.dumps(merged, ensure_ascii=False)}\n\n{teaching}"
             )
-            reason = teaching
-        started = time.perf_counter()
-        result = caller(
-            call_prompt,
-            purpose="monthly-reduce",
-            force_tool_name=schema["name"],
-            tool_schema=schema,
-            max_tokens=token_cap,
-        )
-        duration_ms = int((time.perf_counter() - started) * 1000)
-        last_model = str(result.get("model") or last_model)
-        input_tokens = int(result.get("input_tokens") or 0)
-        output_tokens = int(result.get("output_tokens") or 0)
-        if result.get("failed"):
-            attempts.append(
-                {
-                    "n": attempt,
-                    "tool": schema["name"],
-                    "purpose": "monthly-reduce",
-                    "reason": reason or "transport failed",
-                    "format_fixes": [],
-                    "failed": list(gaps),
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "total_tokens": input_tokens + output_tokens,
-                    "duration_ms": duration_ms,
-                }
+            started = time.perf_counter()
+            result = caller(
+                call_prompt,
+                purpose="monthly-reduce",
+                force_tool_name=schema["name"],
+                tool_schema=schema,
+                max_tokens=token_cap,
             )
-            continue
-        incoming = result.get("tool_args") if isinstance(result.get("tool_args"), dict) else {}
-        received = True
-        if attempt == 1 and not resuming:
-            merged = dict(incoming)
-        elif str(result.get("tool_name") or "") == submit_month_synthesis_schema()["name"]:
-            attempts.append(
-                {
-                    "n": attempt,
-                    "tool": schema["name"],
-                    "purpose": "monthly-reduce",
-                    "reason": reason,
-                    "format_fixes": [],
-                    "failed": list(gaps),
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "total_tokens": input_tokens + output_tokens,
-                    "duration_ms": duration_ms,
-                }
-            )
-            continue
-        else:
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            last_model = str(result.get("model") or last_model)
+            input_tokens = int(result.get("input_tokens") or 0)
+            output_tokens = int(result.get("output_tokens") or 0)
+            if result.get("failed"):
+                attempts.append(
+                    {
+                        "n": attempt,
+                        "tool": schema["name"],
+                        "purpose": "monthly-reduce",
+                        "reason": teaching or "transport failed",
+                        "format_fixes": [],
+                        "failed": list(gaps),
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "total_tokens": input_tokens + output_tokens,
+                        "duration_ms": duration_ms,
+                    }
+                )
+                continue
+            incoming = result.get("tool_args") if isinstance(result.get("tool_args"), dict) else {}
+            received = True
             merged = merge_field_patch(merged, incoming)
+            judged_row = {
+                "n": attempt,
+                "tool": schema["name"],
+                "purpose": "monthly-reduce",
+                "reason": teaching,
+                "format_fixes": [],
+                "failed": [],
+                "retired": [],
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+                "duration_ms": duration_ms,
+            }
+            attempts.append(judged_row)
         merged, format_fixes = normalize_synthesis_args(merged, facts)
         if comparison_exempt:
             merged["comparison_with_last_month"] = {
@@ -1228,21 +1307,8 @@ def synthesize_month(
             merged["user_image"] = image
             format_fixes.append("cognition_change empty_reason set by code")
         gaps = judgment_gaps(merged, facts, comparison_exempt=comparison_exempt)
-        attempts.append(
-            {
-                "n": attempt,
-                "tool": schema["name"],
-                "purpose": "monthly-reduce",
-                "reason": reason,
-                "format_fixes": format_fixes,
-                "failed": list(gaps),
-                "retired": [],
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "total_tokens": input_tokens + output_tokens,
-                "duration_ms": duration_ms,
-            }
-        )
+        judged_row["format_fixes"] = format_fixes
+        judged_row["failed"] = list(gaps)
         if not gaps:
             break
     if not received and not resuming:

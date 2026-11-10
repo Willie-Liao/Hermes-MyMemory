@@ -79,9 +79,11 @@ def _evidence_text_props() -> dict[str, Any]:
 
 
 def submit_month_synthesis_schema() -> dict[str, Any]:
-    """One reduce call writes every narrative field; mechanical facts stay out of this tool.
+    """Hold every narrative field so a group tool can copy the sections it writes.
 
-    The worker returns JSON tool arguments. YAML is rendered later by dump_yaml.
+    The reduce no longer sends this schema. One call for every field shared one
+    output cap and got cut off. Each group copies its keys from here, and a
+    retry copies only the sections that failed. YAML is rendered later by dump_yaml.
     """
     comparison_row = {
         "type": "object",
@@ -338,18 +340,26 @@ def submit_month_suggest_schema() -> dict[str, Any]:
     )
 
 
-def patch_month_synthesis_schema(keys: list[str] | None = None) -> dict[str, Any]:
-    """Expose only the sections that failed so a retry cannot replace the whole month.
+def patch_month_synthesis_schema(
+    keys: list[str] | None = None,
+    *,
+    name: str = "patch_month_synthesis",
+    description: str | None = None,
+) -> dict[str, Any]:
+    """Expose only the named sections so a retry cannot replace the whole month.
 
     A full clone of submit_month_synthesis dropped the first payload and the file
     then copied story seeds. keys are top-level JSON names, not dotted fields.
+    name and description stay at the retry defaults unless a first-pass group
+    needs its own tool name. One shared name would collapse the cached tool menu.
     """
     full = submit_month_synthesis_schema()
     wanted = [key for key in (keys or []) if key in full["parameters"]["properties"]]
     props = {key: full["parameters"]["properties"][key] for key in wanted}
     schema = _schema(
-        "patch_month_synthesis",
-        "Return JSON for only these failed sections. Do not repeat sections that already passed.",
+        name,
+        description
+        or "Return JSON for only these failed sections. Do not repeat sections that already passed.",
         props,
         wanted,
     )
