@@ -105,8 +105,13 @@ BATCH_ASSISTANT_WAIT_SECONDS = 600
 RETRIEVAL_ID_CAP = 8
 RETRIEVAL_TTL_SECONDS = 30 * 60
 USER_CORRECTION_REASON = "rejected by user's correction"
+# English stays word-bounded. Chinese phrases are substrings: \b never falls
+# between two Han characters, so "这条过时了" would miss a bounded 过时.
+# Each phrase is listed in simplified and traditional. 不是真的 is the same in both.
 _USER_DATED_RE = re.compile(
-    r"\b(dated|outdated|wrong|incorrect|not true)\b",
+    r"\b(dated|outdated|wrong|incorrect|not true)\b"
+    r"|过时|過時|过期|過期|不对|不對|错了|錯了|错误|錯誤"
+    r"|不正确|不正確|有误|有誤|不是真的|不属实|不屬實",
     re.I,
 )
 # Trigger reason when the undigested window past the bookmark hits the batch floor.

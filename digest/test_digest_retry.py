@@ -858,6 +858,38 @@ def test_exhausted_detail_aborts_transaction_without_daily_write(tmp_path, monke
     assert _read_entry(tmp_path)["digest_in_flight"] is False
 
 
+def test_user_dated_re_accepts_chinese_correction_phrases():
+    """A Chinese denial must close the same gate as the English keyword list.
+
+    Substring match is required because Han text has no spaces. An apology
+    must not count, or 对不起 / 對不起 would reject a co-retrieved card.
+    """
+    digest = _load_digest()
+    for text in (
+        "这条已经过时了",
+        "這條已經過時了",
+        "过期了",
+        "過期了",
+        "这个不对",
+        "這個不對",
+        "你记错了",
+        "你記錯了",
+        "这是错误的",
+        "這是錯誤的",
+        "不正确",
+        "不正確",
+        "内容有误",
+        "內容有誤",
+        "这不是真的",
+        "此事不属实",
+        "此事不屬實",
+        "that memory is dated",
+    ):
+        assert digest._USER_DATED_RE.search(text), text
+    assert digest._USER_DATED_RE.search("对不起，我晚点回") is None
+    assert digest._USER_DATED_RE.search("對不起，我晚點回") is None
+
+
 def test_retrieval_patch_failure_does_not_mark_phase2_success(tmp_path, monkeypatch):
     digest = _load_digest()
     monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
