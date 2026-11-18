@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -27,6 +28,9 @@ THETA_ARCHIVE = 0.5
 ARCHIVE_AGE_DAYS = 180
 
 OPTIONAL_FIELDS = ("strength", "recall_n", "last_recall_at", "first_seen")
+_MONTH_KEY_ID = re.compile(
+    r"^mem-(\d{4}-\d{2})-key-(decision|procedure)-[0-9a-f]+$"
+)
 
 
 def _as_date(value: Any, default: date | None = None) -> date | None:
@@ -47,16 +51,35 @@ def base_level(
     recall_n: float,
     first_seen: date | str | None,
     *,
+    last_recall_at: date | str | None = None,
     now: date | None = None,
 ) -> float:
-    """Two-scalar ACT-R B_i; t_j clamped ≥ 0.5 so same-day recall is defined."""
+    """Decay from the last recall, with earlier uses spread across the card's life.
+
+    A single clock from first_seen keeps a card strong months after it stopped
+    being used. Petrov's hybrid keeps the exact t^{-d} of the latest recall and
+    approximates the older ones from first_seen, so no recall-date list is stored.
+    Dividing by (1-d) matches the previous one-clock formula when last_recall_at
+    is missing, so archive thresholds do not move for cards that were never stamped.
+    """
     n = max(float(recall_n or 0.0), 0.0)
     if n <= 0:
         return 0.0
     today = now or date.today()
-    seen = _as_date(first_seen, today) or today
-    t = max((today - seen).days, 0.5)
-    return math.log(n / (1.0 - D)) - D * math.log(t)
+    born = _as_date(first_seen, today) or today
+    recent_on = _as_date(last_recall_at, None) or born
+    t1 = max((today - recent_on).days, 0.5)
+    tn = max((today - born).days, t1)
+    recent = min(n, 1.0) * (t1 ** -D)
+    older_n = max(n - 1.0, 0.0)
+    if older_n == 0.0 or tn == t1:
+        older = older_n * (t1 ** -D)
+    else:
+        older = older_n * ((tn ** (1.0 - D)) - (t1 ** (1.0 - D))) / ((1.0 - D) * (tn - t1))
+    total = recent + older
+    if total <= 0.0:
+        return 0.0
+    return math.log(total / (1.0 - D))
 
 
 def strength_value(
@@ -65,9 +88,15 @@ def strength_value(
     first_seen: date | str | None,
     importance: int = 3,
     now: date | None = None,
+    last_recall_at: date | str | None = None,
 ) -> float:
-    """Clamp stored strength so missing fields on old blocks still validate."""
-    b = base_level(recall_n, first_seen, now=now)
+    """Clamp live strength so a missing last_recall_at still decays from first_seen."""
+    b = base_level(
+        recall_n,
+        first_seen,
+        last_recall_at=last_recall_at,
+        now=now,
+    )
     raw = W0 * b + W1 * (int(importance) - 3)
     return max(STRENGTH_MIN, min(STRENGTH_MAX, raw))
 
@@ -93,16 +122,32 @@ def apply_recall(
     *,
     now: date | None = None,
     neighbor_weights: Mapping[str, float] | None = None,
+    credit: float = 1.0,
 ) -> dict[str, Any]:
-    """Increment recall_n on the seed; return neighbor id → added n (not written here)."""
+    """Add recall credit. A full hit moves last_recall_at; a shown neighbor does not.
+
+    Treating a sidebar mention as a recall today would reset decay for a card
+    the user did not ask for. credit below 1 only raises recall_n.
+    """
     today = now or date.today()
-    n = float(parsed.get("recall_n") or 0) + 1.0
+    added = float(credit)
+    n = float(parsed.get("recall_n") or 0) + added
     first = parsed.get("first_seen") or parsed.get("valid_from") or today.isoformat()
     parsed["recall_n"] = n
-    parsed["last_recall_at"] = today.isoformat()
     parsed["first_seen"] = str(first)[:10]
+    if added >= 1.0:
+        parsed["last_recall_at"] = today.isoformat()
     imp = int(parsed.get("importance") or 3)
-    parsed["strength"] = round(strength_value(recall_n=n, first_seen=first, importance=imp, now=today), 4)
+    parsed["strength"] = round(
+        strength_value(
+            recall_n=n,
+            first_seen=parsed["first_seen"],
+            last_recall_at=parsed.get("last_recall_at"),
+            importance=imp,
+            now=today,
+        ),
+        4,
+    )
     return neighbor_credits(neighbor_weights or {})
 
 
@@ -127,27 +172,98 @@ def _upsert_optional_frontmatter(fm: str, parsed: Mapping[str, Any]) -> str:
     return "\n".join(keep)
 
 
+def _month_file(staging: Path | None, month_key: str) -> Path:
+    """Resolve the month file under the caller's staging, not the process home.
+
+    stamp runs from tests and from prefetch with an explicit root. month_file_path
+    always follows HERMES_HOME, which would write the live month during a unit test.
+    """
+    if staging is not None:
+        return Path(staging) / "monthly" / f"{month_key}.md"
+    from monthly_state import month_file_path
+
+    return month_file_path(month_key)
+
+
+def _stamp_month_row(
+    month_key: str,
+    kind: str,
+    mem_id: str,
+    *,
+    staging: Path | None,
+    now: date | None,
+    credit: float,
+) -> dict[str, Any] | None:
+    """Write recall credit onto one key row so monthly guidance decays like a daily card.
+
+    Synthesis never fills these fields. A missing file or id returns None so a
+    bad id in the prefetch text cannot abort the turn.
+    """
+    from monthly_writer import dump_yaml, loads, payload_from_dict
+
+    path = _month_file(staging, month_key)
+    if not path.is_file():
+        return None
+    try:
+        payload = loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    data = payload.to_dict()
+    section = "key_decisions" if kind == "decision" else "key_procedures"
+    target = None
+    for row in data.get(section) or []:
+        if isinstance(row, dict) and str(row.get("id") or "") == mem_id:
+            target = row
+            break
+    if target is None:
+        return None
+    apply_recall(target, now=now, credit=credit)
+    try:
+        body = dump_yaml(payload_from_dict(data))
+        path.write_text(body, encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    return {key: target.get(key) for key in OPTIONAL_FIELDS}
+
+
 def stamp_recall_on_card(
     block_id: str,
     *,
     staging: Path | None = None,
     now: date | None = None,
+    credit: float = 1.0,
+    index: Any = None,
 ) -> dict[str, Any] | None:
-    """Persist apply_recall onto the daily YAML card so L1/L2 have fields to read.
+    """Persist apply_recall onto the daily card or the monthly key row.
 
     Chat recall used to leave staging unchanged; pytest-only apply_recall never
     flushed. Fail-open: missing card or IO error returns None and does not raise.
+    index lets one turn stamp many cards without rescanning daily/*.md each time.
     """
     from .ids import BlockIndex, _FRONTMATTER_RE
 
     if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("RECALL_PERSIST_IN_TEST"):
         return None
 
-    rec = BlockIndex(staging).get(str(block_id or "").strip())
+    mem_id = str(block_id or "").strip()
+    month_hit = _MONTH_KEY_ID.match(mem_id)
+    if month_hit:
+        return _stamp_month_row(
+            month_hit.group(1),
+            month_hit.group(2),
+            mem_id,
+            staging=staging,
+            now=now,
+            credit=credit,
+        )
+
+    store = index if index is not None else BlockIndex(staging)
+    rec = store.get(mem_id)
     if rec is None or not rec.path.is_file():
         return None
     parsed = dict(rec.parsed)
-    apply_recall(parsed, now=now)
+    apply_recall(parsed, now=now, credit=credit)
+    rec.parsed.update({key: parsed.get(key) for key in OPTIONAL_FIELDS})
     try:
         text = rec.path.read_text(encoding="utf-8")
     except OSError:
@@ -179,17 +295,27 @@ def stamp_recall_on_card(
 
 
 def should_drop_from_prefetch(parsed: Mapping[str, Any]) -> bool:
-    """L1 forget: leave the card on disk, omit it from Band B."""
-    if "strength" not in parsed:
+    """L1 forget reads live decay so a snapshot from the stamp day cannot keep a cold card in Band B."""
+    if "recall_n" not in parsed and "strength" not in parsed:
         return False
     try:
-        return float(parsed.get("strength") or 0) < THETA_INJECT
+        live = strength_value(
+            recall_n=float(parsed.get("recall_n") or 0),
+            first_seen=parsed.get("first_seen") or parsed.get("valid_from"),
+            last_recall_at=parsed.get("last_recall_at"),
+            importance=int(parsed.get("importance") or 3),
+        )
     except (TypeError, ValueError):
         return False
+    return live < THETA_INJECT
 
 
 def should_archive_body(parsed: Mapping[str, Any], *, now: date | None = None) -> bool:
-    """L2 forget: move body only; never archive decisions."""
+    """L2 forget uses live decay so a stale snapshot cannot keep an unused card.
+
+    The stored strength is whatever it was on the last stamp. Reading it here
+    would skip archive for a card whose last recall is long past.
+    """
     item_type = str(parsed.get("type") or "").strip()
     if item_type == "decision":
         return False
@@ -199,13 +325,19 @@ def should_archive_body(parsed: Mapping[str, Any], *, now: date | None = None) -
         importance = 3
     if importance > 3:
         return False
+    today = now or date.today()
     try:
-        strength = float(parsed.get("strength") or 0)
+        strength = strength_value(
+            recall_n=float(parsed.get("recall_n") or 0),
+            first_seen=parsed.get("first_seen") or parsed.get("valid_from"),
+            last_recall_at=parsed.get("last_recall_at"),
+            importance=importance,
+            now=today,
+        )
     except (TypeError, ValueError):
         return False
     if strength >= THETA_ARCHIVE:
         return False
-    today = now or date.today()
     seen = _as_date(parsed.get("first_seen") or parsed.get("valid_from"), None)
     if seen is None:
         return False

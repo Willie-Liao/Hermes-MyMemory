@@ -58,3 +58,16 @@ def test_forget_never_deletes_and_skips_decisions(tmp_path: Path):
         blob = fh.read().decode("utf-8")
     assert "secret body" in blob
     assert "mem-old-fact" in blob
+
+
+def test_archive_uses_live_decay_not_the_stored_snapshot():
+    """A high stored strength must not protect a card whose last recall is old."""
+    parsed = {
+        "type": "fact",
+        "importance": 3,
+        "strength": 8.0,
+        "recall_n": 4,
+        "first_seen": "2025-01-01",
+        "last_recall_at": "2025-02-01",
+    }
+    assert should_archive_body(parsed, now=date(2026, 8, 19))

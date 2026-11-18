@@ -912,3 +912,180 @@ def test_embed_all_scales_miss_falls_to_l1_or_miss(staging, monkeypatch):
     assert "channel=embed" not in text
     assert "channel=l1" in text or "channel=miss" in text
 
+
+def _dp_card(root: Path, mem_id: str, type_: str, *, recall_n: float = 0, last: str = "") -> None:
+    extra = ""
+    if recall_n or last:
+        extra = f"recall_n: {recall_n}\nlast_recall_at: '{last}'\nfirst_seen: '2026-01-01'\n"
+    daily = root / "daily"
+    daily.mkdir(parents=True, exist_ok=True)
+    (root / "weekly").mkdir(exist_ok=True)
+    (root / "monthly").mkdir(exist_ok=True)
+    path = daily / f"{mem_id.replace(':', '')}.md"
+    path.write_text(
+        _block(mem_id=mem_id, type_=type_, entity="Guide", body=f"body {mem_id}", extra=extra),
+        encoding="utf-8",
+    )
+
+
+def _guidance_rows(monkeypatch, rows: list[dict]) -> None:
+    monkeypatch.setattr(
+        "monthly_actions.rank_monthly_guidance",
+        lambda *_a, **_k: [],
+    )
+    monkeypatch.setattr("recall.tools.search_lexical", lambda *_a, **_k: rows)
+    monkeypatch.setattr("recall.tools.embed_enabled", lambda *_a, **_k: False)
+
+
+def test_daily_guidance_splits_six_and_spills_to_decisions(tmp_path, monkeypatch):
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "monthly"))
+    rows = []
+    for i in range(10):
+        mid = f"mem-2026-08-01-decision-{i:012d}"
+        _dp_card(tmp_path, mid, "decision")
+        rows.append({"id": mid, "bm25": -2.0})
+    for i in range(4):
+        mid = f"mem-2026-08-02-procedure-{i:012d}"
+        _dp_card(tmp_path, mid, "procedure")
+        rows.append({"id": mid, "bm25": -1.0})
+    _guidance_rows(monkeypatch, rows)
+    text = recall_memory("balance the kinds", staging=tmp_path, mode="guidance")
+    assert text.count("  decision  ") == 8
+    assert text.count("  procedure  ") == 4
+
+
+def test_daily_guidance_tops_up_the_short_kind(tmp_path, monkeypatch):
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "monthly"))
+    rows = []
+    for i in range(5):
+        mid = f"mem-2026-08-03-decision-{i:012d}"
+        _dp_card(tmp_path, mid, "decision")
+        rows.append({"id": mid, "bm25": -2.0})
+    only = "mem-2026-08-04-procedure-000000000001"
+    _dp_card(tmp_path, only, "procedure")
+    rows.append({"id": only, "bm25": -1.0})
+    extra = "mem-2026-08-04-procedure-000000000002"
+    _dp_card(tmp_path, extra, "procedure")
+    _guidance_rows(monkeypatch, rows)
+    monkeypatch.setattr("recall.tools.embed_enabled", lambda *_a, **_k: True)
+    monkeypatch.setattr("recall.tools.rerank_embed", lambda *_a, **_k: extra)
+    text = recall_memory("need both kinds", staging=tmp_path, mode="guidance")
+    assert text.count("  procedure  ") == 2
+    assert extra in text
+
+
+def test_daily_guidance_asks_again_when_rerank_returns_one_card(tmp_path, monkeypatch):
+    """Gap pruning returns one card, so the floor must ask for the next one."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "monthly"))
+    rows = []
+    for i in range(2):
+        mid = f"mem-2026-08-04-procedure-{i:012d}"
+        _dp_card(tmp_path, mid, "procedure")
+        rows.append({"id": mid, "bm25": -1.0})
+    first = "mem-2026-08-05-decision-000000000001"
+    second = "mem-2026-08-05-decision-000000000002"
+    _dp_card(tmp_path, first, "decision")
+    _dp_card(tmp_path, second, "decision")
+    _guidance_rows(monkeypatch, rows)
+    monkeypatch.setattr("recall.tools.embed_enabled", lambda *_a, **_k: True)
+    pending = [first, second]
+
+    def _one(*_a, **_k):
+        return pending.pop(0) if pending else ""
+
+    monkeypatch.setattr("recall.tools.rerank_embed", _one)
+    text = recall_memory("need two decisions", staging=tmp_path, mode="guidance")
+    assert text.count("  decision  ") == 2
+    assert first in text and second in text
+
+
+def test_daily_guidance_rank_uses_live_strength(tmp_path, monkeypatch):
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "monthly"))
+    fresh = "mem-2026-08-05-decision-000000000010"
+    stale = "mem-2026-08-05-decision-000000000011"
+    _dp_card(tmp_path, fresh, "decision", recall_n=6, last="2026-11-18")
+    _dp_card(tmp_path, stale, "decision", recall_n=6, last="2026-01-02")
+    _guidance_rows(
+        monkeypatch,
+        [{"id": fresh, "bm25": -1.0}, {"id": stale, "bm25": -1.0}],
+    )
+    text = recall_memory("same score", staging=tmp_path, mode="guidance")
+    assert text.index(fresh) < text.index(stale)
+
+
+def test_daily_guidance_full_miss(tmp_path, monkeypatch):
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "monthly"))
+    _guidance_rows(monkeypatch, [])
+    text = recall_memory("nothing here", staging=tmp_path, mode="guidance")
+    assert "channel=miss" in text
+
+
+def test_recall_credits_every_hit_and_partial_neighbors(tmp_path, monkeypatch):
+    """Hits get a full recall; a shown neighbor gets fractional credit only."""
+    from datetime import date
+
+    from recall.tools import _recall_then_expand
+
+    monkeypatch.setenv("RECALL_PERSIST_IN_TEST", "1")
+    hits = [
+        "mem-2026-08-06-fact-000000000021",
+        "mem-2026-08-06-fact-000000000022",
+        "mem-2026-08-06-fact-000000000023",
+    ]
+    neighbor = "mem-2026-08-06-fact-000000000031"
+    two_hop = "mem-2026-08-06-fact-000000000032"
+    for mid in (*hits, neighbor, two_hop):
+        extra = ""
+        if mid == neighbor:
+            extra = "recall_n: 1\nlast_recall_at: '2020-01-01'\nfirst_seen: '2020-01-01'\n"
+        daily = tmp_path / "daily"
+        daily.mkdir(parents=True, exist_ok=True)
+        (daily / f"{mid[-6:]}.md").write_text(
+            _block(mem_id=mid, type_="fact", entity="N", body="n", extra=extra),
+            encoding="utf-8",
+        )
+    found = "\n".join(f"- {mid}  2026-08-06  fact  body" for mid in hits)
+    blob = (
+        "## Memory / expand  seed=x  depth=2\n"
+        f"- π=0.20  {neighbor}  2026-08-06\n"
+        f"- π=0.10  {two_hop}  2026-08-06\n"
+        f"- π=0.10  {hits[0]}  2026-08-06\n"
+    )
+    monkeypatch.setattr("recall.tools.recall_memory", lambda *_a, **_k: found)
+    monkeypatch.setattr("recall.tools.expand_memory", lambda *_a, **_k: blob)
+    monkeypatch.setattr("recall.tools.load_edges", lambda *_a, **_k: [])
+
+    def _adj(_edges, min_weight=0.5):
+        del min_weight
+        return {
+            hits[0]: {
+                neighbor: (1.0, "related", "x"),
+                hits[1]: (1.0, "related", "x"),
+            }
+        }
+
+    monkeypatch.setattr("recall.tools.adjacency", _adj)
+    _recall_then_expand("anything", staging=tmp_path)
+    from recall.ids import BlockIndex
+
+    store = BlockIndex(tmp_path)
+    today = date.today().isoformat()
+    for mid in hits:
+        parsed = store.get(mid).parsed
+        assert float(parsed["recall_n"]) == 1.0
+        assert str(parsed["last_recall_at"])[:10] == today
+    neighbor_row = store.get(neighbor).parsed
+    assert abs(float(neighbor_row["recall_n"]) - 1.25) < 1e-9
+    assert str(neighbor_row["last_recall_at"])[:10] == "2020-01-01"
+    assert "recall_n" not in store.get(two_hop).parsed
+

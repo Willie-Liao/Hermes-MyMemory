@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
 import time
@@ -40,6 +41,9 @@ from worker_llm import format_token_line, sum_usage_after, usage_ledger_offset  
 
 _MONTH_KEY_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 _GUIDANCE_GATE = 0.92
+_GUIDANCE_KIND_SHARE = 6
+_GUIDANCE_KIND_FLOOR = 2
+_GUIDANCE_TIE_EPS = 0.01
 _BAND_DECISIONS = 4
 _BAND_PROCEDURES = 3
 _BAND_SUMMARY = 8
@@ -208,6 +212,35 @@ def generate_month(
     else:
         _save_resume(key, resume_body)
         outcome = "partial"
+    if previous is not None:
+        from recall.strength import strength_value
+
+        prev_d = {row.id: row for row in previous.key_decisions}
+        prev_p = {row.id: row for row in previous.key_procedures}
+
+        def _kept(row, prev_rows):
+            old = prev_rows.get(row.id)
+            if old is None:
+                return row
+            seen = old.first_seen or row.first_seen
+            return replace(
+                row,
+                recall_n=old.recall_n,
+                last_recall_at=old.last_recall_at,
+                first_seen=seen,
+                strength=strength_value(
+                    recall_n=old.recall_n,
+                    first_seen=seen,
+                    last_recall_at=old.last_recall_at or None,
+                    importance=3,
+                ),
+            )
+
+        payload = replace(
+            payload,
+            key_decisions=tuple(_kept(row, prev_d) for row in payload.key_decisions),
+            key_procedures=tuple(_kept(row, prev_p) for row in payload.key_procedures),
+        )
     path = write_month(payload)
     return {
         "outcome": outcome,
@@ -300,7 +333,10 @@ def rank_monthly_guidance(
 ) -> list[dict[str, Any]]:
     """Rank active monthly D/P for a task-shaped query so prefetch does not scan daily events first.
 
-    Strength may reorder inside the admitted set; it cannot rescue a row below the 0.92 gate.
+    Decisions that merely pass the gate must not fill the block and hide a procedure
+    for this message. Each kind keeps up to half the slots, and a kind with fewer
+    than two passing rows is topped up from below the gate so it is not absent.
+    Live strength, not the stored snapshot, breaks near-ties as a row ages.
     A row missing from embed-cache.json is scored lexically until the next 01:00 fill.
     """
     q = str(query or "").strip()
@@ -355,46 +391,126 @@ def rank_monthly_guidance(
                 query_vec = encoded[0]
         except Exception:
             query_vec = None
-    admitted: list[dict[str, Any]] = []
+    from recall.strength import strength_value
+
+    passed: list[dict[str, Any]] = []
+    below: dict[str, list[dict[str, Any]]] = {"decision": [], "procedure": []}
     for (kind, payload, row, text), cand_vec in zip(pending, vectors):
         sim = _guidance_sim(q, text, query_vec, cand_vec)
-        if sim < _GUIDANCE_GATE:
-            continue
-        rank = 0.8 * sim + 0.2 * (float(row.strength) / 10.0)
-        admitted.append(
-            {
-                "kind": kind,
-                "month": payload.key,
-                "sim": sim,
-                "rank": rank,
-                "row": row,
-            }
+        live = strength_value(
+            recall_n=float(getattr(row, "recall_n", 0.0) or 0.0),
+            first_seen=getattr(row, "first_seen", None),
+            last_recall_at=getattr(row, "last_recall_at", None) or None,
+            importance=3,
         )
-    prefs = [h for h in admitted if h["kind"] == "decision"]
-    procs = [h for h in admitted if h["kind"] == "procedure"]
-    prefs.sort(key=lambda h: (-h["rank"], h["row"].id))
-    procs.sort(key=lambda h: (-h["rank"], h["row"].id))
-    ordered = prefs + procs
-    return ordered[: max(1, int(limit))]
+        year_s, _, mon_s = str(payload.key).partition("-")
+        try:
+            year_n, mon_n = int(year_s), int(mon_s)
+        except ValueError:
+            year_n, mon_n = 0, 0
+        hit = {
+            "kind": kind,
+            "month": payload.key,
+            "sim": sim,
+            "rank": 0.8 * sim + 0.2 * (live / 10.0),
+            "overlap": _lexical_sim(q, text),
+            "row": row,
+            "topup": False,
+            "spill": False,
+            "_year": year_n,
+            "_mon": mon_n,
+        }
+        if sim >= _GUIDANCE_GATE:
+            passed.append(hit)
+        else:
+            below[kind].append(hit)
+    if not passed:
+        return []
+
+    def _tie(hit: dict[str, Any]) -> tuple:
+        bucket = -math.floor((hit["rank"] / _GUIDANCE_TIE_EPS) + 1e-9)
+        return (
+            bucket,
+            -hit["overlap"],
+            -len(getattr(hit["row"], "evidence", ()) or ()),
+            -hit["_year"],
+            -hit["_mon"],
+            hit["row"].id,
+        )
+
+    prefs = sorted((h for h in passed if h["kind"] == "decision"), key=_tie)
+    procs = sorted((h for h in passed if h["kind"] == "procedure"), key=_tie)
+    for kind in below:
+        below[kind].sort(key=_tie)
+    limit_n = max(1, int(limit))
+    share = max(_GUIDANCE_KIND_FLOOR, min(_GUIDANCE_KIND_SHARE, limit_n // 2))
+    chosen = {
+        "decision": prefs[: min(share, len(prefs))],
+        "procedure": procs[: min(share, len(procs))],
+    }
+    rest = prefs[len(chosen["decision"]) :] + procs[len(chosen["procedure"]) :]
+    rest.sort(key=_tie)
+    room = limit_n - (len(chosen["decision"]) + len(chosen["procedure"]))
+    for hit in rest[: max(room, 0)]:
+        hit["spill"] = True
+        chosen[hit["kind"]].append(hit)
+
+    def _top_up(kind: str, other: str) -> None:
+        need = _GUIDANCE_KIND_FLOOR - len(chosen[kind])
+        if need <= 0:
+            return
+        extras = below[kind][:need]
+        spills = [h for h in chosen[other] if h.get("spill")]
+        for hit in extras:
+            hit["topup"] = True
+            if spills:
+                dropped = spills.pop()
+                chosen[other].remove(dropped)
+            elif (
+                len(chosen["decision"]) + len(chosen["procedure"]) >= limit_n
+                and len(chosen[other]) > _GUIDANCE_KIND_FLOOR
+            ):
+                chosen[other].pop()
+            chosen[kind].append(hit)
+
+    _top_up("procedure", "decision")
+    _top_up("decision", "procedure")
+    chosen["decision"].sort(key=_tie)
+    chosen["procedure"].sort(key=_tie)
+    ordered = chosen["decision"] + chosen["procedure"]
+    for hit in ordered:
+        hit.pop("spill", None)
+        hit.pop("_year", None)
+        hit.pop("_mon", None)
+    return ordered[:limit_n]
 
 
 def format_guidance_hits(hits: list[dict[str, Any]]) -> str:
+    """Print live strength so the agent sees decay, not the value saved on the last stamp."""
     if not hits:
         return ""
+    from recall.strength import strength_value
+
     lines = ["## Memory / recall  channel=monthly_guidance"]
     for hit in hits:
         row = hit["row"]
+        live = strength_value(
+            recall_n=float(getattr(row, "recall_n", 0.0) or 0.0),
+            first_seen=getattr(row, "first_seen", None),
+            last_recall_at=getattr(row, "last_recall_at", None) or None,
+            importance=3,
+        )
         if hit["kind"] == "decision":
             extra = f" except {row.exceptions}" if row.exceptions else ""
             lines.append(
                 f"- preference {row.id}  context={row.context or '-'}  "
-                f"{row.text}{extra}  strength={row.strength:.2f}"
+                f"{row.text}{extra}  strength={live:.2f}"
             )
         else:
             obs = "; ".join(row.obstacles) if row.obstacles else ""
             lines.append(
                 f"- procedure {row.id}  trigger={row.trigger or '-'}  "
-                f"obstacles={obs or '-'}  solution={row.solution}  strength={row.strength:.2f}"
+                f"obstacles={obs or '-'}  solution={row.solution}  strength={live:.2f}"
             )
     return "\n".join(lines)
 

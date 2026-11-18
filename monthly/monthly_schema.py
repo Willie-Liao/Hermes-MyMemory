@@ -168,6 +168,8 @@ class MonthlyDecision:
 
     Context and exceptions exist so recall can match *when* the preference applies
     instead of retrieving a standing rule for every chat turn.
+    recall_n and last_recall_at stay empty at synthesis so only a real recall
+    can raise strength; a month rebuild must not wipe that history.
     """
 
     id: str
@@ -185,6 +187,8 @@ class MonthlyDecision:
     first_seen: str = ""
     last_seen: str = ""
     strength: float = 0.0
+    recall_n: float = 0.0
+    last_recall_at: str = ""
 
     def __post_init__(self) -> None:
         _require_concise_note(self.why_it_matters, "why_it_matters")
@@ -207,6 +211,8 @@ class MonthlyProcedure:
     """Store the reusable Solution: plus trigger/obstacles so recall can match a task, not a dump.
 
     Obstacle clauses stay mechanical so the model cannot invent a failure the daily cards never named.
+    recall_n and last_recall_at stay empty at synthesis so only a real recall
+    can raise strength; a month rebuild must not wipe that history.
     """
 
     id: str
@@ -222,6 +228,8 @@ class MonthlyProcedure:
     first_seen: str = ""
     last_seen: str = ""
     strength: float = 0.0
+    recall_n: float = 0.0
+    last_recall_at: str = ""
 
     def __post_init__(self) -> None:
         _require_concise_note(self.insight, "insight")
@@ -512,6 +520,8 @@ def payload_to_dict(payload: MonthlyPayload) -> dict[str, Any]:
                 "first_seen": row.first_seen,
                 "last_seen": row.last_seen,
                 "strength": row.strength,
+                "recall_n": row.recall_n,
+                "last_recall_at": row.last_recall_at,
             }
             for row in payload.key_decisions
         ],
@@ -530,6 +540,8 @@ def payload_to_dict(payload: MonthlyPayload) -> dict[str, Any]:
                 "first_seen": row.first_seen,
                 "last_seen": row.last_seen,
                 "strength": row.strength,
+                "recall_n": row.recall_n,
+                "last_recall_at": row.last_recall_at,
             }
             for row in payload.key_procedures
         ],

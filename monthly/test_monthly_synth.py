@@ -1332,3 +1332,281 @@ def test_gaps_only_without_a_store_makes_no_model_calls():
     assert result["outcome"] == "ok"
     assert result["map_calls"] == 0
     assert result["pending_sections"] == []
+
+
+def _vec(cosine: float) -> list[float]:
+    import math
+
+    c = max(-1.0, min(1.0, cosine))
+    return [c, math.sqrt(max(0.0, 1.0 - c * c))]
+
+
+def _key_decision(i: int, *, month: str = "2026-08", cosine: float = 0.99, **kwargs):
+    from monthly_schema import MonthlyDecision
+
+    row = MonthlyDecision(
+        id=f"mem-{month}-key-decision-{i:012x}",
+        kind="decision",
+        text=kwargs.get("text", f"alpha rule {i}"),
+        why_it_matters="still changes the next time",
+        context=kwargs.get("context", "planning"),
+        evidence=kwargs.get("evidence", (f"mem-2026-08-01-decision-{i:012d}",)),
+        first_seen=kwargs.get("first_seen", "2026-08-01"),
+        recall_n=kwargs.get("recall_n", 0.0),
+        last_recall_at=kwargs.get("last_recall_at", ""),
+    )
+    return row, cosine
+
+
+def _key_procedure(i: int, *, month: str = "2026-08", cosine: float = 0.97, **kwargs):
+    from monthly_schema import MonthlyProcedure
+
+    row = MonthlyProcedure(
+        id=f"mem-{month}-key-procedure-{i:012x}",
+        problem="case",
+        solution=kwargs.get("solution", f"beta step {i}"),
+        insight="still changes the next time",
+        trigger=kwargs.get("trigger", "task"),
+        evidence=kwargs.get("evidence", (f"mem-2026-08-02-procedure-{i:012d}",)),
+        first_seen=kwargs.get("first_seen", "2026-08-01"),
+        recall_n=kwargs.get("recall_n", 0.0),
+        last_recall_at=kwargs.get("last_recall_at", ""),
+    )
+    return row, cosine
+
+
+def _write_ranked_month(tmp_path, monkeypatch, specs, *, key="2026-08"):
+    from dataclasses import replace
+
+    from monthly_writer import dump_yaml, loads
+    from recall.embed_cache import scale_block_id
+
+    folder = tmp_path / "monthly"
+    if (folder / "2026-08.md").is_file():
+        payload = loads((folder / "2026-08.md").read_text(encoding="utf-8"))
+    else:
+        payload = _write_guidance_month(tmp_path)
+    decisions = [row for row, _c in specs if row.__class__.__name__ == "MonthlyDecision"]
+    procedures = [row for row, _c in specs if row.__class__.__name__ == "MonthlyProcedure"]
+    months = ["2026-08", "2026-07", "2026-06", "2026-05"]
+    cache = {}
+    for path in folder.glob("????-??.md"):
+        path.unlink()
+    for index, month in enumerate(months):
+        d_slice = decisions[index * 12 : (index + 1) * 12]
+        p_slice = procedures[index * 12 : (index + 1) * 12]
+        if not d_slice and not p_slice:
+            continue
+        body = replace(
+            payload,
+            key=month,
+            key_decisions=tuple(d_slice),
+            key_procedures=tuple(p_slice),
+        )
+        (folder / f"{month}.md").write_text(dump_yaml(body), encoding="utf-8")
+        for row in (*d_slice, *p_slice):
+            cosine = next(c for item, c in specs if item.id == row.id)
+            bid = scale_block_id(
+                {
+                    "scale": "month",
+                    "kind": "dp",
+                    "text": row.lookup_text().strip(),
+                    "mem_id": row.id,
+                    "month_key": month,
+                }
+            )
+            cache[bid] = {"embedding": _vec(cosine)}
+    monkeypatch.setattr("recall.embed_cache.load_cache", lambda: cache)
+    monkeypatch.setattr("recall.embed._encode_texts", lambda texts: [[1.0, 0.0]])
+    return payload
+
+
+def _counts(hits):
+    return (
+        sum(h["kind"] == "decision" for h in hits),
+        sum(h["kind"] == "procedure" for h in hits),
+    )
+
+
+def test_guidance_share_is_six_when_both_kinds_are_plentiful(tmp_path, monkeypatch):
+    from monthly_actions import rank_monthly_guidance
+
+    specs = [_key_decision(i) for i in range(14)] + [_key_procedure(i, cosine=0.95) for i in range(8)]
+    _write_ranked_month(tmp_path, monkeypatch, specs)
+    hits = rank_monthly_guidance("zzzz guidance probe", staging=tmp_path, limit=12)
+    assert _counts(hits) == (6, 6)
+
+
+def test_guidance_spills_unused_procedure_slots_to_decisions(tmp_path, monkeypatch):
+    from monthly_actions import rank_monthly_guidance
+
+    specs = [_key_decision(i) for i in range(14)] + [_key_procedure(i, cosine=0.95) for i in range(2)]
+    _write_ranked_month(tmp_path, monkeypatch, specs)
+    hits = rank_monthly_guidance("zzzz guidance probe", staging=tmp_path, limit=12)
+    assert _counts(hits) == (10, 2)
+
+
+def test_guidance_tops_up_two_procedures_from_below_the_gate(tmp_path, monkeypatch):
+    from monthly_actions import rank_monthly_guidance
+
+    specs = [_key_decision(i) for i in range(14)]
+    specs.append(_key_procedure(0, cosine=0.95))
+    specs.extend(_key_procedure(i, cosine=0.4) for i in range(1, 4))
+    _write_ranked_month(tmp_path, monkeypatch, specs)
+    hits = rank_monthly_guidance("zzzz guidance probe", staging=tmp_path, limit=12)
+    assert _counts(hits) == (10, 2)
+    assert sum(h["topup"] for h in hits if h["kind"] == "procedure") == 1
+
+
+def test_guidance_tops_up_when_no_procedure_passed(tmp_path, monkeypatch):
+    from monthly_actions import rank_monthly_guidance
+
+    specs = [_key_decision(i) for i in range(14)]
+    specs.extend(_key_procedure(i, cosine=0.4) for i in range(3))
+    _write_ranked_month(tmp_path, monkeypatch, specs)
+    hits = rank_monthly_guidance("zzzz guidance probe", staging=tmp_path, limit=12)
+    assert _counts(hits) == (10, 2)
+    assert all(h["topup"] for h in hits if h["kind"] == "procedure")
+
+
+def test_guidance_miss_does_not_top_up(tmp_path, monkeypatch):
+    from monthly_actions import rank_monthly_guidance
+
+    specs = [_key_decision(i, cosine=0.2) for i in range(4)]
+    specs += [_key_procedure(i, cosine=0.2) for i in range(4)]
+    _write_ranked_month(tmp_path, monkeypatch, specs)
+    assert rank_monthly_guidance("zzzz guidance probe", staging=tmp_path, limit=12) == []
+
+
+def test_guidance_default_limit_splits_four_and_four(tmp_path, monkeypatch):
+    from monthly_actions import rank_monthly_guidance
+
+    specs = [_key_decision(i) for i in range(14)] + [_key_procedure(i, cosine=0.95) for i in range(8)]
+    _write_ranked_month(tmp_path, monkeypatch, specs)
+    hits = rank_monthly_guidance("zzzz guidance probe", staging=tmp_path)
+    assert _counts(hits) == (4, 4)
+
+
+def test_guidance_tie_break_prefers_overlap_then_evidence_then_month(tmp_path, monkeypatch):
+    from monthly_actions import rank_monthly_guidance
+
+    rich = _key_procedure(
+        1,
+        cosine=0.99,
+        trigger="send file weekly review notes",
+        evidence=("mem-a", "mem-b", "mem-c"),
+    )
+    thin = _key_procedure(2, cosine=0.988, trigger="send", evidence=("mem-a",))
+    _write_ranked_month(tmp_path, monkeypatch, [rich, thin, _key_decision(1)])
+    hits = rank_monthly_guidance("send file weekly", staging=tmp_path, limit=12)
+    procs = [h for h in hits if h["kind"] == "procedure"]
+    assert [h["row"].id for h in procs[:2]] == [rich[0].id, thin[0].id]
+
+    same = _key_procedure(3, cosine=0.99, trigger="send file weekly", evidence=("mem-a", "mem-b"))
+    less = _key_procedure(4, cosine=0.99, trigger="send file weekly", evidence=("mem-a",))
+    _write_ranked_month(tmp_path, monkeypatch, [same, less, _key_decision(2)])
+    hits = rank_monthly_guidance("send file weekly", staging=tmp_path, limit=12)
+    procs = [h for h in hits if h["kind"] == "procedure"]
+    assert procs[0]["row"].id == same[0].id
+
+    older = _key_procedure(5, month="2026-07", cosine=0.99, trigger="send file weekly")
+    newer = _key_procedure(6, month="2026-08", cosine=0.99, trigger="send file weekly")
+    from dataclasses import replace
+
+    from monthly_writer import dump_yaml, loads
+    from recall.embed_cache import scale_block_id
+
+    base = loads((tmp_path / "monthly" / "2026-08.md").read_text(encoding="utf-8"))
+    first = replace(base, key="2026-07", key_decisions=(), key_procedures=(older[0],))
+    second = replace(base, key="2026-08", key_decisions=(_key_decision(7)[0],), key_procedures=(newer[0],))
+    folder = tmp_path / "monthly"
+    folder.joinpath("2026-07.md").write_text(dump_yaml(first), encoding="utf-8")
+    folder.joinpath("2026-08.md").write_text(dump_yaml(second), encoding="utf-8")
+    cache = {}
+    for payload, row, cosine in (
+        (first, older[0], 0.99),
+        (second, newer[0], 0.99),
+        (second, second.key_decisions[0], 0.99),
+    ):
+        bid = scale_block_id(
+            {
+                "scale": "month",
+                "kind": "dp",
+                "text": row.lookup_text().strip(),
+                "mem_id": row.id,
+                "month_key": payload.key,
+            }
+        )
+        cache[bid] = {"embedding": _vec(cosine)}
+    monkeypatch.setattr("recall.embed_cache.load_cache", lambda: cache)
+    hits = rank_monthly_guidance("send file weekly", staging=tmp_path, limit=12)
+    procs = [h for h in hits if h["kind"] == "procedure"]
+    assert procs[0]["row"].id == newer[0].id
+
+
+def test_guidance_live_strength_breaks_equal_similarity(tmp_path, monkeypatch):
+    from datetime import date
+
+    from monthly_actions import rank_monthly_guidance
+
+    today = date.today().isoformat()
+    recent = _key_decision(1, cosine=0.97, recall_n=8, last_recall_at=today, first_seen="2026-08-01")
+    cold = _key_decision(2, cosine=0.97, recall_n=8, last_recall_at="2026-01-01", first_seen="2026-01-01")
+    _write_ranked_month(tmp_path, monkeypatch, [cold, recent])
+    hits = rank_monthly_guidance("zzzz guidance probe", staging=tmp_path, limit=12)
+    assert hits[0]["row"].id == recent[0].id
+
+
+def test_month_stamp_and_generate_carry_recall(tmp_path, monkeypatch):
+    """A guidance stamp must survive the next month rebuild when the id is unchanged."""
+    from monthly_actions import generate_month
+    from monthly_slice import mechanical_facts
+    from monthly_writer import load_month, write_month
+    from recall.strength import stamp_recall_on_card
+
+    monkeypatch.setenv("RECALL_PERSIST_IN_TEST", "1")
+    _write_may_goal()
+    facts = mechanical_facts("2026-06")
+    args = _filled_args(facts)
+
+    def call(prompt, **kwargs):
+        note = _note_ok(**kwargs)
+        if note is not None:
+            return note
+        return _tool_ok(kwargs.get("force_tool_name"), args)
+
+    first = generate_month("2026-06", call_oneshot=call, force_refresh=True)
+    assert first["outcome"] in {"ok", "partial"}
+    saved = load_month("2026-06")
+    row = saved.key_decisions[0]
+    assert stamp_recall_on_card(row.id, staging=tmp_path / "memories" / "staging", now=__import__("datetime").date(2026, 8, 1))
+    assert load_month("2026-06").key_decisions[0].recall_n == 1
+    again = generate_month("2026-06", call_oneshot=call, force_refresh=True)
+    assert again["outcome"] in {"ok", "partial"}
+    kept = load_month("2026-06").key_decisions[0]
+    assert kept.id == row.id
+    assert kept.recall_n == 1
+    other = next(
+        block.id
+        for block in facts.all_dpe
+        if block.type == "decision" and block.id != args["key_decisions"][0]["evidence"][0]
+    )
+    changed = dict(args)
+    changed["key_decisions"] = [dict(args["key_decisions"][0], evidence=[other])]
+
+    def call_changed(prompt, **kwargs):
+        note = _note_ok(**kwargs)
+        if note is not None:
+            return note
+        return _tool_ok(kwargs.get("force_tool_name"), changed)
+
+    generate_month("2026-06", call_oneshot=call_changed, force_refresh=True)
+    fresh = load_month("2026-06").key_decisions[0]
+    assert fresh.id != row.id
+    assert fresh.recall_n == 0
+    assert stamp_recall_on_card("mem-not-a-month-id", staging=tmp_path / "memories" / "staging") is None
+    assert stamp_recall_on_card(
+        "mem-2099-01-key-decision-abcdefabcdef",
+        staging=tmp_path / "memories" / "staging",
+    ) is None
+    del write_month

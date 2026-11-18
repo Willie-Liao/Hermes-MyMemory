@@ -12,6 +12,7 @@ import functools
 import json
 import os
 import sys
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -72,6 +73,9 @@ class MyMemoryProvider(MemoryProvider):
         self._platform = ""
         self._agent_context = "primary"
         self._prefetch_seen: set[str] = set()
+        self._guidance_pending: dict[str, set[str]] = {}
+        self._guidance_stamped: dict[str, set[str]] = {}
+        self._stamp_thread: threading.Thread | None = None
 
     @property
     def name(self) -> str:
@@ -163,6 +167,9 @@ class MyMemoryProvider(MemoryProvider):
                 head = (guided or "").split("\n", 1)[0]
                 if guided.strip() and "channel=miss" not in head:
                     parts.append(guided.strip())
+                    self._guidance_pending.setdefault(sid, set()).update(
+                        _MEM_ID_RE.findall(guided)
+                    )
             except Exception:
                 guided = None
         t_recall = time.perf_counter() - t0_recall
@@ -231,13 +238,30 @@ class MyMemoryProvider(MemoryProvider):
     ) -> None:
         """Queue digest extract after a primary chat turn — must not block the API loop.
 
-        Passes the user text so a just-recalled dated card can be rejected after
-        the turn without waiting for the 12-message Phase-1 batch.
+        Guidance stamps run on a daemon thread so a month-file write cannot hold
+        the turn. Passes the user text so a just-recalled dated card can be
+        rejected after the turn without waiting for the 12-message Phase-1 batch.
         """
         del assistant_content, messages
         if self._agent_context in _SKIP_WRITE_CONTEXTS:
             return
         sid = str(session_id or self._session_id or "")
+        pending = self._guidance_pending.pop(sid, set())
+        stamped = self._guidance_stamped.setdefault(sid, set())
+        fresh = [mem_id for mem_id in pending if mem_id not in stamped]
+        stamped.update(fresh)
+        if fresh:
+            def _stamp(ids: list[str] = fresh) -> None:
+                from recall.strength import stamp_recall_on_card
+
+                for mem_id in ids:
+                    try:
+                        stamp_recall_on_card(mem_id, credit=1.0)
+                    except Exception:
+                        continue
+
+            self._stamp_thread = threading.Thread(target=_stamp, daemon=True)
+            self._stamp_thread.start()
         digest.on_agent_end(
             {
                 "session_id": sid,
@@ -257,6 +281,8 @@ class MyMemoryProvider(MemoryProvider):
             "session_key": self._session_id,
             "platform": self._platform,
         }
+        self._guidance_pending.pop(self._session_id, None)
+        self._guidance_stamped.pop(self._session_id, None)
         digest.on_session_boundary(ctx, reason="on_session_finalize")
         weekly.run_async("on_session_finalize")
         retention.run_async("on_session_finalize")

@@ -31,7 +31,13 @@ from .l1 import search_l1
 from .lexical import search_lexical
 from .normalize import entity_key, load_entity_index, lookup_key
 from .policy import DEFAULT_SCOPE, SCOPE_BUDGETS
-from .strength import apply_recall, should_drop_from_prefetch, stamp_recall_on_card
+from .strength import (
+    apply_recall,
+    neighbor_credits,
+    should_drop_from_prefetch,
+    stamp_recall_on_card,
+    strength_value,
+)
 
 _MEM_ID_RE = re.compile(r"\b(mem-[A-Za-z0-9\-]+|w-evt-\d{4}-\d{2}-\d{2}-\d+|w\d{1,2}-e\d+-[A-Za-z0-9\-]+)\b")
 PPR_ALPHA = 0.5
@@ -647,50 +653,153 @@ def _guidance_recall(
     staging: Path,
     store: BlockIndex,
 ) -> str:
-    """Monthly D/P first; daily decision/procedure only on a monthly miss — never L1 or events."""
+    """Monthly D/P first; daily decision/procedure only on a monthly miss — never L1 or events.
+
+    The daily fallback uses the same per-kind share as monthly guidance so a
+    long run of one kind cannot fill the block. Live strength is part of the
+    rank so an old card loses to a recent one with the same search score.
+    Rerank keeps only the nearest card when the next score is close, so the
+    floor asks again with that card removed until two of the short kind appear.
+    """
     import sys
 
     mdir = Path(__file__).resolve().parent.parent / "monthly"
     if str(mdir) not in sys.path:
         sys.path.insert(0, str(mdir))
-    from monthly_actions import format_guidance_hits, rank_monthly_guidance
+    from monthly_actions import (
+        _GUIDANCE_KIND_FLOOR,
+        _GUIDANCE_KIND_SHARE,
+        format_guidance_hits,
+        rank_monthly_guidance,
+    )
 
     hits = rank_monthly_guidance(query, staging=staging, limit=k)
     if hits:
         return format_guidance_hits(hits)
     allowed = {"decision", "procedure"}
     fts = search_lexical(query, k=k, staging=staging)
-    recs: list[BlockRecord] = []
+    scored: list[tuple[BlockRecord, float]] = []
     seen: set[str] = set()
+    bm25s: list[float] = []
+    fts_rows: list[tuple[BlockRecord, float]] = []
     for row in fts:
         rec = store.get(str(row["id"]))
         if rec is None or rec.block_id in seen or _is_rejected(rec):
             continue
         if rec.item_type not in allowed:
             continue
-        recs.append(rec)
         seen.add(rec.block_id)
-    if not recs and embed_enabled(staging):
+        try:
+            bm25 = float(row.get("bm25") or 0.0)
+        except (TypeError, ValueError):
+            bm25 = 0.0
+        fts_rows.append((rec, bm25))
+        bm25s.append(bm25)
+    if fts_rows:
+        best = min(bm25s) if bm25s else 0.0
+        for rec, bm25 in fts_rows:
+            relevance = (bm25 / best) if best else 1.0
+            scored.append((rec, relevance))
+    elif embed_enabled(staging):
         live = [
             rec
             for rec in store.records
             if rec.item_type in allowed and not _is_rejected(rec)
         ]
         reranked = rerank_embed(query, live, k=k)
+        embed_recs: list[BlockRecord] = []
         for mid in _MEM_ID_RE.findall(str(reranked or "")):
             rec = store.get(mid)
             if rec is None or rec.block_id in seen or rec.item_type not in allowed:
                 continue
-            recs.append(rec)
             seen.add(rec.block_id)
-    if recs:
-        lines = [f"## Memory / recall  channel=daily_dp  q={query}"]
-        for rec in recs[:k]:
-            lines.append(
-                f"- {rec.block_id}  {rec.day} {_week(rec)}  {rec.item_type}  {one_line(rec.body, 80)}"
-            )
-        return "\n".join(lines)
-    return f"## Memory / recall  channel=miss  q={query}\n"
+            embed_recs.append(rec)
+        span = max(len(embed_recs), 1)
+        for i, rec in enumerate(embed_recs):
+            scored.append((rec, 1.0 - (i / span)))
+    if not scored:
+        return f"## Memory / recall  channel=miss  q={query}\n"
+
+    ranked: list[tuple[BlockRecord, float, bool]] = []
+    for index, (rec, relevance) in enumerate(scored):
+        parsed = rec.parsed
+        live = strength_value(
+            recall_n=float(parsed.get("recall_n") or 0.0),
+            first_seen=parsed.get("first_seen") or parsed.get("valid_from"),
+            last_recall_at=parsed.get("last_recall_at"),
+            importance=int(parsed.get("importance") or 3),
+        )
+        rank = 0.8 * relevance + 0.2 * (live / 10.0)
+        ranked.append((rec, rank, False))
+    ranked.sort(key=lambda item: (-item[1], item[0].block_id))
+    by_kind: dict[str, list[tuple[BlockRecord, float, bool]]] = {
+        "decision": [],
+        "procedure": [],
+    }
+    for item in ranked:
+        if item[0].item_type in by_kind:
+            by_kind[item[0].item_type].append(item)
+    limit_n = max(1, int(k))
+    share = max(_GUIDANCE_KIND_FLOOR, min(_GUIDANCE_KIND_SHARE, limit_n // 2))
+    chosen: dict[str, list[tuple[BlockRecord, float, bool]]] = {}
+    for kind, rows in by_kind.items():
+        head = rows[: min(share, len(rows))]
+        chosen[kind] = [(rec, rank, False) for rec, rank, _flag in head]
+    rest: list[tuple[BlockRecord, float, bool]] = []
+    for kind, rows in by_kind.items():
+        rest.extend(rows[len(chosen[kind]) :])
+    rest.sort(key=lambda item: (-item[1], item[0].block_id))
+    room = limit_n - sum(len(rows) for rows in chosen.values())
+    for rec, rank, _flag in rest[: max(room, 0)]:
+        chosen[rec.item_type].append((rec, rank, True))
+
+    def _top_up(kind: str, other: str) -> None:
+        need = _GUIDANCE_KIND_FLOOR - len(chosen[kind])
+        if need <= 0 or not embed_enabled(staging):
+            return
+        have = {rec.block_id for rows in chosen.values() for rec, _r, _s in rows}
+        while need > 0:
+            pool = [
+                rec
+                for rec in store.records
+                if rec.item_type == kind and rec.block_id not in have and not _is_rejected(rec)
+            ]
+            reranked = rerank_embed(query, pool, k=need)
+            added = False
+            spills = [item for item in chosen[other] if item[2]]
+            for mid in _MEM_ID_RE.findall(str(reranked or "")):
+                if need <= 0:
+                    break
+                rec = store.get(mid)
+                if rec is None or rec.block_id in have or rec.item_type != kind:
+                    continue
+                have.add(rec.block_id)
+                if spills:
+                    chosen[other].remove(spills.pop())
+                elif (
+                    sum(len(rows) for rows in chosen.values()) >= limit_n
+                    and len(chosen[other]) > _GUIDANCE_KIND_FLOOR
+                ):
+                    chosen[other].pop()
+                chosen[kind].append((rec, -1.0, False))
+                need -= 1
+                added = True
+            if not added:
+                break
+
+    _top_up("procedure", "decision")
+    _top_up("decision", "procedure")
+    pooled = chosen["decision"] + chosen["procedure"]
+    body = [item for item in pooled if item[1] >= 0]
+    extra = [item for item in pooled if item[1] < 0]
+    body.sort(key=lambda item: (-item[1], item[0].block_id))
+    ordered = (body + extra)[:limit_n]
+    lines = [f"## Memory / recall  channel=daily_dp  q={query}"]
+    for rec, _rank, _spill in ordered:
+        lines.append(
+            f"- {rec.block_id}  {rec.day} {_week(rec)}  {rec.item_type}  {one_line(rec.body, 80)}"
+        )
+    return "\n".join(lines)
 
 
 def _neighborhood(
@@ -1155,15 +1264,35 @@ def _recall_then_expand(
     ids = expand_seeds
     if not ids:
         return found
+    root = staging_root(staging)
+    store = BlockIndex(root)
+    for seed in ids:
+        stamp_recall_on_card(seed, staging=root, credit=1.0, index=store)
     walked = []
+    walked_seeds: list[str] = []
     for seed in ids[:8]:
         blob = expand_memory(seed, depth=MAX_DEPTH, min_weight=min_weight, staging=staging)
         if "  miss" in blob.split("\n", 1)[0]:
             continue
         walked.append(blob)
+        walked_seeds.append(seed)
+    if walked:
+        adj = adjacency(load_edges(root), min_weight=min_weight)
+        credited = set(ids)
+        for seed, blob in zip(walked_seeds, walked):
+            weights: dict[str, float] = {}
+            for mid in _ordered_ids(blob):
+                if mid in credited:
+                    continue
+                rel = (adj.get(seed) or {}).get(mid) or (adj.get(mid) or {}).get(seed)
+                if not rel:
+                    continue
+                weights[mid] = float(rel[0])
+            for mid, added in neighbor_credits(weights).items():
+                stamp_recall_on_card(mid, staging=root, credit=added, index=store)
+                credited.add(mid)
     if not walked:
         return found
-    stamp_recall_on_card(ids[0], staging=staging)
     return found.rstrip() + "\n\n" + "\n\n".join(walked)
 
 

@@ -245,6 +245,8 @@ def payload_from_dict(obj: dict[str, Any]) -> MonthlyPayload:
                 first_seen=str(row.get("first_seen") or ""),
                 last_seen=str(row.get("last_seen") or ""),
                 strength=float(row.get("strength") or 0.0),
+                recall_n=float(row.get("recall_n") or 0.0),
+                last_recall_at=str(row.get("last_recall_at") or ""),
             )
             for row in obj.get("key_decisions") or []
             if isinstance(row, dict) and _stored_note(row.get("why_it_matters"))
@@ -264,6 +266,8 @@ def payload_from_dict(obj: dict[str, Any]) -> MonthlyPayload:
                 first_seen=str(row.get("first_seen") or ""),
                 last_seen=str(row.get("last_seen") or ""),
                 strength=float(row.get("strength") or 0.0),
+                recall_n=float(row.get("recall_n") or 0.0),
+                last_recall_at=str(row.get("last_recall_at") or ""),
             )
             for row in obj.get("key_procedures") or []
             if isinstance(row, dict) and _stored_note(row.get("insight"))
