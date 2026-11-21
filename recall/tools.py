@@ -361,6 +361,90 @@ def _is_rejected(rec: BlockRecord) -> bool:
     return str(rec.parsed.get("status") or "").strip() == "rejected"
 
 
+def _capped_linked_events(
+    targets: Mapping[str, Sequence[str]],
+    store: BlockIndex | None,
+    *,
+    cap: int,
+) -> dict[str, list[BlockRecord]]:
+    """Keep only the newest linked events so an old episode cannot outvote the recent situation.
+
+    One event often names several cards. The cap is applied per target before
+    any cosine, and a rejected event never enters that list.
+    """
+    chosen: dict[str, list[BlockRecord]] = {str(key): [] for key in targets}
+    if store is None or cap <= 0 or not targets:
+        return chosen
+    by_cite: dict[str, list[BlockRecord]] = {}
+    for rec in store.records:
+        if rec.item_type != "event" or _is_rejected(rec):
+            continue
+        for rel in rec.related:
+            by_cite.setdefault(str(rel), []).append(rec)
+    limit = int(cap)
+    for key, ids in targets.items():
+        seen: dict[str, BlockRecord] = {}
+        for cid in ids:
+            for rec in by_cite.get(str(cid), ()):
+                seen[rec.block_id] = rec
+        ordered = sorted(
+            seen.values(),
+            key=lambda rec: (rec.day or "", rec.block_id),
+            reverse=True,
+        )
+        chosen[str(key)] = ordered[:limit]
+    return chosen
+
+
+def linked_event_scores(
+    query_vec: Sequence[float] | None,
+    targets: Mapping[str, Sequence[str]],
+    store: BlockIndex | None,
+    *,
+    cap: int,
+    cache: Mapping[str, Any] | None,
+) -> dict[str, float]:
+    """Score each target by its closest linked event so the situation is not limited to the card text.
+
+    Sibling cards that share one event get the same event score; the caller
+    breaks that tie with the card's own similarity. One matrix product covers
+    every capped event that already has a vector.
+    """
+    scores = {str(key): 0.0 for key in targets}
+    if store is None or not query_vec or not targets:
+        return scores
+    chosen = _capped_linked_events(targets, store, cap=cap)
+    cache = cache or {}
+    vectors: dict[str, list[float]] = {}
+    width = len(list(query_vec))
+    for recs in chosen.values():
+        for rec in recs:
+            if rec.block_id in vectors:
+                continue
+            raw = (cache.get(rec.block_id) or {}).get("embedding") or []
+            if raw and len(raw) == width:
+                vectors[rec.block_id] = [float(x) for x in raw]
+    if not vectors:
+        return scores
+    try:
+        import numpy as np
+
+        ids = list(vectors)
+        mat = np.asarray([vectors[i] for i in ids], dtype=np.float32)
+        dots = mat @ np.asarray(list(query_vec), dtype=np.float32)
+        by_id = {ids[i]: float(dots[i]) for i in range(len(ids))}
+    except Exception:
+        by_id = {
+            eid: float(sum(a * b for a, b in zip(vec, query_vec)))
+            for eid, vec in vectors.items()
+        }
+    for key, recs in chosen.items():
+        vals = [by_id[rec.block_id] for rec in recs if rec.block_id in by_id]
+        if vals:
+            scores[key] = max(vals)
+    return scores
+
+
 def _time_hits(store: BlockIndex, lo: datetime, hi: datetime) -> list[BlockRecord]:
     hits = [
         rec
@@ -464,6 +548,7 @@ def recall_memory(
     time_to: str | None = None,
     mode: str = "normal",
     _skip_scale_embed: bool = False,
+    history: Sequence[tuple[float, str]] = (),
 ) -> str:
     """Channel ladder: id → entity_key → fts5 → month/week/daily embed locate → l1.
 
@@ -490,7 +575,7 @@ def recall_memory(
             return format_id_block(rec)
 
     if str(mode or "normal").strip().casefold() == "guidance":
-        return _guidance_recall(q, k=cap, staging=root, store=store)
+        return _guidance_recall(q, k=cap, staging=root, store=store, history=history)
 
     bounds = _parse_recall_bounds(time_from, time_to)
     timed: list[BlockRecord] = []
@@ -646,20 +731,19 @@ def recall_memory(
     return f"## Memory / recall  channel=miss  q={q}\n"
 
 
-def _guidance_recall(
+def _daily_dp_from_vectors(
     query: str,
     *,
     k: int,
-    staging: Path,
     store: BlockIndex,
+    query_vec: Sequence[float],
+    cache: Mapping[str, Any],
 ) -> str:
-    """Monthly D/P first; daily decision/procedure only on a monthly miss — never L1 or events.
+    """On a monthly miss, pick the daily card whose past situation fits, even when its own text does not.
 
-    The daily fallback uses the same per-kind share as monthly guidance so a
-    long run of one kind cannot fill the block. Live strength is part of the
-    rank so an old card loses to a recent one with the same search score.
-    Rerank keeps only the nearest card when the next score is close, so the
-    floor asks again with that card removed until two of the short kind appear.
+    The linked event is a separate vector, so a procedure's obstacle and solution
+    stay in the card vector and do not dilute the situation. The event itself is
+    never injected. Keyword search stays off this path.
     """
     import sys
 
@@ -667,15 +751,188 @@ def _guidance_recall(
     if str(mdir) not in sys.path:
         sys.path.insert(0, str(mdir))
     from monthly_actions import (
+        _GUIDANCE_EVENT_BETA,
+        _GUIDANCE_EVENT_CAP,
+        _GUIDANCE_KIND_FLOOR,
+        _GUIDANCE_KIND_SHARE,
+    )
+
+    allowed = {"decision", "procedure"}
+    live = [
+        rec
+        for rec in store.records
+        if rec.item_type in allowed and not _is_rejected(rec)
+    ]
+    targets = {rec.block_id: [rec.block_id] for rec in live}
+    evt_scores = linked_event_scores(
+        query_vec,
+        targets,
+        store,
+        cap=_GUIDANCE_EVENT_CAP,
+        cache=cache,
+    )
+    width = len(list(query_vec))
+    qv = [float(x) for x in query_vec]
+    scored: list[dict[str, Any]] = []
+    for rec in live:
+        raw = (cache.get(rec.block_id) or {}).get("embedding") or []
+        s_evt = float(evt_scores.get(rec.block_id) or 0.0)
+        if raw and len(raw) == width:
+            s_card = float(sum(a * b for a, b in zip(raw, qv)))
+            combined = max(s_card, _GUIDANCE_EVENT_BETA * s_evt)
+        else:
+            s_card = 0.0
+            combined = _GUIDANCE_EVENT_BETA * s_evt
+        parsed = rec.parsed
+        strength = strength_value(
+            recall_n=float(parsed.get("recall_n") or 0.0),
+            first_seen=parsed.get("first_seen") or parsed.get("valid_from"),
+            last_recall_at=parsed.get("last_recall_at"),
+            importance=int(parsed.get("importance") or 3),
+        )
+        scored.append(
+            {
+                "rec": rec,
+                "s": combined,
+                "s_card": s_card,
+                "rank": 0.8 * combined + 0.2 * (strength / 10.0),
+                "above": combined >= COSINE_FLOOR,
+            }
+        )
+    above = [item for item in scored if item["above"]]
+    below = [item for item in scored if not item["above"]]
+    if not above:
+        return f"## Memory / recall  channel=miss  q={query}\n"
+
+    def _order(item: dict[str, Any]) -> tuple:
+        return (-item["rank"], -item["s_card"], item["rec"].block_id)
+
+    above.sort(key=_order)
+    below.sort(key=_order)
+    by_kind: dict[str, list[dict[str, Any]]] = {"decision": [], "procedure": []}
+    for item in above:
+        by_kind[item["rec"].item_type].append(item)
+    limit_n = max(1, int(k))
+    share = max(_GUIDANCE_KIND_FLOOR, min(_GUIDANCE_KIND_SHARE, limit_n // 2))
+    chosen: dict[str, list[dict[str, Any]]] = {}
+    for kind, rows in by_kind.items():
+        chosen[kind] = rows[: min(share, len(rows))]
+    rest: list[dict[str, Any]] = []
+    for kind, rows in by_kind.items():
+        rest.extend(rows[len(chosen[kind]) :])
+    rest.sort(key=_order)
+    room = limit_n - sum(len(rows) for rows in chosen.values())
+    for item in rest[: max(room, 0)]:
+        item["spill"] = True
+        chosen[item["rec"].item_type].append(item)
+    below_by_kind: dict[str, list[dict[str, Any]]] = {"decision": [], "procedure": []}
+    for item in below:
+        below_by_kind[item["rec"].item_type].append(item)
+
+    def _top_up(kind: str, other: str) -> None:
+        need = _GUIDANCE_KIND_FLOOR - len(chosen[kind])
+        if need <= 0:
+            return
+        spills = [item for item in chosen[other] if item.get("spill")]
+        for item in below_by_kind[kind]:
+            if need <= 0:
+                break
+            if spills:
+                chosen[other].remove(spills.pop())
+            elif (
+                sum(len(rows) for rows in chosen.values()) >= limit_n
+                and len(chosen[other]) > _GUIDANCE_KIND_FLOOR
+            ):
+                chosen[other].pop()
+            item["topup"] = True
+            chosen[kind].append(item)
+            need -= 1
+
+    _top_up("procedure", "decision")
+    _top_up("decision", "procedure")
+    body = [item for rows in (chosen["decision"], chosen["procedure"]) for item in rows if not item.get("topup")]
+    extra = [item for rows in (chosen["decision"], chosen["procedure"]) for item in rows if item.get("topup")]
+    body.sort(key=_order)
+    lines = [f"## Memory / recall  channel=daily_dp  q={query}"]
+    for item in (body + extra)[:limit_n]:
+        rec = item["rec"]
+        lines.append(
+            f"- {rec.block_id}  {rec.day} {_week(rec)}  {rec.item_type}  {one_line(rec.body, 80)}"
+        )
+    return "\n".join(lines)
+
+
+def _guidance_recall(
+    query: str,
+    *,
+    k: int,
+    staging: Path,
+    store: BlockIndex,
+    history: Sequence[tuple[float, str]] = (),
+) -> str:
+    """Monthly D/P first; daily decision/procedure only on a monthly miss — never L1 or events.
+
+    Encode the query once and reuse it for the month rows and, on a miss, the
+    daily cards. A second encode, or a keyword hit that skips the event view,
+    would hide a card whose past situation fits the line. An acknowledgment
+    returns before that encode so "哈哈" cannot pull a card. history is the
+    earlier user lines for a short follow-up; the daily fallback still uses
+    the latest line's vector when the pile also misses.
+    The daily fallback uses the same per-kind share as monthly guidance so a
+    long run of one kind cannot fill the block. Live strength is part of the
+    rank so an old card loses to a recent one with the same search score.
+    """
+    import sys
+
+    mdir = Path(__file__).resolve().parent.parent / "monthly"
+    if str(mdir) not in sys.path:
+        sys.path.insert(0, str(mdir))
+    from monthly_actions import (
+        _ACK_RE,
         _GUIDANCE_KIND_FLOOR,
         _GUIDANCE_KIND_SHARE,
         format_guidance_hits,
         rank_monthly_guidance,
     )
 
-    hits = rank_monthly_guidance(query, staging=staging, limit=k)
+    if query and _ACK_RE.fullmatch(query):
+        return f"## Memory / recall  channel=miss  q={query}\n"
+    query_vec = None
+    cache = None
+    if embed_enabled(staging) and query:
+        try:
+            from recall.embed_cache import load_cache
+
+            cache = load_cache() or {}
+        except Exception:
+            cache = {}
+        try:
+            from recall.embed import _encode_texts
+
+            encoded = _encode_texts([query])
+            if encoded and encoded[0]:
+                query_vec = list(encoded[0])
+        except Exception:
+            query_vec = None
+    hits = rank_monthly_guidance(
+        query,
+        staging=staging,
+        limit=k,
+        store=store,
+        query_vec=query_vec,
+        cache=cache,
+        history=history,
+    )
     if hits:
         return format_guidance_hits(hits)
+    if query_vec is not None:
+        return _daily_dp_from_vectors(
+            query,
+            k=k,
+            store=store,
+            query_vec=query_vec,
+            cache=cache or {},
+        )
     allowed = {"decision", "procedure"}
     fts = search_lexical(query, k=k, staging=staging)
     scored: list[tuple[BlockRecord, float]] = []

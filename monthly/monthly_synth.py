@@ -110,7 +110,7 @@ REDUCE_PREFIX = (
     "Do not set id. Code mints mem-YYYY-MM-key-decision-{hash} or "
     "mem-YYYY-MM-key-procedure-{hash} from the sorted evidence ids. Do not invent daily ids. "
     f"why_it_matters and insight are required and at most {NOTE_WORD_CAP} words. "
-    "Cite only ids from the card lines. Do not copy Beginning/Course/Outcome/Obstacle. "
+    "Cite only ids from the card lines. Write trigger and context as the general situation shared by the cited card lines; use the situation column when present. Do not copy dates, file names, or the Beginning/Course/Outcome/Obstacle labels. "
     "summary must be an array of one-line stories (text + weeks); never glue two seeds into one string. "
     "Do not invent obstacles or exceptions. "
     "Inside the tool arguments, user_image.goal_alignment, user_image.decision_preference, "
@@ -174,7 +174,11 @@ def _solution_clause(block) -> str:
 
 
 def _card_dump_line(row: dict[str, Any]) -> str:
-    """One line per card so the reduce call cannot spend tokens on indented group JSON."""
+    """Put the linked event on the card line so the reduce model does not paste a payload clause as the trigger.
+
+    A card with no linked event omits the column. The model would otherwise
+    invent a situation from the entity name or from the solution text.
+    """
     kind = str(row.get("kind") or row.get("type") or "")
     day = str(row.get("date") or row.get("first_seen") or "")
     if row.get("type") == "procedure":
@@ -182,7 +186,11 @@ def _card_dump_line(row: dict[str, Any]) -> str:
     else:
         body = str(row.get("text") or "")
     body = " ".join(body.split())
-    return f"{row.get('id')} | {kind} | {day} | {body}"
+    line = f"{row.get('id')} | {kind} | {day} | {body}"
+    situation = " ".join(str(row.get("situation") or "").split())
+    if situation:
+        line += f" | situation: {situation[:160]}"
+    return line
 
 
 def _same_type_evidence(representative: str, raw: tuple[str, ...], type_ids: set[str]) -> tuple[str, ...]:
@@ -534,7 +542,6 @@ def payload_from_synthesis(
             "occurrence_n": len(evidence),
             "first_seen": min(dates) if dates else "",
             "last_seen": max(dates) if dates else "",
-            "strength": float(row.get("strength") or 0.0),
         }
         decisions.append(
             _group_to_decision(
@@ -574,7 +581,6 @@ def payload_from_synthesis(
             "occurrence_n": len(evidence),
             "first_seen": min(dates) if dates else "",
             "last_seen": max(dates) if dates else "",
-            "strength": float(row.get("strength") or 0.0),
         }
         procedures.append(
             _group_to_procedure(

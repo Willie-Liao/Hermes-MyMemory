@@ -12,7 +12,7 @@ import os
 import re
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 import yaml
 
@@ -89,14 +89,35 @@ def strength_value(
     importance: int = 3,
     now: date | None = None,
     last_recall_at: date | str | None = None,
+    evidence: Sequence[Mapping[str, Any]] = (),
 ) -> float:
-    """Clamp live strength so a missing last_recall_at still decays from first_seen."""
-    b = base_level(
-        recall_n,
-        first_seen,
-        last_recall_at=last_recall_at,
-        now=now,
-    )
+    """Use evidence cards so a month rewrite cannot wipe strength that still lives on those days.
+
+    An empty evidence list keeps the caller's own counter. Python round is not
+    used for importance; the caller passes floor(mean + 0.5).
+    """
+    if evidence:
+        levels = []
+        for card in evidence:
+            n = float(card.get("recall_n") or 0.0)
+            if n <= 0:
+                continue
+            levels.append(
+                base_level(
+                    n,
+                    card.get("first_seen") or card.get("valid_from"),
+                    last_recall_at=card.get("last_recall_at"),
+                    now=now,
+                )
+            )
+        b = max(levels) if levels else 0.0
+    else:
+        b = base_level(
+            recall_n,
+            first_seen,
+            last_recall_at=last_recall_at,
+            now=now,
+        )
     raw = W0 * b + W1 * (int(importance) - 3)
     return max(STRENGTH_MIN, min(STRENGTH_MAX, raw))
 
@@ -193,13 +214,17 @@ def _stamp_month_row(
     staging: Path | None,
     now: date | None,
     credit: float,
+    seen: set[str] | None = None,
+    index: Any = None,
 ) -> dict[str, Any] | None:
-    """Write recall credit onto one key row so monthly guidance decays like a daily card.
+    """Write the row's own counter and leave the same credit on each evidence card.
 
-    Synthesis never fills these fields. A missing file or id returns None so a
-    bad id in the prefetch text cannot abort the turn.
+    A later rewrite can reset the row. The daily cards keep the credit, and the
+    row's stored strength is recomputed from those cards after this stamp.
+    A missing evidence card is skipped so one bad id cannot abort the turn.
     """
     from monthly_writer import dump_yaml, loads, payload_from_dict
+    from .ids import BlockIndex
 
     path = _month_file(staging, month_key)
     if not path.is_file():
@@ -217,13 +242,46 @@ def _stamp_month_row(
             break
     if target is None:
         return None
+    store = index if index is not None else BlockIndex(path.parent.parent)
+    evidence_ids = [str(item).strip() for item in (target.get("evidence") or []) if str(item).strip()]
+    for evidence_id in evidence_ids:
+        stamp_recall_on_card(
+            evidence_id,
+            staging=staging,
+            now=now,
+            credit=1.0,
+            index=store,
+            seen=seen,
+        )
+    cards = []
+    for evidence_id in evidence_ids:
+        rec = store.get(evidence_id)
+        if rec is not None:
+            cards.append(dict(rec.parsed))
     apply_recall(target, now=now, credit=credit)
+    if cards:
+        importance = math.floor(
+            sum(int(card.get("importance") or 3) for card in cards) / len(cards) + 0.5
+        )
+    else:
+        importance = 3
+    target["importance"] = importance
+    target["strength"] = round(
+        strength_value(
+            recall_n=0.0,
+            first_seen=None,
+            importance=importance,
+            now=now,
+            evidence=cards,
+        ),
+        4,
+    )
     try:
         body = dump_yaml(payload_from_dict(data))
         path.write_text(body, encoding="utf-8")
     except (OSError, ValueError):
         return None
-    return {key: target.get(key) for key in OPTIONAL_FIELDS}
+    return {key: target.get(key) for key in (*OPTIONAL_FIELDS, "importance")}
 
 
 def stamp_recall_on_card(
@@ -233,12 +291,15 @@ def stamp_recall_on_card(
     now: date | None = None,
     credit: float = 1.0,
     index: Any = None,
+    seen: set[str] | None = None,
 ) -> dict[str, Any] | None:
     """Persist apply_recall onto the daily card or the monthly key row.
 
     Chat recall used to leave staging unchanged; pytest-only apply_recall never
     flushed. Fail-open: missing card or IO error returns None and does not raise.
     index lets one turn stamp many cards without rescanning daily/*.md each time.
+    seen skips a daily id already credited in this turn, so two monthly rows
+    that cite the same card add 1, not 2.
     """
     from .ids import BlockIndex, _FRONTMATTER_RE
 
@@ -255,7 +316,11 @@ def stamp_recall_on_card(
             staging=staging,
             now=now,
             credit=credit,
+            seen=seen,
+            index=index,
         )
+    if seen is not None and mem_id in seen:
+        return None
 
     store = index if index is not None else BlockIndex(staging)
     rec = store.get(mem_id)
@@ -291,6 +356,8 @@ def stamp_recall_on_card(
         rec.path.write_text("".join(parts), encoding="utf-8")
     except OSError:
         return None
+    if seen is not None:
+        seen.add(mem_id)
     return {key: parsed.get(key) for key in OPTIONAL_FIELDS}
 
 

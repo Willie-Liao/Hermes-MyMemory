@@ -634,6 +634,118 @@ def _embed_cache_staging(tmp_path: Path, monkeypatch, body: str = "Casey uses a 
     monkeypatch.setattr(embed_cache, "_embed_cache_tz", lambda: SHANGHAI)
 
 
+def _legacy_split_blocks(content: str) -> list[dict]:
+    """The retired ``\\n---\\n`` scanner, kept only as an oracle for hash stability."""
+    import yaml
+
+    sections = content.split("\n---\n")
+    blocks = []
+    i = 0
+    while i < len(sections):
+        sec = sections[i].strip()
+        if not sec.startswith("id:"):
+            i += 1
+            continue
+        body = ""
+        if i + 1 < len(sections):
+            nxt = sections[i + 1].strip()
+            if nxt and not nxt.startswith("id:") and not nxt.startswith("type:"):
+                body = nxt
+                i += 2
+            else:
+                i += 1
+        else:
+            i += 1
+        parsed = yaml.safe_load(sec)
+        blocks.append({
+            "id": str(parsed.get("id", "")).strip(),
+            "type": str(parsed.get("type", "")).strip(),
+            "entity": str(parsed.get("entity", "")).strip(),
+            "predicate": str(parsed.get("predicate", "")).strip(),
+            "body": body.strip()[:500],
+        })
+    return blocks
+
+
+def test_scan_all_blocks_keeps_first_card_when_file_opens_with_fence(tmp_path, monkeypatch):
+    from recall import embed_cache
+
+    staging = tmp_path / "staging"
+    daily = staging / "daily"
+    daily.mkdir(parents=True)
+    (daily / "2026-08-16.md").write_text(
+        "---\n"
+        "id: mem-first\n"
+        "type: event\n"
+        "entity: Casey\n"
+        "predicate: opened\n"
+        "---\n"
+        "First card body.\n"
+        "\n"
+        "---\n"
+        "id: mem-second\n"
+        "type: decision\n"
+        "entity: Casey\n"
+        "predicate: chose\n"
+        "---\n"
+        "Second card body.\n"
+        "\n"
+        "---\n"
+        "id: mem-third\n"
+        "type: procedure\n"
+        "entity: Casey\n"
+        "predicate: steps\n"
+        "---\n"
+        "Third card body.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(embed_cache, "_staging_root", lambda: staging)
+    found = embed_cache.scan_all_blocks()
+    assert list(found) == ["mem-first", "mem-second", "mem-third"]
+    assert found["mem-first"]["body"] == "First card body."
+    assert found["mem-first"]["type"] == "event"
+
+
+def test_parse_blocks_matches_legacy_split_when_file_has_no_opening_fence(tmp_path, monkeypatch):
+    from recall import embed_cache
+
+    staging = tmp_path / "staging"
+    daily = staging / "daily"
+    daily.mkdir(parents=True)
+    content = (
+        "id: mem-a\n"
+        "type: fact\n"
+        "entity: Casey\n"
+        "predicate: notebook\n"
+        "confidence: high\n"
+        "status: candidate\n"
+        "related: []\n"
+        "---\n"
+        "Casey uses a blue notebook.\n"
+        "\n"
+        "---\n"
+        "id: mem-b\n"
+        "type: decision\n"
+        "entity: Hermes\n"
+        "predicate: ship\n"
+        "confidence: high\n"
+        "status: active\n"
+        "related:\n"
+        "  - mem-a\n"
+        "---\n"
+        "Ship the notebook change.\n"
+    )
+    path = daily / "2026-08-16.md"
+    path.write_text(content, encoding="utf-8")
+    monkeypatch.setattr(embed_cache, "_staging_root", lambda: staging)
+    new = embed_cache._parse_blocks_from_file(path)
+    old = _legacy_split_blocks(content)
+    assert [b["id"] for b in new] == [b["id"] for b in old]
+    for got, expect in zip(new, old):
+        for key in ("id", "type", "entity", "predicate", "body"):
+            assert got[key] == expect[key]
+
+
 def test_embed_cache_reembeds_on_hash_change(tmp_path, monkeypatch):
     from recall import embed_cache
 
@@ -972,6 +1084,7 @@ def test_daily_guidance_tops_up_the_short_kind(tmp_path, monkeypatch):
     _dp_card(tmp_path, extra, "procedure")
     _guidance_rows(monkeypatch, rows)
     monkeypatch.setattr("recall.tools.embed_enabled", lambda *_a, **_k: True)
+    monkeypatch.setattr("recall.embed._encode_texts", lambda texts: [])
     monkeypatch.setattr("recall.tools.rerank_embed", lambda *_a, **_k: extra)
     text = recall_memory("need both kinds", staging=tmp_path, mode="guidance")
     assert text.count("  procedure  ") == 2
@@ -994,6 +1107,7 @@ def test_daily_guidance_asks_again_when_rerank_returns_one_card(tmp_path, monkey
     _dp_card(tmp_path, second, "decision")
     _guidance_rows(monkeypatch, rows)
     monkeypatch.setattr("recall.tools.embed_enabled", lambda *_a, **_k: True)
+    monkeypatch.setattr("recall.embed._encode_texts", lambda texts: [])
     pending = [first, second]
 
     def _one(*_a, **_k):
@@ -1019,6 +1133,146 @@ def test_daily_guidance_rank_uses_live_strength(tmp_path, monkeypatch):
     )
     text = recall_memory("same score", staging=tmp_path, mode="guidance")
     assert text.index(fresh) < text.index(stale)
+
+
+def _unit_vec(cosine: float) -> list[float]:
+    import math
+
+    c = max(-1.0, min(1.0, cosine))
+    return [c, math.sqrt(max(0.0, 1.0 - c * c))]
+
+
+def test_daily_guidance_event_lifts_a_card_the_text_misses(tmp_path, monkeypatch):
+    near = "mem-2026-08-02-procedure-000000000001"
+    far = "mem-2026-08-02-procedure-000000000002"
+    filler = "mem-2026-08-02-procedure-000000000004"
+    event = "mem-2026-08-09-event-000000000003"
+    _dp_card(tmp_path, near, "procedure")
+    _dp_card(tmp_path, far, "procedure")
+    _dp_card(tmp_path, filler, "procedure")
+    (tmp_path / "daily" / "2026-08-09.md").write_text(
+        _block(
+            mem_id=event,
+            type_="event",
+            entity="Guide",
+            body="Beginning: the weekly file went out.",
+            related=near,
+        ),
+        encoding="utf-8",
+    )
+    cache = {
+        near: {"embedding": [0.0, 1.0]},
+        far: {"embedding": [0.0, 1.0]},
+        filler: {"embedding": [1.0, 0.0]},
+        event: {"embedding": [1.0, 0.0]},
+    }
+    calls: list[list[str]] = []
+
+    def _encode(texts):
+        calls.append(list(texts))
+        return [[1.0, 0.0]]
+
+    def _boom(*_a, **_k):
+        raise AssertionError("vector path must not search by keyword")
+
+    monkeypatch.setattr("recall.tools.embed_enabled", lambda *_a, **_k: True)
+    monkeypatch.setattr("recall.embed._encode_texts", _encode)
+    monkeypatch.setattr("recall.embed_cache.load_cache", lambda: cache)
+    monkeypatch.setattr("recall.tools.search_lexical", _boom)
+    monkeypatch.setattr("recall.tools.rerank_embed", _boom)
+    query = "zzzz event situation"
+    text = recall_memory(query, staging=tmp_path, mode="guidance")
+    assert "channel=daily_dp" in text
+    assert near in text
+    assert far not in text
+    assert event not in text
+    assert calls == [[query]]
+
+
+def test_daily_guidance_shared_event_orders_by_card_score(tmp_path, monkeypatch):
+    closer = "mem-2026-08-02-procedure-000000000011"
+    farther = "mem-2026-08-02-procedure-000000000012"
+    event = "mem-2026-08-09-event-000000000013"
+    _dp_card(tmp_path, closer, "procedure")
+    _dp_card(tmp_path, farther, "procedure")
+    (tmp_path / "daily" / "2026-08-09.md").write_text(
+        _block(
+            mem_id=event,
+            type_="event",
+            entity="Guide",
+            body="Beginning: both procedures share this episode.",
+            extra=f"related: [{closer}, {farther}]\n",
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("recall.tools.embed_enabled", lambda *_a, **_k: True)
+    monkeypatch.setattr("recall.embed._encode_texts", lambda texts: [[1.0, 0.0]])
+    monkeypatch.setattr(
+        "recall.embed_cache.load_cache",
+        lambda: {
+            closer: {"embedding": _unit_vec(0.50)},
+            farther: {"embedding": _unit_vec(0.20)},
+            event: {"embedding": [1.0, 0.0]},
+        },
+    )
+    text = recall_memory("zzzz event situation", staging=tmp_path, mode="guidance")
+    assert text.index(closer) < text.index(farther)
+
+
+def test_daily_guidance_keeps_card_when_only_the_event_clears_the_floor(tmp_path, monkeypatch):
+    lifted = "mem-2026-08-02-procedure-000000000021"
+    plain = "mem-2026-08-02-procedure-000000000022"
+    filler = "mem-2026-08-02-procedure-000000000024"
+    event = "mem-2026-08-09-event-000000000023"
+    _dp_card(tmp_path, lifted, "procedure")
+    _dp_card(tmp_path, plain, "procedure")
+    _dp_card(tmp_path, filler, "procedure")
+    (tmp_path / "daily" / "2026-08-09.md").write_text(
+        _block(
+            mem_id=event,
+            type_="event",
+            entity="Guide",
+            body="Beginning: only one procedure is named.",
+            related=lifted,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("recall.tools.embed_enabled", lambda *_a, **_k: True)
+    monkeypatch.setattr("recall.embed._encode_texts", lambda texts: [[1.0, 0.0]])
+    monkeypatch.setattr(
+        "recall.embed_cache.load_cache",
+        lambda: {
+            lifted: {"embedding": _unit_vec(0.20)},
+            plain: {"embedding": _unit_vec(0.20)},
+            filler: {"embedding": [1.0, 0.0]},
+            event: {"embedding": [1.0, 0.0]},
+        },
+    )
+    text = recall_memory("zzzz event situation", staging=tmp_path, mode="guidance")
+    assert lifted in text
+    assert plain not in text
+
+
+def test_daily_guidance_without_a_vector_stays_on_keywords(tmp_path, monkeypatch):
+    mid = "mem-2026-08-06-decision-000000000031"
+    _dp_card(tmp_path, mid, "decision")
+    seen: list[str] = []
+
+    def _lexical(*_a, **_k):
+        seen.append("lexical")
+        return [{"id": mid, "bm25": -1.0}]
+
+    def _rerank(*_a, **_k):
+        seen.append("rerank")
+        return ""
+
+    monkeypatch.setattr("monthly_actions.rank_monthly_guidance", lambda *_a, **_k: [])
+    monkeypatch.setattr("recall.tools.embed_enabled", lambda *_a, **_k: False)
+    monkeypatch.setattr("recall.tools.search_lexical", _lexical)
+    monkeypatch.setattr("recall.tools.rerank_embed", _rerank)
+    text = recall_memory("balance the kinds", staging=tmp_path, mode="guidance")
+    assert mid in text
+    assert seen == ["lexical"]
 
 
 def test_daily_guidance_full_miss(tmp_path, monkeypatch):
@@ -1088,4 +1342,19 @@ def test_recall_credits_every_hit_and_partial_neighbors(tmp_path, monkeypatch):
     assert abs(float(neighbor_row["recall_n"]) - 1.25) < 1e-9
     assert str(neighbor_row["last_recall_at"])[:10] == "2020-01-01"
     assert "recall_n" not in store.get(two_hop).parsed
+
+
+def test_ack_guidance_returns_miss_without_encoding(tmp_path, monkeypatch):
+    """An acknowledgment must not encode, or a nod would inject whatever card is nearest."""
+    calls: list = []
+    monkeypatch.setattr(
+        "recall.embed._encode_texts",
+        lambda texts: calls.append(list(texts)) or [[1.0, 0.0]],
+    )
+    monkeypatch.setattr("recall.embed.embed_enabled", lambda staging=None: True)
+    from recall.tools import recall_memory
+
+    text = recall_memory("哈哈", staging=tmp_path, mode="guidance")
+    assert "channel=miss" in text
+    assert calls == []
 

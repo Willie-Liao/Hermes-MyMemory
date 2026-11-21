@@ -14,6 +14,7 @@ import os
 import sys
 import threading
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -76,6 +77,7 @@ class MyMemoryProvider(MemoryProvider):
         self._guidance_pending: dict[str, set[str]] = {}
         self._guidance_stamped: dict[str, set[str]] = {}
         self._stamp_thread: threading.Thread | None = None
+        self._user_turns: dict[str, deque[tuple[float, str]]] = {}
 
     @property
     def name(self) -> str:
@@ -116,6 +118,72 @@ class MyMemoryProvider(MemoryProvider):
     def system_prompt_block(self) -> str:
         """Cache-stable instructions only — daily file names would bust the prefix cache."""
         return _SYSTEM_PROMPT_BLOCK
+
+    def _guidance_limits(self):
+        """Load the pile constants from monthly_actions without importing it at module load.
+
+        monthly_actions pulls the month writer. Importing it here would cycle
+        through digest while the provider package is still loading.
+        """
+        mdir = Path(__file__).resolve().parent / "monthly"
+        if str(mdir) not in sys.path:
+            sys.path.insert(0, str(mdir))
+        from monthly_actions import _ACK_RE, _PILE_SHORT_CHARS
+
+        return _ACK_RE, _PILE_SHORT_CHARS
+
+    def _history_for(self, sid: str, query: str) -> list[tuple[float, str]]:
+        """Earlier user lines, newest first, so a short follow-up can see what it refers to.
+
+        The buffer is seeded once, and only for a short line, because a long line
+        already carries its own situation and a gateway restart would otherwise
+        reread state.db on every turn.
+        """
+        ack_re, short = self._guidance_limits()
+        if not sid or not query or ack_re.fullmatch(query):
+            buf = self._user_turns.get(sid)
+            return list(reversed(buf)) if buf else []
+        if sid not in self._user_turns and len(query) <= short:
+            self._user_turns[sid] = self._seed_turns(sid, query)
+        buf = self._user_turns.get(sid)
+        return list(reversed(buf)) if buf else []
+
+    def _seed_turns(self, sid: str, query: str) -> deque[tuple[float, str]]:
+        """Fill an empty buffer from active user rows so a restart still sees the prior lines.
+
+        The newest row is dropped when it is this line, and acknowledgments are
+        skipped, so the pile does not score the line twice or pile "好的".
+        """
+        from digest.digest import _fetch_messages
+        from digest.digest_run import _as_unix
+
+        ack_re, _short = self._guidance_limits()
+        buf: deque[tuple[float, str]] = deque(maxlen=5)
+        rows = [row for row in _fetch_messages(sid) if row.get("role") == "user"]
+        if rows and str(rows[-1].get("content") or "").strip() == query:
+            rows = rows[:-1]
+        for row in rows:
+            text = str(row.get("content") or "").strip()
+            if not text or ack_re.fullmatch(text):
+                continue
+            stamp = _as_unix(row.get("timestamp"))
+            if stamp is None:
+                continue
+            buf.append((float(stamp), text))
+        return buf
+
+    def _record_turn(self, sid: str, query: str) -> None:
+        """Remember this line unless it is an acknowledgment.
+
+        Recording "哈哈" would make the next short question pile a line that
+        carries no situation.
+        """
+        if not sid or not query:
+            return
+        ack_re, _short = self._guidance_limits()
+        if ack_re.fullmatch(query):
+            return
+        self._user_turns.setdefault(sid, deque(maxlen=5)).append((time.time(), query))
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Compose Bands A–C plus weekly inject when those hooks would fire.
@@ -160,10 +228,11 @@ class MyMemoryProvider(MemoryProvider):
 
         # Stage 3: recall_memory
         t0_recall = time.perf_counter()
+        history = self._history_for(sid, q)
         if q and not _MEM_ID_RE.search(q):
             try:
                 root = Path(digest.get_hermes_home()) / "memories" / "staging"
-                guided = recall_memory(q, staging=root, mode="guidance")
+                guided = recall_memory(q, staging=root, mode="guidance", history=history)
                 head = (guided or "").split("\n", 1)[0]
                 if guided.strip() and "channel=miss" not in head:
                     parts.append(guided.strip())
@@ -172,6 +241,7 @@ class MyMemoryProvider(MemoryProvider):
                     )
             except Exception:
                 guided = None
+        self._record_turn(sid, q)
         t_recall = time.perf_counter() - t0_recall
 
         joined = "\n\n".join(parts)
@@ -254,9 +324,10 @@ class MyMemoryProvider(MemoryProvider):
             def _stamp(ids: list[str] = fresh) -> None:
                 from recall.strength import stamp_recall_on_card
 
+                seen: set[str] = set()
                 for mem_id in ids:
                     try:
-                        stamp_recall_on_card(mem_id, credit=1.0)
+                        stamp_recall_on_card(mem_id, credit=1.0, seen=seen)
                     except Exception:
                         continue
 
@@ -283,6 +354,7 @@ class MyMemoryProvider(MemoryProvider):
         }
         self._guidance_pending.pop(self._session_id, None)
         self._guidance_stamped.pop(self._session_id, None)
+        self._user_turns.pop(self._session_id, None)
         digest.on_session_boundary(ctx, reason="on_session_finalize")
         weekly.run_async("on_session_finalize")
         retention.run_async("on_session_finalize")
@@ -296,9 +368,25 @@ class MyMemoryProvider(MemoryProvider):
         rewound: bool = False,
         **kwargs,
     ) -> None:
-        """Keep provider session id in sync and re-arm weekly/retention like the old hooks."""
-        del parent_session_id, rewound, kwargs
-        self._session_id = str(new_session_id or "")
+        """Keep provider session id in sync and re-arm weekly/retention like the old hooks.
+
+        A reset or rewind drops the turn buffer so the next short line reseeds
+        from active rows. A compression switch keeps the parent's lines under
+        the new id; dropping them would make the follow-up look like a new chat.
+        """
+        del kwargs
+        new_id = str(new_session_id or "")
+        parent = str(parent_session_id or "")
+        if reset or rewound:
+            self._user_turns.pop(new_id, None)
+            self._user_turns.pop(self._session_id, None)
+            if parent:
+                self._user_turns.pop(parent, None)
+        elif parent:
+            moved = self._user_turns.pop(parent, None)
+            if moved is not None:
+                self._user_turns[new_id] = moved
+        self._session_id = new_id
         self._prefetch_seen.discard(self._session_id)
         if self._agent_context in _SKIP_WRITE_CONTEXTS:
             return

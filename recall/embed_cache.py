@@ -120,58 +120,48 @@ def _load_meta() -> dict[str, Any]:
         return {}
 
 
+def _text_for_frontmatter(content: str) -> str:
+    """Give a missing opening fence so files the old split already hashed stay stable.
+
+    Daily files that begin with ``id:`` have no leading ``---``. Prepending one
+    lets the same fence matcher read them without changing their field text.
+    """
+    text = content.lstrip("\ufeff")
+    if text.lstrip().startswith("---"):
+        return text.lstrip()
+    return "---\n" + text.lstrip()
+
+
 def _parse_blocks_from_file(path: Path) -> list[dict[str, Any]]:
-    """Parse all blocks from a staging .md file."""
+    """Parse every fenced card, including the first block of a file that opens with ---.
+
+    A split on ``\\n---\\n`` left that opening fence glued to ``id:``, so the
+    section failed the ``id:`` prefix check and the card never got a vector.
+    """
     try:
         content = path.read_text(encoding="utf-8")
     except OSError:
         return []
-    
-    blocks = []
-    # Split by --- separators
-    sections = content.split("\n---\n")
-    i = 0
-    while i < len(sections):
-        sec = sections[i].strip()
-        if sec.startswith("id:"):
-            # This is frontmatter; body is next section if it doesn't start with id:
-            body = ""
-            if i + 1 < len(sections):
-                nxt = sections[i + 1].strip()
-                if nxt and not nxt.startswith("id:") and not nxt.startswith("type:"):
-                    body = nxt
-                    i += 2
-                else:
-                    i += 1
-            else:
-                i += 1
-            
-            # Parse YAML frontmatter
-            try:
-                import yaml
-                parsed = yaml.safe_load(sec)
-            except Exception:
-                continue
-            if not isinstance(parsed, dict):
-                continue
-            
-            block_id = str(parsed.get("id", "")).strip()
-            if not block_id:
-                continue
-            
-            blocks.append({
-                "id": block_id,
-                "type": str(parsed.get("type", "")).strip(),
-                "entity": str(parsed.get("entity", "")).strip(),
-                "predicate": str(parsed.get("predicate", "")).strip(),
-                "confidence": str(parsed.get("confidence", "")).strip(),
-                "status": str(parsed.get("status", "")).strip(),
-                "related": parsed.get("related", []),
-                "body": body.strip()[:500],
-                "source_file": str(path.relative_to(_staging_root())),
-            })
-        else:
-            i += 1
+
+    from recall.ids import iter_frontmatter_blocks
+
+    blocks: list[dict[str, Any]] = []
+    source_file = str(path.relative_to(_staging_root()))
+    for parsed, body in iter_frontmatter_blocks(_text_for_frontmatter(content)):
+        block_id = str(parsed.get("id", "")).strip()
+        if not block_id:
+            continue
+        blocks.append({
+            "id": block_id,
+            "type": str(parsed.get("type", "")).strip(),
+            "entity": str(parsed.get("entity", "")).strip(),
+            "predicate": str(parsed.get("predicate", "")).strip(),
+            "confidence": str(parsed.get("confidence", "")).strip(),
+            "status": str(parsed.get("status", "")).strip(),
+            "related": parsed.get("related", []),
+            "body": body.strip()[:500],
+            "source_file": source_file,
+        })
     return blocks
 
 

@@ -467,6 +467,8 @@ def _cluster_same_type(
 ) -> list[dict[str, Any]]:
     """One group per card so a loose centroid cannot join a month of same-type sentences into one obstacle list.
 
+    situation is the linked event text only. The entity fallback stays on context
+    and trigger, so a name is not written into the situation column.
     Same-rule repeats are chosen later by the reduce call. Strength stays on the live-recall path.
     """
     if not blocks:
@@ -500,6 +502,7 @@ def _cluster_same_type(
             "date": rep.valid_from,
             "valid_to": rep.valid_to,
             "weeks": (rep.week_key,) if rep.week_key else (),
+            "situation": inverse,
         }
         if group_type == "decision":
             text = clause_body(rep.clause)

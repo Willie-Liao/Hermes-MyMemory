@@ -166,10 +166,10 @@ class MonthlyProgress:
 class MonthlyDecision:
     """Hold the month's synthesized ruling so guidance does not retrieve one sitting's clause.
 
+    strength and importance are copied from the evidence cards, so a new id does
+    not wipe them. recall_n counts only this row's own recalls and may reset.
     Context and exceptions exist so recall can match *when* the preference applies
     instead of retrieving a standing rule for every chat turn.
-    recall_n and last_recall_at stay empty at synthesis so only a real recall
-    can raise strength; a month rebuild must not wipe that history.
     """
 
     id: str
@@ -187,6 +187,7 @@ class MonthlyDecision:
     first_seen: str = ""
     last_seen: str = ""
     strength: float = 0.0
+    importance: int = 3
     recall_n: float = 0.0
     last_recall_at: str = ""
 
@@ -195,13 +196,15 @@ class MonthlyDecision:
         _require_evidence(self.why_it_matters, self.evidence, "key_decisions")
 
     def lookup_text(self) -> str:
-        """Join applicability fields so guidance ranking does not search verbatim rulings alone."""
+        """Leave exceptions and why_it_matters out so those payload words cannot dilute the situation vector.
+
+        Entity, context, and the ruling are the index. The cited days are
+        matched through the event view, not by stuffing the exception text here.
+        """
         parts = [
             " ".join(self.entity_keys),
             self.context,
             self.text,
-            self.exceptions,
-            self.why_it_matters,
         ]
         return " ".join(p for p in parts if str(p).strip())
 
@@ -210,9 +213,9 @@ class MonthlyDecision:
 class MonthlyProcedure:
     """Store the reusable Solution: plus trigger/obstacles so recall can match a task, not a dump.
 
+    strength and importance are copied from the evidence cards, so a new id does
+    not wipe them. recall_n counts only this row's own recalls and may reset.
     Obstacle clauses stay mechanical so the model cannot invent a failure the daily cards never named.
-    recall_n and last_recall_at stay empty at synthesis so only a real recall
-    can raise strength; a month rebuild must not wipe that history.
     """
 
     id: str
@@ -228,6 +231,7 @@ class MonthlyProcedure:
     first_seen: str = ""
     last_seen: str = ""
     strength: float = 0.0
+    importance: int = 3
     recall_n: float = 0.0
     last_recall_at: str = ""
 
@@ -236,15 +240,13 @@ class MonthlyProcedure:
         _require_evidence(self.problem or self.insight, self.evidence, "key_procedures")
 
     def lookup_text(self) -> str:
-        """Join trigger/problem/obstacles/solution so a paraphrased task can hit the case."""
-        parts = [
-            " ".join(self.entity_keys),
-            self.trigger,
-            self.problem,
-            " ".join(self.obstacles),
-            self.solution,
-            self.insight,
-        ]
+        """Leave obstacles, solution, and insight out so the fix cannot dilute the situation vector.
+
+        Entity plus trigger is the index. Problem is used only when trigger is
+        blank, so an older row still has a situation to embed.
+        """
+        situation = str(self.trigger or "").strip() or str(self.problem or "").strip()
+        parts = [" ".join(self.entity_keys), situation]
         return " ".join(p for p in parts if str(p).strip())
 
 
@@ -520,6 +522,7 @@ def payload_to_dict(payload: MonthlyPayload) -> dict[str, Any]:
                 "first_seen": row.first_seen,
                 "last_seen": row.last_seen,
                 "strength": row.strength,
+                "importance": row.importance,
                 "recall_n": row.recall_n,
                 "last_recall_at": row.last_recall_at,
             }
@@ -540,6 +543,7 @@ def payload_to_dict(payload: MonthlyPayload) -> dict[str, Any]:
                 "first_seen": row.first_seen,
                 "last_seen": row.last_seen,
                 "strength": row.strength,
+                "importance": row.importance,
                 "recall_n": row.recall_n,
                 "last_recall_at": row.last_recall_at,
             }

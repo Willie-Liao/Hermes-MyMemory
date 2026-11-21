@@ -41,6 +41,20 @@ from worker_llm import format_token_line, sum_usage_after, usage_ledger_offset  
 
 _MONTH_KEY_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 _GUIDANCE_GATE = 0.92
+_GUIDANCE_EVENT_BETA = 0.95
+_GUIDANCE_EVENT_CAP = 5
+_ACK_RE = re.compile(
+    r"^(?:(?:哈|嗯|好|行|谢)+|可以|收到|了解|明白|ok|okay|thanks|thank you|got it|lol)"
+    r"[!！.。,，~～…\s]*$",
+    re.IGNORECASE,
+)
+_PILE_SHORT_CHARS = 24
+_PILE_FLOOR = 0.85
+_PILE_MARGIN = 0.10
+_PILE_EPS_BITS = 0.15
+_PILE_GAP_S = 600
+_PILE_MAX_TURNS = 6
+_PILE_TAU = 0.03
 _GUIDANCE_KIND_SHARE = 6
 _GUIDANCE_KIND_FLOOR = 2
 _GUIDANCE_TIE_EPS = 0.01
@@ -212,35 +226,54 @@ def generate_month(
     else:
         _save_resume(key, resume_body)
         outcome = "partial"
-    if previous is not None:
-        from recall.strength import strength_value
+    from recall.ids import BlockIndex
+    from recall.strength import strength_value
 
-        prev_d = {row.id: row for row in previous.key_decisions}
-        prev_p = {row.id: row for row in previous.key_procedures}
+    evidence_store = BlockIndex(monthly_staging_dir().parent)
 
-        def _kept(row, prev_rows):
-            old = prev_rows.get(row.id)
-            if old is None:
-                return row
-            seen = old.first_seen or row.first_seen
-            return replace(
-                row,
-                recall_n=old.recall_n,
-                last_recall_at=old.last_recall_at,
-                first_seen=seen,
-                strength=strength_value(
-                    recall_n=old.recall_n,
-                    first_seen=seen,
-                    last_recall_at=old.last_recall_at or None,
-                    importance=3,
-                ),
+    def _from_evidence(row):
+        cards = []
+        for evidence_id in getattr(row, "evidence", ()) or ():
+            rec = evidence_store.get(str(evidence_id))
+            if rec is not None:
+                cards.append(dict(rec.parsed))
+        if cards:
+            importance = math.floor(
+                sum(int(card.get("importance") or 3) for card in cards) / len(cards) + 0.5
             )
-
-        payload = replace(
-            payload,
-            key_decisions=tuple(_kept(row, prev_d) for row in payload.key_decisions),
-            key_procedures=tuple(_kept(row, prev_p) for row in payload.key_procedures),
+        else:
+            importance = 3
+        return replace(
+            row,
+            importance=importance,
+            strength=strength_value(
+                recall_n=0.0,
+                first_seen=None,
+                importance=importance,
+                evidence=cards,
+            ),
         )
+
+    prev_d = {row.id: row for row in previous.key_decisions} if previous is not None else {}
+    prev_p = {row.id: row for row in previous.key_procedures} if previous is not None else {}
+
+    def _kept(row, prev_rows):
+        filled = _from_evidence(row)
+        old = prev_rows.get(row.id)
+        if old is None:
+            return filled
+        return replace(
+            filled,
+            recall_n=old.recall_n,
+            last_recall_at=old.last_recall_at,
+            first_seen=old.first_seen or filled.first_seen,
+        )
+
+    payload = replace(
+        payload,
+        key_decisions=tuple(_kept(row, prev_d) for row in payload.key_decisions),
+        key_procedures=tuple(_kept(row, prev_p) for row in payload.key_procedures),
+    )
     path = write_month(payload)
     return {
         "outcome": outcome,
@@ -309,8 +342,7 @@ def _guidance_sim(
     """Prefer lexical overlap so an exact English match never waits on ONNX.
 
     Cosine uses vectors the caller already loaded. A missing vector stays lexical
-    so prefetch does not encode one candidate at a time. The 0.92 gate is monthly
-    guidance only; situation questions about a stored preference land near 0.91.
+    so prefetch does not encode one candidate at a time.
     """
     lexical = _lexical_sim(query, candidate)
     if lexical >= _GUIDANCE_GATE:
@@ -330,14 +362,26 @@ def rank_monthly_guidance(
     *,
     staging: Path | None = None,
     limit: int = 8,
+    store=None,
+    scores_out: list[dict[str, Any]] | None = None,
+    query_vec: Sequence[float] | None = None,
+    cache: dict[str, Any] | None = None,
+    history: Sequence[tuple[float, str]] = (),
+    now: float | None = None,
 ) -> list[dict[str, Any]]:
     """Rank active monthly D/P for a task-shaped query so prefetch does not scan daily events first.
 
     Decisions that merely pass the gate must not fill the block and hide a procedure
     for this message. Each kind keeps up to half the slots, and a kind with fewer
     than two passing rows is topped up from below the gate so it is not absent.
-    Live strength, not the stored snapshot, breaks near-ties as a row ages.
-    A row missing from embed-cache.json is scored lexically until the next 01:00 fill.
+    A linked event can lift a row whose own index text does not sound like the query.
+    The event is scored, never injected. Rows lifted by the same event stay ordered
+    by their own index score. Live strength, not the stored snapshot, breaks near-ties
+    as a row ages. A row missing from embed-cache.json is scored lexically until the
+    next 01:00 fill. A short line that misses is re-scored with earlier lines piled
+    on, and stops when the top card is clear, the entropy stalls, the time gap is
+    too wide, or six lines are already in the pile. The daily fallback still sees
+    only the latest line.
     """
     q = str(query or "").strip()
     if not q:
@@ -356,12 +400,15 @@ def rank_monthly_guidance(
     except Exception:
         load_cache = None
         scale_block_id = None
-    cache: dict[str, Any] = {}
-    if load_cache is not None:
-        try:
-            cache = load_cache()
-        except Exception:
-            cache = {}
+    if cache is None:
+        resolved_cache: dict[str, Any] = {}
+        if load_cache is not None:
+            try:
+                resolved_cache = load_cache()
+            except Exception:
+                resolved_cache = {}
+    else:
+        resolved_cache = cache
     vectors: list[list[float] | None] = []
     need_query = False
     for _kind, payload, row, text in pending:
@@ -376,32 +423,99 @@ def rank_monthly_guidance(
                     "month_key": str(getattr(payload, "key", "") or "").strip(),
                 }
             )
-            raw = (cache.get(bid) or {}).get("embedding") or []
+            raw = (resolved_cache.get(bid) or {}).get("embedding") or []
             if raw:
                 vec = list(raw)
                 need_query = True
         vectors.append(vec)
-    query_vec: list[float] | None = None
-    if need_query:
+    targets: dict[str, list[str]] = {}
+    if store is not None:
+        from recall.tools import _capped_linked_events
+
+        for _kind, _payload, row, _text in pending:
+            targets[str(row.id)] = [
+                str(item) for item in (getattr(row, "evidence", ()) or ()) if str(item).strip()
+            ]
+        capped = _capped_linked_events(targets, store, cap=_GUIDANCE_EVENT_CAP)
+        for recs in capped.values():
+            for rec in recs:
+                raw = (resolved_cache.get(rec.block_id) or {}).get("embedding") or []
+                if raw:
+                    need_query = True
+                    break
+            if need_query:
+                break
+    supplied_query = query_vec is not None
+    resolved_query: list[float] | None = list(query_vec) if supplied_query else None
+    if not supplied_query and need_query:
         try:
             from recall.embed import _encode_texts
 
             encoded = _encode_texts([q])
             if encoded and encoded[0]:
-                query_vec = encoded[0]
+                resolved_query = list(encoded[0])
         except Exception:
-            query_vec = None
+            resolved_query = None
+    evt_scores: dict[str, float] = {}
+    if store is not None and resolved_query:
+        from recall.tools import linked_event_scores
+
+        evt_scores = linked_event_scores(
+            resolved_query,
+            targets,
+            store,
+            cap=_GUIDANCE_EVENT_CAP,
+            cache=resolved_cache,
+        )
     from recall.strength import strength_value
+
+    try:
+        from recall.ids import BlockIndex
+
+        evidence_index = store if store is not None else BlockIndex(_month_folder(staging).parent)
+    except Exception:
+        evidence_index = None
+
+    def _cards_for(row) -> tuple[list[dict[str, Any]], int]:
+        cards: list[dict[str, Any]] = []
+        if evidence_index is not None:
+            for evidence_id in getattr(row, "evidence", ()) or ():
+                rec = evidence_index.get(str(evidence_id))
+                if rec is not None:
+                    cards.append(dict(rec.parsed))
+        if cards:
+            importance = math.floor(
+                sum(int(card.get("importance") or 3) for card in cards) / len(cards) + 0.5
+            )
+        else:
+            importance = 3
+        return cards, importance
 
     passed: list[dict[str, Any]] = []
     below: dict[str, list[dict[str, Any]]] = {"decision": [], "procedure": []}
+    all_sims: list[float] = []
     for (kind, payload, row, text), cand_vec in zip(pending, vectors):
-        sim = _guidance_sim(q, text, query_vec, cand_vec)
+        s_trig = _guidance_sim(q, text, resolved_query, cand_vec)
+        s_evt = float(evt_scores.get(str(row.id), 0.0) or 0.0)
+        lifted = _GUIDANCE_EVENT_BETA * s_evt
+        sim = max(s_trig, lifted)
+        all_sims.append(sim)
+        if scores_out is not None:
+            scores_out.append(
+                {
+                    "id": str(row.id),
+                    "kind": kind,
+                    "s_trig": s_trig,
+                    "s_evt": s_evt,
+                    "sim": sim,
+                }
+            )
+        cards, importance = _cards_for(row)
         live = strength_value(
-            recall_n=float(getattr(row, "recall_n", 0.0) or 0.0),
-            first_seen=getattr(row, "first_seen", None),
-            last_recall_at=getattr(row, "last_recall_at", None) or None,
-            importance=3,
+            recall_n=0.0,
+            first_seen=None,
+            importance=importance,
+            evidence=cards,
         )
         year_s, _, mon_s = str(payload.key).partition("-")
         try:
@@ -412,9 +526,14 @@ def rank_monthly_guidance(
             "kind": kind,
             "month": payload.key,
             "sim": sim,
+            "s_trig": s_trig,
+            "s_evt": s_evt,
+            "via": "event" if lifted > s_trig else "index",
             "rank": 0.8 * sim + 0.2 * (live / 10.0),
             "overlap": _lexical_sim(q, text),
             "row": row,
+            "live": live,
+            "importance": importance,
             "topup": False,
             "spill": False,
             "_year": year_n,
@@ -424,6 +543,99 @@ def rank_monthly_guidance(
             passed.append(hit)
         else:
             below[kind].append(hit)
+
+    def _rescore(qtext: str, qvec: list[float] | None) -> list[tuple]:
+        evt: dict[str, float] = {}
+        if store is not None and qvec:
+            from recall.tools import linked_event_scores
+
+            evt = linked_event_scores(
+                qvec,
+                targets,
+                store,
+                cap=_GUIDANCE_EVENT_CAP,
+                cache=resolved_cache,
+            )
+        scored: list[tuple] = []
+        for (kind, payload, row, text), cand_vec in zip(pending, vectors):
+            s_trig = _guidance_sim(qtext, text, qvec, cand_vec)
+            s_evt = float(evt.get(str(row.id), 0.0) or 0.0)
+            lifted = _GUIDANCE_EVENT_BETA * s_evt
+            sim = max(s_trig, lifted)
+            scored.append((sim, s_trig, s_evt, lifted, kind, payload, row, text))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return scored
+
+    def _as_hit(parts: tuple, *, turns: int, piled: str) -> dict[str, Any]:
+        sim, s_trig, s_evt, lifted, kind, payload, row, text = parts
+        cards, importance = _cards_for(row)
+        live = strength_value(
+            recall_n=0.0,
+            first_seen=None,
+            importance=importance,
+            evidence=cards,
+        )
+        return {
+            "kind": kind,
+            "month": payload.key,
+            "sim": sim,
+            "s_trig": s_trig,
+            "s_evt": s_evt,
+            "via": "event" if lifted > s_trig else "index",
+            "rank": 0.8 * sim + 0.2 * (live / 10.0),
+            "overlap": _lexical_sim(piled, text),
+            "row": row,
+            "live": live,
+            "importance": importance,
+            "topup": False,
+            "turns": turns,
+        }
+
+    def _entropy(sims: list[float]) -> float:
+        if not sims:
+            return 0.0
+        peak = max(sims)
+        weights = [math.exp((score - peak) / _PILE_TAU) for score in sims]
+        total = sum(weights) or 1.0
+        entropy = 0.0
+        for weight in weights:
+            prob = weight / total
+            if prob > 0.0:
+                entropy -= prob * math.log(prob, 2)
+        return entropy
+
+    if not passed and history and len(q) <= _PILE_SHORT_CHARS:
+        pile = [q]
+        last_ts = float(now if now is not None else time.time())
+        h_prev = _entropy(all_sims)
+        try:
+            from recall.embed import _encode_texts
+        except Exception:
+            _encode_texts = None
+        for ts, line in history:
+            if len(pile) >= _PILE_MAX_TURNS or last_ts - float(ts) > _PILE_GAP_S:
+                break
+            pile.append(str(line))
+            last_ts = float(ts)
+            if _encode_texts is None:
+                break
+            try:
+                encoded = _encode_texts(["\n".join(pile)])
+            except Exception:
+                break
+            if not encoded or not encoded[0]:
+                break
+            scored = _rescore("\n".join(pile), list(encoded[0]))
+            if not scored:
+                break
+            best = scored[0][0]
+            second = scored[1][0] if len(scored) > 1 else 0.0
+            if best >= _PILE_FLOOR and best - second >= _PILE_MARGIN:
+                return [_as_hit(scored[0], turns=len(pile), piled="\n".join(pile))]
+            h_now = _entropy([item[0] for item in scored])
+            if h_prev - h_now <= _PILE_EPS_BITS:
+                break
+            h_prev = h_now
     if not passed:
         return []
 
@@ -431,6 +643,7 @@ def rank_monthly_guidance(
         bucket = -math.floor((hit["rank"] / _GUIDANCE_TIE_EPS) + 1e-9)
         return (
             bucket,
+            -hit["s_trig"],
             -hit["overlap"],
             -len(getattr(hit["row"], "evidence", ()) or ()),
             -hit["_year"],
@@ -486,31 +699,33 @@ def rank_monthly_guidance(
 
 
 def format_guidance_hits(hits: list[dict[str, Any]]) -> str:
-    """Print live strength so the agent sees decay, not the value saved on the last stamp."""
+    """Print live strength so the agent sees decay, not the value saved on the last stamp.
+
+    turns=N is on the header only when a short follow-up needed earlier lines.
+    A single-line hit must keep the header the prefetch tests already match.
+    """
     if not hits:
         return ""
-    from recall.strength import strength_value
-
-    lines = ["## Memory / recall  channel=monthly_guidance"]
+    turns = max((int(hit.get("turns") or 1) for hit in hits), default=1)
+    header = "## Memory / recall  channel=monthly_guidance"
+    if turns >= 2:
+        header += f"  turns={turns}"
+    lines = [header]
     for hit in hits:
         row = hit["row"]
-        live = strength_value(
-            recall_n=float(getattr(row, "recall_n", 0.0) or 0.0),
-            first_seen=getattr(row, "first_seen", None),
-            last_recall_at=getattr(row, "last_recall_at", None) or None,
-            importance=3,
-        )
+        live = float(hit.get("live") or 0.0)
+        importance = int(hit.get("importance") or 3)
         if hit["kind"] == "decision":
             extra = f" except {row.exceptions}" if row.exceptions else ""
             lines.append(
                 f"- preference {row.id}  context={row.context or '-'}  "
-                f"{row.text}{extra}  strength={live:.2f}"
+                f"{row.text}{extra}  strength={live:.2f} importance={importance}"
             )
         else:
             obs = "; ".join(row.obstacles) if row.obstacles else ""
             lines.append(
                 f"- procedure {row.id}  trigger={row.trigger or '-'}  "
-                f"obstacles={obs or '-'}  solution={row.solution}  strength={live:.2f}"
+                f"obstacles={obs or '-'}  solution={row.solution}  strength={live:.2f} importance={importance}"
             )
     return "\n".join(lines)
 

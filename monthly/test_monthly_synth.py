@@ -12,6 +12,44 @@ from monthly_synth import (
 from monthly_slice import count_tokens
 
 
+def test_lookup_text_joins_only_index_fields():
+    from monthly_schema import MonthlyDecision, MonthlyProcedure
+
+    decision = MonthlyDecision(
+        id="d1",
+        kind="preference",
+        text="Prefer one next action.",
+        why_it_matters="still changes the next time",
+        context="When planning the week",
+        exceptions="A one-day reminder does not count.",
+        entity_keys=("willie",),
+        evidence=("mem-1",),
+    )
+    assert decision.lookup_text() == "willie When planning the week Prefer one next action."
+    assert "reminder" not in decision.lookup_text()
+
+    procedure = MonthlyProcedure(
+        id="p1",
+        problem="Reviews run long",
+        solution="Cut to one line",
+        insight="Length hides the point",
+        trigger="Writing the weekly review",
+        obstacles=("The first note was incomplete.",),
+        entity_keys=("willie",),
+        evidence=("mem-2",),
+    )
+    assert procedure.lookup_text() == "willie Writing the weekly review"
+    blank_trigger = MonthlyProcedure(
+        id="p2",
+        problem="Reviews run long",
+        solution="Cut to one line",
+        insight="Length hides the point",
+        entity_keys=("willie",),
+        evidence=("mem-2",),
+    )
+    assert blank_trigger.lookup_text() == "willie Reviews run long"
+
+
 def _filled_args(facts) -> dict:
     """One valid JSON submit so a unit test does not trip the section retry."""
     decision = next(block for block in facts.all_dpe if block.type == "decision")
@@ -316,6 +354,21 @@ def test_reduce_prompt_is_same_rule_lines_and_blank_why_is_dropped():
         generated_at="2026-09-01T08:00:00+08:00",
     )
     assert capped.key_decisions == ()
+
+
+def test_reduce_card_line_uses_event_situation_without_the_label():
+    from monthly_synth import _card_dump_line
+
+    facts = mechanical_facts("2026-08")
+    lines = [_card_dump_line(row) for row in facts.dp_groups]
+    linked = next(line for line in lines if line.startswith("mem-2026-08-15-decision-55091D2900CD"))
+    assert linked.endswith(" | situation: digest bug;")
+    assert "Beginning:" not in linked
+    bare = next(line for line in lines if line.startswith("mem-2026-08-08-procedure-m"))
+    assert " | situation:" not in bare
+    prompt = build_reduce_prompt("2026-08", [], facts, carry="")
+    assert "Do not copy Beginning/Course/Outcome/Obstacle." not in prompt
+    assert "use the situation column when present" in prompt
 
 
 def test_august_reduce_prompt_under_4000():
@@ -1544,6 +1597,189 @@ def test_guidance_tie_break_prefers_overlap_then_evidence_then_month(tmp_path, m
     assert procs[0]["row"].id == newer[0].id
 
 
+def _event_view_decision(text: str, evidence: tuple[str, ...], *, suffix: str):
+    from monthly_schema import MonthlyDecision
+
+    return MonthlyDecision(
+        id=f"mem-2026-08-key-decision-{suffix}",
+        kind="preference",
+        text=text,
+        why_it_matters="still changes the next time",
+        evidence=evidence,
+    )
+
+
+def _write_event_view_month(tmp_path, rows):
+    from monthly_schema import MonthlyPayload, MonthlyRange
+    from monthly_writer import dump_yaml
+
+    decisions = tuple(row for row in rows if row.__class__.__name__ == "MonthlyDecision")
+    procedures = tuple(row for row in rows if row.__class__.__name__ == "MonthlyProcedure")
+    payload = MonthlyPayload(
+        key="2026-08",
+        range=MonthlyRange(start="2026-08-01", end="2026-08-31"),
+        key_decisions=decisions,
+        key_procedures=procedures,
+    )
+    folder = tmp_path / "monthly"
+    folder.mkdir(exist_ok=True)
+    (folder / "2026-08.md").write_text(dump_yaml(payload), encoding="utf-8")
+    return payload
+
+
+def _month_cache_key(row, month: str = "2026-08") -> str:
+    from recall.embed_cache import scale_block_id
+
+    return scale_block_id(
+        {
+            "scale": "month",
+            "kind": "dp",
+            "text": row.lookup_text().strip(),
+            "mem_id": row.id,
+            "month_key": month,
+        }
+    )
+
+
+def test_guidance_event_view_lifts_card_and_records_every_score(tmp_path, monkeypatch):
+    from recall.ids import BlockIndex
+
+    import monthly_actions
+    from monthly_actions import rank_monthly_guidance
+
+    cited = "mem-2026-08-15-decision-55091D2900CD"
+    lifted = _event_view_decision("alpha rule unrelated", (cited,), suffix="lifted")
+    quiet = _event_view_decision(
+        "beta rule unrelated", ("mem-2026-08-15-decision-quiet",), suffix="quiet"
+    )
+    _write_event_view_month(tmp_path, [lifted, quiet])
+    newest = "mem-2026-08-12-event-9625547B667B"
+    cache = {
+        _month_cache_key(lifted): {"embedding": [0.0, 1.0]},
+        _month_cache_key(quiet): {"embedding": [0.0, 1.0]},
+        newest: {"embedding": [1.0, 0.0]},
+        "mem-2026-08-08-event-g": {"embedding": [0.0, 1.0]},
+        "mem-2026-08-01-event-a": {"embedding": [0.0, 1.0]},
+    }
+    calls: list[list[str]] = []
+
+    def _encode(texts):
+        calls.append(list(texts))
+        return [[1.0, 0.0] for _text in texts]
+
+    monkeypatch.setattr("recall.embed._encode_texts", _encode)
+    store = BlockIndex()
+    query = "zzzz event situation"
+    scores: list[dict] = []
+    hits = rank_monthly_guidance(
+        query, staging=tmp_path, store=store, cache=cache, scores_out=scores
+    )
+    event_hits = [hit for hit in hits if hit["via"] == "event"]
+    assert [hit["row"].id for hit in event_hits] == [lifted.id]
+    assert all(hit["topup"] for hit in hits if hit["row"].id == quiet.id)
+    assert calls == [[query]]
+    assert {row["id"] for row in scores} == {lifted.id, quiet.id}
+
+    calls.clear()
+    again: list[dict] = []
+    rank_monthly_guidance(
+        query,
+        staging=tmp_path,
+        store=store,
+        cache=cache,
+        query_vec=[1.0, 0.0],
+        scores_out=again,
+    )
+    assert calls == []
+    bare: list[dict] = []
+    rank_monthly_guidance(
+        query,
+        staging=tmp_path,
+        cache=cache,
+        query_vec=[1.0, 0.0],
+        scores_out=bare,
+    )
+    bare_lifted = next(row for row in bare if row["id"] == lifted.id)
+    event_lifted = next(row for row in again if row["id"] == lifted.id)
+    assert bare_lifted["sim"] == bare_lifted["s_trig"]
+    assert event_lifted["sim"] > bare_lifted["sim"]
+    assert monthly_actions._GUIDANCE_EVENT_BETA == 0.95
+
+
+def test_guidance_event_view_ignores_rejected_and_keeps_newest(tmp_path, monkeypatch):
+    from recall.ids import BlockIndex
+
+    import monthly_actions
+    from monthly_actions import rank_monthly_guidance
+
+    cited = "mem-2026-08-15-decision-55091D2900CD"
+    row = _event_view_decision("alpha rule unrelated", (cited,), suffix="capped")
+    _write_event_view_month(tmp_path, [row])
+    newest = "mem-2026-08-12-event-9625547B667B"
+    oldest = "mem-2026-08-01-event-a"
+    cache = {
+        _month_cache_key(row): {"embedding": [0.0, 1.0]},
+        newest: {"embedding": [0.0, 1.0]},
+        "mem-2026-08-08-event-g": {"embedding": [0.0, 1.0]},
+        oldest: {"embedding": [1.0, 0.0]},
+    }
+    monkeypatch.setattr(monthly_actions, "_GUIDANCE_EVENT_CAP", 1)
+    monkeypatch.setattr("recall.embed._encode_texts", lambda texts: [[1.0, 0.0]])
+    store = BlockIndex()
+    query = "zzzz event situation"
+    assert rank_monthly_guidance(query, staging=tmp_path, store=store, cache=cache) == []
+    cache[newest] = {"embedding": [1.0, 0.0]}
+    cache[oldest] = {"embedding": [0.0, 1.0]}
+    hits = rank_monthly_guidance(query, staging=tmp_path, store=store, cache=cache)
+    assert [hit["row"].id for hit in hits] == [row.id]
+
+    path = tmp_path / "memories" / "staging" / "daily" / "2026-08-12.md"
+    path.write_text(path.read_text(encoding="utf-8").replace("status: candidate", "status: rejected"), encoding="utf-8")
+    rejected_store = BlockIndex()
+    assert rank_monthly_guidance(query, staging=tmp_path, store=rejected_store, cache=cache) == []
+
+
+def test_guidance_same_event_orders_rows_by_index_score(tmp_path, monkeypatch):
+    from monthly_schema import MonthlyProcedure
+    from recall.ids import BlockIndex
+
+    from monthly_actions import rank_monthly_guidance
+
+    cited = "mem-2026-08-15-decision-55091D2900CD"
+    closer = MonthlyProcedure(
+        id="mem-2026-08-key-procedure-closer",
+        problem="case",
+        solution="cut",
+        insight="still changes the next time",
+        trigger="closer index",
+        evidence=(cited,),
+    )
+    farther = MonthlyProcedure(
+        id="mem-2026-08-key-procedure-farther",
+        problem="case",
+        solution="cut",
+        insight="still changes the next time",
+        trigger="farther index",
+        evidence=(cited,),
+    )
+    _write_event_view_month(tmp_path, [farther, closer])
+    cache = {
+        _month_cache_key(closer): {"embedding": _vec(0.50)},
+        _month_cache_key(farther): {"embedding": _vec(0.20)},
+        "mem-2026-08-12-event-9625547B667B": {"embedding": [1.0, 0.0]},
+    }
+    monkeypatch.setattr("recall.embed._encode_texts", lambda texts: [[1.0, 0.0]])
+    hits = rank_monthly_guidance(
+        "zzzz event situation",
+        staging=tmp_path,
+        store=BlockIndex(),
+        cache=cache,
+    )
+    procs = [hit for hit in hits if hit["kind"] == "procedure"]
+    assert [hit["row"].id for hit in procs] == [closer.id, farther.id]
+    assert procs[0]["via"] == "event" and procs[1]["via"] == "event"
+
+
 def test_guidance_live_strength_breaks_equal_similarity(tmp_path, monkeypatch):
     from datetime import date
 
@@ -1579,8 +1815,46 @@ def test_month_stamp_and_generate_carry_recall(tmp_path, monkeypatch):
     assert first["outcome"] in {"ok", "partial"}
     saved = load_month("2026-06")
     row = saved.key_decisions[0]
-    assert stamp_recall_on_card(row.id, staging=tmp_path / "memories" / "staging", now=__import__("datetime").date(2026, 8, 1))
-    assert load_month("2026-06").key_decisions[0].recall_n == 1
+    from datetime import date as _date
+
+    from recall.ids import BlockIndex
+    from recall.strength import strength_value
+
+    assert stamp_recall_on_card(row.id, staging=tmp_path / "memories" / "staging", now=_date(2026, 8, 1))
+    stamped_row = load_month("2026-06").key_decisions[0]
+    assert stamped_row.recall_n == 1
+    store = BlockIndex(tmp_path / "memories" / "staging")
+    evidence_cards = [store.get(item).parsed for item in stamped_row.evidence if store.get(item)]
+    assert evidence_cards
+    assert all(float(card.get("recall_n") or 0) >= 1 for card in evidence_cards)
+    assert abs(
+        stamped_row.strength
+        - strength_value(
+            recall_n=0,
+            first_seen=None,
+            importance=stamped_row.importance,
+            now=_date(2026, 8, 1),
+            evidence=evidence_cards,
+        )
+    ) < 1e-3
+    from dataclasses import replace as _replace
+
+    from monthly_writer import payload_from_dict, write_month
+
+    second_id = stamped_row.id[:-1] + ("a" if not stamped_row.id.endswith("a") else "b")
+    second = _replace(stamped_row, id=second_id, recall_n=0, last_recall_at="")
+    current = load_month("2026-06")
+    write_month(_replace(current, key_decisions=(stamped_row, second)))
+    seen = set(stamped_row.evidence)
+    before = float(evidence_cards[0].get("recall_n") or 0)
+    stamp_recall_on_card(second.id, staging=tmp_path / "memories" / "staging", now=_date(2026, 8, 1), seen=seen)
+    shared = BlockIndex(tmp_path / "memories" / "staging").get(stamped_row.evidence[0])
+    assert float(shared.parsed.get("recall_n") or 0) == before
+    bare = current.to_dict()
+    for section in ("key_decisions", "key_procedures"):
+        for item in bare.get(section) or []:
+            item.pop("importance", None)
+    assert payload_from_dict(bare).key_decisions[0].importance == 3
     again = generate_month("2026-06", call_oneshot=call, force_refresh=True)
     assert again["outcome"] in {"ok", "partial"}
     kept = load_month("2026-06").key_decisions[0]
@@ -1604,9 +1878,161 @@ def test_month_stamp_and_generate_carry_recall(tmp_path, monkeypatch):
     fresh = load_month("2026-06").key_decisions[0]
     assert fresh.id != row.id
     assert fresh.recall_n == 0
+    fresh_cards = []
+    fresh_store = BlockIndex(tmp_path / "memories" / "staging")
+    for item in fresh.evidence:
+        rec = fresh_store.get(item)
+        if rec is not None:
+            fresh_cards.append(rec.parsed)
+    recalled = [card for card in fresh_cards if float(card.get("recall_n") or 0) > 0]
+    if recalled:
+        assert fresh.strength > 0
+    else:
+        assert fresh.strength == strength_value(
+            recall_n=0,
+            first_seen=None,
+            importance=fresh.importance,
+            evidence=fresh_cards,
+        )
     assert stamp_recall_on_card("mem-not-a-month-id", staging=tmp_path / "memories" / "staging") is None
     assert stamp_recall_on_card(
         "mem-2099-01-key-decision-abcdefabcdef",
         staging=tmp_path / "memories" / "staging",
     ) is None
     del write_month
+
+
+def _pile_encode(calls: list):
+    def encode(texts):
+        calls.append(list(texts))
+        text = texts[0] if texts else ""
+        if "\n" in text:
+            return [[1.0, 0.0]]
+        return [[0.0, 1.0]]
+
+    return encode
+
+
+def test_pile_recovers_a_short_follow_up(tmp_path, monkeypatch):
+    """A short line with no situation of its own must recover the card from the previous line."""
+    from monthly_actions import format_guidance_hits, rank_monthly_guidance
+
+    proc, _cosine = _key_procedure(1, cosine=0.97, trigger="把周报发到微信")
+    _write_ranked_month(tmp_path, monkeypatch, [(proc, 0.97)])
+    calls: list = []
+    monkeypatch.setattr("recall.embed._encode_texts", _pile_encode(calls))
+    alone = rank_monthly_guidance("发给我", staging=tmp_path, now=1_000_000)
+    assert alone == []
+    hits = rank_monthly_guidance(
+        "发给我",
+        staging=tmp_path,
+        now=1_000_000,
+        history=[(999_970, "把周报发到微信")],
+    )
+    assert hits[0]["row"].id == proc.id
+    assert hits[0]["turns"] == 2
+    rendered = format_guidance_hits(hits)
+    assert "turns=2" in rendered.split("\n", 1)[0]
+    assert f"strength={hits[0]['live']:.2f}" in rendered
+    assert f"importance={hits[0]['importance']}" in rendered
+
+
+def test_pile_stops_on_a_time_gap(tmp_path, monkeypatch):
+    """A line from outside the gap is a different conversation and must not be piled."""
+    from monthly_actions import rank_monthly_guidance
+
+    proc, _cosine = _key_procedure(1, cosine=0.97)
+    _write_ranked_month(tmp_path, monkeypatch, [(proc, 0.97)])
+    calls: list = []
+    monkeypatch.setattr("recall.embed._encode_texts", _pile_encode(calls))
+    hits = rank_monthly_guidance(
+        "发给我",
+        staging=tmp_path,
+        now=1_000_000,
+        history=[(1_000_000 - 700, "把周报发到微信")],
+    )
+    assert hits == []
+    assert calls == [["发给我"]]
+
+
+def test_pile_misses_when_two_cards_stay_within_the_margin(tmp_path, monkeypatch):
+    """Two close cards must stay uninjected so a follow-up does not pick one at random."""
+    from monthly_actions import rank_monthly_guidance
+
+    near, _n = _key_procedure(1, cosine=0.97)
+    far, _f = _key_procedure(2, cosine=0.90)
+    _write_ranked_month(tmp_path, monkeypatch, [(near, 0.97), (far, 0.90)])
+    monkeypatch.setattr("recall.embed._encode_texts", _pile_encode([]))
+    hits = rank_monthly_guidance(
+        "发给我",
+        staging=tmp_path,
+        now=1_000_000,
+        history=[(999_970, "把周报发到微信")],
+    )
+    assert hits == []
+
+
+def test_pile_skips_a_long_line(tmp_path, monkeypatch):
+    """A long latest line already has its situation, so earlier lines must not be encoded."""
+    from monthly_actions import rank_monthly_guidance
+
+    proc, _cosine = _key_procedure(1, cosine=0.97)
+    _write_ranked_month(tmp_path, monkeypatch, [(proc, 0.97)])
+    calls: list = []
+    monkeypatch.setattr("recall.embed._encode_texts", _pile_encode(calls))
+    query = "发给我" + (" x" * 20)
+    hits = rank_monthly_guidance(
+        query,
+        staging=tmp_path,
+        now=1_000_000,
+        history=[(999_970, "把周报发到微信")],
+    )
+    assert hits == []
+    assert calls == [[query]]
+
+
+def test_pile_stops_when_entropy_does_not_drop(tmp_path, monkeypatch):
+    """Another line that leaves the scores flat must not spend another encode."""
+    from monthly_actions import rank_monthly_guidance
+
+    proc, _cosine = _key_procedure(1, cosine=0.99)
+    _write_ranked_month(tmp_path, monkeypatch, [(proc, 0.99)])
+    calls: list = []
+
+    def encode(texts):
+        calls.append(list(texts))
+        return [[0.0, 1.0]]
+
+    monkeypatch.setattr("recall.embed._encode_texts", encode)
+    hits = rank_monthly_guidance(
+        "发给我",
+        staging=tmp_path,
+        now=1_000_000,
+        history=[(999_900 - i, f"line {i}") for i in range(4)],
+    )
+    assert hits == []
+    assert len(calls) == 2
+
+
+def test_pile_stops_at_six_lines(tmp_path, monkeypatch):
+    """The pile includes the latest line plus five earlier ones, then stops."""
+    import monthly_actions
+    from monthly_actions import rank_monthly_guidance
+
+    proc, _cosine = _key_procedure(1, cosine=0.99)
+    _write_ranked_month(tmp_path, monkeypatch, [(proc, 0.99)])
+    calls: list = []
+    monkeypatch.setattr(monthly_actions, "_PILE_FLOOR", 2.0)
+    monkeypatch.setattr(monthly_actions, "_PILE_EPS_BITS", -1.0)
+    monkeypatch.setattr(
+        "recall.embed._encode_texts",
+        lambda texts: calls.append(list(texts)) or [[0.0, 1.0]],
+    )
+    hits = rank_monthly_guidance(
+        "发给我",
+        staging=tmp_path,
+        now=1_000_000,
+        history=[(999_980 - i, f"line {i}") for i in range(8)],
+    )
+    assert hits == []
+    assert len(calls) == 6
