@@ -1358,3 +1358,33 @@ def test_ack_guidance_returns_miss_without_encoding(tmp_path, monkeypatch):
     assert "channel=miss" in text
     assert calls == []
 
+
+def test_history_decision_matches_the_pile_stops():
+    """The offline grid must stop where the live pile stops, or calibration would ship a looser rule."""
+    from recall.probe_guidance_gate import _history_decision
+
+    labels = {"right"}
+    step0 = [("right", 0.95), ("other", 0.40)]
+    kind, used = _history_decision([step0], labels, floor=0.85, margin=0.10, eps=0.15, gate=0.92, positive=True)
+    assert kind == "step0" and used == 1
+
+    missed = [[("right", 0.40), ("other", 0.20)], [("right", 0.90), ("other", 0.70)]]
+    kind, used = _history_decision(missed, labels, floor=0.85, margin=0.10, eps=0.15, gate=0.92, positive=True)
+    assert kind == "pile" and used == 2
+
+    close = [[("right", 0.40), ("other", 0.20)], [("right", 0.90), ("other", 0.85)]]
+    kind, used = _history_decision(close, labels, floor=0.85, margin=0.10, eps=0.15, gate=0.92, positive=True)
+    assert kind == "miss" and used == 2
+
+    wrong = [[("other", 0.95), ("right", 0.40)]]
+    kind, used = _history_decision(wrong, labels, floor=0.85, margin=0.10, eps=0.15, gate=0.92, positive=True)
+    assert kind == "miss" and used == 1
+
+    flat = [
+        [("right", 0.40), ("other", 0.39)],
+        [("right", 0.40), ("other", 0.39)],
+        [("right", 0.99), ("other", 0.10)],
+    ]
+    kind, used = _history_decision(flat, labels, floor=0.85, margin=0.10, eps=0.15, gate=0.92, positive=True)
+    assert kind == "miss" and used == 2
+

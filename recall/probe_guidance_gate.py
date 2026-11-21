@@ -35,6 +35,11 @@ _LABELS = frozenset(
         "stop_beta",
         "stop_daily",
         "stop_encode",
+        "stop_admit",
+        "stop_far",
+        "stop_tokens",
+        "stop_sample",
+        "off",
         "not_run",
         "ok",
         "decision",
@@ -205,8 +210,14 @@ def _load_user_messages(db: Path) -> list[dict[str, Any]]:
     return out
 
 
-def _source_labels(store, messages: list[dict[str, Any]]) -> dict[tuple[str, int], set[str]]:
-    """Map a user row to the card ids whose source range contains it."""
+def _source_labels(
+    store, messages: list[dict[str, Any]], *, min_chars: int = _MIN_CHARS
+) -> dict[tuple[str, int], set[str]]:
+    """Keep the long-line gate sample stable while the history probe can still label a short line.
+
+    The gate ignores lines of `_MIN_CHARS` or fewer. A follow-up is often that short,
+    so the history mode passes `min_chars=0` and would otherwise have no positives.
+    """
     from digest.digest_tools import message_range_from_source_tag, session_id_from_source_tag
 
     by_session: dict[str, list[dict[str, Any]]] = {}
@@ -225,7 +236,7 @@ def _source_labels(store, messages: list[dict[str, Any]]) -> dict[tuple[str, int
             for msg in by_session.get(sid, ()):
                 if msg["id"] < start or msg["id"] > end:
                     continue
-                if len(msg["content"]) <= _MIN_CHARS or _ACK_RE.fullmatch(msg["content"]):
+                if len(msg["content"]) <= min_chars or _ACK_RE.fullmatch(msg["content"]):
                     continue
                 labels.setdefault((sid, msg["id"]), set()).add(rec.block_id)
     return labels
@@ -995,6 +1006,422 @@ def _mode_gate(overlay: bool) -> None:
     )
 
 
+def _entropy_bits(sims: list[float], tau: float = 0.03) -> float:
+    """Match the pile's entropy so the grid stops on the same plateau the ranker does.
+
+    A looser copy would keep adding lines after the live loop has already given up.
+    """
+    if not sims:
+        return 0.0
+    peak = max(sims)
+    weights = [math.exp((score - peak) / tau) for score in sims]
+    total = sum(weights) or 1.0
+    entropy = 0.0
+    for weight in weights:
+        prob = weight / total
+        if prob > 0.0:
+            entropy -= prob * math.log(prob, 2)
+    return entropy
+
+
+def _history_decision(
+    steps: list[list[tuple[str, float]]],
+    labels: set[str],
+    *,
+    floor: float,
+    margin: float,
+    eps: float | None,
+    gate: float,
+    positive: bool,
+) -> tuple[str, int]:
+    """Say whether this pile would inject the labelled card, and how many steps it scored.
+
+    Step 0 uses the monthly gate and does not keep piling once any row clears it.
+    Later steps use the pile floor and margin. A winner outside the label is a miss,
+    so a hub card cannot count as a saved follow-up.
+    """
+    if not steps or not steps[0]:
+        return "miss", 0
+
+    def _top(step: list[tuple[str, float]]) -> tuple[str, float, float]:
+        ordered = sorted(step, key=lambda item: item[1], reverse=True)
+        best_id, best = ordered[0]
+        second = ordered[1][1] if len(ordered) > 1 else 0.0
+        return best_id, best, second
+
+    best_id, best, _second = _top(steps[0])
+    if best >= gate:
+        if not positive or best_id in labels:
+            return "step0", 1
+        return "miss", 1
+    h_prev = _entropy_bits([score for _row_id, score in steps[0]])
+    for index, step in enumerate(steps[1:], start=1):
+        if not step:
+            return "miss", index
+        best_id, best, second = _top(step)
+        if best >= floor and best - second >= margin:
+            if not positive or best_id in labels:
+                return "pile", index + 1
+            return "miss", index + 1
+        h_now = _entropy_bits([score for _row_id, score in step])
+        if eps is not None and h_prev - h_now <= eps:
+            return "miss", index + 1
+        h_prev = h_now
+    return "miss", len(steps)
+
+
+def _mode_history() -> None:
+    """Calibrate the short-line pile from live follow-ups without printing a message or a card.
+
+    The grid is scored offline from the same cosine the ranker stores in `scores_out`.
+    One live call checks that copy. Defaults stay in the module until a cell beats
+    step 0 at a false-admit rate of 2% and the pile stays under the embedder's length.
+    """
+    import numpy as np
+
+    from monthly_actions import (
+        _GUIDANCE_EVENT_BETA,
+        _GUIDANCE_EVENT_CAP,
+        _GUIDANCE_GATE,
+        _PILE_MAX_TURNS,
+        _PILE_SHORT_CHARS,
+        _lexical_sim,
+        rank_monthly_guidance,
+    )
+    from recall.embed import MAX_LENGTH
+    from recall.embed_cache import load_cache, scale_block_id
+    from recall.ids import BlockIndex
+
+    home = _home()
+    staging = home / "memories" / "staging"
+    _stage("load")
+    store = BlockIndex(staging)
+    cache = {key: dict(value) for key, value in load_cache().items()}
+    messages = _load_user_messages(home / "state.db")
+    by_session: dict[str, list[dict[str, Any]]] = {}
+    for msg in messages:
+        by_session.setdefault(msg["session_id"], []).append(msg)
+    for rows in by_session.values():
+        rows.sort(key=lambda item: (item["ts"], item["id"]))
+    labels = _source_labels(store, messages, min_chars=0)
+    actives = _active_rows(staging)
+    prepared = []
+    for payload, row, kind in actives:
+        evidence = [str(item) for item in (row.evidence or ()) if str(item).strip()]
+        index_text = str(row.lookup_text() or "").strip()
+        index_id = _scale_id(scale_block_id, text=index_text, mem_id=row.id, month_key=str(payload.key))
+        raw = (cache.get(index_id) or {}).get("embedding") or []
+        events = _event_vectors(store, evidence, cache, _GUIDANCE_EVENT_CAP)
+        prepared.append(
+            {
+                "id": str(row.id),
+                "kind": kind,
+                "index_text": index_text,
+                "evidence": evidence,
+                "index_vec": [float(x) for x in raw],
+                "events": events,
+                "event_mat": np.asarray(events, dtype=np.float64) if events else None,
+            }
+        )
+    evidence_ids = set().union(*(row["evidence"] for row in prepared)) if prepared else set()
+    index_of: dict[tuple[str, int], int] = {}
+    for rows in by_session.values():
+        for index, msg in enumerate(rows):
+            index_of[(msg["session_id"], msg["id"])] = index
+
+    def _history_of(msg: dict[str, Any]) -> list[tuple[float, str]]:
+        rows = by_session.get(msg["session_id"]) or []
+        start = index_of.get((msg["session_id"], msg["id"]), 0)
+        earlier: list[tuple[float, str]] = []
+        for prev in reversed(rows[:start]):
+            if _ACK_RE.fullmatch(prev["content"]):
+                continue
+            earlier.append((float(prev["ts"]), prev["content"]))
+            if len(earlier) >= 5:
+                break
+        return earlier
+
+    positives = []
+    seen_text: set[str] = set()
+    for msg in messages:
+        text = msg["content"]
+        if len(text) > _PILE_SHORT_CHARS or text in seen_text or _ACK_RE.fullmatch(text):
+            continue
+        card_ids = labels.get((msg["session_id"], msg["id"])) or set()
+        row_ids = {row["id"] for row in prepared if card_ids.intersection(row["evidence"])}
+        if not row_ids:
+            continue
+        seen_text.add(text)
+        positives.append({"text": text, "ts": float(msg["ts"]), "labels": row_ids, "history": _history_of(msg)})
+    positives = _sample(positives, _POS_CAP)
+    negatives = []
+    for msg in messages:
+        text = msg["content"]
+        if len(text) > _PILE_SHORT_CHARS or text in seen_text or _ACK_RE.fullmatch(text):
+            continue
+        if (msg["session_id"], msg["id"]) in labels:
+            continue
+        seen_text.add(text)
+        negatives.append({"text": text, "ts": float(msg["ts"]), "labels": set(), "history": _history_of(msg)})
+    negatives = _sample(negatives, _NEG_CAP)
+    if not positives or not prepared:
+        _emit(
+            {
+                "mode": "history",
+                "ok": False,
+                "error": "stop_sample",
+                "short_pos": len(positives),
+                "short_neg": len(negatives),
+                "rows": len(prepared),
+            }
+        )
+        return
+
+    gaps: list[float] = []
+    for rows in by_session.values():
+        inside = [
+            msg
+            for msg in rows
+            if evidence_ids.intersection(labels.get((msg["session_id"], msg["id"])) or set())
+        ]
+        for prev, nxt in zip(inside, inside[1:]):
+            gap = float(nxt["ts"]) - float(prev["ts"])
+            if gap >= 0.0:
+                gaps.append(gap)
+    gap_p90 = _quantile(gaps, 0.90)
+    gap_s = int(math.ceil(gap_p90 / 60.0 - 1e-9) * 60) if gaps else 600
+    if gap_s <= 0:
+        gap_s = 60
+
+    def _prefixes(sample: dict[str, Any]) -> list[str]:
+        pile = [sample["text"]]
+        last_ts = float(sample["ts"])
+        for ts, line in sample["history"]:
+            if len(pile) >= _PILE_MAX_TURNS or last_ts - float(ts) > gap_s:
+                break
+            pile.append(line)
+            last_ts = float(ts)
+        return ["\n".join(pile[: end]) for end in range(1, len(pile) + 1)]
+
+    samples = positives + negatives
+    texts: list[str] = []
+    prefixes = []
+    for sample in samples:
+        steps = _prefixes(sample)
+        prefixes.append(steps)
+        texts.extend(steps)
+    token_lengths = [_embed_token_count(steps[-1]) for steps in prefixes if steps]
+    _stage("encode")
+    encoded = _encode_unique(texts)
+    if texts and not encoded:
+        _emit({"mode": "history", "ok": False, "error": "stop_encode", "short_pos": len(positives)})
+        return
+
+    def _sims(text: str) -> list[tuple[str, float]]:
+        qvec = encoded.get(text) or []
+        q = np.asarray(qvec, dtype=np.float64) if qvec else None
+        scored: list[tuple[str, float]] = []
+        for row in prepared:
+            lexical = _lexical_sim(text, row["index_text"])
+            if lexical >= _GUIDANCE_GATE:
+                s_trig = lexical
+            elif q is not None and row["index_vec"]:
+                s_trig = float(np.dot(np.asarray(row["index_vec"], dtype=np.float64), q))
+            else:
+                s_trig = lexical
+            s_evt = 0.0
+            if q is not None and row["event_mat"] is not None and row["event_mat"].size:
+                s_evt = float(np.max(row["event_mat"] @ q))
+            scored.append((row["id"], max(s_trig, _GUIDANCE_EVENT_BETA * s_evt)))
+        return scored
+
+    sim_cache: dict[str, list[tuple[str, float]]] = {}
+    for text in dict.fromkeys(texts):
+        sim_cache[text] = _sims(text)
+    check_text = texts[0]
+    scores_out: list[dict[str, Any]] = []
+    rank_monthly_guidance(
+        check_text,
+        staging=staging,
+        store=store,
+        scores_out=scores_out,
+        query_vec=encoded.get(check_text) or None,
+        cache=cache,
+        history=(),
+    )
+    ours = {row_id: score for row_id, score in sim_cache[check_text]}
+    diffs = [abs(float(item["sim"]) - ours[item["id"]]) for item in scores_out if item["id"] in ours]
+    diff = max(diffs) if diffs else 0.0
+
+    step_lists = [[sim_cache[text] for text in steps] for steps in prefixes]
+    step0_hits = 0
+    neg_step0 = 0
+    for sample, steps in zip(samples, step_lists):
+        kind, _used = _history_decision(
+            steps,
+            sample["labels"],
+            floor=1.1,
+            margin=1.1,
+            eps=0.0,
+            gate=_GUIDANCE_GATE,
+            positive=bool(sample["labels"]),
+        )
+        if kind == "step0" and sample["labels"]:
+            step0_hits += 1
+        elif kind == "step0":
+            neg_step0 += 1
+    n_pos = len(positives)
+    n_neg = len(negatives)
+    floors = tuple(round(0.75 + i * 0.01, 2) for i in range(16))
+    margins = (0.04, 0.06, 0.08, 0.10, 0.12)
+    eps_grid: tuple[tuple[str, float | None], ...] = (
+        ("e10", 0.10),
+        ("e15", 0.15),
+        ("e25", 0.25),
+        ("off", None),
+    )
+    best: tuple[tuple, dict[str, Any]] | None = None
+    lowest_far: tuple[tuple, dict[str, Any]] | None = None
+    for floor in floors:
+        for margin in margins:
+            for eps_label, eps in eps_grid:
+                pos_hits = 0
+                neg_hits = 0
+                for sample, steps in zip(samples, step_lists):
+                    kind, _used = _history_decision(
+                        steps,
+                        sample["labels"],
+                        floor=floor,
+                        margin=margin,
+                        eps=eps,
+                        gate=_GUIDANCE_GATE,
+                        positive=bool(sample["labels"]),
+                    )
+                    if kind == "miss":
+                        continue
+                    if sample["labels"]:
+                        pos_hits += 1
+                    else:
+                        neg_hits += 1
+                far = (neg_hits / n_neg) if n_neg else 0.0
+                cell = {
+                    "floor": floor,
+                    "margin": margin,
+                    "eps": eps_label,
+                    "admit": pos_hits / n_pos,
+                    "far": far,
+                    "pos_hits": pos_hits,
+                    "neg_hits": neg_hits,
+                }
+                far_key = (far, -pos_hits)
+                if lowest_far is None or far_key < lowest_far[0]:
+                    lowest_far = (far_key, cell)
+                if far <= 0.02 and pos_hits > step0_hits:
+                    pick = (pos_hits, -far)
+                    if best is None or pick > best[0]:
+                        best = (pick, cell)
+    chosen = best[1] if best is not None else (lowest_far[1] if lowest_far else {})
+    tokens_p99 = _quantile([float(n) for n in token_lengths], 0.99)
+    if tokens_p99 >= MAX_LENGTH:
+        verdict = "stop_tokens"
+    elif best is None and (n_neg == 0 or (neg_step0 / n_neg if n_neg else 0.0) > 0.02):
+        verdict = "stop_far"
+    elif best is None:
+        verdict = "stop_admit"
+    else:
+        verdict = "ok"
+
+    _stage("latency")
+    without: list[float] = []
+    with_hist: list[float] = []
+    timed = 0
+    timed_samples = [sample for sample in negatives if sample["history"]] or negatives
+    for sample in timed_samples:
+        if timed >= 12:
+            break
+        started = time.perf_counter()
+        rank_monthly_guidance(
+            sample["text"],
+            staging=staging,
+            store=store,
+            cache=cache,
+            history=(),
+            now=sample["ts"],
+        )
+        without.append(time.perf_counter() - started)
+        started = time.perf_counter()
+        rank_monthly_guidance(
+            sample["text"],
+            staging=staging,
+            store=store,
+            cache=cache,
+            history=sample["history"],
+            now=sample["ts"],
+        )
+        with_hist.append(time.perf_counter() - started)
+        timed += 1
+    added = _quantile(with_hist, 0.95) - _quantile(without, 0.95)
+    eps_number = {"e10": 0.10, "e15": 0.15, "e25": 0.25, "off": 0.0}.get(str(chosen.get("eps", "off")), 0.0)
+    _emit(
+        {
+            "mode": "history",
+            "ok": True,
+            "verdict": verdict,
+            "short_pos": n_pos,
+            "short_neg": n_neg,
+            "rows": len(prepared),
+            "gap_n": len(gaps),
+            "gap_p50": _quantile(gaps, 0.50),
+            "gap_p90": gap_p90,
+            "gap_s": gap_s,
+            "pile_tokens_p99": tokens_p99,
+            "step0_admit": step0_hits / n_pos,
+            "step0_far": (neg_step0 / n_neg) if n_neg else 0.0,
+            "best_floor": float(chosen.get("floor", 0.0)),
+            "best_margin": float(chosen.get("margin", 0.0)),
+            "best_eps": eps_number,
+            "best_eps_off": str(chosen.get("eps", "off")) == "off",
+            "best_admit": float(chosen.get("admit", 0.0)),
+            "best_far": float(chosen.get("far", 0.0)),
+            "best_pos_hits": int(chosen.get("pos_hits", 0)),
+            "best_neg_hits": int(chosen.get("neg_hits", 0)),
+            "scores_out_max_abs_diff": diff,
+            "latency_n": timed,
+            "latency_p95_without": _quantile(without, 0.95),
+            "latency_p95_with": _quantile(with_hist, 0.95),
+            "latency_p95_added": added,
+            "latency_ok": added <= 1.5,
+        }
+    )
+
+
+def _embed_token_count(text: str) -> int:
+    """Count embedder tokens without the 512 cap so a truncated id list cannot hide a long pile.
+
+    The live tokenizer stops at MAX_LENGTH. The probe needs the length before that cut.
+    """
+    tok = getattr(_embed_token_count, "_tok", None)
+    if tok is None:
+        try:
+            from tokenizers import Tokenizer
+
+            from recall.embed import _cache_dir, _onnx_file
+
+            path = _cache_dir() / "tokenizer.json"
+            if not path.is_file():
+                onnx = _onnx_file()
+                if onnx is not None:
+                    path = onnx.parent / "tokenizer.json"
+            if path.is_file():
+                tok = Tokenizer.from_file(str(path))
+        except Exception:
+            tok = False
+        setattr(_embed_token_count, "_tok", tok)
+    if not tok:
+        return len(text)
+    return len(tok.encode(text).ids)
+
+
 def _mode_strength() -> None:
     """Compare each row's stored strength with the live evidence value. Aggregates only."""
     from datetime import date
@@ -1108,7 +1535,7 @@ def main(argv: list[str] | None = None) -> None:
         _mode_strength()
         return
     if args.mode == "history":
-        _emit({"mode": "history", "ok": False, "error": "not_run"})
+        _mode_history()
         return
     _emit({"mode": "gate", "ok": False, "error": "not_run"})
 
