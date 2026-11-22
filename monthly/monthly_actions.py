@@ -43,13 +43,25 @@ _MONTH_KEY_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 _GUIDANCE_GATE = 0.92
 _GUIDANCE_EVENT_BETA = 0.95
 _GUIDANCE_EVENT_CAP = 5
+# Leave-one-out on cited events: weight 1 subtracts 0.49 from a true score of
+# 0.46, so the wanted card drops out of the top. 0.25 keeps top-1 level with
+# the centroid and puts fewer impostors over the gate than R2 alone.
+_GUIDANCE_HUB_ALPHA = 0.25
+# Lowest gate at that weight whose impostors stay within 2.35 and at least half
+# of the cited events still clear it. Monthly and daily differ by 0.08, so the
+# daily fallback has its own constant.
+_GUIDANCE_COS_GATE = 0.31
+_GUIDANCE_COS_GATE_DAILY = 0.39
 _ACK_RE = re.compile(
     r"^(?:(?:哈|嗯|好|行|谢)+|可以|收到|了解|明白|ok|okay|thanks|thank you|got it|lol)"
     r"[!！.。,，~～…\s]*$",
     re.IGNORECASE,
 )
 _PILE_SHORT_CHARS = 24
-_PILE_FLOOR = 0.85
+# Same bar as the cosine gate. 0.85 sat above every R2 score, so a short
+# follow-up could never recover its card. History mode had no labelled
+# short lines (sources are wecom keys), so the margin and tau stay.
+_PILE_FLOOR = 0.31
 _PILE_MARGIN = 0.10
 _PILE_EPS_BITS = 0.15
 _PILE_GAP_S = 600
@@ -338,23 +350,25 @@ def _guidance_sim(
     candidate: str,
     query_vec: Sequence[float] | None,
     cand_vec: Sequence[float] | None,
+    *,
+    mean_dir: Sequence[float] | None = None,
 ) -> float:
-    """Prefer lexical overlap so an exact English match never waits on ONNX.
+    """Prefer an exact lexical match, then R2 cosine, and never a partial word score.
 
-    Cosine uses vectors the caller already loaded. A missing vector stays lexical
-    so prefetch does not encode one candidate at a time.
+    The cosine gate sits far below 0.92. Returning leftover Jaccard when a
+    vector is missing would let word overlap clear that gate with no embedding.
     """
     lexical = _lexical_sim(query, candidate)
     if lexical >= _GUIDANCE_GATE:
         return lexical
     if not query_vec or not cand_vec:
-        return lexical
+        return 0.0
     try:
         from recall.embed import _cosine
 
-        return float(_cosine(query_vec, cand_vec))
+        return float(_cosine(query_vec, cand_vec, mean_dir=mean_dir))
     except Exception:
-        return lexical
+        return 0.0
 
 
 def rank_monthly_guidance(
@@ -368,20 +382,18 @@ def rank_monthly_guidance(
     cache: dict[str, Any] | None = None,
     history: Sequence[tuple[float, str]] = (),
     now: float | None = None,
+    mean_dir: Sequence[float] | None = None,
 ) -> list[dict[str, Any]]:
-    """Rank active monthly D/P for a task-shaped query so prefetch does not scan daily events first.
+    """Rank active monthly D/P in R2 space so the model cone is not treated as a match.
 
     Decisions that merely pass the gate must not fill the block and hide a procedure
     for this message. Each kind keeps up to half the slots, and a kind with fewer
     than two passing rows is topped up from below the gate so it is not absent.
-    A linked event can lift a row whose own index text does not sound like the query.
-    The event is scored, never injected. Rows lifted by the same event stay ordered
-    by their own index score. Live strength, not the stored snapshot, breaks near-ties
-    as a row ages. A row missing from embed-cache.json is scored lexically until the
-    next 01:00 fill. A short line that misses is re-scored with earlier lines piled
-    on, and stops when the top card is clear, the entropy stalls, the time gap is
-    too wide, or six lines are already in the pile. The daily fallback still sees
-    only the latest line.
+    Usage is the centroid of capped events, not the single closest one, and a hub
+    penalty is subtracted once per card. An exact lexical match skips that penalty.
+    A missing vector scores 0 so leftover word overlap cannot clear the cosine gate.
+    A short line that misses is re-scored with earlier lines piled on. The daily
+    fallback still sees only the latest line.
     """
     q = str(query or "").strip()
     if not q:
@@ -409,6 +421,15 @@ def rank_monthly_guidance(
                 resolved_cache = {}
     else:
         resolved_cache = cache
+    if mean_dir is None:
+        try:
+            from recall.embed_cache import mean_direction
+
+            resolved_mean = mean_direction(resolved_cache)
+        except Exception:
+            resolved_mean = None
+    else:
+        resolved_mean = list(mean_dir)
     vectors: list[list[float] | None] = []
     need_query = False
     for _kind, payload, row, text in pending:
@@ -457,6 +478,7 @@ def rank_monthly_guidance(
         except Exception:
             resolved_query = None
     evt_scores: dict[str, float] = {}
+    centroids: dict[str, list[float]] = {}
     if store is not None and resolved_query:
         from recall.tools import linked_event_scores
 
@@ -466,7 +488,39 @@ def rank_monthly_guidance(
             store,
             cap=_GUIDANCE_EVENT_CAP,
             cache=resolved_cache,
+            mean_dir=resolved_mean,
+            centroids_out=centroids,
         )
+    from recall.tools import _unit_residual, event_bank, hub_bias
+
+    lookups: dict[str, list[float]] = {}
+    for (_kind, _payload, row, _text), cand_vec in zip(pending, vectors):
+        if not cand_vec:
+            continue
+        unit = _unit_residual(cand_vec, resolved_mean)
+        if unit is not None:
+            lookups[str(row.id)] = unit
+    if store is not None:
+        bias_cards: dict[str, list[float] | None] = {
+            key: lookups.get(key) for key in targets
+        }
+        exclude = {
+            key: [rec.block_id for rec in recs]
+            for key, recs in _capped_linked_events(
+                targets, store, cap=_GUIDANCE_EVENT_CAP
+            ).items()
+        }
+    else:
+        bias_cards = dict(lookups)
+        exclude = {}
+    biases = hub_bias(
+        bias_cards,
+        centroids,
+        event_bank(store, resolved_cache, resolved_mean),
+        alpha=_GUIDANCE_HUB_ALPHA,
+        exclude=exclude,
+        beta=_GUIDANCE_EVENT_BETA,
+    )
     from recall.strength import strength_value
 
     try:
@@ -494,11 +548,33 @@ def rank_monthly_guidance(
     passed: list[dict[str, Any]] = []
     below: dict[str, list[dict[str, Any]]] = {"decision": [], "procedure": []}
     all_sims: list[float] = []
+    def _channels(
+        qtext: str,
+        qvec: list[float] | None,
+        cand_vec: list[float] | None,
+        text: str,
+        row_id: str,
+        use_scores: dict[str, float],
+    ) -> tuple[float, float, float, float, float]:
+        """Return sim, trigger, usage, bias, and the pre-penalty usage term.
+
+        An exact lexical match skips the hub penalty. Subtracting it there would
+        throw away a verbatim hit because the card is popular.
+        """
+        lexical = _lexical_sim(qtext, text)
+        s_use = float(use_scores.get(row_id, 0.0) or 0.0)
+        bias = float(biases.get(row_id, 0.0) or 0.0)
+        lifted = _GUIDANCE_EVENT_BETA * s_use
+        if lexical >= _GUIDANCE_GATE:
+            return lexical, lexical, s_use, bias, lifted
+        s_trig = _guidance_sim(qtext, text, qvec, cand_vec, mean_dir=resolved_mean)
+        sim = max(s_trig, lifted) - bias
+        return sim, s_trig, s_use, bias, lifted
+
     for (kind, payload, row, text), cand_vec in zip(pending, vectors):
-        s_trig = _guidance_sim(q, text, resolved_query, cand_vec)
-        s_evt = float(evt_scores.get(str(row.id), 0.0) or 0.0)
-        lifted = _GUIDANCE_EVENT_BETA * s_evt
-        sim = max(s_trig, lifted)
+        sim, s_trig, s_use, bias, lifted = _channels(
+            q, resolved_query, cand_vec, text, str(row.id), evt_scores
+        )
         all_sims.append(sim)
         if scores_out is not None:
             scores_out.append(
@@ -506,7 +582,8 @@ def rank_monthly_guidance(
                     "id": str(row.id),
                     "kind": kind,
                     "s_trig": s_trig,
-                    "s_evt": s_evt,
+                    "s_use": s_use,
+                    "bias": bias,
                     "sim": sim,
                 }
             )
@@ -527,8 +604,9 @@ def rank_monthly_guidance(
             "month": payload.key,
             "sim": sim,
             "s_trig": s_trig,
-            "s_evt": s_evt,
-            "via": "event" if lifted > s_trig else "index",
+            "s_use": s_use,
+            "bias": bias,
+            "via": "event" if lifted > s_trig and sim != s_trig else "index",
             "rank": 0.8 * sim + 0.2 * (live / 10.0),
             "overlap": _lexical_sim(q, text),
             "row": row,
@@ -539,7 +617,7 @@ def rank_monthly_guidance(
             "_year": year_n,
             "_mon": mon_n,
         }
-        if sim >= _GUIDANCE_GATE:
+        if sim >= _GUIDANCE_COS_GATE:
             passed.append(hit)
         else:
             below[kind].append(hit)
@@ -555,19 +633,19 @@ def rank_monthly_guidance(
                 store,
                 cap=_GUIDANCE_EVENT_CAP,
                 cache=resolved_cache,
+                mean_dir=resolved_mean,
             )
         scored: list[tuple] = []
         for (kind, payload, row, text), cand_vec in zip(pending, vectors):
-            s_trig = _guidance_sim(qtext, text, qvec, cand_vec)
-            s_evt = float(evt.get(str(row.id), 0.0) or 0.0)
-            lifted = _GUIDANCE_EVENT_BETA * s_evt
-            sim = max(s_trig, lifted)
-            scored.append((sim, s_trig, s_evt, lifted, kind, payload, row, text))
+            sim, s_trig, s_use, bias, lifted = _channels(
+                qtext, qvec, cand_vec, text, str(row.id), evt
+            )
+            scored.append((sim, s_trig, s_use, bias, lifted, kind, payload, row, text))
         scored.sort(key=lambda item: item[0], reverse=True)
         return scored
 
     def _as_hit(parts: tuple, *, turns: int, piled: str) -> dict[str, Any]:
-        sim, s_trig, s_evt, lifted, kind, payload, row, text = parts
+        sim, s_trig, s_use, bias, lifted, kind, payload, row, text = parts
         cards, importance = _cards_for(row)
         live = strength_value(
             recall_n=0.0,
@@ -580,8 +658,9 @@ def rank_monthly_guidance(
             "month": payload.key,
             "sim": sim,
             "s_trig": s_trig,
-            "s_evt": s_evt,
-            "via": "event" if lifted > s_trig else "index",
+            "s_use": s_use,
+            "bias": bias,
+            "via": "event" if lifted > s_trig and sim != s_trig else "index",
             "rank": 0.8 * sim + 0.2 * (live / 10.0),
             "overlap": _lexical_sim(piled, text),
             "row": row,

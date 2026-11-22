@@ -1037,6 +1037,7 @@ def test_guidance_returns_synthesized_month_id(tmp_path, monkeypatch):
         "recall.embed_cache.load_cache",
         lambda: {bid: {"embedding": [1.0, 0.0]}},
     )
+    monkeypatch.setattr("recall.embed_cache.mean_direction", lambda cache=None: None)
 
     def _encode(texts):
         if texts and texts[0] == synthesis:
@@ -1111,6 +1112,7 @@ def test_guidance_uses_cached_vector_for_one_query_encode(tmp_path, monkeypatch)
         "recall.embed_cache.load_cache",
         lambda: {bid: {"embedding": [1.0, 0.0]}},
     )
+    monkeypatch.setattr("recall.embed_cache.mean_direction", lambda cache=None: None)
     calls: list[list[str]] = []
 
     def _encode(texts):
@@ -1122,6 +1124,25 @@ def test_guidance_uses_cached_vector_for_one_query_encode(tmp_path, monkeypatch)
     assert hits
     assert hits[0]["row"].id == row.id
     assert calls == [["prefetch正常吗"]]
+
+
+def test_guidance_sim_scores_zero_when_the_vector_is_missing():
+    """Word overlap below the lexical gate must not survive into the R2 gate.
+
+    The cosine gate will sit far below 0.92. Returning the leftover Jaccard
+    score would let a partial word match clear that gate with no embedding.
+    """
+    from monthly_actions import _guidance_sim
+
+    partial = _guidance_sim("school waimai lunch", "school lunch policy", None, None)
+    assert partial == 0.0
+    same = "school does not allow waimai"
+    assert _guidance_sim(same, same, None, None) == 1.0
+    shared = [1.0, 0.0, 0.0]
+    left = [10.0, 1.0, 0.0]
+    right = [10.0, 0.0, 1.0]
+    scored = _guidance_sim("alpha beta", "gamma delta", left, right, mean_dir=shared)
+    assert abs(scored) < 1e-6
 
 
 def test_guidance_cache_miss_stays_lexical(tmp_path, monkeypatch):
@@ -1470,6 +1491,7 @@ def _write_ranked_month(tmp_path, monkeypatch, specs, *, key="2026-08"):
             )
             cache[bid] = {"embedding": _vec(cosine)}
     monkeypatch.setattr("recall.embed_cache.load_cache", lambda: cache)
+    monkeypatch.setattr("recall.embed_cache.mean_direction", lambda cache=None: None)
     monkeypatch.setattr("recall.embed._encode_texts", lambda texts: [[1.0, 0.0]])
     return payload
 
@@ -1504,7 +1526,7 @@ def test_guidance_tops_up_two_procedures_from_below_the_gate(tmp_path, monkeypat
 
     specs = [_key_decision(i) for i in range(14)]
     specs.append(_key_procedure(0, cosine=0.95))
-    specs.extend(_key_procedure(i, cosine=0.4) for i in range(1, 4))
+    specs.extend(_key_procedure(i, cosine=0.2) for i in range(1, 4))
     _write_ranked_month(tmp_path, monkeypatch, specs)
     hits = rank_monthly_guidance("zzzz guidance probe", staging=tmp_path, limit=12)
     assert _counts(hits) == (10, 2)
@@ -1515,7 +1537,7 @@ def test_guidance_tops_up_when_no_procedure_passed(tmp_path, monkeypatch):
     from monthly_actions import rank_monthly_guidance
 
     specs = [_key_decision(i) for i in range(14)]
-    specs.extend(_key_procedure(i, cosine=0.4) for i in range(3))
+    specs.extend(_key_procedure(i, cosine=0.2) for i in range(3))
     _write_ranked_month(tmp_path, monkeypatch, specs)
     hits = rank_monthly_guidance("zzzz guidance probe", staging=tmp_path, limit=12)
     assert _counts(hits) == (10, 2)
@@ -1642,6 +1664,13 @@ def _month_cache_key(row, month: str = "2026-08") -> str:
 
 
 def test_guidance_event_view_lifts_card_and_records_every_score(tmp_path, monkeypatch):
+    """One aligned event lifts the card after R2, and the record keeps usage and bias.
+
+    The cone axis is the unused third coordinate, so the planted xy match is the
+    usage score. The card's own event is excluded from the hub bank, otherwise
+    the lift would be cancelled by the episode that caused it.
+    """
+    from recall.conftest import _block
     from recall.ids import BlockIndex
 
     import monthly_actions
@@ -1654,31 +1683,53 @@ def test_guidance_event_view_lifts_card_and_records_every_score(tmp_path, monkey
     )
     _write_event_view_month(tmp_path, [lifted, quiet])
     newest = "mem-2026-08-12-event-9625547B667B"
+    daily = tmp_path / "daily"
+    daily.mkdir(parents=True)
+    (tmp_path / "weekly").mkdir(exist_ok=True)
+    (daily / "2026-08-12.md").write_text(
+        _block(
+            mem_id=newest,
+            type_="event",
+            entity="Casey",
+            body="the situation that matches",
+            related=cited,
+        ),
+        encoding="utf-8",
+    )
     cache = {
-        _month_cache_key(lifted): {"embedding": [0.0, 1.0]},
-        _month_cache_key(quiet): {"embedding": [0.0, 1.0]},
-        newest: {"embedding": [1.0, 0.0]},
-        "mem-2026-08-08-event-g": {"embedding": [0.0, 1.0]},
-        "mem-2026-08-01-event-a": {"embedding": [0.0, 1.0]},
+        _month_cache_key(lifted): {"embedding": [0.0, 1.0, 0.0]},
+        _month_cache_key(quiet): {"embedding": [0.0, 1.0, 0.0]},
+        newest: {"embedding": [1.0, 0.0, 0.0]},
     }
     calls: list[list[str]] = []
 
     def _encode(texts):
         calls.append(list(texts))
-        return [[1.0, 0.0] for _text in texts]
+        return [[1.0, 0.0, 0.0] for _text in texts]
 
     monkeypatch.setattr("recall.embed._encode_texts", _encode)
-    store = BlockIndex()
+    store = BlockIndex(tmp_path)
     query = "zzzz event situation"
+    mean = [0.0, 0.0, 1.0]
     scores: list[dict] = []
     hits = rank_monthly_guidance(
-        query, staging=tmp_path, store=store, cache=cache, scores_out=scores
+        query,
+        staging=tmp_path,
+        store=store,
+        cache=cache,
+        scores_out=scores,
+        mean_dir=mean,
     )
     event_hits = [hit for hit in hits if hit["via"] == "event"]
     assert [hit["row"].id for hit in event_hits] == [lifted.id]
     assert all(hit["topup"] for hit in hits if hit["row"].id == quiet.id)
     assert calls == [[query]]
     assert {row["id"] for row in scores} == {lifted.id, quiet.id}
+    lifted_score = next(row for row in scores if row["id"] == lifted.id)
+    assert set(lifted_score) >= {"s_trig", "s_use", "bias", "sim"}
+    assert abs(lifted_score["s_use"] - 1.0) < 1e-6
+    assert lifted_score["bias"] == 0.0
+    assert abs(lifted_score["sim"] - monthly_actions._GUIDANCE_EVENT_BETA) < 1e-6
 
     calls.clear()
     again: list[dict] = []
@@ -1687,8 +1738,9 @@ def test_guidance_event_view_lifts_card_and_records_every_score(tmp_path, monkey
         staging=tmp_path,
         store=store,
         cache=cache,
-        query_vec=[1.0, 0.0],
+        query_vec=[1.0, 0.0, 0.0],
         scores_out=again,
+        mean_dir=mean,
     )
     assert calls == []
     bare: list[dict] = []
@@ -1696,8 +1748,9 @@ def test_guidance_event_view_lifts_card_and_records_every_score(tmp_path, monkey
         query,
         staging=tmp_path,
         cache=cache,
-        query_vec=[1.0, 0.0],
+        query_vec=[1.0, 0.0, 0.0],
         scores_out=bare,
+        mean_dir=mean,
     )
     bare_lifted = next(row for row in bare if row["id"] == lifted.id)
     event_lifted = next(row for row in again if row["id"] == lifted.id)
@@ -1724,14 +1777,21 @@ def test_guidance_event_view_ignores_rejected_and_keeps_newest(tmp_path, monkeyp
         oldest: {"embedding": [1.0, 0.0]},
     }
     monkeypatch.setattr(monthly_actions, "_GUIDANCE_EVENT_CAP", 1)
+    monkeypatch.setattr("recall.embed_cache.mean_direction", lambda cache=None: None)
     monkeypatch.setattr("recall.embed._encode_texts", lambda texts: [[1.0, 0.0]])
     store = BlockIndex()
     query = "zzzz event situation"
     assert rank_monthly_guidance(query, staging=tmp_path, store=store, cache=cache) == []
     cache[newest] = {"embedding": [1.0, 0.0]}
-    cache[oldest] = {"embedding": [0.0, 1.0]}
+    # Drop the older vectors for this call. They stay in the hub bank, and either
+    # a card-aligned or a centroid-aligned vector cancels the single-event lift.
+    held_old = cache.pop(oldest)
+    held_mid = cache.pop("mem-2026-08-08-event-g")
     hits = rank_monthly_guidance(query, staging=tmp_path, store=store, cache=cache)
     assert [hit["row"].id for hit in hits] == [row.id]
+    cache[oldest] = {"embedding": [0.0, 1.0]}
+    cache["mem-2026-08-08-event-g"] = {"embedding": [0.0, 1.0]}
+    del held_old, held_mid
 
     path = tmp_path / "memories" / "staging" / "daily" / "2026-08-12.md"
     path.write_text(path.read_text(encoding="utf-8").replace("status: candidate", "status: rejected"), encoding="utf-8")
@@ -1768,6 +1828,7 @@ def test_guidance_same_event_orders_rows_by_index_score(tmp_path, monkeypatch):
         _month_cache_key(farther): {"embedding": _vec(0.20)},
         "mem-2026-08-12-event-9625547B667B": {"embedding": [1.0, 0.0]},
     }
+    monkeypatch.setattr("recall.embed_cache.mean_direction", lambda cache=None: None)
     monkeypatch.setattr("recall.embed._encode_texts", lambda texts: [[1.0, 0.0]])
     hits = rank_monthly_guidance(
         "zzzz event situation",
@@ -1959,9 +2020,9 @@ def test_pile_misses_when_two_cards_stay_within_the_margin(tmp_path, monkeypatch
     """Two close cards must stay uninjected so a follow-up does not pick one at random."""
     from monthly_actions import rank_monthly_guidance
 
-    near, _n = _key_procedure(1, cosine=0.97)
-    far, _f = _key_procedure(2, cosine=0.90)
-    _write_ranked_month(tmp_path, monkeypatch, [(near, 0.97), (far, 0.90)])
+    near, _n = _key_procedure(1, cosine=0.99)
+    far, _f = _key_procedure(2, cosine=0.96)
+    _write_ranked_month(tmp_path, monkeypatch, [(near, 0.99), (far, 0.96)])
     monkeypatch.setattr("recall.embed._encode_texts", _pile_encode([]))
     hits = rank_monthly_guidance(
         "发给我",

@@ -466,6 +466,123 @@ def _vec_for_cosine(x: float) -> list[float]:
     return [x, y]
 
 
+def _write_linked_events(root: Path, specs: list[tuple[str, str, str]]) -> None:
+    """One daily file per event so the newest day is the cap-1 survivor."""
+    daily = root / "daily"
+    daily.mkdir(parents=True)
+    (root / "weekly").mkdir(exist_ok=True)
+    (root / "monthly").mkdir(exist_ok=True)
+    by_day: dict[str, list[str]] = {}
+    for mem_id, day, _vec_name in specs:
+        by_day.setdefault(day, []).append(
+            _block(
+                mem_id=mem_id,
+                type_="event",
+                entity="Casey",
+                body="linked situation",
+                related="mem-cited",
+            )
+        )
+    for day, blocks in by_day.items():
+        (daily / f"{day}.md").write_text("\n".join(blocks), encoding="utf-8")
+
+
+def test_linked_event_scores_use_the_usage_centroid_not_the_closest_event(tmp_path):
+    """One aligned episode must not outvote two orthogonal ones.
+
+    Max pooling would report 1.0 and hide that most of this card's usage does
+    not match the query. The centroid of three orthonormal events is 1/sqrt(3).
+    Cap 1 still has to equal that single newest event.
+    """
+    from recall.ids import BlockIndex
+    from recall.tools import linked_event_scores
+
+    aligned = "mem-2026-08-12-event-aaaaaaaaaaaa"
+    side = "mem-2026-08-10-event-bbbbbbbbbbbb"
+    other = "mem-2026-08-08-event-cccccccccccc"
+    _write_linked_events(
+        tmp_path,
+        [
+            (aligned, "2026-08-12", "aligned"),
+            (side, "2026-08-10", "side"),
+            (other, "2026-08-08", "other"),
+        ],
+    )
+    cache = {
+        aligned: {"embedding": [1.0, 0.0, 0.0]},
+        side: {"embedding": [0.0, 1.0, 0.0]},
+        other: {"embedding": [0.0, 0.0, 1.0]},
+    }
+    store = BlockIndex(tmp_path)
+    centroids: dict[str, list[float]] = {}
+    scores = linked_event_scores(
+        [1.0, 0.0, 0.0],
+        {"card": ["mem-cited"]},
+        store,
+        cap=5,
+        cache=cache,
+        centroids_out=centroids,
+    )
+    expect = 1.0 / (3.0 ** 0.5)
+    assert abs(scores["card"] - expect) < 1e-6
+    assert scores["card"] != 1.0
+    assert abs(centroids["card"][0] - expect) < 1e-6
+
+    capped = linked_event_scores(
+        [1.0, 0.0, 0.0],
+        {"card": ["mem-cited"]},
+        store,
+        cap=1,
+        cache=cache,
+    )
+    assert abs(capped["card"] - 1.0) < 1e-6
+
+
+def test_hub_bias_penalises_a_card_near_every_event_except_its_own():
+    """A card that matches the whole bank is a hub; its own events must not count.
+
+    Without the exclusion, every used card would subtract the episodes that
+    define it. An empty bank has nothing to subtract, so the bias stays 0.
+    """
+    from recall.tools import hub_bias
+
+    bank = [
+        ("e1", [1.0, 0.0]),
+        ("e2", [1.0, 0.0]),
+        ("e3", [1.0, 0.0]),
+        ("e4", [0.0, 1.0]),
+    ]
+    cards = {"hub": [1.0, 0.0], "rare": [0.0, 1.0]}
+    bias = hub_bias(cards, {}, bank, k=8, alpha=1.0)
+    assert bias["hub"] > bias["rare"]
+    assert abs(bias["hub"] - 0.75) < 1e-6
+    excluded = hub_bias(cards, {}, bank, k=8, exclude={"rare": ["e4"]})
+    assert excluded["rare"] == 0.0
+    assert hub_bias(cards, {}, []) == {"hub": 0.0, "rare": 0.0}
+
+
+def test_r2_cosine_drops_a_shared_cone_that_raw_cosine_keeps():
+    """Two vectors that only agree along the model mean must not look like a match.
+
+    Raw cosine stays high because both sit in the same cone. After projection
+    off that axis they are orthogonal, so guidance can stop treating the cone
+    as evidence.
+    """
+    from recall.embed import _cosine, _l2_normalize
+
+    mu = [1.0, 0.0, 0.0]
+    left = [10.0, 1.0, 0.0]
+    right = [10.0, 0.0, 1.0]
+    assert _cosine(left, right) > 0.8
+    assert abs(_cosine(left, right, mean_dir=mu)) < 1e-6
+    import numpy as np
+
+    projected = _l2_normalize(np.array([left, right], dtype="float32"), mean_dir=mu)
+    assert abs(float(projected[0, 0])) < 1e-5
+    assert abs(float(projected[1, 0])) < 1e-5
+    assert abs(float(projected[0] @ projected[1])) < 1e-5
+
+
 def test_embed_flat_pile_keeps_rank1_only(staging, monkeypatch):
     """Int8 piles of 0.83 vs 0.82 must not dump sibling cards into the LLM context."""
     def _stub_encode(texts):
@@ -800,6 +917,49 @@ def test_embed_cache_one_am_stamps_last_checked_on(tmp_path, monkeypatch):
     assert stats["embedded"] == 1
     meta = json.loads((tmp_path / "embeddings" / "embed-cache-meta.json").read_text(encoding="utf-8"))
     assert meta["last_checked_on"] == "2026-08-16"
+
+
+def test_embed_cache_writes_mean_direction_and_keeps_it_on_noop_tick(tmp_path, monkeypatch):
+    """The 01:00 rebuild must store the cone axis, and a no-op next day must not drop it.
+
+    R2 reads mean_dir from meta. A stamp-only tick that rewrote meta from a
+    fresh dict would erase the axis and every later query would score raw cosine.
+    """
+    from recall import embed_cache
+
+    def encode_fn(texts):
+        return [[3.0, 4.0] for _ in texts]
+
+    _embed_cache_staging(tmp_path, monkeypatch)
+    now = datetime(2026, 8, 16, 1, 0, tzinfo=SHANGHAI)
+    embed_cache.incremental_update(encode_fn=encode_fn, now=now)
+    meta = json.loads((tmp_path / "embeddings" / "embed-cache-meta.json").read_text(encoding="utf-8"))
+    assert len(meta["mean_dir"]) == 2
+    assert meta["mean_dir"] == [0.6, 0.8]
+    assert meta["mean_norm"] == 5.0
+    assert embed_cache.mean_direction() == [0.6, 0.8]
+
+    later = embed_cache.incremental_update(
+        encode_fn=encode_fn, now=datetime(2026, 8, 17, 1, 0, tzinfo=SHANGHAI)
+    )
+    assert later["embedded"] == 0
+    kept = json.loads((tmp_path / "embeddings" / "embed-cache-meta.json").read_text(encoding="utf-8"))
+    assert kept["mean_dir"] == [0.6, 0.8]
+    assert kept["mean_norm"] == 5.0
+    assert kept["last_checked_on"] == "2026-08-17"
+
+
+def test_mean_direction_recomputes_when_meta_width_mismatches(tmp_path, monkeypatch):
+    from recall import embed_cache
+
+    _embed_cache_staging(tmp_path, monkeypatch)
+    cache = {
+        "a": {"embedding": [1.0, 0.0]},
+        "b": {"embedding": [0.0, 1.0]},
+    }
+    embed_cache.save_cache(cache, {"mean_dir": [1.0], "dim": 1})
+    assert embed_cache.mean_direction(cache) == [0.7071067811865475, 0.7071067811865475]
+    assert embed_cache.mean_direction({}) is None
 
 
 def test_embed_cache_once_per_civil_day(tmp_path, monkeypatch):
@@ -1143,6 +1303,11 @@ def _unit_vec(cosine: float) -> list[float]:
 
 
 def test_daily_guidance_event_lifts_a_card_the_text_misses(tmp_path, monkeypatch):
+    """The usage centroid lifts a card whose own text is orthogonal to the query.
+
+    The toy cache is the whole vector set, so its mean is the signal. Freezing
+    the cone keeps the planted axes as the R2 input.
+    """
     near = "mem-2026-08-02-procedure-000000000001"
     far = "mem-2026-08-02-procedure-000000000002"
     filler = "mem-2026-08-02-procedure-000000000004"
@@ -1178,6 +1343,7 @@ def test_daily_guidance_event_lifts_a_card_the_text_misses(tmp_path, monkeypatch
     monkeypatch.setattr("recall.tools.embed_enabled", lambda *_a, **_k: True)
     monkeypatch.setattr("recall.embed._encode_texts", _encode)
     monkeypatch.setattr("recall.embed_cache.load_cache", lambda: cache)
+    monkeypatch.setattr("recall.embed_cache.mean_direction", lambda cache=None: None)
     monkeypatch.setattr("recall.tools.search_lexical", _boom)
     monkeypatch.setattr("recall.tools.rerank_embed", _boom)
     query = "zzzz event situation"
@@ -1190,6 +1356,7 @@ def test_daily_guidance_event_lifts_a_card_the_text_misses(tmp_path, monkeypatch
 
 
 def test_daily_guidance_shared_event_orders_by_card_score(tmp_path, monkeypatch):
+    """Two cards that share one centroid still sort by their own text score."""
     closer = "mem-2026-08-02-procedure-000000000011"
     farther = "mem-2026-08-02-procedure-000000000012"
     event = "mem-2026-08-09-event-000000000013"
@@ -1207,6 +1374,7 @@ def test_daily_guidance_shared_event_orders_by_card_score(tmp_path, monkeypatch)
     )
     monkeypatch.setattr("recall.tools.embed_enabled", lambda *_a, **_k: True)
     monkeypatch.setattr("recall.embed._encode_texts", lambda texts: [[1.0, 0.0]])
+    monkeypatch.setattr("recall.embed_cache.mean_direction", lambda cache=None: None)
     monkeypatch.setattr(
         "recall.embed_cache.load_cache",
         lambda: {
@@ -1220,6 +1388,11 @@ def test_daily_guidance_shared_event_orders_by_card_score(tmp_path, monkeypatch)
 
 
 def test_daily_guidance_keeps_card_when_only_the_event_clears_the_floor(tmp_path, monkeypatch):
+    """A 0.20 card score stays under the shared cosine gate; the event centroid does not.
+
+    The daily path uses ``_GUIDANCE_COS_GATE``, so a card the month path would
+    reject cannot come back on a lower raw floor.
+    """
     lifted = "mem-2026-08-02-procedure-000000000021"
     plain = "mem-2026-08-02-procedure-000000000022"
     filler = "mem-2026-08-02-procedure-000000000024"
@@ -1239,6 +1412,7 @@ def test_daily_guidance_keeps_card_when_only_the_event_clears_the_floor(tmp_path
     )
     monkeypatch.setattr("recall.tools.embed_enabled", lambda *_a, **_k: True)
     monkeypatch.setattr("recall.embed._encode_texts", lambda texts: [[1.0, 0.0]])
+    monkeypatch.setattr("recall.embed_cache.mean_direction", lambda cache=None: None)
     monkeypatch.setattr(
         "recall.embed_cache.load_cache",
         lambda: {

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import sys
 import threading
@@ -286,6 +287,75 @@ _embed_clock_stop = threading.Event()
 _embed_clock_thread: threading.Thread | None = None
 
 
+def _numeric_vector(value: Any) -> list[float] | None:
+    """Accept only a non-empty list of numbers so a bad cache row cannot define the axis."""
+    if not isinstance(value, list) or not value:
+        return None
+    out: list[float] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (int, float)):
+            return None
+        out.append(float(item))
+    return out
+
+
+def _mean_of_embeddings(cache: Mapping[str, Any]) -> tuple[list[float] | None, float | None]:
+    """Unit mean of cached vectors, plus the length of that mean before normalisation.
+
+    The length is the cone strength. A zero-length mean is not an axis, so both
+    values stay None and R2 falls back to plain cosine.
+    """
+    rows: list[list[float]] = []
+    width: int | None = None
+    for row in cache.values():
+        if not isinstance(row, dict):
+            continue
+        vec = _numeric_vector(row.get("embedding"))
+        if vec is None:
+            continue
+        if width is None:
+            width = len(vec)
+        if len(vec) != width:
+            continue
+        rows.append(vec)
+    if not rows or width is None:
+        return None, None
+    acc = [0.0] * width
+    scale = 1.0 / len(rows)
+    for vec in rows:
+        for index, value in enumerate(vec):
+            acc[index] += value
+    mean = [value * scale for value in acc]
+    norm = math.sqrt(sum(value * value for value in mean))
+    if norm <= 0.0:
+        return None, None
+    return [value / norm for value in mean], norm
+
+
+def mean_direction(cache: dict[str, Any] | None = None) -> list[float] | None:
+    """Return the model-wide cone axis so R2 can subtract the shared direction.
+
+    Prefer the 01:00 ``mean_dir`` when its width matches this cache. Recompute
+    when that vector is missing or stale, so a query before the next rebuild
+    still projects. An empty cache returns None and scoring stays plain cosine.
+    """
+    if cache is None:
+        cache = load_cache()
+    width: int | None = None
+    for row in cache.values():
+        if not isinstance(row, dict):
+            continue
+        vec = _numeric_vector(row.get("embedding"))
+        if vec is not None:
+            width = len(vec)
+            break
+    stored = _numeric_vector(_load_meta().get("mean_dir"))
+    if width is not None and stored is not None and len(stored) == width:
+        return stored
+    direction, _norm = _mean_of_embeddings(cache)
+    return direction
+
+
 def load_cache() -> dict[str, dict[str, Any]]:
     """Load the embedding cache from disk."""
     cache_path = _cache_root() / _CACHE_FILE
@@ -482,6 +552,10 @@ def incremental_update(
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "total_blocks": len(merged),
         }
+        direction, norm = _mean_of_embeddings(merged)
+        if direction is not None and norm is not None:
+            meta["mean_dir"] = direction
+            meta["mean_norm"] = norm
         if stamp_day is not None:
             meta["last_checked_on"] = stamp_day
         save_cache(merged, meta)

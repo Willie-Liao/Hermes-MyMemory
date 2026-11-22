@@ -27,6 +27,9 @@ _LABELS = frozenset(
         "legacy",
         "index",
         "index_events",
+        "r2",
+        "r2_centroid",
+        "r2_centroid_nnn",
         "card",
         "card_events",
         "ship",
@@ -62,10 +65,13 @@ _POS_CAP = 400
 _NEG_CAP = 400
 _SEED = 0
 _MIN_CHARS = 24
-_LOOKBACK_S = 60 * 24 * 3600
+# August's labelled lines are older than 60 days. A shorter window emits the
+# grid floor from an empty sample and cannot set the cosine gate.
+_LOOKBACK_S = 180 * 24 * 3600
 _BETAS = (0.85, 0.90, 0.95, 1.00)
 _CAPS = (3, 5)
 _GATES = tuple(round(x * 0.01, 2) for x in range(50, 100))
+_R2_GATES = tuple(round(x * 0.01, 2) for x in range(5, 100))
 _KIND_K = 6
 _LEXICAL_K = 12
 
@@ -272,20 +278,6 @@ def _dot(a: list[float], b: list[float]) -> float:
     return float(sum(x * y for x, y in zip(a, b)))
 
 
-def _max_event(query: list[float], rows: list[list[float]]) -> float:
-    if not query or not rows:
-        return 0.0
-    best = 0.0
-    width = len(query)
-    for row in rows:
-        if len(row) != width:
-            continue
-        score = _dot(query, row)
-        if score > best:
-            best = score
-    return best
-
-
 def _event_count(store, ids: list[str]) -> int:
     from recall.tools import _is_rejected
 
@@ -299,16 +291,117 @@ def _event_count(store, ids: list[str]) -> int:
     return len(seen)
 
 
-def _event_vectors(store, ids: list[str], cache: dict, cap: int) -> list[list[float]]:
-    from recall.tools import _capped_linked_events
+def _event_units(
+    store,
+    ids: list[str],
+    cache: dict,
+    cap: int,
+    mean_dir: list[float] | None = None,
+) -> list[tuple[str, list[float]]]:
+    """Capped event ids and R2 vectors, so a leave-one-out query can drop itself.
+
+    Averaging the probe event back in scores a sentence against itself. The id
+    stays beside the vector so the offline gate can exclude that one event
+    without changing the ranker's own centroid.
+    """
+    from recall.tools import _capped_linked_events, _unit_residual
 
     chosen = _capped_linked_events({"row": ids}, store, cap=cap).get("row") or []
-    vectors: list[list[float]] = []
+    units: list[tuple[str, list[float]]] = []
     for rec in chosen:
         raw = (cache.get(rec.block_id) or {}).get("embedding") or []
-        if raw:
-            vectors.append([float(x) for x in raw])
-    return vectors
+        if not raw:
+            continue
+        if mean_dir is None:
+            units.append((rec.block_id, [float(x) for x in raw]))
+            continue
+        unit = _unit_residual(raw, mean_dir)
+        if unit:
+            units.append((rec.block_id, unit))
+    return units
+
+
+def _event_vectors(
+    store,
+    ids: list[str],
+    cache: dict,
+    cap: int,
+    mean_dir: list[float] | None = None,
+) -> list[list[float]]:
+    """Capped event vectors in R2 space when the cone axis is known.
+
+    Raw vectors make the model mean look like a match. The ranker projects
+    before the centroid, so the probe has to do the same or its gate is fiction.
+    """
+    return [vec for _event_id, vec in _event_units(store, ids, cache, cap, mean_dir)]
+
+
+def _event_probe_queries(store, prepared: list[dict[str, Any]], blocks: dict) -> list[dict[str, Any]]:
+    """Use each cited event as a query when session tags never meet a card.
+
+    This notebook's sources are wecom keys, so the message join is empty and
+    the gate collapses to the grid floor. The measured bar is the event body
+    against the monthly rows that cite it, with that event left out of the centroid.
+    """
+    from recall.embed_cache import _compose_embedding_text
+    from recall.tools import _is_rejected
+
+    # A monthly row cites the daily card. The event points at that card through
+    # related, which is the same join `_capped_linked_events` uses.
+    cited: dict[str, set[str]] = {}
+    for row in prepared:
+        for item in row["evidence"]:
+            cited.setdefault(str(item), set()).add(str(row["id"]))
+    queries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for rec in store.records:
+        if rec.item_type != "event" or _is_rejected(rec):
+            continue
+        labels: set[str] = set()
+        for item in rec.related or ():
+            labels.update(cited.get(str(item), ()))
+        block = blocks.get(rec.block_id)
+        if not labels or not block:
+            continue
+        text = _compose_embedding_text(block)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        queries.append(
+            {
+                "text": text,
+                "labels": set(labels),
+                "key": ("event", rec.block_id),
+                "event_id": rec.block_id,
+            }
+        )
+    return queries
+
+
+def _centroid_vec(rows: list[list[float]]) -> list[float]:
+    """Mean of already-projected event vectors, renormalised.
+
+    Max-pooling one neighbour hides the rest of the card's usage. This is the
+    same reduction ``linked_event_scores`` uses.
+    """
+    from recall.tools import _unit_residual
+
+    usable = [row for row in rows if row]
+    if not usable:
+        return []
+    dim = len(usable[0])
+    acc = [0.0] * dim
+    count = 0
+    for row in usable:
+        if len(row) != dim:
+            continue
+        count += 1
+        for index, value in enumerate(row):
+            acc[index] += float(value)
+    if not count:
+        return []
+    mean = [value / count for value in acc]
+    return _unit_residual(mean, None) or []
 
 
 def _bucket(count: int) -> str:
@@ -319,13 +412,17 @@ def _bucket(count: int) -> str:
     return "three_plus"
 
 
-def _lowest_gate(neg_scores: list[float], pos_hits: list[tuple[float, bool]]) -> tuple[float, float]:
+def _lowest_gate(
+    neg_scores: list[float],
+    pos_hits: list[tuple[float, bool]],
+    gates: tuple[float, ...] | None = None,
+) -> tuple[float, float]:
     """Lowest gate whose false-admit rate is at most 2%, and the admit rate there."""
     chosen = -1.0
     admit = 0.0
     n_neg = max(len(neg_scores), 1)
     n_pos = max(len(pos_hits), 1)
-    for gate in _GATES:
+    for gate in gates or _GATES:
         false_n = sum(1 for score in neg_scores if score >= gate)
         if false_n / n_neg > 0.02:
             continue
@@ -421,7 +518,7 @@ def _active_rows(staging: Path) -> list[Any]:
 def _mode_gate(overlay: bool) -> None:
     import numpy as np
 
-    from monthly_actions import _guidance_sim
+    from monthly_actions import _GUIDANCE_HUB_ALPHA, _guidance_sim, _lexical_sim
     from recall.embed import COSINE_FLOOR
     from recall.embed_cache import _compose_embedding_text, load_cache, scale_block_id
     from recall.ids import BlockIndex
@@ -445,6 +542,12 @@ def _mode_gate(overlay: bool) -> None:
         evidence_of[row.id] = evidence
         index_text = str(row.lookup_text() or "").strip()
         legacy_text = _legacy_lookup(row)
+        live = strength_value(
+            recall_n=float(getattr(row, "recall_n", 0.0) or 0.0),
+            first_seen=getattr(row, "first_seen", None) or getattr(row, "valid_from", None),
+            last_recall_at=getattr(row, "last_recall_at", None),
+            importance=int(getattr(row, "importance", 3) or 3),
+        )
         prepared.append(
             {
                 "id": row.id,
@@ -453,6 +556,7 @@ def _mode_gate(overlay: bool) -> None:
                 "index_text": index_text,
                 "legacy_text": legacy_text,
                 "evidence": evidence,
+                "live": float(live),
                 "index_id": _scale_id(
                     scale_block_id, text=index_text, mem_id=row.id, month_key=str(payload.key)
                 ),
@@ -477,6 +581,14 @@ def _mode_gate(overlay: bool) -> None:
         }
         if row_ids:
             monthly_pos.append({"text": msg["content"], "labels": row_ids, "key": key})
+    event_sample = False
+    if not monthly_pos:
+        # Session tags never meet these cards. The cited event is the query the
+        # leave-one-out bar was measured on; a message-only sample emits the grid floor.
+        from recall.embed_cache import scan_all_blocks
+
+        monthly_pos = _event_probe_queries(store, prepared, scan_all_blocks())
+        event_sample = bool(monthly_pos)
     positive_available = len(monthly_pos)
     monthly_pos = _sample(monthly_pos, _POS_CAP)
     positive_keys = {item["key"] for item in monthly_pos}
@@ -521,11 +633,53 @@ def _mode_gate(overlay: bool) -> None:
         row["legacy_vec"] = [float(x) for x in legacy]
         row["index_vec"] = [float(x) for x in index]
         row["event_n"] = _event_count(store, row["evidence"])
-        row["events"] = {
-            cap: _event_vectors(store, row["evidence"], cache, cap) for cap in _CAPS
-        }
+    from recall.embed_cache import mean_direction
+    from recall.tools import _capped_linked_events, _unit_residual, event_bank, hub_bias
 
-    def score_variant(query: str, qv: list[float], qi: int, *, legacy: bool, cap: int, beta: float):
+    mu = mean_direction(cache)
+    for row in prepared:
+        row["event_units"] = {
+            cap: _event_units(store, row["evidence"], cache, cap, mu) for cap in _CAPS
+        }
+        row["events"] = {
+            cap: [vec for _event_id, vec in units]
+            for cap, units in row["event_units"].items()
+        }
+    month_targets = {row["id"]: row["evidence"] for row in prepared}
+    month_capped = _capped_linked_events(month_targets, store, cap=5)
+    month_exclude = {
+        key: [rec.block_id for rec in recs] for key, recs in month_capped.items()
+    }
+    month_lookups = {
+        row["id"]: unit
+        for row in prepared
+        if row["index_vec"] and (unit := _unit_residual(row["index_vec"], mu))
+    }
+    month_centroids = {
+        row["id"]: centroid
+        for row in prepared
+        if (centroid := _centroid_vec(row["events"].get(5) or []))
+    }
+    month_bias = hub_bias(
+        month_lookups,
+        month_centroids,
+        event_bank(store, cache, mu),
+        k=8,
+        alpha=_GUIDANCE_HUB_ALPHA,
+        exclude=month_exclude,
+        beta=0.95,
+    )
+
+    def score_variant(
+        query: str,
+        qv: list[float],
+        qi: int,
+        *,
+        legacy: bool,
+        cap: int,
+        beta: float,
+        nnn: bool = False,
+    ):
         best_id = ""
         best_key = None
         top = 0.0
@@ -533,9 +687,13 @@ def _mode_gate(overlay: bool) -> None:
         for ri, row in enumerate(prepared):
             text = row["legacy_text"] if legacy else row["index_text"]
             vec = row["legacy_vec"] if legacy else row["index_vec"]
-            s_trig = _guidance_sim(query, text, qv, vec)
+            s_trig = _guidance_sim(
+                query, text, qv, vec, mean_dir=None if legacy else mu
+            )
             s_evt = 0.0 if legacy or cap == 0 else float(month_evt[cap][qi, ri])
             sim = s_trig if legacy or cap == 0 else max(s_trig, beta * s_evt)
+            if nnn and not legacy:
+                sim -= float(month_bias.get(row["id"], 0.0))
             key = (sim, s_trig, row["id"])
             if best_key is None or key > best_key:
                 best_key = key
@@ -547,13 +705,16 @@ def _mode_gate(overlay: bool) -> None:
     _stage("score-month")
     queries = [(item["text"], item["labels"], "pos") for item in monthly_pos]
     queries += [(msg["content"], set(), "neg") for msg in negatives]
+    query_events = [str(item.get("event_id") or "") for item in monthly_pos]
+    query_events += [""] * len(negatives)
     qvecs = [encoded.get(text) or [] for text, _labels, _kind in queries]
     width = next((len(vec) for vec in qvecs if vec), 0)
-    qmat = (
-        np.asarray(
-            [vec if len(vec) == width else [0.0] * width for vec in qvecs],
-            dtype=np.float32,
-        )
+    q_r2 = []
+    for vec in qvecs:
+        unit = _unit_residual(vec, mu) if vec else None
+        q_r2.append(unit if unit and len(unit) == width else [0.0] * width)
+    qmat_r2 = (
+        np.asarray(q_r2, dtype=np.float32)
         if qvecs and width
         else np.zeros((len(qvecs), 1), dtype=np.float32)
     )
@@ -562,14 +723,143 @@ def _mode_gate(overlay: bool) -> None:
         columns = []
         for row in prepared:
             vecs = [vec for vec in (row["events"].get(cap) or []) if len(vec) == width]
-            if not vecs or not len(qvecs) or not width:
+            centroid = _centroid_vec(vecs)
+            if not centroid or not len(qvecs) or not width:
                 columns.append(np.zeros(len(qvecs), dtype=np.float32))
                 continue
-            emat = np.asarray(vecs, dtype=np.float32)
-            columns.append(np.max(qmat @ emat.T, axis=1))
+            columns.append(qmat_r2 @ np.asarray(centroid, dtype=np.float32))
         month_evt[cap] = np.stack(columns, axis=1) if columns else np.zeros((len(qvecs), 0))
 
-    def run_cell(*, legacy: bool, cap: int, beta: float) -> dict[str, Any]:
+    def _loo_summary(
+        cap: int, beta: float, *, nnn: bool, shared_gate: float | None = None
+    ) -> dict[str, float]:
+        """Rank each cited event with that event left out of its own centroid.
+
+        Including it scores the sentence against itself and the gate comes out
+        too high for a new message. Live flips count how often 0.2 * live/10
+        changes the winner on this wider scale.
+        """
+        ranked: list[tuple[list[tuple[float, str, float]], set[str]]] = []
+        flips = 0
+        for qi, ((text, labels, role), qv) in enumerate(zip(queries, qvecs)):
+            if role != "pos" or not qv:
+                continue
+            drop = query_events[qi] if qi < len(query_events) else ""
+            scored: list[tuple[float, str, float]] = []
+            for row in prepared:
+                s_trig = _guidance_sim(
+                    text, row["index_text"], qv, row["index_vec"], mean_dir=mu
+                )
+                sim = s_trig
+                if cap:
+                    kept = [
+                        vec
+                        for event_id, vec in (row["event_units"].get(cap) or [])
+                        if event_id != drop and len(vec) == width
+                    ]
+                    centroid = _centroid_vec(kept)
+                    s_use = (
+                        float(sum(a * b for a, b in zip(q_r2[qi], centroid)))
+                        if centroid
+                        else 0.0
+                    )
+                    sim = max(s_trig, beta * s_use)
+                if nnn:
+                    sim -= float(month_bias.get(row["id"], 0.0))
+                scored.append((sim, str(row["id"]), float(row.get("live") or 0.0)))
+            if not scored:
+                continue
+            by_sim = max(scored, key=lambda item: (item[0], item[1]))
+            by_live = max(
+                scored,
+                key=lambda item: (0.8 * item[0] + 0.2 * item[2] / 10.0, item[0], item[1]),
+            )
+            if by_sim[1] != by_live[1]:
+                flips += 1
+            ranked.append((scored, labels))
+        n = len(ranked)
+        if not n:
+            return {
+                "loo_n": 0,
+                "loo_top1": 0.0,
+                "loo_mean_rank": 0.0,
+                "loo_impostors": 0.0,
+                "loo_gate": 0.0,
+                "loo_admit": 0.0,
+                "loo_over_gate": 0.0,
+                "loo_over_shared": 0.0,
+                "live_flips": 0,
+            }
+        top1 = 0
+        rank_sum = 0
+        ahead_sum = 0
+        best_true: list[float | None] = []
+        impostor_counts: list[list[float]] = []
+        for scored, labels in ranked:
+            trues = [sim for sim, card_id, _live in scored if card_id in labels]
+            if not trues:
+                best_true.append(None)
+                impostor_counts.append([sim for sim, _card_id, _live in scored])
+                rank_sum += len(scored) + 1
+                ahead_sum += len(scored)
+                continue
+            target = max(trues)
+            best_true.append(target)
+            ahead = sum(
+                1 for sim, card_id, _live in scored if card_id not in labels and sim > target
+            )
+            ahead_sum += ahead
+            rank_sum += ahead + 1
+            if ahead == 0:
+                top1 += 1
+            impostor_counts.append(
+                [sim for sim, card_id, _live in scored if card_id not in labels]
+            )
+        chosen_gate = 0.0
+        chosen_admit = 0.0
+        chosen_over = 0.0
+        fallback: tuple[float, float, float] | None = None
+        for gate_value in _R2_GATES:
+            admit_n = sum(
+                1 for score in best_true if score is not None and score >= gate_value
+            )
+            over = sum(
+                sum(1 for sim in sims if sim >= gate_value) for sims in impostor_counts
+            ) / n
+            admit = admit_n / n
+            if over <= 2.35 and (fallback is None or admit > fallback[1]):
+                fallback = (gate_value, admit, over)
+            if over <= 2.35 and admit >= 0.50:
+                chosen_gate = gate_value
+                chosen_admit = admit
+                chosen_over = over
+                break
+        if chosen_gate == 0.0 and fallback is not None:
+            chosen_gate, chosen_admit, chosen_over = fallback
+        shared = chosen_gate if shared_gate is None else shared_gate
+        over_shared = (
+            sum(sum(1 for sim in sims if sim >= shared) for sims in impostor_counts) / n
+        )
+        return {
+            "loo_n": n,
+            "loo_top1": top1 / n,
+            "loo_mean_rank": rank_sum / n,
+            "loo_impostors": ahead_sum / n,
+            "loo_gate": chosen_gate,
+            "loo_admit": chosen_admit,
+            "loo_over_gate": chosen_over,
+            "loo_over_shared": over_shared,
+            "live_flips": flips,
+        }
+
+    def run_cell(
+        *,
+        legacy: bool,
+        cap: int,
+        beta: float,
+        nnn: bool = False,
+        variant: str | None = None,
+    ) -> dict[str, Any]:
         pos_hits: list[tuple[float, bool]] = []
         proc_hits: list[tuple[float, bool]] = []
         neg_scores: list[float] = []
@@ -577,7 +867,9 @@ def _mode_gate(overlay: bool) -> None:
         for qi, ((text, labels, role), qv) in enumerate(zip(queries, qvecs)):
             if not qv:
                 continue
-            top, winner = score_variant(text, qv, qi, legacy=legacy, cap=cap, beta=beta)
+            top, winner = score_variant(
+                text, qv, qi, legacy=legacy, cap=cap, beta=beta, nnn=nnn
+            )
             if role == "neg":
                 neg_scores.append(top)
                 neg_buckets.append((top, _bucket(int(winner["event_n"]))))
@@ -594,12 +886,17 @@ def _mode_gate(overlay: bool) -> None:
                 }
                 if proc_labels:
                     proc_hits.append((top, winner["id"] in proc_labels))
-        gate, admit = _lowest_gate(neg_scores, proc_hits or pos_hits)
+        gate, admit = _lowest_gate(
+            neg_scores,
+            proc_hits or pos_hits,
+            gates=_GATES if legacy else _R2_GATES,
+        )
         n_neg = max(len(neg_scores), 1)
         n_pos = max(len(pos_hits), 1)
         n_proc = max(len(proc_hits), 1)
         cell = {
-            "variant": "legacy" if legacy else ("index" if cap == 0 else "index_events"),
+            "variant": variant
+            or ("legacy" if legacy else ("index" if cap == 0 else "index_events")),
             "beta": float(beta),
             "cap": int(cap),
             "n_pos": len(pos_hits),
@@ -617,10 +914,23 @@ def _mode_gate(overlay: bool) -> None:
         cell.update(_far_split(neg_buckets))
         return cell
 
-    cells = [run_cell(legacy=True, cap=0, beta=0.0), run_cell(legacy=False, cap=0, beta=0.0)]
+    cells = [run_cell(legacy=True, cap=0, beta=0.0), run_cell(legacy=False, cap=0, beta=0.0, variant="r2")]
     for cap in _CAPS:
         for beta in _BETAS:
             cells.append(run_cell(legacy=False, cap=cap, beta=beta))
+    cells.append(run_cell(legacy=False, cap=5, beta=0.95, variant="r2_centroid"))
+    cells.append(run_cell(legacy=False, cap=5, beta=0.95, nnn=True, variant="r2_centroid_nnn"))
+    loo_nnn = _loo_summary(5, 0.95, nnn=True)
+    loo_by_variant = {
+        "r2": _loo_summary(0, 0.0, nnn=False, shared_gate=loo_nnn["loo_gate"]),
+        "r2_centroid": _loo_summary(5, 0.95, nnn=False, shared_gate=loo_nnn["loo_gate"]),
+        "r2_centroid_nnn": loo_nnn,
+    }
+    loo_nnn["loo_over_shared"] = loo_nnn["loo_over_gate"]
+    for cell in cells:
+        extra = loo_by_variant.get(str(cell["variant"]))
+        if extra:
+            cell.update(extra)
 
     diff = 0.0
     if monthly_pos and qvecs and qvecs[0]:
@@ -648,6 +958,7 @@ def _mode_gate(overlay: bool) -> None:
                 cache=held,
                 query_vec=qvecs[0],
                 scores_out=scores,
+                mean_dir=mu,
                 limit=8,
             )
         finally:
@@ -656,10 +967,19 @@ def _mode_gate(overlay: bool) -> None:
         ours = {}
         for row in prepared:
             s_trig = _guidance_sim(
-                monthly_pos[0]["text"], row["index_text"], qvecs[0], row["index_vec"]
+                monthly_pos[0]["text"],
+                row["index_text"],
+                qvecs[0],
+                row["index_vec"],
+                mean_dir=mu,
             )
-            s_evt = _max_event(qvecs[0], row["events"].get(5) or [])
-            ours[row["id"]] = max(s_trig, 0.95 * s_evt)
+            s_evt = float(month_evt[5][0, prepared.index(row)]) if prepared else 0.0
+            blended = max(s_trig, 0.95 * s_evt)
+            lexical = _lexical_sim(monthly_pos[0]["text"], row["index_text"])
+            if lexical >= 0.92:
+                ours[row["id"]] = lexical
+            else:
+                ours[row["id"]] = blended - float(month_bias.get(row["id"], 0.0))
         for item in scores:
             diff = max(diff, abs(float(item["sim"]) - ours.get(item["id"], 0.0)))
 
@@ -675,6 +995,7 @@ def _mode_gate(overlay: bool) -> None:
             last_recall_at=rec.parsed.get("last_recall_at"),
             importance=int(rec.parsed.get("importance") or 3),
         )
+        units = {cap: _event_units(store, [rec.block_id], cache, cap, mu) for cap in _CAPS}
         daily_cards.append(
             {
                 "id": rec.block_id,
@@ -682,9 +1003,8 @@ def _mode_gate(overlay: bool) -> None:
                 "vec": [float(x) for x in raw],
                 "live": float(live),
                 "event_n": _event_count(store, [rec.block_id]),
-                "events": {
-                    cap: _event_vectors(store, [rec.block_id], cache, cap) for cap in _CAPS
-                },
+                "event_units": units,
+                "events": {cap: [vec for _event_id, vec in units[cap]] for cap in _CAPS},
             }
         )
     daily_pairs = []
@@ -725,6 +1045,8 @@ def _mode_gate(overlay: bool) -> None:
             "top1_unlinked": 0,
             "tie_n": 0,
             "tie_first_n": 0,
+            "rank_sum": 0.0,
+            "ahead_sum": 0.0,
         }
         for pair in daily_pairs:
             qv = encoded.get(pair["text"]) or []
@@ -764,6 +1086,14 @@ def _mode_gate(overlay: bool) -> None:
                 stats["tie_n"] += 1
                 if tied == "first":
                     stats["tie_first_n"] += 1
+            order_ids = [item["id"] for item in ranked]
+            if pair["card"] in order_ids:
+                place = order_ids.index(pair["card"])
+                stats["rank_sum"] += place + 1
+                stats["ahead_sum"] += place
+            else:
+                stats["rank_sum"] += len(order_ids) + 1
+                stats["ahead_sum"] += len(order_ids)
         def rate(num: str, den: str) -> float:
             return (stats[num] / stats[den]) if stats[den] else 0.0
 
@@ -781,21 +1111,25 @@ def _mode_gate(overlay: bool) -> None:
             "top1_unlinked": rate("top1_unlinked", "n_unlinked"),
             "tie_n": stats["tie_n"],
             "tie_first_n": stats["tie_first_n"],
+            "mean_rank": (stats["rank_sum"] / stats["n"]) if stats["n"] else 0.0,
+            "impostors_ahead": (stats["ahead_sum"] / stats["n"]) if stats["n"] else 0.0,
         }
 
     width = next((len(vec) for vec in encoded.values() if vec), 0)
     q_rows = []
     for pair in daily_pairs:
-        vec = encoded.get(pair["text"]) or []
-        q_rows.append(vec if len(vec) == width else [0.0] * width)
+        raw = encoded.get(pair["text"]) or []
+        unit = _unit_residual(raw, mu) if raw else None
+        q_rows.append(unit if unit and len(unit) == width else [0.0] * width)
     qmat = (
         np.asarray(q_rows, dtype=np.float32)
         if q_rows and width
         else np.zeros((len(daily_pairs), 1), dtype=np.float32)
     )
-    c_rows = [
-        card["vec"] if len(card["vec"]) == width else [0.0] * max(width, 1) for card in daily_cards
-    ]
+    c_rows = []
+    for card in daily_cards:
+        unit = _unit_residual(card["vec"], mu) if card["vec"] else None
+        c_rows.append(unit if unit and len(unit) == width else [0.0] * max(width, 1))
     cmat = (
         np.asarray(c_rows, dtype=np.float32)
         if c_rows and width
@@ -810,12 +1144,130 @@ def _mode_gate(overlay: bool) -> None:
         columns = []
         for card in daily_cards:
             vecs = [vec for vec in (card["events"].get(cap) or []) if len(vec) == width]
-            if not vecs or not len(daily_pairs) or not width:
+            centroid = _centroid_vec(vecs)
+            if not centroid or not len(daily_pairs) or not width:
                 columns.append(np.zeros(len(daily_pairs), dtype=np.float32))
                 continue
-            emat = np.asarray(vecs, dtype=np.float32)
-            columns.append(np.max(qmat @ emat.T, axis=1))
+            columns.append(qmat @ np.asarray(centroid, dtype=np.float32))
         s_evt_all[cap] = np.stack(columns, axis=1)
+    daily_targets = {card["id"]: [card["id"]] for card in daily_cards}
+    daily_capped = _capped_linked_events(daily_targets, store, cap=5)
+    daily_bias = hub_bias(
+        {card["id"]: c_rows[index] if any(c_rows[index]) else None for index, card in enumerate(daily_cards)},
+        {card["id"]: centroid for card in daily_cards if (centroid := _centroid_vec(card["events"].get(5) or []))},
+        event_bank(store, cache, mu),
+        k=8,
+        alpha=_GUIDANCE_HUB_ALPHA,
+        exclude={key: [rec.block_id for rec in recs] for key, recs in daily_capped.items()},
+        beta=0.95,
+    )
+
+    def _daily_loo(nnn: bool) -> dict[str, float]:
+        """Leave each cited event out of its daily card, on the same score the fallback uses.
+
+        Message labels do not meet these cards. The daily gate has to come from
+        the event the card already cites, or it is just the grid floor.
+        """
+        pairs: list[tuple[list[float], set[str], str]] = []
+        for rec in store.records:
+            if rec.item_type != "event" or _is_rejected(rec):
+                continue
+            related = {str(item) for item in (rec.related or ())}
+            hit_ids = {card["id"] for card in daily_cards if card["id"] in related}
+            if not hit_ids:
+                continue
+            raw = (cache.get(rec.block_id) or {}).get("embedding") or []
+            unit = _unit_residual(list(raw), mu) if raw else None
+            if not unit:
+                continue
+            pairs.append((unit, hit_ids, rec.block_id))
+        card_units = []
+        for index, _card in enumerate(daily_cards):
+            unit = list(c_rows[index]) if index < len(c_rows) else []
+            card_units.append(unit if any(unit) else [])
+        n = len(pairs)
+        if not n:
+            return {
+                "loo_n": 0,
+                "loo_top1": 0.0,
+                "loo_mean_rank": 0.0,
+                "loo_impostors": 0.0,
+                "loo_gate": 0.0,
+                "loo_admit": 0.0,
+                "loo_over_gate": 0.0,
+            }
+        top1 = 0
+        rank_sum = 0
+        ahead_sum = 0
+        best_true: list[float | None] = []
+        impostor_counts: list[list[float]] = []
+        for query, hit_ids, drop in pairs:
+            scored: list[tuple[float, str]] = []
+            for card, unit in zip(daily_cards, card_units):
+                s_card = (
+                    float(sum(a * b for a, b in zip(query, unit)))
+                    if unit and len(unit) == len(query)
+                    else 0.0
+                )
+                kept = [
+                    vec
+                    for event_id, vec in (card["event_units"].get(5) or [])
+                    if event_id != drop and len(vec) == len(query)
+                ]
+                centroid = _centroid_vec(kept)
+                s_use = (
+                    float(sum(a * b for a, b in zip(query, centroid))) if centroid else 0.0
+                )
+                sim = max(s_card, 0.95 * s_use)
+                if nnn:
+                    sim -= float(daily_bias.get(card["id"], 0.0))
+                scored.append((sim, card["id"]))
+            trues = [sim for sim, card_id in scored if card_id in hit_ids]
+            if not trues:
+                best_true.append(None)
+                impostor_counts.append([sim for sim, _card_id in scored])
+                rank_sum += len(scored) + 1
+                ahead_sum += len(scored)
+                continue
+            target = max(trues)
+            best_true.append(target)
+            ahead = sum(1 for sim, card_id in scored if card_id not in hit_ids and sim > target)
+            ahead_sum += ahead
+            rank_sum += ahead + 1
+            if ahead == 0:
+                top1 += 1
+            impostor_counts.append([sim for sim, card_id in scored if card_id not in hit_ids])
+        chosen_gate = 0.0
+        chosen_admit = 0.0
+        chosen_over = 0.0
+        fallback: tuple[float, float, float] | None = None
+        for gate_value in _R2_GATES:
+            admit = sum(
+                1 for score in best_true if score is not None and score >= gate_value
+            ) / n
+            over = sum(
+                sum(1 for sim in sims if sim >= gate_value) for sims in impostor_counts
+            ) / n
+            if over <= 2.35 and (fallback is None or admit > fallback[1]):
+                fallback = (gate_value, admit, over)
+            if over <= 2.35 and admit >= 0.50:
+                chosen_gate = gate_value
+                chosen_admit = admit
+                chosen_over = over
+                break
+        if chosen_gate == 0.0 and fallback is not None:
+            chosen_gate, chosen_admit, chosen_over = fallback
+        return {
+            "loo_n": n,
+            "loo_top1": top1 / n,
+            "loo_mean_rank": rank_sum / n,
+            "loo_impostors": ahead_sum / n,
+            "loo_gate": chosen_gate,
+            "loo_admit": chosen_admit,
+            "loo_over_gate": chosen_over,
+        }
+
+    daily_loo = _daily_loo(True)
     for index, pair in enumerate(daily_pairs):
         pair["i"] = index
     by_id = {card["id"]: card for card in daily_cards}
@@ -872,13 +1324,14 @@ def _mode_gate(overlay: bool) -> None:
             )
         return _finish(scored, pair, event_tie="")
 
-    def _vector_order(beta: float, cap: int, use_events: bool):
+    def _vector_order(beta: float, cap: int, use_events: bool, nnn: bool = False):
         def order(pair: dict[str, Any], qv: list[float]):
             del qv
             row_i = int(pair["i"])
             scored = []
             event_winners = []
             label_evt = 0.0
+            floor = -1.0 if nnn else COSINE_FLOOR
             for col, card in enumerate(daily_cards):
                 s_card = float(s_card_all[row_i, col]) if card["vec"] else 0.0
                 s_evt = float(s_evt_all[cap][row_i, col]) if use_events else 0.0
@@ -888,7 +1341,9 @@ def _mode_gate(overlay: bool) -> None:
                     sim = max(s_card, beta * s_evt) if use_events else s_card
                 else:
                     sim = beta * s_evt if use_events else 0.0
-                if sim < COSINE_FLOOR:
+                if nnn:
+                    sim -= float(daily_bias.get(card["id"], 0.0))
+                if sim < floor:
                     continue
                 scored.append(
                     {
@@ -934,6 +1389,25 @@ def _mode_gate(overlay: bool) -> None:
                     **daily_rates(_vector_order(beta, cap, True)),
                 }
             )
+    daily_cells.append(
+        {"variant": "r2", "beta": 0.0, "cap": 0, **daily_rates(_vector_order(0.0, 5, False))}
+    )
+    daily_cells.append(
+        {
+            "variant": "r2_centroid",
+            "beta": 0.95,
+            "cap": 5,
+            **daily_rates(_vector_order(0.95, 5, True)),
+        }
+    )
+    daily_cells.append(
+        {
+            "variant": "r2_centroid_nnn",
+            "beta": 0.95,
+            "cap": 5,
+            **daily_rates(_vector_order(0.95, 5, True, True)),
+        }
+    )
 
     legacy_cell = cells[0]
     index_cells = [cell for cell in cells if cell["variant"] == "index_events" and cell["gate_far_002"] > 0]
@@ -982,6 +1456,7 @@ def _mode_gate(overlay: bool) -> None:
             "overlay": overlay,
             "positive_available": positive_available,
             "positive_used": len(monthly_pos),
+            "event_sample": event_sample,
             "negative_used": len(negatives),
             "daily_available": daily_available,
             "daily_used": len(daily_pairs),
@@ -1002,6 +1477,21 @@ def _mode_gate(overlay: bool) -> None:
             "legacy_daily_top1": float(legacy_daily["top1"]),
             "daily_english_top1": float(chosen_daily["top1_english"]),
             "legacy_english_top1": float(legacy_daily["top1_english"]),
+            "loo_top1": float(loo_nnn["loo_top1"]),
+            "loo_mean_rank": float(loo_nnn["loo_mean_rank"]),
+            "loo_impostors": float(loo_nnn["loo_impostors"]),
+            "loo_gate": float(loo_nnn["loo_gate"]),
+            "loo_admit": float(loo_nnn["loo_admit"]),
+            "loo_over_gate": float(loo_nnn["loo_over_gate"]),
+            "loo_n": int(loo_nnn["loo_n"]),
+            "live_flips": int(loo_nnn["live_flips"]),
+            "daily_loo_top1": float(daily_loo["loo_top1"]),
+            "daily_loo_mean_rank": float(daily_loo["loo_mean_rank"]),
+            "daily_loo_impostors": float(daily_loo["loo_impostors"]),
+            "daily_loo_gate": float(daily_loo["loo_gate"]),
+            "daily_loo_admit": float(daily_loo["loo_admit"]),
+            "daily_loo_over": float(daily_loo["loo_over_gate"]),
+            "daily_loo_n": int(daily_loo["loo_n"]),
         }
     )
 
@@ -1033,6 +1523,7 @@ def _history_decision(
     eps: float | None,
     gate: float,
     positive: bool,
+    tau: float = 0.03,
 ) -> tuple[str, int]:
     """Say whether this pile would inject the labelled card, and how many steps it scored.
 
@@ -1054,7 +1545,7 @@ def _history_decision(
         if not positive or best_id in labels:
             return "step0", 1
         return "miss", 1
-    h_prev = _entropy_bits([score for _row_id, score in steps[0]])
+    h_prev = _entropy_bits([score for _row_id, score in steps[0]], tau)
     for index, step in enumerate(steps[1:], start=1):
         if not step:
             return "miss", index
@@ -1063,7 +1554,7 @@ def _history_decision(
             if not positive or best_id in labels:
                 return "pile", index + 1
             return "miss", index + 1
-        h_now = _entropy_bits([score for _row_id, score in step])
+        h_now = _entropy_bits([score for _row_id, score in step], tau)
         if eps is not None and h_prev - h_now <= eps:
             return "miss", index + 1
         h_prev = h_now
@@ -1080,23 +1571,47 @@ def _mode_history() -> None:
     import numpy as np
 
     from monthly_actions import (
+        _GUIDANCE_COS_GATE,
         _GUIDANCE_EVENT_BETA,
         _GUIDANCE_EVENT_CAP,
         _GUIDANCE_GATE,
+        _GUIDANCE_HUB_ALPHA,
         _PILE_MAX_TURNS,
         _PILE_SHORT_CHARS,
         _lexical_sim,
         rank_monthly_guidance,
     )
     from recall.embed import MAX_LENGTH
-    from recall.embed_cache import load_cache, scale_block_id
+    from recall.embed_cache import (
+        _compose_embedding_text,
+        load_cache,
+        mean_direction,
+        scale_block_id,
+        scan_all_blocks,
+    )
     from recall.ids import BlockIndex
+    from recall.tools import _capped_linked_events, _unit_residual, event_bank, hub_bias
 
     home = _home()
     staging = home / "memories" / "staging"
     _stage("load")
     store = BlockIndex(staging)
     cache = {key: dict(value) for key, value in load_cache().items()}
+    missing_blocks = []
+    missing_texts = []
+    for block in scan_all_blocks().values():
+        if (cache.get(block["id"]) or {}).get("embedding"):
+            continue
+        missing_blocks.append(block)
+        missing_texts.append(_compose_embedding_text(block))
+    if missing_texts:
+        _stage("encode-cards")
+        filled = _encode_unique(missing_texts)
+        for block in missing_blocks:
+            vec = filled.get(_compose_embedding_text(block)) or []
+            if vec:
+                cache[block["id"]] = {"embedding": vec}
+    mu = mean_direction(cache)
     messages = _load_user_messages(home / "state.db")
     by_session: dict[str, list[dict[str, Any]]] = {}
     for msg in messages:
@@ -1111,7 +1626,7 @@ def _mode_history() -> None:
         index_text = str(row.lookup_text() or "").strip()
         index_id = _scale_id(scale_block_id, text=index_text, mem_id=row.id, month_key=str(payload.key))
         raw = (cache.get(index_id) or {}).get("embedding") or []
-        events = _event_vectors(store, evidence, cache, _GUIDANCE_EVENT_CAP)
+        events = _event_vectors(store, evidence, cache, _GUIDANCE_EVENT_CAP, mu)
         prepared.append(
             {
                 "id": str(row.id),
@@ -1120,9 +1635,24 @@ def _mode_history() -> None:
                 "evidence": evidence,
                 "index_vec": [float(x) for x in raw],
                 "events": events,
-                "event_mat": np.asarray(events, dtype=np.float64) if events else None,
+                "centroid": _centroid_vec(events),
             }
         )
+    history_targets = {row["id"]: row["evidence"] for row in prepared}
+    history_capped = _capped_linked_events(history_targets, store, cap=_GUIDANCE_EVENT_CAP)
+    history_bias = hub_bias(
+        {
+            row["id"]: unit
+            for row in prepared
+            if row["index_vec"] and (unit := _unit_residual(row["index_vec"], mu))
+        },
+        {row["id"]: row["centroid"] for row in prepared if row["centroid"]},
+        event_bank(store, cache, mu),
+        k=8,
+        alpha=_GUIDANCE_HUB_ALPHA,
+        exclude={key: [rec.block_id for rec in recs] for key, recs in history_capped.items()},
+        beta=_GUIDANCE_EVENT_BETA,
+    )
     evidence_ids = set().union(*(row["evidence"] for row in prepared)) if prepared else set()
     index_of: dict[tuple[str, int], int] = {}
     for rows in by_session.values():
@@ -1219,20 +1749,18 @@ def _mode_history() -> None:
 
     def _sims(text: str) -> list[tuple[str, float]]:
         qvec = encoded.get(text) or []
-        q = np.asarray(qvec, dtype=np.float64) if qvec else None
+        query = _unit_residual(qvec, mu) if qvec else None
         scored: list[tuple[str, float]] = []
         for row in prepared:
             lexical = _lexical_sim(text, row["index_text"])
             if lexical >= _GUIDANCE_GATE:
-                s_trig = lexical
-            elif q is not None and row["index_vec"]:
-                s_trig = float(np.dot(np.asarray(row["index_vec"], dtype=np.float64), q))
-            else:
-                s_trig = lexical
-            s_evt = 0.0
-            if q is not None and row["event_mat"] is not None and row["event_mat"].size:
-                s_evt = float(np.max(row["event_mat"] @ q))
-            scored.append((row["id"], max(s_trig, _GUIDANCE_EVENT_BETA * s_evt)))
+                scored.append((row["id"], lexical))
+                continue
+            index = _unit_residual(row["index_vec"], mu) if row["index_vec"] else None
+            s_trig = _dot(query or [], index or [])
+            s_use = _dot(query or [], row["centroid"])
+            sim = max(s_trig, _GUIDANCE_EVENT_BETA * s_use) - float(history_bias.get(row["id"], 0.0))
+            scored.append((row["id"], sim))
         return scored
 
     sim_cache: dict[str, list[tuple[str, float]]] = {}
@@ -1263,7 +1791,7 @@ def _mode_history() -> None:
             floor=1.1,
             margin=1.1,
             eps=0.0,
-            gate=_GUIDANCE_GATE,
+            gate=_GUIDANCE_COS_GATE,
             positive=bool(sample["labels"]),
         )
         if kind == "step0" and sample["labels"]:
@@ -1272,8 +1800,9 @@ def _mode_history() -> None:
             neg_step0 += 1
     n_pos = len(positives)
     n_neg = len(negatives)
-    floors = tuple(round(0.75 + i * 0.01, 2) for i in range(16))
-    margins = (0.04, 0.06, 0.08, 0.10, 0.12)
+    floors = tuple(round(0.05 + i * 0.05, 2) for i in range(12))
+    margins = (0.02, 0.04, 0.06, 0.10)
+    taus = (0.02, 0.03, 0.05, 0.10)
     eps_grid: tuple[tuple[str, float | None], ...] = (
         ("e10", 0.10),
         ("e15", 0.15),
@@ -1284,42 +1813,45 @@ def _mode_history() -> None:
     lowest_far: tuple[tuple, dict[str, Any]] | None = None
     for floor in floors:
         for margin in margins:
-            for eps_label, eps in eps_grid:
-                pos_hits = 0
-                neg_hits = 0
-                for sample, steps in zip(samples, step_lists):
-                    kind, _used = _history_decision(
-                        steps,
-                        sample["labels"],
-                        floor=floor,
-                        margin=margin,
-                        eps=eps,
-                        gate=_GUIDANCE_GATE,
-                        positive=bool(sample["labels"]),
-                    )
-                    if kind == "miss":
-                        continue
-                    if sample["labels"]:
-                        pos_hits += 1
-                    else:
-                        neg_hits += 1
-                far = (neg_hits / n_neg) if n_neg else 0.0
-                cell = {
-                    "floor": floor,
-                    "margin": margin,
-                    "eps": eps_label,
-                    "admit": pos_hits / n_pos,
-                    "far": far,
-                    "pos_hits": pos_hits,
-                    "neg_hits": neg_hits,
-                }
-                far_key = (far, -pos_hits)
-                if lowest_far is None or far_key < lowest_far[0]:
-                    lowest_far = (far_key, cell)
-                if far <= 0.02 and pos_hits > step0_hits:
-                    pick = (pos_hits, -far)
-                    if best is None or pick > best[0]:
-                        best = (pick, cell)
+            for tau in taus:
+                for eps_label, eps in eps_grid:
+                    pos_hits = 0
+                    neg_hits = 0
+                    for sample, steps in zip(samples, step_lists):
+                        kind, _used = _history_decision(
+                            steps,
+                            sample["labels"],
+                            floor=floor,
+                            margin=margin,
+                            eps=eps,
+                            gate=_GUIDANCE_COS_GATE,
+                            positive=bool(sample["labels"]),
+                            tau=tau,
+                        )
+                        if kind == "miss":
+                            continue
+                        if sample["labels"]:
+                            pos_hits += 1
+                        else:
+                            neg_hits += 1
+                    far = (neg_hits / n_neg) if n_neg else 0.0
+                    cell = {
+                        "floor": floor,
+                        "margin": margin,
+                        "tau": tau,
+                        "eps": eps_label,
+                        "admit": pos_hits / n_pos,
+                        "far": far,
+                        "pos_hits": pos_hits,
+                        "neg_hits": neg_hits,
+                    }
+                    far_key = (far, -pos_hits)
+                    if lowest_far is None or far_key < lowest_far[0]:
+                        lowest_far = (far_key, cell)
+                    if far <= 0.02 and pos_hits > step0_hits:
+                        pick = (pos_hits, -far)
+                        if best is None or pick > best[0]:
+                            best = (pick, cell)
     chosen = best[1] if best is not None else (lowest_far[1] if lowest_far else {})
     tokens_p99 = _quantile([float(n) for n in token_lengths], 0.99)
     if tokens_p99 >= MAX_LENGTH:
@@ -1379,6 +1911,7 @@ def _mode_history() -> None:
             "step0_far": (neg_step0 / n_neg) if n_neg else 0.0,
             "best_floor": float(chosen.get("floor", 0.0)),
             "best_margin": float(chosen.get("margin", 0.0)),
+            "best_tau": float(chosen.get("tau", 0.03)),
             "best_eps": eps_number,
             "best_eps_off": str(chosen.get("eps", "off")) == "off",
             "best_admit": float(chosen.get("admit", 0.0)),

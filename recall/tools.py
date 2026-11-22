@@ -14,7 +14,15 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .edges import WEIGHT_OVERLAP, adjacency, load_edges
-from .embed import COSINE_FLOOR, _cosine, _encode_texts, embed_enabled, log_fts_miss, rerank_embed
+from .embed import (
+    COSINE_FLOOR,
+    _cosine,
+    _encode_texts,
+    _project_off,
+    embed_enabled,
+    log_fts_miss,
+    rerank_embed,
+)
 from .ids import (
     BlockIndex,
     BlockRecord,
@@ -396,6 +404,21 @@ def _capped_linked_events(
     return chosen
 
 
+def _unit_residual(
+    vec: Sequence[float], mean_dir: Sequence[float] | None
+) -> list[float] | None:
+    """Project off the cone and renormalise so a centroid is not pulled by vector length.
+
+    A residual that is exactly the cone has no direction left, so it is dropped
+    instead of becoming a zero vector in the average.
+    """
+    projected = _project_off(vec, mean_dir)
+    norm = math.sqrt(sum(value * value for value in projected))
+    if norm == 0.0:
+        return None
+    return [value / norm for value in projected]
+
+
 def linked_event_scores(
     query_vec: Sequence[float] | None,
     targets: Mapping[str, Sequence[str]],
@@ -403,12 +426,13 @@ def linked_event_scores(
     *,
     cap: int,
     cache: Mapping[str, Any] | None,
+    mean_dir: Sequence[float] | None = None,
+    centroids_out: dict[str, list[float]] | None = None,
 ) -> dict[str, float]:
-    """Score each target by its closest linked event so the situation is not limited to the card text.
+    """Score each target by the mean of its capped events so one episode cannot define usage.
 
-    Sibling cards that share one event get the same event score; the caller
-    breaks that tie with the card's own similarity. One matrix product covers
-    every capped event that already has a vector.
+    Closest-event max let a single neighbour outvote the rest of the card's
+    history. The centroid is that usage vector. A target with no vectors stays 0.
     """
     scores = {str(key): 0.0 for key in targets}
     if store is None or not query_vec or not targets:
@@ -424,25 +448,99 @@ def linked_event_scores(
             raw = (cache.get(rec.block_id) or {}).get("embedding") or []
             if raw and len(raw) == width:
                 vectors[rec.block_id] = [float(x) for x in raw]
-    if not vectors:
+    prepared = {
+        eid: unit
+        for eid, raw in vectors.items()
+        if (unit := _unit_residual(raw, mean_dir)) is not None
+    }
+    query = _unit_residual(query_vec, mean_dir)
+    if query is None or not prepared:
         return scores
-    try:
-        import numpy as np
-
-        ids = list(vectors)
-        mat = np.asarray([vectors[i] for i in ids], dtype=np.float32)
-        dots = mat @ np.asarray(list(query_vec), dtype=np.float32)
-        by_id = {ids[i]: float(dots[i]) for i in range(len(ids))}
-    except Exception:
-        by_id = {
-            eid: float(sum(a * b for a, b in zip(vec, query_vec)))
-            for eid, vec in vectors.items()
-        }
     for key, recs in chosen.items():
-        vals = [by_id[rec.block_id] for rec in recs if rec.block_id in by_id]
-        if vals:
-            scores[key] = max(vals)
+        rows = [prepared[rec.block_id] for rec in recs if rec.block_id in prepared]
+        if not rows:
+            continue
+        dim = len(rows[0])
+        mean = [0.0] * dim
+        for row in rows:
+            for index, value in enumerate(row):
+                mean[index] += value
+        scale = 1.0 / len(rows)
+        mean = [value * scale for value in mean]
+        centroid = _unit_residual(mean, None)
+        if centroid is None:
+            continue
+        if centroids_out is not None:
+            centroids_out[str(key)] = centroid
+        scores[str(key)] = sum(left * right for left, right in zip(query, centroid))
     return scores
+
+
+def hub_bias(
+    cards: Mapping[str, Sequence[float] | None],
+    centroids: Mapping[str, Sequence[float]],
+    bank: Sequence[tuple[str, Sequence[float]]],
+    *,
+    k: int = 8,
+    alpha: float = 1.0,
+    exclude: Mapping[str, Sequence[str]] | None = None,
+    beta: float = 0.95,
+) -> dict[str, float]:
+    """Penalise a card that sits near many unrelated events so popularity is not relevance.
+
+    The penalty does not depend on the query, so the pile loop can reuse it.
+    A card's own capped events are left out; otherwise every used card would
+    subtract the episodes that define it. An empty bank leaves the bias at 0.
+    ``beta`` matches the usage-channel discount in monthly guidance.
+    """
+    owned = exclude or {}
+    limit = max(int(k), 0)
+    out: dict[str, float] = {}
+    for card_id, lookup in cards.items():
+        key = str(card_id)
+        skip = {str(item) for item in owned.get(key, ())}
+        centroid = centroids.get(key)
+        vals: list[float] = []
+        for event_id, vec in bank:
+            if str(event_id) in skip:
+                continue
+            trig = _cosine(vec, lookup) if lookup else 0.0
+            use = _cosine(vec, centroid) if centroid else 0.0
+            vals.append(max(trig, beta * use))
+        if limit <= 0 or not vals:
+            out[key] = 0.0
+            continue
+        top = sorted(vals, reverse=True)[:limit]
+        out[key] = float(alpha) * (sum(top) / len(top))
+    return out
+
+
+def event_bank(
+    store: BlockIndex | None,
+    cache: Mapping[str, Any] | None,
+    mean_dir: Sequence[float] | None = None,
+) -> list[tuple[str, list[float]]]:
+    """R2 vectors of non-rejected daily events, the reference set for hubness.
+
+    Monthly rows live in the same cache. Counting them would penalise a card
+    for resembling other guidance, which is a different question than popularity
+    across situations.
+    """
+    if store is None:
+        return []
+    rows = cache or {}
+    bank: list[tuple[str, list[float]]] = []
+    for rec in store.records:
+        if rec.item_type != "event" or _is_rejected(rec):
+            continue
+        raw = (rows.get(rec.block_id) or {}).get("embedding") or []
+        if not raw:
+            continue
+        unit = _unit_residual(raw, mean_dir)
+        if unit is None:
+            continue
+        bank.append((rec.block_id, unit))
+    return bank
 
 
 def _time_hits(store: BlockIndex, lo: datetime, hi: datetime) -> list[BlockRecord]:
@@ -738,12 +836,13 @@ def _daily_dp_from_vectors(
     store: BlockIndex,
     query_vec: Sequence[float],
     cache: Mapping[str, Any],
+    mean_dir: Sequence[float] | None = None,
 ) -> str:
-    """On a monthly miss, pick the daily card whose past situation fits, even when its own text does not.
+    """On a monthly miss, score daily D/P in the same R2 space as the month path.
 
-    The linked event is a separate vector, so a procedure's obstacle and solution
-    stay in the card vector and do not dilute the situation. The event itself is
-    never injected. Keyword search stays off this path.
+    A separate raw-cosine floor let a daily card through after the month path
+    had already rejected that similarity. The centroid and the hub penalty are
+    the ones monthly guidance just used. The event itself is never injected.
     """
     import sys
 
@@ -751,7 +850,9 @@ def _daily_dp_from_vectors(
     if str(mdir) not in sys.path:
         sys.path.insert(0, str(mdir))
     from monthly_actions import (
+        _GUIDANCE_COS_GATE_DAILY,
         _GUIDANCE_EVENT_BETA,
+        _GUIDANCE_HUB_ALPHA,
         _GUIDANCE_EVENT_CAP,
         _GUIDANCE_KIND_FLOOR,
         _GUIDANCE_KIND_SHARE,
@@ -764,25 +865,47 @@ def _daily_dp_from_vectors(
         if rec.item_type in allowed and not _is_rejected(rec)
     ]
     targets = {rec.block_id: [rec.block_id] for rec in live}
+    centroids: dict[str, list[float]] = {}
     evt_scores = linked_event_scores(
         query_vec,
         targets,
         store,
         cap=_GUIDANCE_EVENT_CAP,
         cache=cache,
+        mean_dir=mean_dir,
+        centroids_out=centroids,
     )
     width = len(list(query_vec))
-    qv = [float(x) for x in query_vec]
-    scored: list[dict[str, Any]] = []
+    lookups: dict[str, list[float]] = {}
     for rec in live:
         raw = (cache.get(rec.block_id) or {}).get("embedding") or []
-        s_evt = float(evt_scores.get(rec.block_id) or 0.0)
         if raw and len(raw) == width:
-            s_card = float(sum(a * b for a, b in zip(raw, qv)))
-            combined = max(s_card, _GUIDANCE_EVENT_BETA * s_evt)
-        else:
-            s_card = 0.0
-            combined = _GUIDANCE_EVENT_BETA * s_evt
+            unit = _unit_residual(raw, mean_dir)
+            if unit is not None:
+                lookups[rec.block_id] = unit
+    exclude = {
+        key: [rec.block_id for rec in recs]
+        for key, recs in _capped_linked_events(
+            targets, store, cap=_GUIDANCE_EVENT_CAP
+        ).items()
+    }
+    biases = hub_bias(
+        {rec.block_id: lookups.get(rec.block_id) for rec in live},
+        centroids,
+        event_bank(store, cache, mean_dir),
+        alpha=_GUIDANCE_HUB_ALPHA,
+        exclude=exclude,
+        beta=_GUIDANCE_EVENT_BETA,
+    )
+    query_unit = _unit_residual(query_vec, mean_dir)
+    scored: list[dict[str, Any]] = []
+    for rec in live:
+        card = lookups.get(rec.block_id)
+        s_use = float(evt_scores.get(rec.block_id) or 0.0)
+        s_card = float(_cosine(query_unit, card)) if query_unit and card else 0.0
+        combined = max(s_card, _GUIDANCE_EVENT_BETA * s_use) - float(
+            biases.get(rec.block_id) or 0.0
+        )
         parsed = rec.parsed
         strength = strength_value(
             recall_n=float(parsed.get("recall_n") or 0.0),
@@ -796,7 +919,7 @@ def _daily_dp_from_vectors(
                 "s": combined,
                 "s_card": s_card,
                 "rank": 0.8 * combined + 0.2 * (strength / 10.0),
-                "above": combined >= COSINE_FLOOR,
+                "above": combined >= _GUIDANCE_COS_GATE_DAILY,
             }
         )
     above = [item for item in scored if item["above"]]
@@ -899,13 +1022,16 @@ def _guidance_recall(
         return f"## Memory / recall  channel=miss  q={query}\n"
     query_vec = None
     cache = None
+    mean_dir = None
     if embed_enabled(staging) and query:
         try:
-            from recall.embed_cache import load_cache
+            from recall.embed_cache import load_cache, mean_direction
 
             cache = load_cache() or {}
+            mean_dir = mean_direction(cache)
         except Exception:
             cache = {}
+            mean_dir = None
         try:
             from recall.embed import _encode_texts
 
@@ -922,6 +1048,7 @@ def _guidance_recall(
         query_vec=query_vec,
         cache=cache,
         history=history,
+        mean_dir=mean_dir,
     )
     if hits:
         return format_guidance_hits(hits)
@@ -932,6 +1059,7 @@ def _guidance_recall(
             store=store,
             query_vec=query_vec,
             cache=cache or {},
+            mean_dir=mean_dir,
         )
     allowed = {"decision", "procedure"}
     fts = search_lexical(query, k=k, staging=staging)

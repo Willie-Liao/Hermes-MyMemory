@@ -183,12 +183,37 @@ def _mean_pool(hidden: Any, mask: Any) -> Any:
     return summed / counts
 
 
-def _l2_normalize(rows: Any) -> Any:
+def _unit_direction(mean_dir: Sequence[float] | None) -> list[float] | None:
+    """Unit cone axis, or None when the caller did not supply one.
+
+    A non-unit mean would scale the subtracted component and leave a leftover
+    of the shared direction in the residual.
+    """
+    if not mean_dir:
+        return None
+    coords = [float(value) for value in mean_dir]
+    norm = sum(value * value for value in coords) ** 0.5
+    if norm == 0.0:
+        return None
+    return [value / norm for value in coords]
+
+
+def _l2_normalize(rows: Any, mean_dir: Sequence[float] | None = None) -> Any:
+    """Renormalise rows, after dropping the shared cone when ``mean_dir`` is set.
+
+    Encoding still calls this with no axis, so cached vectors stay raw. Guidance
+    passes the axis here so later dots are not dominated by the model mean.
+    """
     import numpy as np
 
-    norms = np.linalg.norm(rows, axis=1, keepdims=True)
+    arr = np.asarray(rows, dtype="float32")
+    hat = _unit_direction(mean_dir)
+    if hat is not None and arr.ndim == 2 and arr.shape[1] == len(hat):
+        axis = np.asarray(hat, dtype="float32")
+        arr = arr - (arr @ axis)[:, None] * axis
+    norms = np.linalg.norm(arr, axis=1, keepdims=True)
     norms = np.where(norms == 0.0, 1.0, norms)
-    return rows / norms
+    return arr / norms
 
 
 def _encode_chunk(batch: list[str]) -> list[list[float]]:
@@ -256,7 +281,34 @@ def _passage_text(rec: BlockRecord) -> str:
     return " ".join(b for b in bits if b)
 
 
-def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
+def _project_off(vec: Sequence[float], mean_dir: Sequence[float] | None) -> list[float]:
+    """Drop the component along ``mean_dir`` when the widths match.
+
+    A width mismatch leaves the vector unchanged so a stale axis cannot zero
+    every score.
+    """
+    coords = [float(value) for value in vec]
+    hat = _unit_direction(mean_dir)
+    if hat is None or len(coords) != len(hat):
+        return coords
+    dot = sum(coords[i] * hat[i] for i in range(len(hat)))
+    return [coords[i] - dot * hat[i] for i in range(len(hat))]
+
+
+def _cosine(
+    a: Sequence[float],
+    b: Sequence[float],
+    *,
+    mean_dir: Sequence[float] | None = None,
+) -> float:
+    """Cosine after an optional cone projection so shared model bias is not a match.
+
+    ``mean_dir`` defaults to off. Rerank and scale-row scoring keep raw cosine
+    until a caller opts in.
+    """
+    if mean_dir is not None:
+        a = _project_off(a, mean_dir)
+        b = _project_off(b, mean_dir)
     n = min(len(a), len(b))
     if n == 0:
         return 0.0
