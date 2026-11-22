@@ -76,10 +76,14 @@ def _plugin_subpath(name: str) -> Path:
     return Path(__file__).resolve().parent.parent / name
 
 
-def collect_month_scale_rows(staging: Path) -> list[dict[str, Any]]:
+def collect_month_scale_rows(
+    staging: Path, *, views: bool = False
+) -> list[dict[str, Any]]:
     """Index month stories and D/P lookup text so Channel 4 can rank a small bag before daily cards.
 
     Daily YAML remains the card corpus; these rows only supply locators (weeks or mem-ids).
+    Solution and context rows exist so the 01:00 cache can embed those views. Channel 4
+    must not see them, or a fix would locate a card whose situation never matched.
     """
     mdir = _plugin_subpath("monthly")
     if str(mdir) not in sys.path:
@@ -112,21 +116,38 @@ def collect_month_scale_rows(staging: Path) -> list[dict[str, Any]]:
             )
         for row in list(payload.key_decisions or ()) + list(payload.key_procedures or ()):
             text = str(row.lookup_text() if hasattr(row, "lookup_text") else "").strip()
-            if not text:
-                continue
             evidence = tuple(
                 str(x).strip() for x in (getattr(row, "evidence", ()) or ()) if str(x).strip()
             )
-            rows.append(
-                {
-                    "scale": "month",
-                    "kind": "dp",
-                    "text": text,
-                    "mem_id": str(getattr(row, "id", "") or "").strip(),
-                    "evidence": evidence,
-                    "month_key": str(getattr(payload, "key", "") or "").strip(),
-                }
-            )
+            mem_id = str(getattr(row, "id", "") or "").strip()
+            month_key = str(getattr(payload, "key", "") or "").strip()
+            if text:
+                rows.append(
+                    {
+                        "scale": "month",
+                        "kind": "dp",
+                        "text": text,
+                        "mem_id": mem_id,
+                        "evidence": evidence,
+                        "month_key": month_key,
+                    }
+                )
+            if not views or not hasattr(row, "lookup_text"):
+                continue
+            for kind, view_name in (("dp_solution", "solution"), ("dp_context", "context")):
+                view = str(row.lookup_text(view_name) or "").strip()
+                if not view:
+                    continue
+                rows.append(
+                    {
+                        "scale": "month",
+                        "kind": kind,
+                        "text": view,
+                        "mem_id": mem_id,
+                        "evidence": evidence,
+                        "month_key": month_key,
+                    }
+                )
     return rows
 
 
@@ -476,8 +497,15 @@ def linked_event_scores(
     return scores
 
 
+def _card_views(lookup: Sequence[Sequence[float]] | None) -> list[Sequence[float]]:
+    """Keep only real view vectors so a missing solution cannot zero the hub term."""
+    if not lookup:
+        return []
+    return [view for view in lookup if view]
+
+
 def hub_bias(
-    cards: Mapping[str, Sequence[float] | None],
+    cards: Mapping[str, Sequence[Sequence[float]] | None],
     centroids: Mapping[str, Sequence[float]],
     bank: Sequence[tuple[str, Sequence[float]]],
     *,
@@ -489,8 +517,10 @@ def hub_bias(
     """Penalise a card that sits near many unrelated events so popularity is not relevance.
 
     The penalty does not depend on the query, so the pile loop can reuse it.
-    A card's own capped events are left out; otherwise every used card would
-    subtract the episodes that define it. An empty bank leaves the bias at 0.
+    Each card passes a list of view vectors. The trigger term is the closest
+    view, so a popular solution still counts when the trigger is rare. A card's
+    own capped events are left out; otherwise every used card would subtract
+    the episodes that define it. An empty bank leaves the bias at 0.
     ``beta`` matches the usage-channel discount in monthly guidance.
     """
     owned = exclude or {}
@@ -500,11 +530,12 @@ def hub_bias(
         key = str(card_id)
         skip = {str(item) for item in owned.get(key, ())}
         centroid = centroids.get(key)
+        views = _card_views(lookup)
         vals: list[float] = []
         for event_id, vec in bank:
             if str(event_id) in skip:
                 continue
-            trig = _cosine(vec, lookup) if lookup else 0.0
+            trig = max((_cosine(vec, view) for view in views), default=0.0)
             use = _cosine(vec, centroid) if centroid else 0.0
             vals.append(max(trig, beta * use))
         if limit <= 0 or not vals:
@@ -841,8 +872,11 @@ def _daily_dp_from_vectors(
     """On a monthly miss, score daily D/P in the same R2 space as the month path.
 
     A separate raw-cosine floor let a daily card through after the month path
-    had already rejected that similarity. The centroid and the hub penalty are
-    the ones monthly guidance just used. The event itself is never injected.
+    had already rejected that similarity. A slotted procedure is the max of its
+    obstacle and solution views, so the full-card vector cannot admit a card
+    whose slots miss. A body without those slots keeps the full-card vector.
+    The centroid and the hub penalty are the ones monthly guidance just used.
+    The event itself is never injected.
     """
     import sys
 
@@ -876,13 +910,36 @@ def _daily_dp_from_vectors(
         centroids_out=centroids,
     )
     width = len(list(query_vec))
-    lookups: dict[str, list[float]] = {}
+
+    def _cached_unit(key: str) -> list[float] | None:
+        raw = (cache.get(key) or {}).get("embedding") or []
+        if not raw or len(raw) != width:
+            return None
+        return _unit_residual(raw, mean_dir)
+
+    from recall.embed_cache import scale_block_id
+
+    lookups: dict[str, list[list[float]]] = {}
+    view_names: dict[str, list[str]] = {}
     for rec in live:
-        raw = (cache.get(rec.block_id) or {}).get("embedding") or []
-        if raw and len(raw) == width:
-            unit = _unit_residual(raw, mean_dir)
+        units: list[list[float]] = []
+        names: list[str] = []
+        if rec.item_type == "procedure":
+            for kind in ("obstacle", "solution"):
+                unit = _cached_unit(
+                    scale_block_id({"scale": "day", "kind": kind, "mem_id": rec.block_id})
+                )
+                if unit is not None:
+                    units.append(unit)
+                    names.append(kind)
+        if not units:
+            unit = _cached_unit(rec.block_id)
             if unit is not None:
-                lookups[rec.block_id] = unit
+                units.append(unit)
+                names.append("card")
+        if units:
+            lookups[rec.block_id] = units
+            view_names[rec.block_id] = names
     exclude = {
         key: [rec.block_id for rec in recs]
         for key, recs in _capped_linked_events(
@@ -900,12 +957,23 @@ def _daily_dp_from_vectors(
     query_unit = _unit_residual(query_vec, mean_dir)
     scored: list[dict[str, Any]] = []
     for rec in live:
-        card = lookups.get(rec.block_id)
+        views = lookups.get(rec.block_id) or []
+        names = view_names.get(rec.block_id) or []
+        scored_views = [
+            (name, float(_cosine(query_unit, view)))
+            for name, view in zip(names, views)
+            if query_unit
+        ]
+        s_card = max((score for _name, score in scored_views), default=0.0)
         s_use = float(evt_scores.get(rec.block_id) or 0.0)
-        s_card = float(_cosine(query_unit, card)) if query_unit and card else 0.0
-        combined = max(s_card, _GUIDANCE_EVENT_BETA * s_use) - float(
-            biases.get(rec.block_id) or 0.0
-        )
+        lifted = _GUIDANCE_EVENT_BETA * s_use
+        combined = max(s_card, lifted) - float(biases.get(rec.block_id) or 0.0)
+        if lifted > s_card:
+            via = "event"
+        elif scored_views:
+            via = max(scored_views, key=lambda item: item[1])[0]
+        else:
+            via = "card"
         parsed = rec.parsed
         strength = strength_value(
             recall_n=float(parsed.get("recall_n") or 0.0),
@@ -918,6 +986,7 @@ def _daily_dp_from_vectors(
                 "rec": rec,
                 "s": combined,
                 "s_card": s_card,
+                "via": via,
                 "rank": 0.8 * combined + 0.2 * (strength / 10.0),
                 "above": combined >= _GUIDANCE_COS_GATE_DAILY,
             }
@@ -980,7 +1049,7 @@ def _daily_dp_from_vectors(
     for item in (body + extra)[:limit_n]:
         rec = item["rec"]
         lines.append(
-            f"- {rec.block_id}  {rec.day} {_week(rec)}  {rec.item_type}  {one_line(rec.body, 80)}"
+            f"- {rec.block_id}  {rec.day} {_week(rec)}  {rec.item_type}  via={item['via']}  {one_line(rec.body, 80)}"
         )
     return "\n".join(lines)
 

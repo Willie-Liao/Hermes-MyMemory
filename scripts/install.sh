@@ -92,6 +92,9 @@ RSYNC_EXCLUDES=(
   # Week-numbered harnesses (test_w38_…) are one-off date tests, not the suite.
   --exclude 'test_w[0-9]*_*.py'
   --exclude 'debug_w[0-9]*_*.py'
+  # One-off probe scripts stay off the gateway. The guidance gate probe is the
+  # current tool, so it has to win over that exclude.
+  --include 'recall/probe_guidance_gate.py'
   --exclude 'probe_*.py'
   --exclude 'Install MyMemory.command'
   --exclude '__pycache__/'
@@ -127,12 +130,33 @@ find "$DEST" -name '._*' -delete
 # rsync does not delete a probe, debug script, or retired module left on the gateway.
 # .cursor holds local agent tests and dated fixtures (2026-07-11.md). Week-numbered
 # test_wNN_ / debug_wNN_ files are the same kind of leftover and must not stay installed.
+# Their .pyc files outlive the .py because rsync never deletes __pycache__.
 purge_retired_mymemory_harnesses() {
   local dest="$1"
   rm -rf "$dest/.cursor"
   find "$dest/weekly" -maxdepth 1 -type f -name 'debug_*.py' -delete 2>/dev/null || true
-  find "$dest" -type f \( -name 'probe_*.py' -o -name 'test_w[0-9]*_*.py' -o -name 'debug_w[0-9]*_*.py' -o -name 'test_*20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]*' -o -name 'debug_*20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]*' \) -delete 2>/dev/null || true
-  rm -f "$dest/weekly/weekly_brief_validate.py" "$dest/weekly/test_weekly_brief_validate.py"
+  find "$dest" -type f \( \
+      -name 'probe_*.py' -o -name 'probe_*.pyc' \
+      -o -name 'test_w[0-9]*_*.py' -o -name 'test_w[0-9]*_*.pyc' \
+      -o -name 'debug_w[0-9]*_*.py' -o -name 'debug_w[0-9]*_*.pyc' \
+      -o -name 'test_*20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]*' \
+      -o -name 'debug_*20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]*' \
+    \) ! -name 'probe_guidance_gate.py' ! -name 'probe_guidance_gate.*.pyc' -delete 2>/dev/null || true
+  rm -f "$dest/weekly/weekly_brief_validate.py" "$dest/weekly/test_weekly_brief_validate.py" \
+    "$dest/digest/test_weekly_span_bridge.py" "$dest/digest/span_weekly.py"
+  # A retired test is gone only when its bytecode is gone too.
+  local cache parent base stem src
+  while IFS= read -r -d '' cache; do
+    parent="$(dirname "$cache")"
+    for src in "$cache"/*; do
+      [[ -f "$src" ]] || continue
+      base="$(basename "$src")"
+      stem="${base%%.*}"
+      if [[ ! -f "$parent/$stem.py" ]]; then
+        rm -f "$src"
+      fi
+    done
+  done < <(find "$dest" -type d -name '__pycache__' -print0 2>/dev/null)
   local note
   for note in 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37; do
     rm -f "$dest/RELEASE_NOTES_1.1.${note}.md"

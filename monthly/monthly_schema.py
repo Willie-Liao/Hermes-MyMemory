@@ -195,15 +195,19 @@ class MonthlyDecision:
         _require_concise_note(self.why_it_matters, "why_it_matters")
         _require_evidence(self.why_it_matters, self.evidence, "key_decisions")
 
-    def lookup_text(self) -> str:
-        """Leave exceptions and why_it_matters out so those payload words cannot dilute the situation vector.
+    def lookup_text(self, view: str = "index") -> str:
+        """Keep the ruling vector free of context so a standing rule is not retrieved whenever the situation words recur.
 
-        Entity, context, and the ruling are the index. The cited days are
-        matched through the event view, not by stuffing the exception text here.
+        Context is its own view. Exceptions and why_it_matters stay out of both,
+        because those payload words are not the situation being matched.
         """
+        name = str(view or "index").strip()
+        if name == "context":
+            return str(self.context or "").strip()
+        if name != "index":
+            return ""
         parts = [
             " ".join(self.entity_keys),
-            self.context,
             self.text,
         ]
         return " ".join(p for p in parts if str(p).strip())
@@ -239,12 +243,17 @@ class MonthlyProcedure:
         _require_concise_note(self.insight, "insight")
         _require_evidence(self.problem or self.insight, self.evidence, "key_procedures")
 
-    def lookup_text(self) -> str:
-        """Leave obstacles, solution, and insight out so the fix cannot dilute the situation vector.
+    def lookup_text(self, view: str = "index") -> str:
+        """Keep the fix off the situation vector so a solution's words cannot outrank the trigger.
 
-        Entity plus trigger is the index. Problem is used only when trigger is
-        blank, so an older row still has a situation to embed.
+        The solution view is scored on its own. Problem fills the index only
+        when trigger is blank, so an older row still has a situation to embed.
         """
+        name = str(view or "index").strip()
+        if name == "solution":
+            return str(self.solution or "").strip()
+        if name != "index":
+            return ""
         situation = str(self.trigger or "").strip() or str(self.problem or "").strip()
         parts = [" ".join(self.entity_keys), situation]
         return " ".join(p for p in parts if str(p).strip())

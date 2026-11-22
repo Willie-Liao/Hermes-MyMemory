@@ -25,7 +25,10 @@ def test_lookup_text_joins_only_index_fields():
         entity_keys=("willie",),
         evidence=("mem-1",),
     )
-    assert decision.lookup_text() == "willie When planning the week Prefer one next action."
+    assert decision.lookup_text() == "willie Prefer one next action."
+    assert "When planning the week" not in decision.lookup_text()
+    assert decision.lookup_text("context") == "When planning the week"
+    assert decision.lookup_text("solution") == ""
     assert "reminder" not in decision.lookup_text()
 
     procedure = MonthlyProcedure(
@@ -39,6 +42,9 @@ def test_lookup_text_joins_only_index_fields():
         evidence=("mem-2",),
     )
     assert procedure.lookup_text() == "willie Writing the weekly review"
+    assert procedure.lookup_text("solution") == "Cut to one line"
+    assert procedure.lookup_text("context") == ""
+    assert "Length hides the point" not in procedure.lookup_text("solution")
     blank_trigger = MonthlyProcedure(
         id="p2",
         problem="Reviews run long",
@@ -1661,6 +1667,87 @@ def _month_cache_key(row, month: str = "2026-08") -> str:
             "month_key": month,
         }
     )
+
+
+def _view_cache_key(row, kind: str, text: str, month: str = "2026-08") -> str:
+    from recall.embed_cache import scale_block_id
+
+    return scale_block_id(
+        {
+            "scale": "month",
+            "kind": kind,
+            "text": text.strip(),
+            "mem_id": row.id,
+            "month_key": month,
+        }
+    )
+
+
+def test_guidance_solution_view_rescues_a_procedure_the_trigger_misses(tmp_path, monkeypatch):
+    """A planted solution vector admits the procedure when the trigger vector does not."""
+    from monthly_schema import MonthlyProcedure
+    from monthly_actions import format_guidance_hits, rank_monthly_guidance
+
+    row = MonthlyProcedure(
+        id="mem-2026-08-key-procedure-media",
+        problem="file send",
+        solution="send the chapter via MEDIA",
+        insight="still changes the next time",
+        trigger="unrelated trigger words",
+        evidence=("mem-ev",),
+    )
+    _write_event_view_month(tmp_path, [row])
+    cache = {
+        _month_cache_key(row): {"embedding": [0.0, 1.0, 0.0]},
+        _view_cache_key(row, "dp_solution", row.lookup_text("solution")): {
+            "embedding": [1.0, 0.0, 0.0]
+        },
+    }
+    monkeypatch.setattr("recall.embed._encode_texts", lambda texts: [[1.0, 0.0, 0.0]])
+    scores: list[dict] = []
+    hits = rank_monthly_guidance(
+        "zzzz media delivery",
+        staging=tmp_path,
+        cache=cache,
+        scores_out=scores,
+        mean_dir=[0.0, 0.0, 1.0],
+    )
+    assert [hit["row"].id for hit in hits if hit["via"] == "solution"] == [row.id]
+    assert "via=solution" in format_guidance_hits(hits)
+    recorded = next(item for item in scores if item["id"] == row.id)
+    assert recorded["s_view"] > recorded["s_trig"]
+    assert abs(recorded["s_view"] - 1.0) < 1e-6
+
+
+def test_guidance_context_view_rescues_a_decision_the_ruling_misses(tmp_path, monkeypatch):
+    """A planted context vector admits the decision when the ruling vector does not."""
+    from monthly_schema import MonthlyDecision
+    from monthly_actions import format_guidance_hits, rank_monthly_guidance
+
+    row = MonthlyDecision(
+        id="mem-2026-08-key-decision-waimai",
+        kind="preference",
+        text="Prefer one next action.",
+        why_it_matters="still changes the next time",
+        context="When the school blocks delivery",
+        evidence=("mem-ev",),
+    )
+    _write_event_view_month(tmp_path, [row])
+    cache = {
+        _month_cache_key(row): {"embedding": [0.0, 1.0, 0.0]},
+        _view_cache_key(row, "dp_context", row.lookup_text("context")): {
+            "embedding": [1.0, 0.0, 0.0]
+        },
+    }
+    monkeypatch.setattr("recall.embed._encode_texts", lambda texts: [[1.0, 0.0, 0.0]])
+    hits = rank_monthly_guidance(
+        "zzzz school delivery",
+        staging=tmp_path,
+        cache=cache,
+        mean_dir=[0.0, 0.0, 1.0],
+    )
+    assert [hit["row"].id for hit in hits if hit["via"] == "context"] == [row.id]
+    assert "via=context" in format_guidance_hits(hits)
 
 
 def test_guidance_event_view_lifts_card_and_records_every_score(tmp_path, monkeypatch):

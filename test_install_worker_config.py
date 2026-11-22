@@ -41,19 +41,25 @@ def test_install_sh_bash_n():
 
 
 def test_install_drops_cursor_tree_and_dated_test_files(tmp_path: Path):
-    """A gateway copy must not keep agent test trees or week/calendar date tests.
+    """A gateway copy must not keep dated harnesses, including bytecode rsync will not delete.
 
-    rsync will not delete those if an older install already left them behind.
+    The guidance probe is the current tool. A blanket probe_*.py exclude would
+    drop it and leave an older install without the file the suite just shipped.
     """
     home = tmp_path / "hermes"
     plugin = home / "plugins" / "MyMemory"
     dated = plugin / "weekly" / "test_w38_sunday_evening_patch.py"
+    dated_pyc = plugin / "weekly" / "__pycache__" / "test_w38_sunday_evening_patch.cpython-313.pyc"
     calendar_test = plugin / "digest" / "test_2026-07-11_once.py"
+    stray_probe = plugin / "digest" / "probe_recall_mimo.py"
     calendar = plugin / ".cursor" / "skills" / "real-llm-test" / "assets" / "daily" / "2026-07-11.md"
     dated.parent.mkdir(parents=True)
     dated.write_text("raise SystemExit('stale week harness')\n", encoding="utf-8")
+    dated_pyc.parent.mkdir(parents=True)
+    dated_pyc.write_bytes(b"stale")
     calendar_test.parent.mkdir(parents=True)
     calendar_test.write_text("raise SystemExit('stale calendar harness')\n", encoding="utf-8")
+    stray_probe.write_text("raise SystemExit('stale probe')\n", encoding="utf-8")
     calendar.parent.mkdir(parents=True)
     calendar.write_text("# stale dated fixture\n", encoding="utf-8")
     (tmp_path / "bin").mkdir(exist_ok=True)
@@ -63,10 +69,15 @@ def test_install_drops_cursor_tree_and_dated_test_files(tmp_path: Path):
     combined = proc.stdout + proc.stderr
     assert proc.returncode == 0, combined
     assert not dated.exists()
+    assert not dated_pyc.exists()
     assert not calendar_test.exists()
+    assert not stray_probe.exists()
     assert not calendar.exists()
     assert not (plugin / ".cursor").exists()
     assert (plugin / "weekly" / "test_weekly_tidy.py").is_file()
+    gate = plugin / "recall" / "probe_guidance_gate.py"
+    assert gate.is_file()
+    assert "def _encode_unique" in gate.read_text(encoding="utf-8")
 
 
 def test_worker_from_chat_pins_lanes_and_keeps_chat_model(tmp_path: Path):

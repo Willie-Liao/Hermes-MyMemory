@@ -138,11 +138,27 @@ def _legacy_lookup(row: Any) -> str:
     return " ".join(part for part in parts if str(part).strip())
 
 
-def _scale_id(scale_block_id, *, text: str, mem_id: str, month_key: str) -> str:
+def _view_of(row: Any) -> tuple[str, str]:
+    """Name the extra embedded view so the probe maxes the same channel the ranker does.
+
+    A decision's context and a procedure's solution are separate cache rows.
+    Leaving them out would calibrate a gate for a score the live path no longer uses.
+    """
+    name = row.__class__.__name__
+    if name == "MonthlyDecision":
+        return "dp_context", str(row.lookup_text("context") or "").strip()
+    if name == "MonthlyProcedure":
+        return "dp_solution", str(row.lookup_text("solution") or "").strip()
+    return "", ""
+
+
+def _scale_id(
+    scale_block_id, *, text: str, mem_id: str, month_key: str, kind: str = "dp"
+) -> str:
     return scale_block_id(
         {
             "scale": "month",
-            "kind": "dp",
+            "kind": kind,
             "text": text.strip(),
             "mem_id": mem_id,
             "month_key": month_key,
@@ -462,7 +478,7 @@ def _mode_cache() -> None:
     )
     month_rows = []
     try:
-        month_rows = list(collect_month_scale_rows(staging))
+        month_rows = list(collect_month_scale_rows(staging, views=True))
     except Exception:
         month_rows = []
     week_rows = []
@@ -470,11 +486,22 @@ def _mode_cache() -> None:
         week_rows = list(collect_week_scale_rows(staging))
     except Exception:
         week_rows = []
-    current = {scale_block_id(row) for row in (*month_rows, *week_rows)}
+    from recall.embed_cache import scan_all_blocks
+
+    scanned = scan_all_blocks()
+    current = {key for key in scanned if str(key).startswith("emb-scale:")}
+    current.update(scale_block_id(row) for row in (*month_rows, *week_rows))
     missing_month = sum(
         1
         for row in month_rows
         if not (cache.get(scale_block_id(row)) or {}).get("embedding")
+    )
+    view_kinds = {"dp_solution", "dp_context", "obstacle", "solution"}
+    missing_views = sum(
+        1
+        for key, block in scanned.items()
+        if str(block.get("kind") or "") in view_kinds
+        and not (cache.get(key) or {}).get("embedding")
     )
     stale_month = sum(
         1 for key in cache if str(key).startswith("emb-scale:") and key not in current
@@ -495,6 +522,7 @@ def _mode_cache() -> None:
             "missing_daily": missing_daily,
             "live_daily": len(live),
             "missing_month": missing_month,
+            "missing_views": missing_views,
             "month_rows": len(month_rows),
             "stale_month": stale_month,
         }
@@ -541,6 +569,7 @@ def _mode_gate(overlay: bool) -> None:
         evidence = [str(item) for item in (row.evidence or ()) if str(item).strip()]
         evidence_of[row.id] = evidence
         index_text = str(row.lookup_text() or "").strip()
+        view_kind, view_text = _view_of(row)
         legacy_text = _legacy_lookup(row)
         live = strength_value(
             recall_n=float(getattr(row, "recall_n", 0.0) or 0.0),
@@ -554,12 +583,23 @@ def _mode_gate(overlay: bool) -> None:
                 "kind": kind,
                 "month": str(payload.key),
                 "index_text": index_text,
+                "view_kind": view_kind,
+                "view_text": view_text,
                 "legacy_text": legacy_text,
                 "evidence": evidence,
                 "live": float(live),
                 "index_id": _scale_id(
                     scale_block_id, text=index_text, mem_id=row.id, month_key=str(payload.key)
                 ),
+                "view_id": _scale_id(
+                    scale_block_id,
+                    text=view_text,
+                    mem_id=row.id,
+                    month_key=str(payload.key),
+                    kind=view_kind or "dp",
+                )
+                if view_text
+                else "",
                 "legacy_id": _scale_id(
                     scale_block_id, text=legacy_text, mem_id=row.id, month_key=str(payload.key)
                 ),
@@ -604,6 +644,7 @@ def _mode_gate(overlay: bool) -> None:
 
     texts = [item["text"] for item in monthly_pos] + [msg["content"] for msg in negatives]
     texts.extend(row["index_text"] for row in prepared)
+    texts.extend(row["view_text"] for row in prepared if row["view_text"])
     missing_blocks = []
     if overlay:
         from recall.embed_cache import scan_all_blocks
@@ -623,6 +664,9 @@ def _mode_gate(overlay: bool) -> None:
             vec = encoded.get(row["index_text"]) or []
             if vec:
                 cache[row["index_id"]] = {"embedding": vec}
+            view = (encoded.get(row["view_text"]) or []) if row["view_text"] else []
+            if view and row["view_id"]:
+                cache[row["view_id"]] = {"embedding": view}
         for block in missing_blocks:
             vec = encoded.get(_compose_embedding_text(block)) or []
             if vec:
@@ -630,8 +674,10 @@ def _mode_gate(overlay: bool) -> None:
     for row in prepared:
         legacy = (cache.get(row["legacy_id"]) or {}).get("embedding") or []
         index = (cache.get(row["index_id"]) or {}).get("embedding") or []
+        view = (cache.get(row["view_id"]) or {}).get("embedding") or [] if row["view_id"] else []
         row["legacy_vec"] = [float(x) for x in legacy]
         row["index_vec"] = [float(x) for x in index]
+        row["view_vec"] = [float(x) for x in view]
         row["event_n"] = _event_count(store, row["evidence"])
     from recall.embed_cache import mean_direction
     from recall.tools import _capped_linked_events, _unit_residual, event_bank, hub_bias
@@ -650,11 +696,14 @@ def _mode_gate(overlay: bool) -> None:
     month_exclude = {
         key: [rec.block_id for rec in recs] for key, recs in month_capped.items()
     }
-    month_lookups = {
-        row["id"]: unit
-        for row in prepared
-        if row["index_vec"] and (unit := _unit_residual(row["index_vec"], mu))
-    }
+    month_lookups = {}
+    for row in prepared:
+        units = []
+        for raw in (row["index_vec"], row["view_vec"]):
+            if raw and (unit := _unit_residual(raw, mu)):
+                units.append(unit)
+        if units:
+            month_lookups[row["id"]] = units
     month_centroids = {
         row["id"]: centroid
         for row in prepared
@@ -690,8 +739,15 @@ def _mode_gate(overlay: bool) -> None:
             s_trig = _guidance_sim(
                 query, text, qv, vec, mean_dir=None if legacy else mu
             )
+            s_view = 0.0
+            if not legacy and row["view_text"]:
+                s_view = _guidance_sim(
+                    query, row["view_text"], qv, row["view_vec"], mean_dir=mu
+                )
             s_evt = 0.0 if legacy or cap == 0 else float(month_evt[cap][qi, ri])
-            sim = s_trig if legacy or cap == 0 else max(s_trig, beta * s_evt)
+            sim = s_trig if legacy else max(s_trig, s_view)
+            if not legacy and cap:
+                sim = max(sim, beta * s_evt)
             if nnn and not legacy:
                 sim -= float(month_bias.get(row["id"], 0.0))
             key = (sim, s_trig, row["id"])
@@ -750,7 +806,12 @@ def _mode_gate(overlay: bool) -> None:
                 s_trig = _guidance_sim(
                     text, row["index_text"], qv, row["index_vec"], mean_dir=mu
                 )
-                sim = s_trig
+                s_view = (
+                    _guidance_sim(text, row["view_text"], qv, row["view_vec"], mean_dir=mu)
+                    if row["view_text"]
+                    else 0.0
+                )
+                sim = max(s_trig, s_view)
                 if cap:
                     kept = [
                         vec
@@ -763,7 +824,7 @@ def _mode_gate(overlay: bool) -> None:
                         if centroid
                         else 0.0
                     )
-                    sim = max(s_trig, beta * s_use)
+                    sim = max(sim, beta * s_use)
                 if nnn:
                     sim -= float(month_bias.get(row["id"], 0.0))
                 scored.append((sim, str(row["id"]), float(row.get("live") or 0.0)))
@@ -840,6 +901,37 @@ def _mode_gate(overlay: bool) -> None:
         over_shared = (
             sum(sum(1 for sim in sims if sim >= shared) for sims in impostor_counts) / n
         )
+        proc_ids = {row["id"] for row in prepared if row["kind"] == "procedure"}
+        proc_ranked = [
+            (scored, labels)
+            for scored, labels in ranked
+            if labels.intersection(proc_ids)
+        ]
+        proc_n = len(proc_ranked)
+        proc_top1 = 0
+        proc_rank_sum = 0
+        proc_over = 0
+        for scored, labels in proc_ranked:
+            wanted = labels.intersection(proc_ids)
+            trues = [sim for sim, card_id, _live in scored if card_id in wanted]
+            if not trues:
+                proc_rank_sum += len(scored) + 1
+                proc_over += sum(1 for sim, _card_id, _live in scored if sim >= 0.31)
+                continue
+            target = max(trues)
+            ahead = sum(
+                1
+                for sim, card_id, _live in scored
+                if card_id not in wanted and sim > target
+            )
+            proc_rank_sum += ahead + 1
+            if ahead == 0:
+                proc_top1 += 1
+            proc_over += sum(
+                1
+                for sim, card_id, _live in scored
+                if card_id not in wanted and sim >= 0.31
+            )
         return {
             "loo_n": n,
             "loo_top1": top1 / n,
@@ -850,6 +942,10 @@ def _mode_gate(overlay: bool) -> None:
             "loo_over_gate": chosen_over,
             "loo_over_shared": over_shared,
             "live_flips": flips,
+            "proc_n": proc_n,
+            "proc_top1": (proc_top1 / proc_n) if proc_n else 0.0,
+            "proc_mean_rank": (proc_rank_sum / proc_n) if proc_n else 0.0,
+            "proc_over_031": (proc_over / proc_n) if proc_n else 0.0,
         }
 
     def run_cell(
@@ -940,6 +1036,8 @@ def _mode_gate(overlay: bool) -> None:
         for row in prepared:
             if row["index_vec"]:
                 held[row["index_id"]] = {"embedding": row["index_vec"]}
+            if row["view_vec"] and row["view_id"]:
+                held[row["view_id"]] = {"embedding": row["view_vec"]}
         for key, value in cache.items():
             if not str(key).startswith("emb-scale:"):
                 held[key] = value
@@ -973,13 +1071,28 @@ def _mode_gate(overlay: bool) -> None:
                 row["index_vec"],
                 mean_dir=mu,
             )
+            s_view = (
+                _guidance_sim(
+                    monthly_pos[0]["text"],
+                    row["view_text"],
+                    qvecs[0],
+                    row["view_vec"],
+                    mean_dir=mu,
+                )
+                if row["view_text"]
+                else 0.0
+            )
             s_evt = float(month_evt[5][0, prepared.index(row)]) if prepared else 0.0
-            blended = max(s_trig, 0.95 * s_evt)
             lexical = _lexical_sim(monthly_pos[0]["text"], row["index_text"])
-            if lexical >= 0.92:
-                ours[row["id"]] = lexical
+            lexical_view = (
+                _lexical_sim(monthly_pos[0]["text"], row["view_text"]) if row["view_text"] else 0.0
+            )
+            if lexical >= 0.92 or lexical_view >= 0.92:
+                ours[row["id"]] = max(lexical, lexical_view)
             else:
-                ours[row["id"]] = blended - float(month_bias.get(row["id"], 0.0))
+                ours[row["id"]] = max(s_trig, s_view, 0.95 * s_evt) - float(
+                    month_bias.get(row["id"], 0.0)
+                )
         for item in scores:
             diff = max(diff, abs(float(item["sim"]) - ours.get(item["id"], 0.0)))
 
@@ -1126,19 +1239,33 @@ def _mode_gate(overlay: bool) -> None:
         if q_rows and width
         else np.zeros((len(daily_pairs), 1), dtype=np.float32)
     )
-    c_rows = []
     for card in daily_cards:
-        unit = _unit_residual(card["vec"], mu) if card["vec"] else None
-        c_rows.append(unit if unit and len(unit) == width else [0.0] * max(width, 1))
-    cmat = (
-        np.asarray(c_rows, dtype=np.float32)
-        if c_rows and width
-        else np.zeros((len(daily_cards), qmat.shape[1]), dtype=np.float32)
-    )
+        units: list[list[float]] = []
+        if card["kind"] == "procedure":
+            for view_kind in ("obstacle", "solution"):
+                raw = (
+                    cache.get(
+                        scale_block_id(
+                            {"scale": "day", "kind": view_kind, "mem_id": card["id"]}
+                        )
+                    )
+                    or {}
+                ).get("embedding") or []
+                unit = _unit_residual(list(raw), mu) if raw else None
+                if unit and len(unit) == width:
+                    units.append(unit)
+        if not units and card["vec"]:
+            unit = _unit_residual(card["vec"], mu)
+            if unit and len(unit) == width:
+                units.append(unit)
+        card["score_units"] = units
+    s_card_all = np.zeros((len(daily_pairs), len(daily_cards)), dtype=np.float32)
     if len(daily_pairs) and len(daily_cards) and width:
-        s_card_all = qmat @ cmat.T
-    else:
-        s_card_all = np.zeros((len(daily_pairs), len(daily_cards)), dtype=np.float32)
+        for col, card in enumerate(daily_cards):
+            if not card["score_units"]:
+                continue
+            view_mat = np.asarray(card["score_units"], dtype=np.float32)
+            s_card_all[:, col] = (qmat @ view_mat.T).max(axis=1)
     s_evt_all: dict[int, Any] = {}
     for cap in _CAPS:
         columns = []
@@ -1153,7 +1280,7 @@ def _mode_gate(overlay: bool) -> None:
     daily_targets = {card["id"]: [card["id"]] for card in daily_cards}
     daily_capped = _capped_linked_events(daily_targets, store, cap=5)
     daily_bias = hub_bias(
-        {card["id"]: c_rows[index] if any(c_rows[index]) else None for index, card in enumerate(daily_cards)},
+        {card["id"]: card["score_units"] or None for card in daily_cards},
         {card["id"]: centroid for card in daily_cards if (centroid := _centroid_vec(card["events"].get(5) or []))},
         event_bank(store, cache, mu),
         k=8,
@@ -1181,10 +1308,7 @@ def _mode_gate(overlay: bool) -> None:
             if not unit:
                 continue
             pairs.append((unit, hit_ids, rec.block_id))
-        card_units = []
-        for index, _card in enumerate(daily_cards):
-            unit = list(c_rows[index]) if index < len(c_rows) else []
-            card_units.append(unit if any(unit) else [])
+        card_units = [list(card["score_units"]) for card in daily_cards]
         n = len(pairs)
         if not n:
             return {
@@ -1203,12 +1327,13 @@ def _mode_gate(overlay: bool) -> None:
         impostor_counts: list[list[float]] = []
         for query, hit_ids, drop in pairs:
             scored: list[tuple[float, str]] = []
-            for card, unit in zip(daily_cards, card_units):
-                s_card = (
+            for card, units in zip(daily_cards, card_units):
+                dots = [
                     float(sum(a * b for a, b in zip(query, unit)))
+                    for unit in units
                     if unit and len(unit) == len(query)
-                    else 0.0
-                )
+                ]
+                s_card = max(dots) if dots else 0.0
                 kept = [
                     vec
                     for event_id, vec in (card["event_units"].get(5) or [])
@@ -1333,11 +1458,11 @@ def _mode_gate(overlay: bool) -> None:
             label_evt = 0.0
             floor = -1.0 if nnn else COSINE_FLOOR
             for col, card in enumerate(daily_cards):
-                s_card = float(s_card_all[row_i, col]) if card["vec"] else 0.0
+                s_card = float(s_card_all[row_i, col]) if card["score_units"] else 0.0
                 s_evt = float(s_evt_all[cap][row_i, col]) if use_events else 0.0
                 if card["id"] == pair["card"]:
                     label_evt = s_evt
-                if card["vec"]:
+                if card["score_units"]:
                     sim = max(s_card, beta * s_evt) if use_events else s_card
                 else:
                     sim = beta * s_evt if use_events else 0.0
@@ -1624,28 +1749,47 @@ def _mode_history() -> None:
     for payload, row, kind in actives:
         evidence = [str(item) for item in (row.evidence or ()) if str(item).strip()]
         index_text = str(row.lookup_text() or "").strip()
+        view_kind, view_text = _view_of(row)
         index_id = _scale_id(scale_block_id, text=index_text, mem_id=row.id, month_key=str(payload.key))
+        view_id = (
+            _scale_id(
+                scale_block_id,
+                text=view_text,
+                mem_id=row.id,
+                month_key=str(payload.key),
+                kind=view_kind,
+            )
+            if view_text
+            else ""
+        )
         raw = (cache.get(index_id) or {}).get("embedding") or []
+        view_raw = (cache.get(view_id) or {}).get("embedding") or [] if view_id else []
         events = _event_vectors(store, evidence, cache, _GUIDANCE_EVENT_CAP, mu)
         prepared.append(
             {
                 "id": str(row.id),
                 "kind": kind,
                 "index_text": index_text,
+                "view_text": view_text,
                 "evidence": evidence,
                 "index_vec": [float(x) for x in raw],
+                "view_vec": [float(x) for x in view_raw],
                 "events": events,
                 "centroid": _centroid_vec(events),
             }
         )
     history_targets = {row["id"]: row["evidence"] for row in prepared}
     history_capped = _capped_linked_events(history_targets, store, cap=_GUIDANCE_EVENT_CAP)
+    history_cards: dict[str, list[list[float]]] = {}
+    for row in prepared:
+        units = []
+        for raw in (row["index_vec"], row["view_vec"]):
+            if raw and (unit := _unit_residual(raw, mu)):
+                units.append(unit)
+        if units:
+            history_cards[row["id"]] = units
     history_bias = hub_bias(
-        {
-            row["id"]: unit
-            for row in prepared
-            if row["index_vec"] and (unit := _unit_residual(row["index_vec"], mu))
-        },
+        history_cards,
         {row["id"]: row["centroid"] for row in prepared if row["centroid"]},
         event_bank(store, cache, mu),
         k=8,
@@ -1753,13 +1897,18 @@ def _mode_history() -> None:
         scored: list[tuple[str, float]] = []
         for row in prepared:
             lexical = _lexical_sim(text, row["index_text"])
-            if lexical >= _GUIDANCE_GATE:
-                scored.append((row["id"], lexical))
+            lexical_view = _lexical_sim(text, row["view_text"]) if row["view_text"] else 0.0
+            if lexical >= _GUIDANCE_GATE or lexical_view >= _GUIDANCE_GATE:
+                scored.append((row["id"], max(lexical, lexical_view)))
                 continue
             index = _unit_residual(row["index_vec"], mu) if row["index_vec"] else None
+            view = _unit_residual(row["view_vec"], mu) if row["view_vec"] else None
             s_trig = _dot(query or [], index or [])
+            s_view = _dot(query or [], view or [])
             s_use = _dot(query or [], row["centroid"])
-            sim = max(s_trig, _GUIDANCE_EVENT_BETA * s_use) - float(history_bias.get(row["id"], 0.0))
+            sim = max(s_trig, s_view, _GUIDANCE_EVENT_BETA * s_use) - float(
+                history_bias.get(row["id"], 0.0)
+            )
             scored.append((row["id"], sim))
         return scored
 

@@ -216,15 +216,62 @@ def _compose_embedding_text(block: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+def _procedure_view_blocks(block: dict[str, Any]) -> list[dict[str, Any]]:
+    """Give a slotted daily procedure its own obstacle and solution vectors.
+
+    The full card stays under the raw id for normal recall. Guidance then
+    scores the slots separately, and a body without Obstacle:/Solution: keeps
+    that single vector instead of inventing empty views.
+    """
+    if str(block.get("type") or "") != "procedure":
+        return []
+    digest = Path(__file__).resolve().parent.parent / "digest"
+    if str(digest) not in sys.path:
+        sys.path.insert(0, str(digest))
+    try:
+        from digest_tools import parse_rendered_body_slots
+    except Exception:
+        return []
+    try:
+        slots = dict(parse_rendered_body_slots("procedure", str(block.get("body") or "")) or {})
+    except Exception:
+        return []
+    views: list[dict[str, Any]] = []
+    mem_id = str(block.get("id") or "").strip()
+    for kind in ("obstacle", "solution"):
+        text = str(slots.get(kind) or "").strip()
+        if not text or not mem_id:
+            continue
+        bid = scale_block_id({"scale": "day", "kind": kind, "mem_id": mem_id})
+        views.append(
+            {
+                "id": bid,
+                "type": "",
+                "entity": "",
+                "predicate": "",
+                "body": text,
+                "scale": "day",
+                "kind": kind,
+                "mem_id": mem_id,
+                "source_file": str(block.get("source_file") or ""),
+            }
+        )
+    return views
+
+
 def _sidecar_scale_blocks() -> dict[str, dict[str, Any]]:
-    """Month/week sidecar sentences share the daily 01:00 incremental_update pass."""
+    """Month/week sidecar sentences share the daily 01:00 incremental_update pass.
+
+    Solution and context rows ride along so guidance can load them by id. Channel 4
+    still asks for the locator bag without those views.
+    """
     try:
         from .tools import collect_month_scale_rows, collect_week_scale_rows
     except Exception:
         return {}
     root = _staging_root()
     out: dict[str, dict[str, Any]] = {}
-    for row in collect_month_scale_rows(root):
+    for row in collect_month_scale_rows(root, views=True):
         item = dict(row)
         item.setdefault("scale", "month")
         bid = scale_block_id(item)
@@ -271,6 +318,8 @@ def scan_all_blocks() -> dict[str, dict[str, Any]]:
         for f in sorted(daily_dir.glob("*.md")):
             for block in _parse_blocks_from_file(f):
                 all_blocks[block["id"]] = block
+                for view in _procedure_view_blocks(block):
+                    all_blocks[view["id"]] = view
 
     weekly_dir = root / "weekly"
     if weekly_dir.is_dir():

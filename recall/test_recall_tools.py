@@ -552,13 +552,16 @@ def test_hub_bias_penalises_a_card_near_every_event_except_its_own():
         ("e3", [1.0, 0.0]),
         ("e4", [0.0, 1.0]),
     ]
-    cards = {"hub": [1.0, 0.0], "rare": [0.0, 1.0]}
+    cards = {"hub": [[1.0, 0.0]], "rare": [[0.0, 1.0]]}
     bias = hub_bias(cards, {}, bank, k=8, alpha=1.0)
     assert bias["hub"] > bias["rare"]
     assert abs(bias["hub"] - 0.75) < 1e-6
     excluded = hub_bias(cards, {}, bank, k=8, exclude={"rare": ["e4"]})
     assert excluded["rare"] == 0.0
     assert hub_bias(cards, {}, []) == {"hub": 0.0, "rare": 0.0}
+    split = {"hub": [[0.0, 1.0], [1.0, 0.0]], "rare": [[0.0, 1.0]]}
+    split_bias = hub_bias(split, {}, bank, k=8, alpha=1.0)
+    assert split_bias["hub"] > split_bias["rare"]
 
 
 def test_r2_cosine_drops_a_shared_cone_that_raw_cosine_keeps():
@@ -821,6 +824,103 @@ def test_scan_all_blocks_keeps_first_card_when_file_opens_with_fence(tmp_path, m
     assert list(found) == ["mem-first", "mem-second", "mem-third"]
     assert found["mem-first"]["body"] == "First card body."
     assert found["mem-first"]["type"] == "event"
+
+
+def test_scan_all_blocks_embeds_procedure_obstacle_and_solution(tmp_path, monkeypatch):
+    """A slotted procedure gets two view ids; a decision body does not."""
+    from recall import embed_cache
+    from recall.embed_cache import scale_block_id
+
+    staging = tmp_path / "staging"
+    daily = staging / "daily"
+    daily.mkdir(parents=True)
+    (daily / "2026-08-16.md").write_text(
+        "---\n"
+        "id: mem-proc\n"
+        "type: procedure\n"
+        "entity: Casey\n"
+        "predicate: send\n"
+        "---\n"
+        "Obstacle: WeChat has no file flag; Solution: send the chapter via MEDIA.\n"
+        "\n"
+        "---\n"
+        "id: mem-dec\n"
+        "type: decision\n"
+        "entity: Casey\n"
+        "predicate: chose\n"
+        "---\n"
+        "Preference: keep one next action.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(embed_cache, "_staging_root", lambda: staging)
+    found = embed_cache.scan_all_blocks()
+    obs = scale_block_id({"scale": "day", "kind": "obstacle", "mem_id": "mem-proc"})
+    sol = scale_block_id({"scale": "day", "kind": "solution", "mem_id": "mem-proc"})
+    assert found["mem-proc"]["body"].startswith("Obstacle:")
+    assert found[obs]["body"] == "WeChat has no file flag"
+    assert found[sol]["body"] == "send the chapter via MEDIA."
+    assert found[obs]["kind"] == "obstacle"
+    assert found[sol]["kind"] == "solution"
+    assert found[obs]["scale"] == "day"
+    view_owners = [
+        row.get("mem_id")
+        for key, row in found.items()
+        if str(key).startswith("emb-scale:")
+    ]
+    assert view_owners == ["mem-proc", "mem-proc"]
+
+
+def test_month_scale_views_stay_out_of_channel_four(tmp_path, monkeypatch):
+    """Channel 4 locates from summary and dp rows; solution and context are cache-only."""
+    from recall.tools import _scale_embed_locate, collect_month_scale_rows
+
+    staging = tmp_path / "staging"
+    monthly = staging / "monthly"
+    monthly.mkdir(parents=True)
+    (monthly / "2026-08.md").write_text(
+        "schema_version: 2\n"
+        "cycle: monthly\n"
+        "month_key: '2026-08'\n"
+        "key_decisions:\n"
+        "  - id: mem-d\n"
+        "    kind: preference\n"
+        "    text: Prefer one next action.\n"
+        "    why_it_matters: still changes the next time\n"
+        "    context: When planning the week\n"
+        "    evidence: [mem-d]\n"
+        "key_procedures:\n"
+        "  - id: mem-p\n"
+        "    problem: Reviews run long\n"
+        "    solution: send the chapter via MEDIA\n"
+        "    insight: keep it short\n"
+        "    trigger: Writing the weekly review\n"
+        "    obstacles: [The first note was incomplete.]\n"
+        "    evidence: [mem-p]\n"
+        "summary:\n"
+        "  - text: June start\n"
+        "    weeks: ['2026-W32']\n",
+        encoding="utf-8",
+    )
+    plain = collect_month_scale_rows(staging)
+    assert {row["kind"] for row in plain} <= {"summary", "dp"}
+    assert all("MEDIA" not in str(row.get("text") or "") for row in plain)
+    assert all("planning the week" not in str(row.get("text") or "").casefold() for row in plain)
+    viewed = collect_month_scale_rows(staging, views=True)
+    by_kind = {row["kind"]: row for row in viewed}
+    assert by_kind["dp_solution"]["text"] == "send the chapter via MEDIA"
+    assert by_kind["dp_solution"]["mem_id"] == "mem-p"
+    assert by_kind["dp_context"]["text"] == "When planning the week"
+    assert by_kind["dp_context"]["mem_id"] == "mem-d"
+    seen: list[bool] = []
+
+    def _spy(root, views=False):
+        seen.append(bool(views))
+        return []
+
+    monkeypatch.setattr("recall.tools.collect_month_scale_rows", _spy)
+    monkeypatch.setattr("recall.tools.collect_week_scale_rows", lambda *_a, **_k: [])
+    assert _scale_embed_locate("send the chapter via MEDIA", staging) is None
+    assert seen == [False]
 
 
 def test_parse_blocks_matches_legacy_split_when_file_has_no_opening_fence(tmp_path, monkeypatch):
@@ -1353,6 +1453,75 @@ def test_daily_guidance_event_lifts_a_card_the_text_misses(tmp_path, monkeypatch
     assert far not in text
     assert event not in text
     assert calls == [[query]]
+
+
+def _day_view_id(mem_id: str, kind: str) -> str:
+    from recall.embed_cache import scale_block_id
+
+    return scale_block_id({"scale": "day", "kind": kind, "mem_id": mem_id})
+
+
+def _slotted_procedure(root: Path, mem_id: str) -> None:
+    daily = root / "daily"
+    daily.mkdir(parents=True, exist_ok=True)
+    (root / "weekly").mkdir(exist_ok=True)
+    (root / "monthly").mkdir(exist_ok=True)
+    (daily / f"{mem_id}.md").write_text(
+        _block(
+            mem_id=mem_id,
+            type_="procedure",
+            entity="Guide",
+            body="Obstacle: WeChat has no file flag; Solution: send the chapter via MEDIA.",
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_daily_guidance_solution_view_rescues_a_slotted_procedure(tmp_path, monkeypatch):
+    """The solution vector admits a procedure whose full-card vector is orthogonal."""
+    slotted = "mem-2026-08-02-procedure-000000000031"
+    _slotted_procedure(tmp_path, slotted)
+    monkeypatch.setattr("recall.tools.embed_enabled", lambda *_a, **_k: True)
+    monkeypatch.setattr("recall.embed._encode_texts", lambda texts: [[1.0, 0.0]])
+    monkeypatch.setattr("recall.embed_cache.mean_direction", lambda cache=None: None)
+    monkeypatch.setattr(
+        "recall.embed_cache.load_cache",
+        lambda: {
+            slotted: {"embedding": [0.0, 1.0]},
+            _day_view_id(slotted, "obstacle"): {"embedding": [0.0, 1.0]},
+            _day_view_id(slotted, "solution"): {"embedding": [1.0, 0.0]},
+        },
+    )
+    text = recall_memory("zzzz media delivery", staging=tmp_path, mode="guidance")
+    assert "channel=daily_dp" in text
+    assert slotted in text
+    assert "via=solution" in text
+
+
+def test_daily_guidance_ignores_full_card_when_slots_miss(tmp_path, monkeypatch):
+    """A slotted procedure whose views miss stays out even if the full card matches."""
+    good = "mem-2026-08-02-procedure-000000000041"
+    other = "mem-2026-08-02-procedure-000000000042"
+    bad = "mem-2026-08-02-procedure-000000000043"
+    _dp_card(tmp_path, good, "procedure")
+    _dp_card(tmp_path, other, "procedure")
+    _slotted_procedure(tmp_path, bad)
+    monkeypatch.setattr("recall.tools.embed_enabled", lambda *_a, **_k: True)
+    monkeypatch.setattr("recall.embed._encode_texts", lambda texts: [[1.0, 0.0]])
+    monkeypatch.setattr("recall.embed_cache.mean_direction", lambda cache=None: None)
+    monkeypatch.setattr(
+        "recall.embed_cache.load_cache",
+        lambda: {
+            good: {"embedding": [1.0, 0.0]},
+            other: {"embedding": [1.0, 0.0]},
+            bad: {"embedding": [1.0, 0.0]},
+            _day_view_id(bad, "obstacle"): {"embedding": [0.0, 1.0]},
+            _day_view_id(bad, "solution"): {"embedding": [0.0, 1.0]},
+        },
+    )
+    text = recall_memory("zzzz media delivery", staging=tmp_path, mode="guidance")
+    assert good in text and other in text
+    assert bad not in text
 
 
 def test_daily_guidance_shared_event_orders_by_card_score(tmp_path, monkeypatch):

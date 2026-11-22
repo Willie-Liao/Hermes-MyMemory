@@ -389,8 +389,11 @@ def rank_monthly_guidance(
     Decisions that merely pass the gate must not fill the block and hide a procedure
     for this message. Each kind keeps up to half the slots, and a kind with fewer
     than two passing rows is topped up from below the gate so it is not absent.
-    Usage is the centroid of capped events, not the single closest one, and a hub
-    penalty is subtracted once per card. An exact lexical match skips that penalty.
+    A procedure also carries its solution vector and a decision its context vector.
+    The card score is the best of the index, that view, and the usage centroid, so
+    a fix can admit a card whose trigger does not resemble the line. Usage is the
+    centroid of capped events, not the single closest one, and a hub penalty is
+    subtracted once per card. An exact lexical match skips that penalty.
     A missing vector scores 0 so leftover word overlap cannot clear the cosine gate.
     A short line that misses is re-scored with earlier lines piled on. The daily
     fallback still sees only the latest line.
@@ -398,15 +401,19 @@ def rank_monthly_guidance(
     q = str(query or "").strip()
     if not q:
         return []
-    pending: list[tuple[str, Any, Any, str]] = []
+    pending: list[tuple[str, Any, Any, str, str]] = []
     for payload in _iter_payloads(staging):
         superseded = {sid for row in payload.key_decisions for sid in row.supersedes}
         for row in payload.key_decisions:
             if not _is_active_decision(row, superseded):
                 continue
-            pending.append(("decision", payload, row, row.lookup_text()))
+            pending.append(
+                ("decision", payload, row, row.lookup_text(), row.lookup_text("context"))
+            )
         for row in payload.key_procedures:
-            pending.append(("procedure", payload, row, row.lookup_text()))
+            pending.append(
+                ("procedure", payload, row, row.lookup_text(), row.lookup_text("solution"))
+            )
     try:
         from recall.embed_cache import load_cache, scale_block_id
     except Exception:
@@ -431,29 +438,39 @@ def rank_monthly_guidance(
     else:
         resolved_mean = list(mean_dir)
     vectors: list[list[float] | None] = []
+    view_vectors: list[list[float] | None] = []
     need_query = False
-    for _kind, payload, row, text in pending:
-        vec: list[float] | None = None
-        if scale_block_id is not None and _lexical_sim(q, text) < _GUIDANCE_GATE:
-            bid = scale_block_id(
-                {
-                    "scale": "month",
-                    "kind": "dp",
-                    "text": text.strip(),
-                    "mem_id": str(getattr(row, "id", "") or "").strip(),
-                    "month_key": str(getattr(payload, "key", "") or "").strip(),
-                }
-            )
-            raw = (resolved_cache.get(bid) or {}).get("embedding") or []
-            if raw:
-                vec = list(raw)
-                need_query = True
-        vectors.append(vec)
+
+    def _cached_vec(kind_name: str, text: str, row, payload) -> list[float] | None:
+        nonlocal need_query
+        if scale_block_id is None or not str(text or "").strip():
+            return None
+        if _lexical_sim(q, text) >= _GUIDANCE_GATE:
+            return None
+        bid = scale_block_id(
+            {
+                "scale": "month",
+                "kind": kind_name,
+                "text": text.strip(),
+                "mem_id": str(getattr(row, "id", "") or "").strip(),
+                "month_key": str(getattr(payload, "key", "") or "").strip(),
+            }
+        )
+        raw = (resolved_cache.get(bid) or {}).get("embedding") or []
+        if not raw:
+            return None
+        need_query = True
+        return list(raw)
+
+    for kind, payload, row, text, view_text in pending:
+        vectors.append(_cached_vec("dp", text, row, payload))
+        view_kind = "dp_context" if kind == "decision" else "dp_solution"
+        view_vectors.append(_cached_vec(view_kind, view_text, row, payload))
     targets: dict[str, list[str]] = {}
     if store is not None:
         from recall.tools import _capped_linked_events
 
-        for _kind, _payload, row, _text in pending:
+        for _kind, _payload, row, _text, _view in pending:
             targets[str(row.id)] = [
                 str(item) for item in (getattr(row, "evidence", ()) or ()) if str(item).strip()
             ]
@@ -493,13 +510,19 @@ def rank_monthly_guidance(
         )
     from recall.tools import _unit_residual, event_bank, hub_bias
 
-    lookups: dict[str, list[float]] = {}
-    for (_kind, _payload, row, _text), cand_vec in zip(pending, vectors):
-        if not cand_vec:
-            continue
-        unit = _unit_residual(cand_vec, resolved_mean)
-        if unit is not None:
-            lookups[str(row.id)] = unit
+    lookups: dict[str, list[list[float]]] = {}
+    for (_kind, _payload, row, _text, _view), cand_vec, view_vec in zip(
+        pending, vectors, view_vectors
+    ):
+        units: list[list[float]] = []
+        for cand in (cand_vec, view_vec):
+            if not cand:
+                continue
+            unit = _unit_residual(cand, resolved_mean)
+            if unit is not None:
+                units.append(unit)
+        if units:
+            lookups[str(row.id)] = units
     if store is not None:
         bias_cards: dict[str, list[float] | None] = {
             key: lookups.get(key) for key in targets
@@ -553,27 +576,53 @@ def rank_monthly_guidance(
         qvec: list[float] | None,
         cand_vec: list[float] | None,
         text: str,
+        view_vec: list[float] | None,
+        view_text: str,
         row_id: str,
         use_scores: dict[str, float],
-    ) -> tuple[float, float, float, float, float]:
-        """Return sim, trigger, usage, bias, and the pre-penalty usage term.
+    ) -> tuple[float, float, float, float, float, float]:
+        """Return sim, trigger, view, usage, bias, and the pre-penalty usage term.
 
-        An exact lexical match skips the hub penalty. Subtracting it there would
-        throw away a verbatim hit because the card is popular.
+        An exact lexical match on the index or the view skips the hub penalty.
+        Subtracting it there would throw away a verbatim hit because the card is popular.
+        The view is the solution for a procedure and the context for a decision.
         """
         lexical = _lexical_sim(qtext, text)
+        lexical_view = _lexical_sim(qtext, view_text) if str(view_text or "").strip() else 0.0
         s_use = float(use_scores.get(row_id, 0.0) or 0.0)
         bias = float(biases.get(row_id, 0.0) or 0.0)
         lifted = _GUIDANCE_EVENT_BETA * s_use
-        if lexical >= _GUIDANCE_GATE:
-            return lexical, lexical, s_use, bias, lifted
+        if lexical >= _GUIDANCE_GATE or lexical_view >= _GUIDANCE_GATE:
+            return max(lexical, lexical_view), lexical, lexical_view, s_use, bias, lifted
         s_trig = _guidance_sim(qtext, text, qvec, cand_vec, mean_dir=resolved_mean)
-        sim = max(s_trig, lifted) - bias
-        return sim, s_trig, s_use, bias, lifted
+        s_view = (
+            _guidance_sim(qtext, view_text, qvec, view_vec, mean_dir=resolved_mean)
+            if view_vec or str(view_text or "").strip()
+            else 0.0
+        )
+        sim = max(s_trig, s_view, lifted) - bias
+        return sim, s_trig, s_view, s_use, bias, lifted
 
-    for (kind, payload, row, text), cand_vec in zip(pending, vectors):
-        sim, s_trig, s_use, bias, lifted = _channels(
-            q, resolved_query, cand_vec, text, str(row.id), evt_scores
+    def _via(kind: str, s_trig: float, s_view: float, lifted: float, sim: float) -> str:
+        """Name the channel that admitted the card so a rescue is visible in the hit."""
+        if s_view > s_trig and s_view >= lifted and sim != s_trig:
+            return "solution" if kind == "procedure" else "context"
+        if lifted > s_trig and lifted > s_view and sim != max(s_trig, s_view):
+            return "event"
+        return "index"
+
+    for (kind, payload, row, text, view_text), cand_vec, view_vec in zip(
+        pending, vectors, view_vectors
+    ):
+        sim, s_trig, s_view, s_use, bias, lifted = _channels(
+            q,
+            resolved_query,
+            cand_vec,
+            text,
+            view_vec,
+            view_text,
+            str(row.id),
+            evt_scores,
         )
         all_sims.append(sim)
         if scores_out is not None:
@@ -582,6 +631,7 @@ def rank_monthly_guidance(
                     "id": str(row.id),
                     "kind": kind,
                     "s_trig": s_trig,
+                    "s_view": s_view,
                     "s_use": s_use,
                     "bias": bias,
                     "sim": sim,
@@ -604,9 +654,10 @@ def rank_monthly_guidance(
             "month": payload.key,
             "sim": sim,
             "s_trig": s_trig,
+            "s_view": s_view,
             "s_use": s_use,
             "bias": bias,
-            "via": "event" if lifted > s_trig and sim != s_trig else "index",
+            "via": _via(kind, s_trig, s_view, lifted, sim),
             "rank": 0.8 * sim + 0.2 * (live / 10.0),
             "overlap": _lexical_sim(q, text),
             "row": row,
@@ -636,16 +687,20 @@ def rank_monthly_guidance(
                 mean_dir=resolved_mean,
             )
         scored: list[tuple] = []
-        for (kind, payload, row, text), cand_vec in zip(pending, vectors):
-            sim, s_trig, s_use, bias, lifted = _channels(
-                qtext, qvec, cand_vec, text, str(row.id), evt
+        for (kind, payload, row, text, view_text), cand_vec, view_vec in zip(
+            pending, vectors, view_vectors
+        ):
+            sim, s_trig, s_view, s_use, bias, lifted = _channels(
+                qtext, qvec, cand_vec, text, view_vec, view_text, str(row.id), evt
             )
-            scored.append((sim, s_trig, s_use, bias, lifted, kind, payload, row, text))
+            scored.append(
+                (sim, s_trig, s_view, s_use, bias, lifted, kind, payload, row, text)
+            )
         scored.sort(key=lambda item: item[0], reverse=True)
         return scored
 
     def _as_hit(parts: tuple, *, turns: int, piled: str) -> dict[str, Any]:
-        sim, s_trig, s_use, bias, lifted, kind, payload, row, text = parts
+        sim, s_trig, s_view, s_use, bias, lifted, kind, payload, row, text = parts
         cards, importance = _cards_for(row)
         live = strength_value(
             recall_n=0.0,
@@ -658,9 +713,10 @@ def rank_monthly_guidance(
             "month": payload.key,
             "sim": sim,
             "s_trig": s_trig,
+            "s_view": s_view,
             "s_use": s_use,
             "bias": bias,
-            "via": "event" if lifted > s_trig and sim != s_trig else "index",
+            "via": _via(kind, s_trig, s_view, lifted, sim),
             "rank": 0.8 * sim + 0.2 * (live / 10.0),
             "overlap": _lexical_sim(piled, text),
             "row": row,
@@ -778,10 +834,11 @@ def rank_monthly_guidance(
 
 
 def format_guidance_hits(hits: list[dict[str, Any]]) -> str:
-    """Print live strength so the agent sees decay, not the value saved on the last stamp.
+    """Name the view that admitted the card so a solution or context hit is not read as the trigger.
 
     turns=N is on the header only when a short follow-up needed earlier lines.
     A single-line hit must keep the header the prefetch tests already match.
+    Live strength is printed so the agent sees decay, not the value saved on the last stamp.
     """
     if not hits:
         return ""
@@ -794,16 +851,17 @@ def format_guidance_hits(hits: list[dict[str, Any]]) -> str:
         row = hit["row"]
         live = float(hit.get("live") or 0.0)
         importance = int(hit.get("importance") or 3)
+        via = str(hit.get("via") or "index")
         if hit["kind"] == "decision":
             extra = f" except {row.exceptions}" if row.exceptions else ""
             lines.append(
-                f"- preference {row.id}  context={row.context or '-'}  "
+                f"- preference {row.id}  via={via}  context={row.context or '-'}  "
                 f"{row.text}{extra}  strength={live:.2f} importance={importance}"
             )
         else:
             obs = "; ".join(row.obstacles) if row.obstacles else ""
             lines.append(
-                f"- procedure {row.id}  trigger={row.trigger or '-'}  "
+                f"- procedure {row.id}  via={via}  trigger={row.trigger or '-'}  "
                 f"obstacles={obs or '-'}  solution={row.solution}  strength={live:.2f} importance={importance}"
             )
     return "\n".join(lines)
