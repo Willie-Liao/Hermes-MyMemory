@@ -566,27 +566,32 @@ def evening_daily_slice_text(
     before: datetime,
     known_ids: set[str],
 ) -> str:
-    """Keep Sunday 16:00–00:00 cards by extract clock without rewriting digest dates.
+    """Accept a Sunday-evening message whose save stamp landed just after midnight.
 
-    Leftover valid_from often stays Saturday; restamping it made Worker-1 titles
-    look like Sunday while the daily still said Saturday — and hid the bodies.
+    The 23:59 leftover finishes after 00:00 and writes generated_at then, so a
+    save-time-only window drops the card. Message time still inside 16:00–00:00
+    keeps it. valid_from is not a clock: restamping it made titles look like
+    Sunday while the daily still said Saturday.
     """
+
+    def _in_window(clock: datetime | None) -> bool:
+        if clock is None:
+            return False
+        if clock.tzinfo is None:
+            clock = clock.replace(tzinfo=after.tzinfo)
+        elif after.tzinfo is not None:
+            clock = clock.astimezone(after.tzinfo)
+        return after <= clock < before
+
     kept: list[dict[str, Any]] = []
     for block in parse_blocks(text):
         fm = block.get("frontmatter") or {}
         mem_id = str(fm.get("id") or "").strip()
         if not mem_id or mem_id in known_ids:
             continue
-        clock = _parse_card_clock(fm.get("generated_at")) or _parse_card_clock(
-            fm.get("user_message_at")
-        )
-        if clock is None:
-            continue
-        if clock.tzinfo is None:
-            clock = clock.replace(tzinfo=after.tzinfo)
-        elif after.tzinfo is not None:
-            clock = clock.astimezone(after.tzinfo)
-        if after <= clock < before:
+        saved = _parse_card_clock(fm.get("generated_at"))
+        said = _parse_card_clock(fm.get("user_message_at"))
+        if _in_window(saved) or _in_window(said):
             kept.append(block)
     return "\n\n".join(_render_block(block) for block in kept)
 

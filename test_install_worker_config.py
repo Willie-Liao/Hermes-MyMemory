@@ -75,6 +75,7 @@ def test_install_drops_cursor_tree_and_dated_test_files(tmp_path: Path):
     assert not calendar.exists()
     assert not (plugin / ".cursor").exists()
     assert (plugin / "weekly" / "test_weekly_tidy.py").is_file()
+    assert (plugin / "weekly" / "test_sunday_evening_slice.py").is_file()
     gate = plugin / "recall" / "probe_guidance_gate.py"
     assert gate.is_file()
     assert "def _encode_unique" in gate.read_text(encoding="utf-8")

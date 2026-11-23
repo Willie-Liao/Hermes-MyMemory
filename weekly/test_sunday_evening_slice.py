@@ -19,7 +19,17 @@ def _load_workers():
     return mod
 
 
-def _card(mem_id: str, generated_at: str, body: str) -> str:
+def _card(
+    mem_id: str,
+    generated_at: str,
+    body: str,
+    *,
+    user_message_at: str = "",
+) -> str:
+    """Build one card. user_message_at is optional so older save-time cases stay unchanged."""
+    message = ""
+    if user_message_at:
+        message = f"user_message_at: '{user_message_at}'\n"
     return (
         "---\n"
         f"id: {mem_id}\n"
@@ -28,6 +38,7 @@ def _card(mem_id: str, generated_at: str, body: str) -> str:
         "status: candidate\n"
         "sources: [test]\n"
         f"generated_at: '{generated_at}'\n"
+        f"{message}"
         "---\n"
         f"{body}\n"
     )
@@ -93,6 +104,36 @@ def test_evening_slice_keeps_post_1600_and_skips_known_ids():
     assert "mem-late" in sliced
     assert "mem-early" not in sliced
     assert "mem-known" not in sliced
+
+
+def test_evening_slice_keeps_message_time_when_save_is_after_midnight():
+    workers = _load_workers()
+    text = "\n".join(
+        [
+            _card(
+                "mem-spill",
+                "2026-08-17T00:00:25+08:00",
+                "Beginning: sunday night; Course: x; Outcome: y",
+                user_message_at="2026-08-16T20:18:43+08:00",
+            ),
+            _card(
+                "mem-monday",
+                "2026-08-17T00:03:00+08:00",
+                "Beginning: monday; Course: x; Outcome: y",
+                user_message_at="2026-08-17T00:02:00+08:00",
+            ),
+        ]
+    )
+    after = datetime(2026, 8, 16, 16, 0, tzinfo=SHANGHAI)
+    before = datetime(2026, 8, 17, 0, 0, tzinfo=SHANGHAI)
+    sliced = workers.evening_daily_slice_text(
+        text,
+        after=after,
+        before=before,
+        known_ids=set(),
+    )
+    assert "mem-spill" in sliced
+    assert "mem-monday" not in sliced
 
 
 FRENCH_EVENT = (
