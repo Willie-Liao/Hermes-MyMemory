@@ -607,6 +607,59 @@ def incremental_update(
             meta["mean_norm"] = norm
         if stamp_day is not None:
             meta["last_checked_on"] = stamp_day
+        centroids: dict[str, list[float]] = {}
+        try:
+            import sys
+
+            from .ids import BlockIndex
+            from .tools import _is_rejected, linked_event_scores
+
+            store = BlockIndex(_staging_root())
+            targets: dict[str, list[str]] = {}
+            for rec in store.records:
+                if rec.item_type not in {"decision", "procedure"} or _is_rejected(rec):
+                    continue
+                targets[rec.block_id] = [rec.block_id]
+            mdir = Path(__file__).resolve().parent.parent / "monthly"
+            if str(mdir) not in sys.path:
+                sys.path.insert(0, str(mdir))
+            from monthly_actions import (  # noqa: E402
+                _GUIDANCE_EVENT_CAP,
+                _is_active_decision,
+                _iter_payloads,
+            )
+
+            for payload in _iter_payloads(_staging_root()):
+                superseded = {
+                    sid for row in payload.key_decisions for sid in row.supersedes
+                }
+                rows = [
+                    row
+                    for row in payload.key_decisions
+                    if _is_active_decision(row, superseded)
+                ]
+                rows.extend(list(payload.key_procedures))
+                for row in rows:
+                    targets[str(row.id)] = [
+                        str(item)
+                        for item in (getattr(row, "evidence", ()) or ())
+                        if str(item).strip()
+                    ]
+            linked_event_scores(
+                None,
+                targets,
+                store,
+                cap=_GUIDANCE_EVENT_CAP,
+                cache=merged,
+                mean_dir=direction,
+                centroids_out=centroids,
+            )
+        except Exception:
+            logger.exception("guidance centroid rebuild failed")
+            previous = _load_meta().get("centroids")
+            if isinstance(previous, dict):
+                centroids = previous
+        meta["centroids"] = centroids
         save_cache(merged, meta)
     
     logger.info(

@@ -10,7 +10,7 @@ import time
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 _monthly = Path(__file__).resolve().parent
 _mymemory = _monthly.parent
@@ -43,10 +43,6 @@ _MONTH_KEY_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 _GUIDANCE_GATE = 0.92
 _GUIDANCE_EVENT_BETA = 0.95
 _GUIDANCE_EVENT_CAP = 5
-# Leave-one-out on cited events: weight 1 subtracts 0.49 from a true score of
-# 0.46, so the wanted card drops out of the top. 0.25 keeps top-1 level with
-# the centroid and puts fewer impostors over the gate than R2 alone.
-_GUIDANCE_HUB_ALPHA = 0.25
 # Lowest gate at that weight whose impostors stay within 2.35 and at least half
 # of the cited events still clear it. Monthly and daily differ by 0.08, so the
 # daily fallback has its own constant.
@@ -383,6 +379,7 @@ def rank_monthly_guidance(
     history: Sequence[tuple[float, str]] = (),
     now: float | None = None,
     mean_dir: Sequence[float] | None = None,
+    stored_centroids: Mapping[str, Sequence[float]] | None = None,
 ) -> list[dict[str, Any]]:
     """Rank active monthly D/P in R2 space so the model cone is not treated as a match.
 
@@ -392,8 +389,9 @@ def rank_monthly_guidance(
     A procedure also carries its solution vector and a decision its context vector.
     The card score is the best of the index, that view, and the usage centroid, so
     a fix can admit a card whose trigger does not resemble the line. Usage is the
-    centroid of capped events, not the single closest one, and a hub penalty is
-    subtracted once per card. An exact lexical match skips that penalty.
+    centroid of capped events, not the single closest one. A stored centroid from
+    the 01:00 cache is that same vector. An exact lexical match is the score, so
+    a verbatim line is not replaced by a weaker cosine.
     A missing vector scores 0 so leftover word overlap cannot clear the cosine gate.
     A short line that misses is re-scored with earlier lines piled on. The daily
     fallback still sees only the latest line.
@@ -495,7 +493,6 @@ def rank_monthly_guidance(
         except Exception:
             resolved_query = None
     evt_scores: dict[str, float] = {}
-    centroids: dict[str, list[float]] = {}
     if store is not None and resolved_query:
         from recall.tools import linked_event_scores
 
@@ -506,44 +503,8 @@ def rank_monthly_guidance(
             cap=_GUIDANCE_EVENT_CAP,
             cache=resolved_cache,
             mean_dir=resolved_mean,
-            centroids_out=centroids,
+            stored=stored_centroids,
         )
-    from recall.tools import _unit_residual, event_bank, hub_bias
-
-    lookups: dict[str, list[list[float]]] = {}
-    for (_kind, _payload, row, _text, _view), cand_vec, view_vec in zip(
-        pending, vectors, view_vectors
-    ):
-        units: list[list[float]] = []
-        for cand in (cand_vec, view_vec):
-            if not cand:
-                continue
-            unit = _unit_residual(cand, resolved_mean)
-            if unit is not None:
-                units.append(unit)
-        if units:
-            lookups[str(row.id)] = units
-    if store is not None:
-        bias_cards: dict[str, list[float] | None] = {
-            key: lookups.get(key) for key in targets
-        }
-        exclude = {
-            key: [rec.block_id for rec in recs]
-            for key, recs in _capped_linked_events(
-                targets, store, cap=_GUIDANCE_EVENT_CAP
-            ).items()
-        }
-    else:
-        bias_cards = dict(lookups)
-        exclude = {}
-    biases = hub_bias(
-        bias_cards,
-        centroids,
-        event_bank(store, resolved_cache, resolved_mean),
-        alpha=_GUIDANCE_HUB_ALPHA,
-        exclude=exclude,
-        beta=_GUIDANCE_EVENT_BETA,
-    )
     from recall.strength import strength_value
 
     try:
@@ -580,28 +541,27 @@ def rank_monthly_guidance(
         view_text: str,
         row_id: str,
         use_scores: dict[str, float],
-    ) -> tuple[float, float, float, float, float, float]:
-        """Return sim, trigger, view, usage, bias, and the pre-penalty usage term.
+    ) -> tuple[float, float, float, float, float]:
+        """Return sim, trigger, view, usage, and the discounted usage term.
 
-        An exact lexical match on the index or the view skips the hub penalty.
-        Subtracting it there would throw away a verbatim hit because the card is popular.
-        The view is the solution for a procedure and the context for a decision.
+        An exact lexical match on the index or the view is the score, so a
+        verbatim line is not replaced by a weaker cosine. The view is the
+        solution for a procedure and the context for a decision.
         """
         lexical = _lexical_sim(qtext, text)
         lexical_view = _lexical_sim(qtext, view_text) if str(view_text or "").strip() else 0.0
         s_use = float(use_scores.get(row_id, 0.0) or 0.0)
-        bias = float(biases.get(row_id, 0.0) or 0.0)
         lifted = _GUIDANCE_EVENT_BETA * s_use
         if lexical >= _GUIDANCE_GATE or lexical_view >= _GUIDANCE_GATE:
-            return max(lexical, lexical_view), lexical, lexical_view, s_use, bias, lifted
+            return max(lexical, lexical_view), lexical, lexical_view, s_use, lifted
         s_trig = _guidance_sim(qtext, text, qvec, cand_vec, mean_dir=resolved_mean)
         s_view = (
             _guidance_sim(qtext, view_text, qvec, view_vec, mean_dir=resolved_mean)
             if view_vec or str(view_text or "").strip()
             else 0.0
         )
-        sim = max(s_trig, s_view, lifted) - bias
-        return sim, s_trig, s_view, s_use, bias, lifted
+        sim = max(s_trig, s_view, lifted)
+        return sim, s_trig, s_view, s_use, lifted
 
     def _via(kind: str, s_trig: float, s_view: float, lifted: float, sim: float) -> str:
         """Name the channel that admitted the card so a rescue is visible in the hit."""
@@ -614,7 +574,7 @@ def rank_monthly_guidance(
     for (kind, payload, row, text, view_text), cand_vec, view_vec in zip(
         pending, vectors, view_vectors
     ):
-        sim, s_trig, s_view, s_use, bias, lifted = _channels(
+        sim, s_trig, s_view, s_use, lifted = _channels(
             q,
             resolved_query,
             cand_vec,
@@ -633,7 +593,6 @@ def rank_monthly_guidance(
                     "s_trig": s_trig,
                     "s_view": s_view,
                     "s_use": s_use,
-                    "bias": bias,
                     "sim": sim,
                 }
             )
@@ -656,7 +615,6 @@ def rank_monthly_guidance(
             "s_trig": s_trig,
             "s_view": s_view,
             "s_use": s_use,
-            "bias": bias,
             "via": _via(kind, s_trig, s_view, lifted, sim),
             "rank": 0.8 * sim + 0.2 * (live / 10.0),
             "overlap": _lexical_sim(q, text),
@@ -685,22 +643,23 @@ def rank_monthly_guidance(
                 cap=_GUIDANCE_EVENT_CAP,
                 cache=resolved_cache,
                 mean_dir=resolved_mean,
+                stored=stored_centroids,
             )
         scored: list[tuple] = []
         for (kind, payload, row, text, view_text), cand_vec, view_vec in zip(
             pending, vectors, view_vectors
         ):
-            sim, s_trig, s_view, s_use, bias, lifted = _channels(
+            sim, s_trig, s_view, s_use, lifted = _channels(
                 qtext, qvec, cand_vec, text, view_vec, view_text, str(row.id), evt
             )
             scored.append(
-                (sim, s_trig, s_view, s_use, bias, lifted, kind, payload, row, text)
+                (sim, s_trig, s_view, s_use, lifted, kind, payload, row, text)
             )
         scored.sort(key=lambda item: item[0], reverse=True)
         return scored
 
     def _as_hit(parts: tuple, *, turns: int, piled: str) -> dict[str, Any]:
-        sim, s_trig, s_view, s_use, bias, lifted, kind, payload, row, text = parts
+        sim, s_trig, s_view, s_use, lifted, kind, payload, row, text = parts
         cards, importance = _cards_for(row)
         live = strength_value(
             recall_n=0.0,
@@ -715,7 +674,6 @@ def rank_monthly_guidance(
             "s_trig": s_trig,
             "s_view": s_view,
             "s_use": s_use,
-            "bias": bias,
             "via": _via(kind, s_trig, s_view, lifted, sim),
             "rank": 0.8 * sim + 0.2 * (live / 10.0),
             "overlap": _lexical_sim(piled, text),

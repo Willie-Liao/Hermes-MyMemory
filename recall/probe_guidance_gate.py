@@ -546,7 +546,7 @@ def _active_rows(staging: Path) -> list[Any]:
 def _mode_gate(overlay: bool) -> None:
     import numpy as np
 
-    from monthly_actions import _GUIDANCE_HUB_ALPHA, _guidance_sim, _lexical_sim
+    from monthly_actions import _guidance_sim, _lexical_sim
     from recall.embed import COSINE_FLOOR
     from recall.embed_cache import _compose_embedding_text, load_cache, scale_block_id
     from recall.ids import BlockIndex
@@ -680,7 +680,7 @@ def _mode_gate(overlay: bool) -> None:
         row["view_vec"] = [float(x) for x in view]
         row["event_n"] = _event_count(store, row["evidence"])
     from recall.embed_cache import mean_direction
-    from recall.tools import _capped_linked_events, _unit_residual, event_bank, hub_bias
+    from recall.tools import _unit_residual
 
     mu = mean_direction(cache)
     for row in prepared:
@@ -691,34 +691,6 @@ def _mode_gate(overlay: bool) -> None:
             cap: [vec for _event_id, vec in units]
             for cap, units in row["event_units"].items()
         }
-    month_targets = {row["id"]: row["evidence"] for row in prepared}
-    month_capped = _capped_linked_events(month_targets, store, cap=5)
-    month_exclude = {
-        key: [rec.block_id for rec in recs] for key, recs in month_capped.items()
-    }
-    month_lookups = {}
-    for row in prepared:
-        units = []
-        for raw in (row["index_vec"], row["view_vec"]):
-            if raw and (unit := _unit_residual(raw, mu)):
-                units.append(unit)
-        if units:
-            month_lookups[row["id"]] = units
-    month_centroids = {
-        row["id"]: centroid
-        for row in prepared
-        if (centroid := _centroid_vec(row["events"].get(5) or []))
-    }
-    month_bias = hub_bias(
-        month_lookups,
-        month_centroids,
-        event_bank(store, cache, mu),
-        k=8,
-        alpha=_GUIDANCE_HUB_ALPHA,
-        exclude=month_exclude,
-        beta=0.95,
-    )
-
     def score_variant(
         query: str,
         qv: list[float],
@@ -733,6 +705,7 @@ def _mode_gate(overlay: bool) -> None:
         best_key = None
         top = 0.0
         winner = prepared[0] if prepared else None
+        del nnn  # the all-event penalty this flag subtracted is gone
         for ri, row in enumerate(prepared):
             text = row["legacy_text"] if legacy else row["index_text"]
             vec = row["legacy_vec"] if legacy else row["index_vec"]
@@ -748,8 +721,6 @@ def _mode_gate(overlay: bool) -> None:
             sim = s_trig if legacy else max(s_trig, s_view)
             if not legacy and cap:
                 sim = max(sim, beta * s_evt)
-            if nnn and not legacy:
-                sim -= float(month_bias.get(row["id"], 0.0))
             key = (sim, s_trig, row["id"])
             if best_key is None or key > best_key:
                 best_key = key
@@ -795,6 +766,7 @@ def _mode_gate(overlay: bool) -> None:
         too high for a new message. Live flips count how often 0.2 * live/10
         changes the winner on this wider scale.
         """
+        del nnn  # the all-event penalty this flag subtracted is gone
         ranked: list[tuple[list[tuple[float, str, float]], set[str]]] = []
         flips = 0
         for qi, ((text, labels, role), qv) in enumerate(zip(queries, qvecs)):
@@ -825,8 +797,6 @@ def _mode_gate(overlay: bool) -> None:
                         else 0.0
                     )
                     sim = max(sim, beta * s_use)
-                if nnn:
-                    sim -= float(month_bias.get(row["id"], 0.0))
                 scored.append((sim, str(row["id"]), float(row.get("live") or 0.0)))
             if not scored:
                 continue
@@ -1090,9 +1060,7 @@ def _mode_gate(overlay: bool) -> None:
             if lexical >= 0.92 or lexical_view >= 0.92:
                 ours[row["id"]] = max(lexical, lexical_view)
             else:
-                ours[row["id"]] = max(s_trig, s_view, 0.95 * s_evt) - float(
-                    month_bias.get(row["id"], 0.0)
-                )
+                ours[row["id"]] = max(s_trig, s_view, 0.95 * s_evt)
         for item in scores:
             diff = max(diff, abs(float(item["sim"]) - ours.get(item["id"], 0.0)))
 
@@ -1277,24 +1245,13 @@ def _mode_gate(overlay: bool) -> None:
                 continue
             columns.append(qmat @ np.asarray(centroid, dtype=np.float32))
         s_evt_all[cap] = np.stack(columns, axis=1)
-    daily_targets = {card["id"]: [card["id"]] for card in daily_cards}
-    daily_capped = _capped_linked_events(daily_targets, store, cap=5)
-    daily_bias = hub_bias(
-        {card["id"]: card["score_units"] or None for card in daily_cards},
-        {card["id"]: centroid for card in daily_cards if (centroid := _centroid_vec(card["events"].get(5) or []))},
-        event_bank(store, cache, mu),
-        k=8,
-        alpha=_GUIDANCE_HUB_ALPHA,
-        exclude={key: [rec.block_id for rec in recs] for key, recs in daily_capped.items()},
-        beta=0.95,
-    )
-
     def _daily_loo(nnn: bool) -> dict[str, float]:
         """Leave each cited event out of its daily card, on the same score the fallback uses.
 
         Message labels do not meet these cards. The daily gate has to come from
         the event the card already cites, or it is just the grid floor.
         """
+        del nnn  # the all-event penalty this flag subtracted is gone
         pairs: list[tuple[list[float], set[str], str]] = []
         for rec in store.records:
             if rec.item_type != "event" or _is_rejected(rec):
@@ -1344,8 +1301,6 @@ def _mode_gate(overlay: bool) -> None:
                     float(sum(a * b for a, b in zip(query, centroid))) if centroid else 0.0
                 )
                 sim = max(s_card, 0.95 * s_use)
-                if nnn:
-                    sim -= float(daily_bias.get(card["id"], 0.0))
                 scored.append((sim, card["id"]))
             trues = [sim for sim, card_id in scored if card_id in hit_ids]
             if not trues:
@@ -1466,8 +1421,6 @@ def _mode_gate(overlay: bool) -> None:
                     sim = max(s_card, beta * s_evt) if use_events else s_card
                 else:
                     sim = beta * s_evt if use_events else 0.0
-                if nnn:
-                    sim -= float(daily_bias.get(card["id"], 0.0))
                 if sim < floor:
                     continue
                 scored.append(
@@ -1700,7 +1653,6 @@ def _mode_history() -> None:
         _GUIDANCE_EVENT_BETA,
         _GUIDANCE_EVENT_CAP,
         _GUIDANCE_GATE,
-        _GUIDANCE_HUB_ALPHA,
         _PILE_MAX_TURNS,
         _PILE_SHORT_CHARS,
         _lexical_sim,
@@ -1715,7 +1667,7 @@ def _mode_history() -> None:
         scan_all_blocks,
     )
     from recall.ids import BlockIndex
-    from recall.tools import _capped_linked_events, _unit_residual, event_bank, hub_bias
+    from recall.tools import _unit_residual
 
     home = _home()
     staging = home / "memories" / "staging"
@@ -1778,25 +1730,6 @@ def _mode_history() -> None:
                 "centroid": _centroid_vec(events),
             }
         )
-    history_targets = {row["id"]: row["evidence"] for row in prepared}
-    history_capped = _capped_linked_events(history_targets, store, cap=_GUIDANCE_EVENT_CAP)
-    history_cards: dict[str, list[list[float]]] = {}
-    for row in prepared:
-        units = []
-        for raw in (row["index_vec"], row["view_vec"]):
-            if raw and (unit := _unit_residual(raw, mu)):
-                units.append(unit)
-        if units:
-            history_cards[row["id"]] = units
-    history_bias = hub_bias(
-        history_cards,
-        {row["id"]: row["centroid"] for row in prepared if row["centroid"]},
-        event_bank(store, cache, mu),
-        k=8,
-        alpha=_GUIDANCE_HUB_ALPHA,
-        exclude={key: [rec.block_id for rec in recs] for key, recs in history_capped.items()},
-        beta=_GUIDANCE_EVENT_BETA,
-    )
     evidence_ids = set().union(*(row["evidence"] for row in prepared)) if prepared else set()
     index_of: dict[tuple[str, int], int] = {}
     for rows in by_session.values():
@@ -1906,9 +1839,7 @@ def _mode_history() -> None:
             s_trig = _dot(query or [], index or [])
             s_view = _dot(query or [], view or [])
             s_use = _dot(query or [], row["centroid"])
-            sim = max(s_trig, s_view, _GUIDANCE_EVENT_BETA * s_use) - float(
-                history_bias.get(row["id"], 0.0)
-            )
+            sim = max(s_trig, s_view, _GUIDANCE_EVENT_BETA * s_use)
             scored.append((row["id"], sim))
         return scored
 

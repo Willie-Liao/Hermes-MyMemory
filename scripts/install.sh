@@ -157,10 +157,8 @@ purge_retired_mymemory_harnesses() {
       fi
     done
   done < <(find "$dest" -type d -name '__pycache__' -print0 2>/dev/null)
-  local note
-  for note in 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37; do
-    rm -f "$dest/RELEASE_NOTES_1.1.${note}.md"
-  done
+  # The 1.1 series is retired. A fixed 22–37 list left 1.1.38 on the gateway.
+  rm -f "$dest"/RELEASE_NOTES_1.1.*.md
 }
 purge_retired_mymemory_harnesses "$DEST"
 echo "installed: plugins/MyMemory"

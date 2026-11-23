@@ -1751,11 +1751,10 @@ def test_guidance_context_view_rescues_a_decision_the_ruling_misses(tmp_path, mo
 
 
 def test_guidance_event_view_lifts_card_and_records_every_score(tmp_path, monkeypatch):
-    """One aligned event lifts the card after R2, and the record keeps usage and bias.
+    """One aligned event lifts the card after R2, and the record keeps that usage.
 
     The cone axis is the unused third coordinate, so the planted xy match is the
-    usage score. The card's own event is excluded from the hub bank, otherwise
-    the lift would be cancelled by the episode that caused it.
+    usage score. The score is the discounted centroid, with nothing subtracted.
     """
     from recall.conftest import _block
     from recall.ids import BlockIndex
@@ -1813,9 +1812,9 @@ def test_guidance_event_view_lifts_card_and_records_every_score(tmp_path, monkey
     assert calls == [[query]]
     assert {row["id"] for row in scores} == {lifted.id, quiet.id}
     lifted_score = next(row for row in scores if row["id"] == lifted.id)
-    assert set(lifted_score) >= {"s_trig", "s_use", "bias", "sim"}
+    assert set(lifted_score) >= {"s_trig", "s_use", "sim"}
+    assert "bias" not in lifted_score
     assert abs(lifted_score["s_use"] - 1.0) < 1e-6
-    assert lifted_score["bias"] == 0.0
     assert abs(lifted_score["sim"] - monthly_actions._GUIDANCE_EVENT_BETA) < 1e-6
 
     calls.clear()

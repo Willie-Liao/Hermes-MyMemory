@@ -538,30 +538,39 @@ def test_linked_event_scores_use_the_usage_centroid_not_the_closest_event(tmp_pa
     assert abs(capped["card"] - 1.0) < 1e-6
 
 
-def test_hub_bias_penalises_a_card_near_every_event_except_its_own():
-    """A card that matches the whole bank is a hub; its own events must not count.
+def test_stored_centroid_matches_a_fresh_usage_score(tmp_path):
+    """A centroid saved at 01:00 must score the message the same as a fresh mean.
 
-    Without the exclusion, every used card would subtract the episodes that
-    define it. An empty bank has nothing to subtract, so the bias stays 0.
+    Prefetch multiplies the message by that stored vector. Rebuilding the mean
+    on the message path would do the same arithmetic twice and could drift.
     """
-    from recall.tools import hub_bias
+    from recall.ids import BlockIndex
+    from recall.tools import linked_event_scores
 
-    bank = [
-        ("e1", [1.0, 0.0]),
-        ("e2", [1.0, 0.0]),
-        ("e3", [1.0, 0.0]),
-        ("e4", [0.0, 1.0]),
-    ]
-    cards = {"hub": [[1.0, 0.0]], "rare": [[0.0, 1.0]]}
-    bias = hub_bias(cards, {}, bank, k=8, alpha=1.0)
-    assert bias["hub"] > bias["rare"]
-    assert abs(bias["hub"] - 0.75) < 1e-6
-    excluded = hub_bias(cards, {}, bank, k=8, exclude={"rare": ["e4"]})
-    assert excluded["rare"] == 0.0
-    assert hub_bias(cards, {}, []) == {"hub": 0.0, "rare": 0.0}
-    split = {"hub": [[0.0, 1.0], [1.0, 0.0]], "rare": [[0.0, 1.0]]}
-    split_bias = hub_bias(split, {}, bank, k=8, alpha=1.0)
-    assert split_bias["hub"] > split_bias["rare"]
+    event_id = "mem-2026-08-12-event-aaaaaaaaaaaa"
+    _write_linked_events(tmp_path, [(event_id, "2026-08-12", "aligned")])
+    cache = {event_id: {"embedding": [1.0, 0.0, 0.0]}}
+    store = BlockIndex(tmp_path)
+    targets = {"card": ["mem-cited"]}
+    built: dict[str, list[float]] = {}
+    fresh = linked_event_scores(
+        [1.0, 0.0, 0.0],
+        targets,
+        store,
+        cap=5,
+        cache=cache,
+        centroids_out=built,
+    )
+    stored = linked_event_scores(
+        [1.0, 0.0, 0.0],
+        targets,
+        store,
+        cap=5,
+        cache={},
+        stored=built,
+    )
+    assert abs(stored["card"] - fresh["card"]) < 1e-6
+    assert abs(stored["card"] - 1.0) < 1e-6
 
 
 def test_r2_cosine_drops_a_shared_cone_that_raw_cosine_keeps():
@@ -1017,6 +1026,101 @@ def test_embed_cache_one_am_stamps_last_checked_on(tmp_path, monkeypatch):
     assert stats["embedded"] == 1
     meta = json.loads((tmp_path / "embeddings" / "embed-cache-meta.json").read_text(encoding="utf-8"))
     assert meta["last_checked_on"] == "2026-08-16"
+
+
+def test_embed_cache_stores_own_event_centroid(tmp_path, monkeypatch):
+    """The 01:00 save must keep one centroid for a decision and the event it owns.
+
+    Reloading that vector and dotting the message with it has to match a centroid
+    built from the same cache, or prefetch would score a different episode.
+    """
+    from recall import embed_cache
+    from recall.ids import BlockIndex
+    from recall.tools import linked_event_scores
+
+    decision_id = "mem-2026-08-16-decision-aaaaaaaaaaaa"
+    event_id = "mem-2026-08-16-event-bbbbbbbbbbbb"
+    staging = tmp_path / "staging"
+    daily = staging / "daily"
+    daily.mkdir(parents=True)
+    (staging / "weekly").mkdir()
+    (daily / "2026-08-16.md").write_text(
+        (
+            "---\n"
+            f"id: {event_id}\n"
+            "type: event\n"
+            "entity: Casey\n"
+            "predicate: class_correction\n"
+            "confidence: explicit\n"
+            "status: candidate\n"
+            f"related: [{decision_id}]\n"
+            "---\n"
+            "Nina was filed under the wrong class.\n"
+            "\n"
+            "---\n"
+            f"id: {decision_id}\n"
+            "type: decision\n"
+            "entity: User\n"
+            "predicate: ask_before_class\n"
+            "confidence: explicit\n"
+            "status: candidate\n"
+            "related: []\n"
+            "---\n"
+            "Ask for the class before writing a class-linked note.\n"
+        ),
+        encoding="utf-8",
+    )
+    cache_dir = tmp_path / "embeddings"
+    monkeypatch.setattr(embed_cache, "_staging_root", lambda: staging)
+    monkeypatch.setattr(embed_cache, "_cache_root", lambda: cache_dir)
+    monkeypatch.setattr(embed_cache, "_embed_cache_tz", lambda: SHANGHAI)
+
+    def encode_fn(texts):
+        rows = []
+        for text in texts:
+            if "wrong class" in text:
+                rows.append([1.0, 0.0, 0.0])
+            else:
+                rows.append([0.0, 1.0, 0.0])
+        return rows
+
+    embed_cache.incremental_update(
+        encode_fn=encode_fn, now=datetime(2026, 8, 16, 1, 0, tzinfo=SHANGHAI)
+    )
+    meta = json.loads((cache_dir / "embed-cache-meta.json").read_text(encoding="utf-8"))
+    assert decision_id in meta["centroids"]
+    blocks = json.loads((cache_dir / "embed-cache.json").read_text(encoding="utf-8"))["blocks"]
+    store = BlockIndex(staging)
+    fresh: dict[str, list[float]] = {}
+    linked_event_scores(
+        None,
+        {decision_id: [decision_id]},
+        store,
+        cap=5,
+        cache=blocks,
+        mean_dir=meta["mean_dir"],
+        centroids_out=fresh,
+    )
+    assert meta["centroids"][decision_id] == fresh[decision_id]
+    query = [1.0, 0.0, 0.0]
+    from_disk = linked_event_scores(
+        query,
+        {decision_id: [decision_id]},
+        store,
+        cap=5,
+        cache=blocks,
+        mean_dir=meta["mean_dir"],
+        stored=meta["centroids"],
+    )
+    rebuilt = linked_event_scores(
+        query,
+        {decision_id: [decision_id]},
+        store,
+        cap=5,
+        cache=blocks,
+        mean_dir=meta["mean_dir"],
+    )
+    assert abs(from_disk[decision_id] - rebuilt[decision_id]) < 1e-6
 
 
 def test_embed_cache_writes_mean_direction_and_keeps_it_on_noop_tick(tmp_path, monkeypatch):
