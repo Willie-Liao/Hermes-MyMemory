@@ -331,6 +331,67 @@ def test_request_weekly_reorganise_propagates_oneshot_failure(tmp_path, monkeypa
     assert result["outcome"] == "failed"
 
 
+def test_reorganise_fails_when_model_merge_never_lists_absorbed_ids(tmp_path, monkeypatch):
+    dr = _load_digest_run()
+    digest = dr.digest
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    daily_dir = tmp_path / "memories" / "staging" / "daily"
+    daily_dir.mkdir(parents=True, exist_ok=True)
+    daily = daily_dir / "2026-07-27.md"
+    daily.write_text(_DAILY_TWO_FACTS, encoding="utf-8")
+    before = daily.read_bytes()
+    bad = {
+        "operation": "merge",
+        "survivor_id": "mem-a",
+        "target_id": "mem-a",
+    }
+
+    def fake_oneshot(prompt, platform, *, purpose, force_tool_name="", **_k):
+        name = force_tool_name or "submit_operations"
+        return {
+            "tool_name": name,
+            "tool_args": {"operations": [dict(bad)]},
+            "failed": False,
+        }
+
+    monkeypatch.setattr(digest, "_invoke_digest_oneshot_tool", fake_oneshot)
+    result = dr.request_weekly_reorganise(date_str="2026-07-27")
+    assert result["outcome"] == "failed"
+    assert any("merges were invalid" in str(item) for item in result.get("errors") or [])
+    assert daily.read_bytes() == before
+
+
+def test_reorganise_fails_when_patch_answers_no_merge_after_a_bad_merge(tmp_path, monkeypatch):
+    dr = _load_digest_run()
+    digest = dr.digest
+    monkeypatch.setattr(digest, "get_hermes_home", lambda: tmp_path)
+    daily_dir = tmp_path / "memories" / "staging" / "daily"
+    daily_dir.mkdir(parents=True, exist_ok=True)
+    daily = daily_dir / "2026-07-27.md"
+    daily.write_text(_DAILY_TWO_FACTS, encoding="utf-8")
+    before = daily.read_bytes()
+    bad = {
+        "operation": "merge",
+        "survivor_id": "mem-a",
+        "target_id": "mem-a",
+    }
+
+    def fake_oneshot(prompt, platform, *, purpose, force_tool_name="", **_k):
+        name = force_tool_name or "submit_operations"
+        ops = [dict(bad)] if name == "submit_operations" else []
+        return {
+            "tool_name": name,
+            "tool_args": {"operations": ops},
+            "failed": False,
+        }
+
+    monkeypatch.setattr(digest, "_invoke_digest_oneshot_tool", fake_oneshot)
+    result = dr.request_weekly_reorganise(date_str="2026-07-27")
+    assert result["outcome"] == "failed"
+    assert any("merges were invalid" in str(item) for item in result.get("errors") or [])
+    assert daily.read_bytes() == before
+
+
 def test_request_weekly_reorganise_wait_false_returns_in_flight(tmp_path, monkeypatch):
     dr = _load_digest_run()
     digest = dr.digest

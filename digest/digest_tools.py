@@ -975,28 +975,76 @@ def skip_schema() -> dict[str, Any]:
 
 
 def _operations_op_item_schema() -> dict[str, Any]:
-    """Shared op-item schema for submit/patch (Option A merge nests visible)."""
-    props: dict[str, Any] = {
-        "operation": {"type": "string", "enum": list(OP_ENUM)},
-        "id": {"type": "string"},
-        "block": {"type": "object"},
-        "changes": {"type": "object"},
-        "survivor_id": {"type": "string"},
-        "absorbed_ids": {"type": "array", "items": {"type": "string"}},
-        "reason": {"type": "string"},
-        "helper_id": {"type": "string"},
-        "target_id": {"type": "string"},
-        "correction": {"type": "string"},
-        "confidence": _confidence_prop(),
+    """Keep target_id off merge so a model cannot copy the supersede id field.
+
+    A flat item listed absorbed_ids and target_id as optional siblings, and
+    Phase-2 merge filled target_id instead of the duplicate card ids.
+    """
+    nests = {
+        nest_key: _merge_nest_object_schema(nest_key) for nest_key in MERGE_NEST_KEYS
     }
-    for nest_key in MERGE_NEST_KEYS:
-        props[nest_key] = _merge_nest_object_schema(nest_key)
-    return {
+    update = {
         "type": "object",
-        "properties": props,
-        "required": ["operation"],
         "additionalProperties": False,
+        "required": ["operation", "id", "changes"],
+        "properties": {
+            "operation": {"const": "update"},
+            "id": {"type": "string"},
+            "changes": {"type": "object"},
+        },
     }
+    merge = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["operation", "survivor_id", "absorbed_ids", "reason"],
+        "properties": {
+            "operation": {"const": "merge"},
+            "survivor_id": {"type": "string"},
+            "absorbed_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "description": (
+                    "Other card ids folded into the survivor. Required. "
+                    "Do not send target_id on merge."
+                ),
+            },
+            "reason": {"type": "string"},
+            **nests,
+        },
+    }
+    drop = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["operation", "id", "reason"],
+        "properties": {
+            "operation": {"const": "drop"},
+            "id": {"type": "string"},
+            "reason": {"type": "string"},
+        },
+    }
+    supersede = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "operation",
+            "helper_id",
+            "target_id",
+            "correction",
+            "confidence",
+        ],
+        "properties": {
+            "operation": {"const": "supersede"},
+            "helper_id": {"type": "string"},
+            "target_id": {
+                "type": "string",
+                "description": "Old card id. Supersede only, never merge.",
+            },
+            "correction": {"type": "string"},
+            "confidence": {"type": "string", "enum": ["explicit"]},
+        },
+    }
+    return {"oneOf": [update, merge, drop, supersede]}
 
 
 def submit_operations_schema() -> dict[str, Any]:
@@ -1005,10 +1053,12 @@ def submit_operations_schema() -> dict[str, Any]:
         (
             "Submit phase-2 consolidate ops (update|merge|drop|supersede). "
             "Do not emit create — new cards are already on the daily file. "
-            "Empty operations[] keeps them. For merge: fill exactly one nest "
-            "matching survivor type (event|procedure|decision|fact); every "
-            "nest field REQUIRED non-empty; code renders body (no free-form "
-            "body, no concat)."
+            "Empty operations[] keeps them. Each item is oneOf by operation. "
+            "For merge: absorbed_ids is required (the other card ids) and "
+            "target_id is not allowed (target_id is only for supersede). "
+            "Fill exactly one nest matching survivor type "
+            "(event|procedure|decision|fact); every nest field REQUIRED "
+            "non-empty; code renders body (no free-form body, no concat)."
         ),
         {"operations": {"type": "array", "items": _operations_op_item_schema()}},
         ["operations"],
@@ -1051,8 +1101,9 @@ def patch_operations_schema() -> dict[str, Any]:
         "patch_operations",
         (
             "Sparse patch for operations proposal (changed fields / ops only). "
-            "When replacing operations, merge items use the same nested slot "
-            "objects as submit_operations."
+            "When replacing operations, each item is the same oneOf as "
+            "submit_operations: a merge must list absorbed_ids and must not "
+            "send target_id. Merge items use the same nested slot objects."
         ),
         {
             "operations": {

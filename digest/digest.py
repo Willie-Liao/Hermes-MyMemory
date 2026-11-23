@@ -3509,8 +3509,13 @@ def _run_update_operator(
     run_id: str,
     proposer: Any = None,
     max_attempts: int | None = None,
+    fail_on_dropped_merge: bool = False,
 ) -> tuple[list[digest_operations.Operation], Path]:
-    """Compare validated blocks and store validated operations without file mutation."""
+    """Compare validated blocks and store validated operations without file mutation.
+
+    Phase-2 passes fail_on_dropped_merge so a sanitizer-dropped merge is not
+    committed as keep-all. Other callers leave the default off and still fail open.
+    """
     operation_dir = _hermes_home() / "memories" / "staging" / ".tmp_mem_files" / session_id
     return digest_operations.prepare_operations(
         existing_blocks,
@@ -3525,6 +3530,7 @@ def _run_update_operator(
             if max_attempts is not None
             else MAX_PROPOSER_VALIDATION_ATTEMPTS
         ),
+        fail_on_dropped_merge=fail_on_dropped_merge,
     )
 
 
@@ -5218,7 +5224,11 @@ def _run_phase2_consolidate(
     proposer: Any = None,
     max_attempts: int | None = None,
 ) -> tuple[bool, list[str]]:
-    """Consolidate after Phase-1 persist. Failure leaves daily candidates as-is."""
+    """Consolidate after Phase-1 persist. Failure leaves daily candidates as-is.
+
+    A merge the model cannot repair raises instead of committing an empty op
+    list, which the UI would show as a successful reorganise.
+    """
     if not new_blocks and not existing_blocks:
         return True, []
     try:
@@ -5232,6 +5242,7 @@ def _run_phase2_consolidate(
                 run_id=run_id,
             proposer=dedup_proposer,
             max_attempts=max_attempts,
+            fail_on_dropped_merge=True,
         )
         before = daily_path.read_text(encoding="utf-8") if daily_path.exists() else ""
         board_ids = {

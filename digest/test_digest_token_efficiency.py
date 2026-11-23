@@ -72,8 +72,22 @@ def test_submit_and_patch_schemas_enums():
 def test_submit_operations_schema_exposes_nested_merge_slots():
     schema = digest_tools.submit_operations_schema()
     op_item = schema["parameters"]["properties"]["operations"]["items"]
-    props = op_item["properties"]
+    assert "properties" not in op_item
+    branches = op_item["oneOf"]
+    assert [branch["properties"]["operation"]["const"] for branch in branches] == list(
+        digest_tools.OP_ENUM
+    )
+    merge = next(
+        branch
+        for branch in branches
+        if branch["properties"]["operation"]["const"] == "merge"
+    )
+    props = merge["properties"]
     assert "body" not in props
+    assert "target_id" not in props
+    assert "absorbed_ids" in merge["required"]
+    assert "survivor_id" in merge["required"]
+    assert props["absorbed_ids"]["minItems"] == 1
     for nest in ("event", "procedure", "decision", "fact"):
         assert nest in props
         nest_schema = props[nest]
@@ -84,12 +98,23 @@ def test_submit_operations_schema_exposes_nested_merge_slots():
             field = nest_schema["properties"][key]
             if field.get("type") == "string" and "enum" not in field:
                 assert field.get("minLength") == 1
+    supersede = next(
+        branch
+        for branch in branches
+        if branch["properties"]["operation"]["const"] == "supersede"
+    )
+    assert "target_id" in supersede["properties"]
+    assert "target_id" in supersede["required"]
+    assert "absorbed_ids" not in supersede["properties"]
     patch = digest_tools.patch_operations_schema()
-    patch_ops = patch["parameters"]["properties"]["operations"]["items"]
+    patch_merge = next(
+        branch
+        for branch in patch["parameters"]["properties"]["operations"]["items"]["oneOf"]
+        if branch["properties"]["operation"]["const"] == "merge"
+    )
     for nest in ("event", "procedure", "decision", "fact"):
-        assert nest in patch_ops["properties"]
+        assert nest in patch_merge["properties"]
     assert "create" not in digest_tools.OP_ENUM
-    assert op_item["properties"]["operation"]["enum"] == list(digest_tools.OP_ENUM)
 
 
 def test_render_body_from_slots_shared_helper():

@@ -130,9 +130,12 @@ find "$DEST" -name '._*' -delete
 # rsync does not delete a probe, debug script, or retired module left on the gateway.
 # .cursor holds local agent tests and dated fixtures (2026-07-11.md). Week-numbered
 # test_wNN_ / debug_wNN_ files are the same kind of leftover and must not stay installed.
+# A test removed from the pack is the same problem: run-tests.sh still collects it
+# on the gateway, so the install fails on code that no longer exists.
 # Their .pyc files outlive the .py because rsync never deletes __pycache__.
 purge_retired_mymemory_harnesses() {
   local dest="$1"
+  local pack="${2:-}"
   rm -rf "$dest/.cursor"
   find "$dest/weekly" -maxdepth 1 -type f -name 'debug_*.py' -delete 2>/dev/null || true
   find "$dest" -type f \( \
@@ -144,6 +147,22 @@ purge_retired_mymemory_harnesses() {
     \) ! -name 'probe_guidance_gate.py' ! -name 'probe_guidance_gate.*.pyc' -delete 2>/dev/null || true
   rm -f "$dest/weekly/weekly_brief_validate.py" "$dest/weekly/test_weekly_brief_validate.py" \
     "$dest/digest/test_weekly_span_bridge.py" "$dest/digest/span_weekly.py"
+  # Installed tests with no twin in this pack are retired. Skip dependency
+  # trees and local harness homes so a vendored test_*.py is not treated as ours.
+  if [[ -n "$pack" && -d "$pack" ]]; then
+    local installed rel
+    while IFS= read -r -d '' installed; do
+      rel="${installed#"$dest"/}"
+      case "$rel" in
+        node_modules/*|*/node_modules/*|.test-hermes-home/*|*/.test-hermes-home/*)
+          continue
+          ;;
+      esac
+      if [[ ! -f "$pack/$rel" ]]; then
+        rm -f "$installed"
+      fi
+    done < <(find "$dest" -type f \( -name 'test_*.py' -o -path '*/weekly/ui/src/*.test.ts' \) -print0 2>/dev/null)
+  fi
   # A retired test is gone only when its bytecode is gone too.
   local cache parent base stem src
   while IFS= read -r -d '' cache; do
@@ -160,7 +179,7 @@ purge_retired_mymemory_harnesses() {
   # The 1.1 series is retired. A fixed 22–37 list left 1.1.38 on the gateway.
   rm -f "$dest"/RELEASE_NOTES_1.1.*.md
 }
-purge_retired_mymemory_harnesses "$DEST"
+purge_retired_mymemory_harnesses "$DEST" "$PACK_ROOT"
 echo "installed: plugins/MyMemory"
 
 install_memory_health_skill() {

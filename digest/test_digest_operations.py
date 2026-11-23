@@ -1428,3 +1428,34 @@ def test_external_update_must_be_metadata_only():
         retrieval_ids=[old["id"], new["id"]],
     )
     assert too_early
+
+
+def test_sanitize_records_merge_that_uses_target_id_instead_of_absorbed_ids():
+    operations = _operations()
+    dropped: list[str] = []
+    cleaned = operations.sanitize_operations_list(
+        [
+            {
+                "operation": "merge",
+                "survivor_id": "mem-a",
+                "target_id": "mem-a",
+            }
+        ],
+        {"mem-a", "mem-b"},
+        dropped=dropped,
+    )
+    assert cleaned == []
+    assert len(dropped) == 1
+    assert "absorbed_ids" in dropped[0]
+    assert "supersede" in dropped[0]
+    silent = operations.sanitize_operations_list(
+        [
+            {
+                "operation": "merge",
+                "survivor_id": "mem-a",
+                "target_id": "mem-a",
+            }
+        ],
+        {"mem-a", "mem-b"},
+    )
+    assert silent == []

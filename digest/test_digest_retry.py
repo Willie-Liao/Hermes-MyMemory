@@ -964,3 +964,96 @@ def test_retrieval_patch_failure_does_not_mark_phase2_success(tmp_path, monkeypa
     retrieval = payload["sessions"]["s-retry"]["retrieval"]
     assert retrieval.get("consumed") is not True
     assert retrieval.get("ids") == [old_id, new_id]
+
+
+def _fact_card(block_id: str) -> dict:
+    return {
+        "id": block_id,
+        "type": "fact",
+        "entity": "Project",
+        "confidence": "high",
+        "status": "candidate",
+        "sources": ["session s1"],
+        "body": "Factual: the same record.",
+        "importance": 3,
+    }
+
+
+def _good_fact_merge() -> dict:
+    return {
+        "operation": "merge",
+        "survivor_id": "mem-a",
+        "absorbed_ids": ["mem-b"],
+        "reason": "same record",
+        "fact": {"kind": "Factual", "content": "the same record, combined"},
+    }
+
+
+def test_dropped_target_id_merge_is_taught_then_accepted(tmp_path):
+    operations = load_plugin_module("operations.py", "memory_digest_retry_merge_teach")
+    seen: list[tuple[str, ...]] = []
+
+    def proposer(existing, new, *, errors, attempt):
+        seen.append(errors)
+        if attempt == 1:
+            return [
+                {
+                    "operation": "merge",
+                    "survivor_id": "mem-a",
+                    "target_id": "mem-a",
+                }
+            ]
+        return [_good_fact_merge()]
+
+    prepared, _path = operations.prepare_operations(
+        [_fact_card("mem-a"), _fact_card("mem-b")],
+        [],
+        session_id="s1",
+        run_id="r1",
+        session_dir=tmp_path / "s1",
+        proposer=proposer,
+        max_attempts=2,
+    )
+    assert len(seen) == 2
+    assert any("absorbed_ids" in error for error in seen[1])
+    assert any(op.operation == "merge" and op.absorbed_ids == ["mem-b"] for op in prepared)
+
+
+def test_dropped_merge_raises_when_phase2_refuses_dirty_accept(tmp_path):
+    operations = load_plugin_module("operations.py", "memory_digest_retry_merge_fail")
+
+    def proposer(existing, new, *, errors, attempt):
+        return [
+            {
+                "operation": "merge",
+                "survivor_id": "mem-a",
+                "target_id": "mem-a",
+            }
+        ]
+
+    try:
+        operations.prepare_operations(
+            [_fact_card("mem-a"), _fact_card("mem-b")],
+            [],
+            session_id="s1",
+            run_id="r1",
+            session_dir=tmp_path / "raise",
+            proposer=proposer,
+            max_attempts=2,
+            fail_on_dropped_merge=True,
+        )
+    except ValueError as exc:
+        assert "model merges were invalid" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+    prepared, _path = operations.prepare_operations(
+        [_fact_card("mem-a"), _fact_card("mem-b")],
+        [],
+        session_id="s1",
+        run_id="r1",
+        session_dir=tmp_path / "dirty",
+        proposer=proposer,
+        max_attempts=2,
+    )
+    assert prepared == []

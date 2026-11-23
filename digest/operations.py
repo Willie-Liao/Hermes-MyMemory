@@ -1286,8 +1286,16 @@ def _known_ids_for_ops(
 def sanitize_operations_list(
     proposed: Iterable[Operation | Mapping[str, Any]],
     existing_ids: Iterable[str],
+    *,
+    dropped: list[str] | None = None,
 ) -> list[Operation]:
-    """Drop junk ops and strip extra fields. Never LLM."""
+    """Drop junk ops and strip extra fields. Never LLM.
+
+    A merge or supersede that names no real other card used to vanish with no
+    reason, so the retry loop treated it as "nothing to merge". ``dropped``
+    records that reason for the proposer teach. Update and drop junk stays
+    silent so it does not buy an extra model call.
+    """
     raw_ops: list[Operation] = []
     for raw in proposed:
         try:
@@ -1319,16 +1327,33 @@ def sanitize_operations_list(
             if not _nonempty_id(cleaned.id) or str(cleaned.id) not in known:
                 continue
         elif cleaned.operation == "merge":
-            if not _nonempty_id(cleaned.survivor_id) or str(cleaned.survivor_id) not in known:
+            survivor = str(cleaned.survivor_id or "")
+            if not _nonempty_id(cleaned.survivor_id) or survivor not in known:
+                if dropped is not None:
+                    dropped.append(
+                        f"merge survivor {survivor or '(missing)'} is not a card on this day"
+                    )
                 continue
             absorbed = [
                 str(item)
                 for item in (cleaned.absorbed_ids or [])
                 if _nonempty_id(item)
                 and str(item) in known
-                and str(item) != str(cleaned.survivor_id)
+                and str(item) != survivor
             ]
             if not absorbed:
+                if dropped is not None:
+                    # ``op`` still has target_id; trimming already stripped it
+                    # from ``cleaned``, so the hint would otherwise never fire.
+                    hint = (
+                        " (target_id is only for supersede)"
+                        if op.target_id
+                        else ""
+                    )
+                    dropped.append(
+                        f"merge on {survivor} lists no other card in "
+                        f"absorbed_ids{hint}; put the duplicate card ids in absorbed_ids"
+                    )
                 continue
             cleaned.absorbed_ids = absorbed
         elif cleaned.operation == "supersede":
@@ -1338,6 +1363,10 @@ def sanitize_operations_list(
                 or str(cleaned.helper_id) not in known
                 or str(cleaned.target_id) not in known
             ):
+                if dropped is not None:
+                    dropped.append(
+                        "supersede needs helper_id and target_id of two cards on this day"
+                    )
                 continue
         out.append(cleaned)
     return out
@@ -1487,11 +1516,14 @@ def prepare_operations(
     max_attempts: int = 5,
     alive_ids: set[str] | None = None,
     soft_merge_threshold: int = 15,
+    fail_on_dropped_merge: bool = False,
 ) -> tuple[list[Operation], Path]:
     """Build/validate operations with dry-run composition + standalone decay.
 
     On exhaustion with a last usable proposal, accept it dirty (audit-stored)
-    rather than raising — digest continues.
+    rather than raising — digest continues. Phase-2 sets fail_on_dropped_merge
+    so a merge the sanitizer threw away, including a later empty "no merge",
+    is not stored as a keep-all success.
     """
     from composition import (
         append_standalone_decay_ops,
@@ -1507,7 +1539,12 @@ def prepare_operations(
     existing_ids = {str(block.get("id")) for block in existing if block.get("id")}
     last_errors: list[str] = []
     last_usable: list[Operation] | None = None
+    dropped: list[str] = []
+    # A later empty list must not erase the fact that a merge was thrown away.
+    invalid_merge_reasons: list[str] = []
+    saw_dropped_merge = False
     for attempt in range(1, max_attempts + 1):
+        dropped = []
         pressure: list[str] = []
         if (
             attempt == 1
@@ -1541,11 +1578,17 @@ def prepare_operations(
         except (TypeError, ValueError) as exc:
             last_errors = [str(exc)]
             continue
-        normalized = sanitize_operations_list(normalized, existing_ids)
+        normalized = sanitize_operations_list(
+            normalized,
+            existing_ids,
+            dropped=dropped if proposer is not None else None,
+        )
         normalized = rewrite_type_priority_ops(existing, normalized)
         # Keep last list even when checks fail — dirty hand-in on exhaust.
         last_usable = list(normalized)
-        last_errors = check_type_rules(existing, normalized)
+        if dropped:
+            invalid_merge_reasons = list(dropped)
+        last_errors = list(dropped) + check_type_rules(existing, normalized)
         last_errors.extend(
             validate_operations(
                 normalized,
@@ -1597,6 +1640,15 @@ def prepare_operations(
             last_errors = decay_errors
             last_usable = list(normalized)
             continue
+        if (
+            fail_on_dropped_merge
+            and invalid_merge_reasons
+            and not any(op.operation in {"merge", "supersede"} for op in normalized)
+        ):
+            # An empty follow-up is the model giving up, not "nothing to merge".
+            raise ValueError(
+                "model merges were invalid: " + "; ".join(invalid_merge_reasons[:3])
+            )
         return normalized, store_operations(
             normalized,
             session_dir=session_dir,
@@ -1604,6 +1656,15 @@ def prepare_operations(
             run_id=run_id,
         )
     if last_usable is not None:
+        unrepaired = bool(dropped) or (
+            bool(invalid_merge_reasons)
+            and not any(op.operation in {"merge", "supersede"} for op in last_usable)
+        )
+        if fail_on_dropped_merge and unrepaired:
+            reasons = dropped or invalid_merge_reasons
+            raise ValueError(
+                "model merges were invalid: " + "; ".join(reasons[:3])
+            )
         # Fail-open: hand in last proposal so commit can still proceed.
         # Do not import digest (circular); keep a plain audit line on stderr.
         import sys
