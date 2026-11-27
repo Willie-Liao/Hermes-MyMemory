@@ -7,6 +7,12 @@ export interface Participant {
   role?: string;
 }
 
+/** English canonical plus the user's short surfaces, so the YAML pane cannot drop the daily keyword list. */
+export interface ProcedureKeyword {
+  canonical: string;
+  originals: string[];
+}
+
 /** Daily block importance: 0–5 (5 = most important). Missing → treat as 3. */
 export type ImportanceLevel = 0 | 1 | 2 | 3 | 4 | 5;
 
@@ -21,6 +27,7 @@ export interface MemoryBlock {
   sources: string[];
   entity?: string;
   entity_aliases?: string[];
+  procedure_keywords?: ProcedureKeyword[];
   valid_from?: string;
   valid_to?: string;
   involves?: string[];

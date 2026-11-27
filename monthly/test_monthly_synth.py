@@ -1448,6 +1448,7 @@ def _key_procedure(i: int, *, month: str = "2026-08", cosine: float = 0.97, **kw
         insight="still changes the next time",
         trigger=kwargs.get("trigger", "task"),
         evidence=kwargs.get("evidence", (f"mem-2026-08-02-procedure-{i:012d}",)),
+        procedure_keywords=kwargs.get("procedure_keywords", ()),
         first_seen=kwargs.get("first_seen", "2026-08-01"),
         recall_n=kwargs.get("recall_n", 0.0),
         last_recall_at=kwargs.get("last_recall_at", ""),
@@ -2183,3 +2184,207 @@ def test_pile_stops_at_six_lines(tmp_path, monkeypatch):
     )
     assert hits == []
     assert len(calls) == 6
+
+
+def test_cited_procedures_union_keywords_and_old_month_loads():
+    from datetime import date
+
+    from monthly_schema import MonthlyMetrics
+    from monthly_slice import MechanicalFacts, SliceBlock
+    from monthly_synth import payload_from_synthesis
+    from monthly_writer import dump_yaml, loads
+
+    def block(mem_id: str, keywords: tuple) -> SliceBlock:
+        return SliceBlock(
+            id=mem_id,
+            day=date(2026, 9, 2),
+            type="procedure",
+            entity="",
+            valid_from="2026-09-02",
+            valid_to="",
+            confidence="high",
+            importance="3",
+            body="Obstacle: booking; Solution: book the venue",
+            clause="Obstacle: booking; Solution: book the venue",
+            related=(),
+            supersedes=(),
+            degree=0,
+            week_key="2026-W36",
+            entity_key="",
+            procedure_keywords=keywords,
+        )
+
+    first = block(
+        "mem-2026-09-02-procedure-a",
+        ({"canonical": "venue", "originals": ["场馆"]},),
+    )
+    second = block(
+        "mem-2026-09-03-procedure-b",
+        ({"canonical": "venue", "originals": ["场地"]},),
+    )
+    facts = MechanicalFacts(
+        metrics=MonthlyMetrics(),
+        state=(),
+        open_decision_ids=(),
+        cross_month_entities=(),
+        supersedes_pairs=(),
+        intra_day_thread_text="",
+        weeks=(),
+        decision_kind_counts={},
+        behavior={},
+        blocks_by_id={first.id: first, second.id: second},
+        all_dpe=(first, second),
+    )
+    payload = payload_from_synthesis(
+        "2026-09",
+        {
+            "key_procedures": [
+                {
+                    "solution": "book the venue before the day",
+                    "problem": "the booking step was unclear",
+                    "insight": "the step still changes the next time",
+                    "evidence": [first.id, second.id],
+                }
+            ]
+        },
+        facts,
+        carry="",
+        model="test",
+        map_calls=0,
+        reduce_tokens=0,
+        generated_at="2026-09-30T00:00:00",
+        comparison_exempt=True,
+    )
+    row = payload.key_procedures[0]
+    assert row.procedure_keywords[0]["canonical"] == "venue"
+    assert list(row.procedure_keywords[0]["originals"]) == ["场馆", "场地"]
+    bare = loads(dump_yaml(payload).replace("procedure_keywords:", "dropped_keywords:"))
+    assert bare.key_procedures[0].procedure_keywords == ()
+
+
+def test_stamp_copies_procedure_keywords_from_daily_evidence(tmp_path, monkeypatch):
+    """A recall stamp must store daily canonicals on the month row without a model call."""
+    from datetime import date
+
+    from monthly_schema import MonthlyProcedure
+    from monthly_writer import load_month, write_month
+    from recall.strength import stamp_recall_on_card
+
+    monkeypatch.setenv("RECALL_PERSIST_IN_TEST", "1")
+    evidence_id = "mem-2026-10-22-procedure-56C6619C7B64"
+    daily = tmp_path / "memories" / "staging" / "daily" / "2026-10-22.md"
+    daily.write_text(
+        "---\n"
+        f"id: {evidence_id}\n"
+        "type: procedure\n"
+        "importance: 4\n"
+        "procedure_keywords:\n"
+        "  - canonical: parents\n"
+        "    originals:\n"
+        "      - 家长\n"
+        "  - canonical: message\n"
+        "    originals:\n"
+        "      - 消息\n"
+        "---\n"
+        "Obstacle: tone; Solution: write the parent note.\n",
+        encoding="utf-8",
+    )
+    row = MonthlyProcedure(
+        id="mem-2026-10-key-procedure-051db73c3510",
+        problem="parent reply",
+        solution="write the facts",
+        insight="still changes the next time",
+        trigger="a demanding parent needs a written response",
+        evidence=(evidence_id,),
+    )
+    from monthly_schema import MonthlyPayload, MonthlyRange
+
+    write_month(
+        MonthlyPayload(
+            key="2026-10",
+            range=MonthlyRange(start="2026-10-01", end="2026-10-31"),
+            key_procedures=(row,),
+        )
+    )
+    assert stamp_recall_on_card(
+        row.id,
+        staging=tmp_path / "memories" / "staging",
+        now=date(2026, 11, 27),
+    )
+    saved = load_month("2026-10").key_procedures[0]
+    assert saved.procedure_keywords[0]["canonical"] == "parents"
+    assert list(saved.procedure_keywords[0]["originals"]) == ["家长"]
+    assert saved.procedure_keywords[1]["canonical"] == "message"
+
+
+def test_guidance_uses_daily_canonicals_when_the_month_row_has_none(tmp_path, monkeypatch):
+    """Ranking reads the cited daily canonicals the same way it recomputes live strength."""
+    from monthly_actions import rank_monthly_guidance
+
+    evidence_id = "mem-2026-10-22-procedure-56C6619C7B64"
+    daily = tmp_path / "daily"
+    daily.mkdir()
+    (daily / "2026-10-22.md").write_text(
+        "---\n"
+        f"id: {evidence_id}\n"
+        "type: procedure\n"
+        "importance: 3\n"
+        "procedure_keywords:\n"
+        "  - canonical: parents\n"
+        "    originals:\n"
+        "      - 家长\n"
+        "---\n"
+        "Obstacle: tone; Solution: write the parent note.\n",
+        encoding="utf-8",
+    )
+    specs = [
+        _key_procedure(0, cosine=0.2, evidence=(evidence_id,), procedure_keywords=()),
+        _key_procedure(1, cosine=0.95),
+    ]
+    _write_ranked_month(tmp_path, monkeypatch, specs)
+    hits = rank_monthly_guidance("家长", staging=tmp_path, limit=12)
+    procs = [hit for hit in hits if hit["kind"] == "procedure"]
+    assert procs
+    assert procs[0]["row"].id.endswith("0")
+
+
+def test_guidance_keyword_hit_beats_cosine_and_keeps_decisions(tmp_path, monkeypatch):
+    from monthly_actions import rank_monthly_guidance
+
+    venue = (
+        {"canonical": "venue", "originals": ["场馆"]},
+        {"canonical": "book", "originals": []},
+        {"canonical": "remind", "originals": []},
+    )
+    specs = [
+        _key_decision(0, cosine=0.99),
+        _key_procedure(0, cosine=0.2, procedure_keywords=venue),
+        _key_procedure(1, cosine=0.95),
+    ]
+    _write_ranked_month(tmp_path, monkeypatch, specs)
+    swapped = rank_monthly_guidance("馆场", staging=tmp_path, limit=12)
+    procs = [hit for hit in swapped if hit["kind"] == "procedure"]
+    assert procs[0]["row"].id.endswith("0")
+    assert any(hit["kind"] == "decision" for hit in swapped)
+    english = rank_monthly_guidance("venue", staging=tmp_path, limit=12)
+    assert [hit for hit in english if hit["kind"] == "procedure"][0]["row"].id.endswith("0")
+    missed = [
+        _key_procedure(
+            2,
+            cosine=0.95,
+            procedure_keywords=venue,
+        ),
+        _key_procedure(
+            3,
+            cosine=0.4,
+            procedure_keywords=(
+                {"canonical": "other", "originals": []},
+                {"canonical": "thing", "originals": []},
+                {"canonical": "item", "originals": []},
+            ),
+        ),
+    ]
+    _write_ranked_month(tmp_path, monkeypatch, missed)
+    cosine_hits = rank_monthly_guidance("zzzz guidance probe", staging=tmp_path, limit=12)
+    order = [hit["row"].id for hit in cosine_hits if hit["kind"] == "procedure"]
+    assert order[0].endswith("2")

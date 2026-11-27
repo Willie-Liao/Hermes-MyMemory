@@ -251,16 +251,26 @@ def generate_month(
             )
         else:
             importance = 3
-        return replace(
-            row,
-            importance=importance,
-            strength=strength_value(
+        updates: dict[str, Any] = {
+            "importance": importance,
+            "strength": strength_value(
                 recall_n=0.0,
                 first_seen=None,
                 importance=importance,
                 evidence=cards,
             ),
-        )
+        }
+        if cards and hasattr(row, "procedure_keywords"):
+            try:
+                from digest.digest_tools import union_procedure_keywords
+            except ImportError:
+                from digest_tools import union_procedure_keywords
+            fresh = union_procedure_keywords(
+                *(card.get("procedure_keywords") for card in cards)
+            )
+            if fresh:
+                updates["procedure_keywords"] = tuple(fresh)
+        return replace(row, **updates)
 
     prev_d = {row.id: row for row in previous.key_decisions} if previous is not None else {}
     prev_p = {row.id: row for row in previous.key_procedures} if previous is not None else {}
@@ -381,7 +391,7 @@ def rank_monthly_guidance(
     mean_dir: Sequence[float] | None = None,
     stored_centroids: Mapping[str, Sequence[float]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Rank active monthly D/P in R2 space so the model cone is not treated as a match.
+    """Rank active monthly D/P in R2 space so a keyword hit can shrink procedures without hiding decisions.
 
     Decisions that merely pass the gate must not fill the block and hide a procedure
     for this message. Each kind keeps up to half the slots, and a kind with fewer
@@ -399,6 +409,77 @@ def rank_monthly_guidance(
     q = str(query or "").strip()
     if not q:
         return []
+
+    def _damerau(left: str, right: str) -> int:
+        """Count one adjacent swap as one edit so a reversed Chinese pair still hits.
+
+        Distance above 1 is irrelevant here; longer gaps return 2 and do not match.
+        """
+        if left == right:
+            return 0
+        left_n, right_n = len(left), len(right)
+        if abs(left_n - right_n) > 1:
+            return 2
+        previous_previous: list[int] | None = None
+        previous = list(range(right_n + 1))
+        for i, left_ch in enumerate(left, 1):
+            current = [i]
+            for j, right_ch in enumerate(right, 1):
+                cost = 0 if left_ch == right_ch else 1
+                best = min(
+                    current[j - 1] + 1,
+                    previous[j] + 1,
+                    previous[j - 1] + cost,
+                )
+                if (
+                    previous_previous is not None
+                    and i > 1
+                    and j > 1
+                    and left_ch == right[j - 2]
+                    and left[i - 2] == right_ch
+                ):
+                    best = min(best, previous_previous[j - 2] + 1)
+                current.append(best)
+            previous_previous, previous = previous, current
+        return previous[-1]
+
+    def _surface_hit(query_key: str, surface_key: str) -> bool:
+        if not surface_key or not query_key:
+            return False
+        if surface_key in query_key or query_key == surface_key:
+            return True
+        if len(surface_key) < 2:
+            return False
+        lengths = {len(surface_key) - 1, len(surface_key), len(surface_key) + 1}
+        for length in lengths:
+            if length < 2 or length > len(query_key):
+                continue
+            for start in range(0, len(query_key) - length + 1):
+                if _damerau(surface_key, query_key[start : start + length]) <= 1:
+                    return True
+        return False
+
+    def _procedure_keyword_hits(text: str, keywords: Sequence[Any]) -> int:
+        """Count distinct procedure keywords the line hits, including a one-step transposition.
+
+        Decisions are not counted. An empty list stays on the cosine path.
+        """
+        from recall.normalize import entity_key
+
+        query_key = entity_key(text)
+        hits = 0
+        for item in keywords or ():
+            if not isinstance(item, Mapping):
+                continue
+            surfaces = [str(item.get("canonical") or "")]
+            originals = item.get("originals") or ()
+            if isinstance(originals, str):
+                originals = [originals]
+            surfaces.extend(str(surface) for surface in originals)
+            if any(_surface_hit(query_key, entity_key(surface)) for surface in surfaces):
+                hits += 1
+        return hits
+
     pending: list[tuple[str, Any, Any, str, str]] = []
     for payload in _iter_payloads(staging):
         superseded = {sid for row in payload.key_decisions for sid in row.supersedes}
@@ -626,7 +707,23 @@ def rank_monthly_guidance(
             "_year": year_n,
             "_mon": mon_n,
         }
-        if sim >= _GUIDANCE_COS_GATE:
+        keywords = getattr(row, "procedure_keywords", ()) or ()
+        if kind == "procedure" and cards:
+            try:
+                from digest.digest_tools import union_procedure_keywords
+            except ImportError:
+                from digest_tools import union_procedure_keywords
+            fresh = union_procedure_keywords(
+                *(card.get("procedure_keywords") for card in cards)
+            )
+            if fresh:
+                keywords = tuple(fresh)
+        keyword_n = (
+            _procedure_keyword_hits(q, keywords) if kind == "procedure" else 0
+        )
+        hit["keyword_n"] = keyword_n
+        hit["keyword_listed"] = bool(keywords) if kind == "procedure" else False
+        if sim >= _GUIDANCE_COS_GATE or keyword_n > 0:
             passed.append(hit)
         else:
             below[kind].append(hit)
@@ -744,8 +841,20 @@ def rank_monthly_guidance(
             hit["row"].id,
         )
 
+    procedure_rows = [h for h in passed if h["kind"] == "procedure"] + below["procedure"]
+    any_keyword = any(h.get("keyword_n") for h in procedure_rows)
     prefs = sorted((h for h in passed if h["kind"] == "decision"), key=_tie)
-    procs = sorted((h for h in passed if h["kind"] == "procedure"), key=_tie)
+    if any_keyword:
+        procs = sorted(
+            (h for h in procedure_rows if h.get("keyword_n")),
+            key=lambda h: (-int(h.get("keyword_n") or 0),) + _tie(h),
+        )
+        below["procedure"] = sorted(
+            (h for h in procedure_rows if not h.get("keyword_listed")),
+            key=_tie,
+        )
+    else:
+        procs = sorted((h for h in passed if h["kind"] == "procedure"), key=_tie)
     for kind in below:
         below[kind].sort(key=_tie)
     limit_n = max(1, int(limit))
@@ -782,12 +891,19 @@ def rank_monthly_guidance(
     _top_up("procedure", "decision")
     _top_up("decision", "procedure")
     chosen["decision"].sort(key=_tie)
-    chosen["procedure"].sort(key=_tie)
+    if any_keyword:
+        chosen["procedure"].sort(
+            key=lambda h: (-int(h.get("keyword_n") or 0),) + _tie(h)
+        )
+    else:
+        chosen["procedure"].sort(key=_tie)
     ordered = chosen["decision"] + chosen["procedure"]
     for hit in ordered:
         hit.pop("spill", None)
         hit.pop("_year", None)
         hit.pop("_mon", None)
+        hit.pop("keyword_n", None)
+        hit.pop("keyword_listed", None)
     return ordered[:limit_n]
 
 

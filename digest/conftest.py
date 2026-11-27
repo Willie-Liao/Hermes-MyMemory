@@ -55,6 +55,11 @@ def sample_phase1_tool_args() -> dict:
                 "type": "procedure",
                 "obstacle": "source notes were scattered",
                 "solution": "use an abstract source-triage checklist",
+                "procedure_keywords": [
+                    {"canonical": "source", "originals": ["笔记"]},
+                    {"canonical": "note", "originals": []},
+                    {"canonical": "triage", "originals": []},
+                ],
                 "confidence": "explicit",
                 "importance": 3,
                 "related": ["tmp-e1"],

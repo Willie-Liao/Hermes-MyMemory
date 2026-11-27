@@ -93,6 +93,46 @@ describe('staging frontmatter display', () => {
     assert.equal(bareYaml.includes('generated_at:'), false);
   });
 
+  it('shows procedure_keywords in digest order and round-trips them', () => {
+    const raw = `---
+id: mem-2026-11-27-procedure-65A87A8A87A0
+type: procedure
+procedure_keywords:
+  - canonical: duplicate messages
+    originals:
+      - 消息都是两条
+  - canonical: WeChat adapter
+    originals:
+      - weixin
+  - canonical: reply format
+    originals: []
+valid_from: 2026-11-27
+valid_to: open
+confidence: high
+importance: 3
+status: candidate
+sources: [session s1]
+---
+Obstacle: two bubbles.
+`;
+    const parsed = parseMDBlock(raw, '2026-11-27.md');
+    assert.equal(parsed[0]?.procedure_keywords?.length, 3);
+    assert.equal(parsed[0]?.procedure_keywords?.[0]?.canonical, 'duplicate messages');
+    assert.deepEqual(parsed[0]?.procedure_keywords?.[0]?.originals, ['消息都是两条']);
+    assert.deepEqual(parsed[0]?.procedure_keywords?.[2]?.originals, []);
+    const yaml = formatStagingFrontmatter(parsed[0]!);
+    assert.match(yaml, /procedure_keywords:\n {2}- canonical: duplicate messages\n {4}originals:\n {6}- 消息都是两条/);
+    assert.match(yaml, /canonical: reply format\n {4}originals: \[\]/);
+    const aliasIdx = yaml.indexOf('entity:');
+    const keywordIdx = yaml.indexOf('procedure_keywords:');
+    const validIdx = yaml.indexOf('valid_from:');
+    assert.equal(aliasIdx, -1);
+    assert.ok(keywordIdx > 0 && keywordIdx < validIdx);
+    assert.ok(STAGING_FRONTMATTER_KEY_ORDER.indexOf('procedure_keywords') < STAGING_FRONTMATTER_KEY_ORDER.indexOf('predicate'));
+    const again = parseMDBlock(stringifyMDBlock(parsed[0]!), '2026-11-27.md');
+    assert.deepEqual(again[0]?.procedure_keywords, parsed[0]?.procedure_keywords);
+  });
+
   it('parse + stringify round-trips supersedes and discarded_at', () => {
     const raw = `---
 id: mem-helper

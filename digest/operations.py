@@ -42,18 +42,26 @@ except Exception:  # pragma: no cover - standalone operation tests
 
 try:
     from digest_tools import (
+        _PROCEDURE_KEYWORD_CAP,
+        _PROCEDURE_KEYWORD_OVERFLOW_KEEP,
         _decision_ruling_from_body,
+        _surface_key,
         parse_rendered_body_slots,
         render_body_from_slots,
+        union_procedure_keywords,
         validate_worker_slot_args,
         validate_worker_tool_args,
     )
 except Exception:  # pragma: no cover - standalone imports
     parse_rendered_body_slots = None  # type: ignore[assignment]
     render_body_from_slots = None  # type: ignore[assignment]
+    union_procedure_keywords = None  # type: ignore[assignment]
     validate_worker_slot_args = None  # type: ignore[assignment]
     validate_worker_tool_args = None  # type: ignore[assignment]
     _decision_ruling_from_body = None  # type: ignore[assignment]
+    _surface_key = None  # type: ignore[assignment]
+    _PROCEDURE_KEYWORD_CAP = 6
+    _PROCEDURE_KEYWORD_OVERFLOW_KEEP = 5
 
 
 @dataclass
@@ -381,10 +389,16 @@ def _validate_merge_nests(
     *,
     blocks_by_id: Mapping[str, Mapping[str, Any]] | None,
 ) -> list[str]:
-    """Option A: exactly one nest matching survivor type; nonempty slots."""
+    """Reject a merge nest that would store more than six procedure canonicals.
+
+    A pool already over six must name exactly five canonicals from those cards.
+    Keeping the union would hand recall a grab bag the phase-2 pick was supposed
+    to cut.
+    """
     errors: list[str] = []
     present = _present_merge_nests(op)
     survivor_type = ""
+    survivor: Mapping[str, Any] | None = None
     absorbed_blocks: list[Mapping[str, Any]] = []
     if blocks_by_id and _nonempty_id(op.survivor_id):
         survivor = blocks_by_id.get(str(op.survivor_id))
@@ -411,12 +425,54 @@ def _validate_merge_nests(
         if isinstance(nest, dict) and nest:
             nest_validator = (
                 validate_worker_tool_args
-                if survivor_type == "decision" and validate_worker_tool_args is not None
+                if validate_worker_tool_args is not None
+                and (
+                    survivor_type == "decision"
+                    or (
+                        survivor_type == "procedure"
+                        and isinstance(nest, dict)
+                        and "procedure_keywords" in nest
+                    )
+                )
                 else validate_worker_slot_args
             )
             if nest_validator is not None:
                 for err in nest_validator(survivor_type, nest):
                     errors.append(f"merge.{survivor_type}: {err}")
+            if (
+                survivor_type == "procedure"
+                and union_procedure_keywords is not None
+                and survivor is not None
+            ):
+                # Pool is the cards already on disk. The nest is the model's
+                # pick, so a seventh canonical is rejected instead of stored.
+                pool = union_procedure_keywords(
+                    survivor.get("procedure_keywords"),
+                    *[
+                        block.get("procedure_keywords")
+                        for block in absorbed_blocks
+                    ],
+                )
+                nest_keywords = nest.get("procedure_keywords")
+                if len(pool) > _PROCEDURE_KEYWORD_CAP:
+                    picked = union_procedure_keywords(nest_keywords)
+                    if (
+                        len(picked) != _PROCEDURE_KEYWORD_OVERFLOW_KEEP
+                        or len(union_procedure_keywords(pool, picked)) != len(pool)
+                    ):
+                        errors.append(
+                            "merge.procedure: when merged canonicals exceed 6, "
+                            "procedure_keywords must name exactly 5 canonicals "
+                            "already on the cards"
+                        )
+                elif (
+                    len(union_procedure_keywords(pool, nest_keywords))
+                    > _PROCEDURE_KEYWORD_CAP
+                ):
+                    errors.append(
+                        "merge.procedure: procedure_keywords must contain at "
+                        "most 6 canonicals"
+                    )
             if survivor_type == "fact" and fact_merge_requires_narration(
                 blocks_by_id.get(str(op.survivor_id), {}),  # type: ignore[arg-type]
                 absorbed_blocks,
@@ -442,7 +498,15 @@ def _validate_merge_nests(
             if isinstance(nest, dict):
                 nest_validator = (
                     validate_worker_tool_args
-                    if nest_key == "decision" and validate_worker_tool_args is not None
+                    if validate_worker_tool_args is not None
+                    and (
+                        nest_key == "decision"
+                        or (
+                            nest_key == "procedure"
+                            and isinstance(nest, dict)
+                            and "procedure_keywords" in nest
+                        )
+                    )
                     else validate_worker_slot_args
                 )
                 if nest_validator is not None:
@@ -543,7 +607,12 @@ def apply_operation(
     operation: Operation | Mapping[str, Any],
     blocks: Iterable[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Apply one already-validated operation to an in-memory block snapshot."""
+    """Apply one already-validated operation without writing a seventh canonical.
+
+    When the procedure cards already have more than six canonicals, only a
+    five-name pick from those cards replaces the list. An invalid pick leaves
+    the survivor keywords in place so a skipped validator cannot store the union.
+    """
     op = normalize_operation(operation)
     result = [copy.deepcopy(dict(block)) for block in blocks]
     by_id = {block.get("id"): block for block in result}
@@ -567,6 +636,11 @@ def apply_operation(
         survivor = by_id.get(op.survivor_id)
         absorbed_blocks = [by_id[item] for item in op.absorbed_ids if item in by_id]
         if survivor is not None:
+            keyword_lists: list[Any] = []
+            if _block_type(survivor) == "procedure":
+                keyword_lists.append(survivor.get("procedure_keywords"))
+                for block in absorbed_blocks:
+                    keyword_lists.append(block.get("procedure_keywords"))
             for block in absorbed_blocks:
                 for key in ("sources", "related", "supersedes", "participants"):
                     merged = list(survivor.get(key, [])) + list(block.get(key, []))
@@ -590,6 +664,7 @@ def apply_operation(
                         "related",
                         "supersedes",
                         "participants",
+                        "procedure_keywords",
                     }:
                         continue
                     if key not in survivor or survivor[key] in (None, ""):
@@ -619,6 +694,36 @@ def apply_operation(
                 survivor["body"] = _truncate_body(
                     render_body_from_slots(nest_type, nest)
                 )
+            if nest_type == "procedure" and union_procedure_keywords is not None:
+                pool = union_procedure_keywords(*keyword_lists)
+                nest_keywords = (
+                    nest.get("procedure_keywords") if isinstance(nest, dict) else None
+                )
+                if len(pool) > _PROCEDURE_KEYWORD_CAP:
+                    picked = union_procedure_keywords(nest_keywords)
+                    pick_is_five = (
+                        len(picked) == _PROCEDURE_KEYWORD_OVERFLOW_KEEP
+                        and len(union_procedure_keywords(pool, picked)) == len(pool)
+                        and _surface_key is not None
+                    )
+                    if pick_is_five:
+                        full = union_procedure_keywords(pool, nest_keywords)
+                        by_key = {
+                            _surface_key(str(row["canonical"])): row for row in full
+                        }
+                        survivor["procedure_keywords"] = [
+                            by_key[_surface_key(str(row["canonical"]))]
+                            for row in picked
+                        ]
+                else:
+                    merged_keywords = union_procedure_keywords(pool, nest_keywords)
+                    if (
+                        merged_keywords
+                        and len(merged_keywords) <= _PROCEDURE_KEYWORD_CAP
+                    ):
+                        survivor["procedure_keywords"] = merged_keywords
+                    elif not merged_keywords:
+                        survivor.pop("procedure_keywords", None)
             _ensure_narration_body_for_cast(survivor)
             if survivor.get("body"):
                 survivor["body"] = _truncate_body(str(survivor["body"]))
@@ -1467,6 +1572,26 @@ def _rewrite_merge_type_priority(
     return [normalize_operation(swapped)]
 
 
+def _with_procedure_keywords(
+    slots: dict[str, Any],
+    survivor: Mapping[str, Any],
+    survivor_type: str,
+) -> dict[str, Any]:
+    """Keep an existing keyword list on a code-owned nest so merge does not invent words.
+
+    A legacy procedure has no list. Copying only when the survivor already
+    stored one leaves that card mergeable.
+    """
+    if survivor_type != "procedure":
+        return slots
+    raw = survivor.get("procedure_keywords")
+    if not isinstance(raw, list) or not raw:
+        return slots
+    out = dict(slots)
+    out["procedure_keywords"] = copy.deepcopy(raw)
+    return out
+
+
 def _merge_into_nest_slots(
     survivor: Mapping[str, Any],
     survivor_type: str,
@@ -1482,7 +1607,7 @@ def _merge_into_nest_slots(
     if validate_worker_slot_args is not None and not validate_worker_slot_args(
         stype, slots
     ):
-        return slots
+        return _with_procedure_keywords(slots, survivor, stype)
     # Fallback so code-owned merge still carries a nest for validate/apply.
     if stype == "event":
         return {
@@ -1491,7 +1616,11 @@ def _merge_into_nest_slots(
             "outcome": ".",
         }
     if stype == "procedure":
-        return {"obstacle": body or ".", "solution": "."}
+        return _with_procedure_keywords(
+            {"obstacle": body or ".", "solution": "."},
+            survivor,
+            stype,
+        )
     if stype == "decision":
         if _decision_ruling_from_body is not None:
             ruling = _decision_ruling_from_body(body, "user") or "."

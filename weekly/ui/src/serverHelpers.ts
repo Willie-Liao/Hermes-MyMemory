@@ -22,6 +22,7 @@ import {
   WeeklyState, 
   MemoryGateState,
   Participant,
+  ProcedureKeyword,
   HotMemoryFile,
   type ApprovalBatch,
   type ApprovalOperation,
@@ -113,7 +114,40 @@ export function ensureDirs() {
   if (!fs.existsSync(WEEKLY_DIR)) fs.mkdirSync(WEEKLY_DIR, { recursive: true });
 }
 
-/** Parse daily YAML so original-language entity_aliases survive a later stringify instead of being dropped. */
+/** Read digest's nested keyword list. A flat colon scan would turn each canonical into a stray key and the YAML pane would stay empty. */
+function parseProcedureKeywordLines(lines: string[]): ProcedureKeyword[] {
+  const items: ProcedureKeyword[] = [];
+  let current: ProcedureKeyword | null = null;
+  let inOriginals = false;
+  for (const line of lines) {
+    const canon = line.match(/^\s+-\s+canonical:\s*(.*)$/);
+    if (canon) {
+      if (current?.canonical) items.push(current);
+      current = { canonical: stripOuterQuotes(canon[1].trim()), originals: [] };
+      inOriginals = false;
+      continue;
+    }
+    if (!current) continue;
+    if (/^\s+originals:\s*\[\s*\]\s*$/.test(line)) {
+      current.originals = [];
+      inOriginals = false;
+      continue;
+    }
+    if (/^\s+originals:\s*$/.test(line)) {
+      inOriginals = true;
+      continue;
+    }
+    const surface = line.match(/^\s+-\s+(.*)$/);
+    if (inOriginals && surface) {
+      const text = stripOuterQuotes(surface[1].trim());
+      if (text) current.originals.push(text);
+    }
+  }
+  if (current?.canonical) items.push(current);
+  return items;
+}
+
+/** Parse daily YAML so original-language entity_aliases and procedure_keywords survive a later stringify instead of being dropped. */
 export function parseMDBlock(fileContent: string, filePath: string): MemoryBlock[] {
   const { fences } = splitDailyWrapup(fileContent);
   const blocks: MemoryBlock[] = [];
@@ -136,9 +170,30 @@ export function parseMDBlock(fileContent: string, filePath: string): MemoryBlock
       
       let participantsYaml: string[] = [];
       let inParticipants = false;
+      let keywordLines: string[] = [];
+      let inKeywords = false;
+
+      const finishKeywords = () => {
+        if (!inKeywords) return;
+        meta['procedure_keywords'] = parseProcedureKeywordLines(keywordLines);
+        keywordLines = [];
+        inKeywords = false;
+      };
       
       for (const line of frontmatterLines) {
         const trimmed = line.trim();
+        if (trimmed.startsWith('procedure_keywords:')) {
+          inKeywords = true;
+          keywordLines = [];
+          continue;
+        }
+        if (inKeywords) {
+          if (/^\s/.test(line) && trimmed) {
+            keywordLines.push(line);
+            continue;
+          }
+          finishKeywords();
+        }
         if (trimmed.startsWith('participants:')) {
           inParticipants = true;
           meta['participants'] = [];
@@ -164,6 +219,7 @@ export function parseMDBlock(fileContent: string, filePath: string): MemoryBlock
           }
         }
       }
+      finishKeywords();
       
       // Parse participants if any
       if (participantsYaml.length > 0) {
@@ -205,6 +261,9 @@ export function parseMDBlock(fileContent: string, filePath: string): MemoryBlock
         sources: Array.isArray(meta.sources) ? meta.sources : [String(meta.sources || '')],
         entity: meta.entity,
         entity_aliases: Array.isArray(meta.entity_aliases) ? meta.entity_aliases : undefined,
+        procedure_keywords: Array.isArray(meta.procedure_keywords) && meta.procedure_keywords.length
+          ? meta.procedure_keywords
+          : undefined,
         valid_from: meta.valid_from,
         valid_to: meta.valid_to,
         involves: Array.isArray(meta.involves) ? meta.involves : undefined,

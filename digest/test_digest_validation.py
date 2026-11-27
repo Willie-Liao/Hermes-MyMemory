@@ -83,6 +83,16 @@ def test_worker_validator_accepts_each_assigned_worker_contract():
             type_="procedure",
             entity=None,
             body="Obstacle: sources were scattered; Solution: use an abstract source-triage checklist.",
+            extra=(
+                "procedure_keywords:\n"
+                "  - canonical: source\n"
+                "    originals:\n"
+                "      - 笔记\n"
+                "  - canonical: note\n"
+                "    originals: []\n"
+                "  - canonical: triage\n"
+                "    originals: []"
+            ),
         ),
         "decision": _block(
             type_="decision",
@@ -229,6 +239,15 @@ def test_worker_validator_allows_semicolons_inside_procedure_obstacle():
         body=(
             "Obstacle: path lacked a flag; retry needed; "
             "Solution: use abstract file-delivery."
+        ),
+        extra=(
+            "procedure_keywords:\n"
+            "  - canonical: path\n"
+            "    originals: []\n"
+            "  - canonical: flag\n"
+            "    originals: []\n"
+            "  - canonical: retry\n"
+            "    originals: []"
         ),
     )
     assert digest._validate_worker_output(content, "procedure") == []

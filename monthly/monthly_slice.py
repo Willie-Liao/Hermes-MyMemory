@@ -14,7 +14,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 _here = Path(__file__).resolve().parent
 _mymemory = _here.parent
@@ -128,6 +128,7 @@ class SliceBlock:
     degree: int
     week_key: str
     entity_key: str
+    procedure_keywords: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -242,6 +243,21 @@ def render_clause_line(block: SliceBlock) -> str:
     return f"{block.id} | {block.clause}"
 
 
+def _procedure_keywords_from_fm(fm: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+    """Keep daily keyword maps on the slice so month code can union them without a second file read.
+
+    A missing list is empty. Old procedure cards stay loadable.
+    """
+    raw = fm.get("procedure_keywords")
+    if not isinstance(raw, list) or not raw:
+        return ()
+    try:
+        from digest.digest_tools import union_procedure_keywords
+    except ImportError:
+        from digest_tools import union_procedure_keywords
+    return tuple(union_procedure_keywords(raw))
+
+
 def _slice_block(
     day: date,
     fm: dict[str, Any],
@@ -271,6 +287,7 @@ def _slice_block(
         degree=degree,
         week_key=week_key_for(day),
         entity_key=normalize_entity_key(entity),
+        procedure_keywords=_procedure_keywords_from_fm(fm),
     )
 
 

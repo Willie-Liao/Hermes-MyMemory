@@ -416,6 +416,7 @@ _FRONTMATTER_KEY_ORDER = (
     "type",
     "entity",
     "entity_aliases",
+    "procedure_keywords",
     "predicate",
     "participants",
     "involves",
@@ -1294,7 +1295,9 @@ def _render_digest_block(parsed: dict[str, Any], body: str) -> str:
         if key not in parsed:
             continue
         seen.add(key)
-        if key in LIST_FRONTMATTER_KEYS:
+        if key == "procedure_keywords":
+            lines.extend(digest_tools.format_procedure_keywords_lines(parsed[key]))
+        elif key in LIST_FRONTMATTER_KEYS:
             lines.append(f"{key}: {_format_sources(parsed[key])}")
         elif key in {"participants", "involves"}:
             lines.extend(_format_entity_collection_lines(key, parsed[key]))
@@ -1303,7 +1306,9 @@ def _render_digest_block(parsed: dict[str, Any], body: str) -> str:
     for key, value in parsed.items():
         if key in seen:
             continue
-        if key in LIST_FRONTMATTER_KEYS:
+        if key == "procedure_keywords":
+            lines.extend(digest_tools.format_procedure_keywords_lines(value))
+        elif key in LIST_FRONTMATTER_KEYS:
             lines.append(f"{key}: {_format_sources(value)}")
         elif key in {"participants", "involves"}:
             lines.extend(_format_entity_collection_lines(key, value))
@@ -1882,6 +1887,8 @@ def _tool_args_from_parsed_block(
         "valid_to",
         "related",
         "supersedes",
+        "procedure_keywords",
+        "entity_aliases",
         "id",
         "status",
     ):

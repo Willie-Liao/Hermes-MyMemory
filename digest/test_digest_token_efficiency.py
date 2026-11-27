@@ -1393,3 +1393,138 @@ def test_phase2_empty_ops_records_no_merge(tmp_path, monkeypatch):
     assert failed["failed"] is True
     assert failed["reason"] == "tool error"
     assert "socket reset" in failed["error"]
+
+
+def _three_keywords():
+    return [
+        {"canonical": "venue", "originals": ["场馆"]},
+        {"canonical": "book", "originals": []},
+        {"canonical": "remind", "originals": ["提醒"]},
+    ]
+
+
+def test_procedure_keywords_reject_two_and_round_trip():
+    import yaml
+
+    short = digest_tools.validate_worker_tool_args(
+        "procedure",
+        {
+            "obstacle": "notes were scattered",
+            "solution": "use a checklist",
+            "procedure_keywords": _three_keywords()[:2],
+            "confidence": "high",
+            "importance": 3,
+        },
+    )
+    assert any("at least 3" in err for err in short)
+    repeat = digest_tools.validate_worker_tool_args(
+        "procedure",
+        {
+            "obstacle": "notes were scattered",
+            "solution": "use a checklist",
+            "procedure_keywords": [
+                {"canonical": "venue", "originals": ["venue"]},
+                {"canonical": "book", "originals": []},
+                {"canonical": "remind", "originals": []},
+            ],
+            "confidence": "high",
+            "importance": 3,
+        },
+    )
+    assert any("must not repeat the canonical" in err for err in repeat)
+    assert digest_tools.validate_worker_tool_args(
+        "procedure",
+        {
+            "obstacle": "notes were scattered",
+            "solution": "use a checklist",
+            "procedure_keywords": _three_keywords(),
+            "confidence": "high",
+            "importance": 3,
+        },
+    ) == []
+    rendered = digest_tools.render_worker_yaml_from_args(
+        "procedure",
+        {
+            "obstacle": "notes were scattered",
+            "solution": "use a checklist",
+            "procedure_keywords": _three_keywords(),
+            "confidence": "high",
+            "importance": 3,
+        },
+        session_id="s1",
+        today="2026-09-15",
+    )
+    assert "Obstacle:" in rendered.split("---", 2)[-1]
+    front = rendered.split("---", 2)[1]
+    parsed = yaml.safe_load(front)
+    assert parsed["procedure_keywords"][0]["canonical"] == "venue"
+    assert parsed["procedure_keywords"][0]["originals"] == ["场馆"]
+    schema = digest_tools.submit_operations_schema()
+    nests = schema["parameters"]["properties"]["operations"]["items"]["oneOf"]
+    merge = next(item for item in nests if item["properties"]["operation"]["const"] == "merge")
+    procedure = merge["properties"]["procedure"]
+    assert "procedure_keywords" in procedure["required"]
+    assert procedure["properties"]["procedure_keywords"]["minItems"] == 3
+    assert procedure["properties"]["procedure_keywords"]["maxItems"] == 6
+    assert "exactly the 5" in procedure["properties"]["procedure_keywords"]["description"]
+    seven = digest_tools.validate_worker_tool_args(
+        "procedure",
+        {
+            "obstacle": "notes were scattered",
+            "solution": "use a checklist",
+            "procedure_keywords": [
+                {"canonical": name, "originals": []}
+                for name in ("venue", "book", "remind", "pay", "seat", "queue", "cancel")
+            ],
+            "confidence": "high",
+            "importance": 3,
+        },
+    )
+    assert any("at most 6" in err for err in seven)
+    six = digest_tools.validate_worker_tool_args(
+        "procedure",
+        {
+            "obstacle": "notes were scattered",
+            "solution": "use a checklist",
+            "procedure_keywords": [
+                {"canonical": name, "originals": []}
+                for name in ("venue", "book", "remind", "pay", "seat", "queue")
+            ],
+            "confidence": "high",
+            "importance": 3,
+        },
+    )
+    assert six == []
+
+
+def test_procedure_keyword_originals_stay_short():
+    """A long original becomes a second query key, so surfaces stay to 4 Chinese characters or 2 English words."""
+
+    def errors_for(originals):
+        return digest_tools.validate_worker_tool_args(
+            "procedure",
+            {
+                "obstacle": "notes were scattered",
+                "solution": "use a checklist",
+                "procedure_keywords": [
+                    {"canonical": "venue", "originals": originals},
+                    {"canonical": "book", "originals": []},
+                    {"canonical": "remind", "originals": []},
+                ],
+                "confidence": "high",
+                "importance": 3,
+            },
+        )
+
+    too_long = errors_for(["消息都是两条"])
+    assert any("4 Chinese" in err and "2 English" in err for err in too_long)
+    assert any("4 Chinese" in err for err in errors_for(["short chat block"]))
+    assert errors_for(["回复格式"]) == []
+    assert errors_for(["reply format"]) == []
+    assert errors_for(["weixin"]) == []
+    assert errors_for(["minimax 直连"]) == []
+    description = digest_tools._procedure_keywords_prop()["items"]["properties"][
+        "originals"
+    ]["description"]
+    assert "4 Chinese" in description
+    assert "2 English" in description

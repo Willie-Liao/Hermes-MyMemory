@@ -80,6 +80,168 @@ _MEM_TYPE_IN_ID_RE = re.compile(
 
 # Option A: merge rewrite nests on the shared submit_operations op item.
 MERGE_NEST_KEYS = ("event", "procedure", "decision", "fact")
+_PROCEDURE_KEYWORD_MIN = 3
+_PROCEDURE_KEYWORD_CAP = 6
+_PROCEDURE_KEYWORD_OVERFLOW_KEEP = 5
+
+
+def _surface_key(surface: str) -> str:
+    """Fold a keyword with entity_key so English and CJK surfaces share one canonical.
+
+    A second normalizer would split 场馆 from its English row the way an
+    unaliased entity splits Band B.
+    """
+    from recall.normalize import entity_key
+
+    return entity_key(surface)
+
+
+def union_procedure_keywords(*lists: Any) -> list[dict[str, Any]]:
+    """Fold keyword rows onto one English canonical so a merge cannot drop an original.
+
+    The first spelling of a canonical wins. An original is kept when its key is
+    new and is not the canonical key. Empty inputs contribute nothing.
+    """
+    order: list[str] = []
+    rows: dict[str, dict[str, Any]] = {}
+    for raw in lists:
+        if not isinstance(raw, (list, tuple)):
+            continue
+        for item in raw:
+            if not isinstance(item, Mapping):
+                continue
+            canonical = str(item.get("canonical") or "").strip()
+            key = _surface_key(canonical)
+            if not canonical or not key:
+                continue
+            originals = item.get("originals")
+            if originals is None:
+                originals = item.get("original")
+            if isinstance(originals, str):
+                originals = [originals]
+            if not isinstance(originals, (list, tuple)):
+                originals = []
+            if key not in rows:
+                rows[key] = {"canonical": canonical, "originals": []}
+                order.append(key)
+            node = rows[key]
+            seen = {_surface_key(text) for text in node["originals"]}
+            canon_key = _surface_key(str(node["canonical"]))
+            for surface in originals:
+                text = str(surface or "").strip()
+                surface_key = _surface_key(text)
+                if not text or not surface_key or surface_key == canon_key or surface_key in seen:
+                    continue
+                node["originals"].append(text)
+                seen.add(surface_key)
+    return [rows[key] for key in order]
+
+
+def _procedure_keyword_errors(bag: Mapping[str, Any]) -> list[str]:
+    """Reject a short list or a phrase-length original so recall cannot rank on a sentence.
+
+    Three distinct English canonicals are the minimum and six is the ceiling.
+    A longer list turns one procedure into a grab bag of lookup keys. An
+    original that folds onto its canonical is the same string twice. More than
+    4 Chinese characters or 2 English words is a phrase, not a lookup key.
+    """
+    items = bag.get("procedure_keywords")
+    if not isinstance(items, list) or len(items) < _PROCEDURE_KEYWORD_MIN:
+        return ["procedure_keywords must contain at least 3 items"]
+    if len(items) > _PROCEDURE_KEYWORD_CAP:
+        return ["procedure_keywords must contain at most 6 canonicals"]
+    errors: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, Mapping):
+            errors.append("procedure_keywords items must be objects with canonical")
+            break
+        canonical = str(item.get("canonical") or "").strip()
+        key = _surface_key(canonical)
+        if not canonical or not key:
+            errors.append("procedure_keywords canonical must be non-empty")
+            break
+        if key in seen:
+            errors.append("procedure_keywords canonicals must be unique")
+            break
+        seen.add(key)
+        originals = item.get("originals")
+        if originals is None:
+            originals = []
+        if isinstance(originals, str):
+            originals = [originals]
+        if not isinstance(originals, list):
+            errors.append("procedure_keywords originals must be a list")
+            break
+        for surface in originals:
+            text = str(surface or "").strip()
+            if not text:
+                errors.append("procedure_keywords originals must be non-empty strings")
+                break
+            if _surface_key(text) == key:
+                errors.append("procedure_keywords originals must not repeat the canonical")
+                break
+            han = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", text))
+            english_words = re.findall(r"[A-Za-z]+", text)
+            if han > 4 or len(english_words) > 2:
+                errors.append(
+                    "procedure_keywords originals must be at most "
+                    "4 Chinese characters and 2 English words"
+                )
+                break
+        else:
+            continue
+        break
+    return errors
+
+
+def _procedure_keywords_prop(*, merge: bool = False) -> dict[str, Any]:
+    """Share one keyword schema so phase 2 cannot invent a second field name.
+
+    The merge flag adds the overflow rule only on the phase-2 nest. A phase-1
+    submit that saw that sentence would try to pick five words from cards it
+    does not have.
+    """
+    description = (
+        "At least 3 and at most 6 task words the user actually used. "
+        "canonical is the stable English form. originals are the user's "
+        "surfaces for that word, at most 4 Chinese characters and 2 English "
+        "words; leave empty when the user already said the English word."
+    )
+    if merge:
+        description += (
+            " When the procedure cards being merged already contain more than "
+            "6 distinct canonicals, name exactly the 5 most important: prefer "
+            "words from the higher-importance card, then words the merged "
+            "solution still uses. Every canonical must already appear on those "
+            "cards."
+        )
+    return {
+        "type": "array",
+        "minItems": _PROCEDURE_KEYWORD_MIN,
+        "maxItems": _PROCEDURE_KEYWORD_CAP,
+        "description": description,
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["canonical"],
+            "properties": {
+                "canonical": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Stable English keyword",
+                },
+                "originals": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                    "description": (
+                        "Exact user surfaces, at most 4 Chinese characters and "
+                        "2 English words; empty when identical to canonical"
+                    ),
+                },
+            },
+        },
+    }
 
 
 def _truncate_rendered_body(text: str) -> str:
@@ -200,7 +362,7 @@ def _merge_nest_object_schema(worker_type: str) -> dict[str, Any]:
                 "Use ONLY when survivor type is procedure. All fields REQUIRED "
                 "non-empty. Do not also send event/decision/fact."
             ),
-            "required": ["obstacle", "solution"],
+            "required": ["obstacle", "solution", "procedure_keywords"],
             "properties": {
                 "obstacle": {
                     "type": "string",
@@ -212,6 +374,7 @@ def _merge_nest_object_schema(worker_type: str) -> dict[str, Any]:
                     "minLength": 1,
                     "description": "REQUIRED non-empty; merged Solution meaning",
                 },
+                "procedure_keywords": _procedure_keywords_prop(merge=True),
             },
         }
     if wt == "decision":
@@ -432,7 +595,7 @@ def validate_worker_tool_args(
     *,
     user_subjects: frozenset[str] | set[str] | None = None,
 ) -> list[str]:
-    """Reject unusable bilingual aliases so recall cannot mint a second key from the original-language surface."""
+    """Reject unusable bilingual aliases and short procedure keyword lists so recall cannot mint a second key."""
     wt = worker_type.strip().lower()
     errors = list(validate_worker_slot_args(wt, args))
     bag = dict(args or {})
@@ -471,6 +634,7 @@ def validate_worker_tool_args(
         )
         if any(token in blob for token in _PROCEDURE_TOOL_LOG_TOKENS):
             errors.append("procedure body must not contain raw tool logs")
+        errors.extend(_procedure_keyword_errors(bag))
 
     elif wt == "decision":
         subject = str(bag.get("subject", "")).strip()
@@ -837,6 +1001,7 @@ def _fact_props() -> dict[str, Any]:
 
 def _procedure_props() -> dict[str, Any]:
     return {
+        "procedure_keywords": _procedure_keywords_prop(),
         "obstacle": _slot_string(
             "Procedure slot; code renders Obstacle:. Combined Obstacle/Solution "
             "line <= 500 chars",
@@ -935,7 +1100,7 @@ def submit_schema(worker_type: str) -> dict[str, Any]:
             "submit_procedure_block",
             "Submit a complete procedure memory block (full slot fill).",
             _procedure_props(),
-            ["obstacle", "solution", "confidence", "importance"],
+            ["obstacle", "solution", "procedure_keywords", "confidence", "importance"],
         )
     if wt == "decision":
         return _schema(
@@ -1138,7 +1303,7 @@ _FLAT_REQUIRED: dict[str, list[str]] = {
         "valid_to",
     ],
     "fact": ["entity", "kind", "content", "confidence", "importance"],
-    "procedure": ["obstacle", "solution", "confidence", "importance"],
+    "procedure": ["obstacle", "solution", "procedure_keywords", "confidence", "importance"],
     "decision": ["kind", "subject", "ruling", "confidence", "importance"],
 }
 
@@ -1933,6 +2098,37 @@ def _yaml_scalar(value: Any) -> str:
     return text
 
 
+def format_procedure_keywords_lines(items: Any) -> list[str]:
+    """Write keyword maps as YAML so a later load keeps canonical and originals apart.
+
+    A scalar dump would turn the list into one string and the next pass could
+    not union an original back onto its English canonical.
+    """
+    lines = ["procedure_keywords:"]
+    if not isinstance(items, (list, tuple)):
+        return lines
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        canonical = str(item.get("canonical") or "").strip()
+        if not canonical:
+            continue
+        lines.append(f"  - canonical: {_yaml_scalar(canonical)}")
+        originals = item.get("originals")
+        if isinstance(originals, str):
+            originals = [originals]
+        if not isinstance(originals, (list, tuple)):
+            originals = []
+        cleaned = [str(surface).strip() for surface in originals if str(surface).strip()]
+        if not cleaned:
+            lines.append("    originals: []")
+            continue
+        lines.append("    originals:")
+        for surface in cleaned:
+            lines.append(f"      - {_yaml_scalar(surface)}")
+    return lines
+
+
 def _format_list(values: Any) -> str:
     if not isinstance(values, list):
         return "[]"
@@ -2110,6 +2306,7 @@ def render_worker_yaml_from_args(
     for key in (
         "entity",
         "entity_aliases",
+        "procedure_keywords",
         "predicate",
         "valid_from",
         "valid_to",
@@ -2129,6 +2326,7 @@ def render_worker_yaml_from_args(
         "type",
         "entity",
         "entity_aliases",
+        "procedure_keywords",
         "predicate",
         "confidence",
         "importance",
@@ -2148,7 +2346,9 @@ def render_worker_yaml_from_args(
             continue
         seen.add(key)
         val = parsed[key]
-        if key in {"sources", "related", "supersedes", "entity_aliases"}:
+        if key == "procedure_keywords":
+            lines.extend(format_procedure_keywords_lines(val))
+        elif key in {"sources", "related", "supersedes", "entity_aliases"}:
             lines.append(f"{key}: {_format_list(val)}")
         else:
             lines.append(f"{key}: {_yaml_scalar(val)}")

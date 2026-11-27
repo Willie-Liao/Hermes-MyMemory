@@ -2,7 +2,7 @@
  * Format MemoryBlock frontmatter like daily staging files (digest key order).
  * Pure / browser-safe — shared by WeekReview display and stringifyMDBlock writes.
  */
-import type { ImportanceLevel, MemoryBlock, Participant } from './types';
+import type { ImportanceLevel, MemoryBlock, Participant, ProcedureKeyword } from './types';
 
 /** Match digest `_FRONTMATTER_KEY_ORDER` / `_format_sources` list style. */
 export const STAGING_FRONTMATTER_KEY_ORDER = [
@@ -10,6 +10,7 @@ export const STAGING_FRONTMATTER_KEY_ORDER = [
   'type',
   'entity',
   'entity_aliases',
+  'procedure_keywords',
   'predicate',
   'participants',
   'involves',
@@ -41,6 +42,26 @@ export function formatStagingFlowList(values: string[]): string {
   return `[${values.map((v) => String(v)).join(', ')}]`;
 }
 
+/** Nested canonical/originals so a save writes the same shape digest stored, not one flattened string. */
+function formatProcedureKeywords(items: ProcedureKeyword[]): string {
+  const lines = ['procedure_keywords:'];
+  for (const item of items) {
+    const canonical = item.canonical.trim();
+    if (!canonical) continue;
+    lines.push(`  - canonical: ${yamlQuoteIfNeeded(canonical)}`);
+    const originals = (item.originals || []).map((surface) => surface.trim()).filter(Boolean);
+    if (originals.length === 0) {
+      lines.push('    originals: []');
+      continue;
+    }
+    lines.push('    originals:');
+    for (const surface of originals) {
+      lines.push(`      - ${yamlQuoteIfNeeded(surface)}`);
+    }
+  }
+  return lines.join('\n');
+}
+
 function formatParticipants(participants: Participant[]): string {
   const lines = ['participants:'];
   for (const p of participants) {
@@ -63,7 +84,7 @@ function normalizeImportanceLocal(value: unknown): ImportanceLevel {
 }
 
 /** Frontmatter only (opening `---` … closing `---`), no body.
- * entity_aliases is written immediately after entity so a save cannot drop the original-language surface.
+ * entity_aliases and procedure_keywords stay in digest order so a save cannot drop the original surfaces.
  */
 export function formatStagingFrontmatter(block: MemoryBlock): string {
   const lines: string[] = ['---'];
@@ -73,6 +94,10 @@ export function formatStagingFrontmatter(block: MemoryBlock): string {
   if (block.entity) lines.push(`entity: ${yamlQuoteIfNeeded(block.entity)}`);
   if (block.entity_aliases && block.entity_aliases.length > 0) {
     lines.push(`entity_aliases: ${formatStagingFlowList(block.entity_aliases)}`);
+  }
+  if (block.procedure_keywords && block.procedure_keywords.length > 0) {
+    const rendered = formatProcedureKeywords(block.procedure_keywords);
+    if (rendered.includes('\n')) lines.push(rendered);
   }
   if (block.predicate) lines.push(`predicate: ${yamlQuoteIfNeeded(block.predicate)}`);
   if (block.participants && block.participants.length > 0) {

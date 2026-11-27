@@ -229,6 +229,7 @@ class MonthlyProcedure:
     trigger: str = ""
     obstacles: tuple[str, ...] = ()
     entity_keys: tuple[str, ...] = ()
+    procedure_keywords: tuple[dict[str, Any], ...] = ()
     weeks: tuple[str, ...] = ()
     evidence: tuple[str, ...] = ()
     occurrence_n: int = 1
@@ -546,6 +547,19 @@ def payload_to_dict(payload: MonthlyPayload) -> dict[str, Any]:
                 "solution": row.solution,
                 "insight": row.insight,
                 "entity_keys": list(row.entity_keys),
+                **(
+                    {
+                        "procedure_keywords": [
+                            {
+                                "canonical": str(item.get("canonical") or ""),
+                                "originals": list(item.get("originals") or ()),
+                            }
+                            for item in row.procedure_keywords
+                        ]
+                    }
+                    if row.procedure_keywords
+                    else {}
+                ),
                 "weeks": list(row.weeks),
                 "evidence": list(row.evidence),
                 "occurrence_n": row.occurrence_n,

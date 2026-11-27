@@ -151,15 +151,17 @@ class MyMemoryProvider(MemoryProvider):
     def _seed_turns(self, sid: str, query: str) -> deque[tuple[float, str]]:
         """Fill an empty buffer from active user rows so a restart still sees the prior lines.
 
-        The newest row is dropped when it is this line, and acknowledgments are
-        skipped, so the pile does not score the line twice or pile "好的".
+        digest.py puts its folder on sys.path, so a later ``import digest`` binds
+        that file and ``digest.digest`` is not the package. Reading the module
+        this provider already holds keeps a short line after restart from seeing
+        no earlier rows. The newest row is dropped when it is this line, and
+        acknowledgments are skipped, so the pile does not score the line twice.
         """
-        from digest.digest import _fetch_messages
-        from digest.digest_run import _as_unix
+        from .digest.digest_run import _as_unix
 
         ack_re, _short = self._guidance_limits()
         buf: deque[tuple[float, str]] = deque(maxlen=5)
-        rows = [row for row in _fetch_messages(sid) if row.get("role") == "user"]
+        rows = [row for row in digest._fetch_messages(sid) if row.get("role") == "user"]
         if rows and str(rows[-1].get("content") or "").strip() == query:
             rows = rows[:-1]
         for row in rows:

@@ -386,6 +386,22 @@ def _group_to_decision(
     )
 
 
+def _union_cited_keywords(cited: list[Any]) -> tuple[dict[str, Any], ...]:
+    """Union daily keyword lists onto the month row so the model is not asked to rewrite them.
+
+    Phase 2 already folded merged cards onto the survivor. Citing that survivor
+    keeps every canonical and original the merge kept.
+    """
+    lists = [getattr(block, "procedure_keywords", ()) for block in cited]
+    if not any(lists):
+        return ()
+    try:
+        from digest.digest_tools import union_procedure_keywords
+    except ImportError:
+        from digest_tools import union_procedure_keywords
+    return tuple(union_procedure_keywords(*lists))
+
+
 def _group_to_procedure(
     group: dict[str, Any],
     insight: str,
@@ -407,6 +423,7 @@ def _group_to_procedure(
         solution=cleaned,
         insight=insight,
         entity_keys=tuple(group.get("entity_keys") or ()),
+        procedure_keywords=tuple(group.get("procedure_keywords") or ()),
         weeks=tuple(group.get("weeks") or ()),
         evidence=tuple(group.get("evidence") or (group["id"],)),
         occurrence_n=int(group.get("occurrence_n") or 1),
@@ -576,6 +593,7 @@ def payload_from_synthesis(
             "entity_keys": tuple(
                 dict.fromkeys(b.entity_key for b in cited if b.entity_key)
             ),
+            "procedure_keywords": _union_cited_keywords(cited),
             "weeks": weeks,
             "evidence": evidence,
             "occurrence_n": len(evidence),

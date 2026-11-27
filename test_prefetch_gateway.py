@@ -125,7 +125,7 @@ def test_prefetch_passes_history_newest_first_and_seeds_once(tmp_path, monkeypat
             {"id": 3, "role": "user", "content": "newer wechat note", "timestamp": 200},
         ]
 
-    monkeypatch.setattr("digest.digest._fetch_messages", fetch)
+    monkeypatch.setattr(provider.digest, "_fetch_messages", fetch)
     host = provider.MyMemoryProvider()
     host.prefetch("发给我", session_id="sess")
     assert fetches["n"] == 1
@@ -146,7 +146,8 @@ def test_prefetch_seeds_only_a_short_line(tmp_path, monkeypatch):
     )
     fetches = {"n": 0}
     monkeypatch.setattr(
-        "digest.digest._fetch_messages",
+        provider.digest,
+        "_fetch_messages",
         lambda *_a, **_k: fetches.__setitem__("n", fetches["n"] + 1) or [],
     )
     host = provider.MyMemoryProvider()

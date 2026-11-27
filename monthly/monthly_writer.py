@@ -101,6 +101,32 @@ def _stored_note(value: Any) -> str:
     return " ".join(words[:NOTE_WORD_CAP])
 
 
+def _keyword_rows(value: Any) -> tuple:
+    """Load stored keyword maps so a month file written before the field still opens.
+
+    Missing or blank rows become an empty tuple. Code, not the monthly model, fills this.
+    """
+    rows: list[dict[str, Any]] = []
+    if not isinstance(value, (list, tuple)):
+        return ()
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        canonical = str(item.get("canonical") or "").strip()
+        if not canonical:
+            continue
+        originals = item.get("originals") or ()
+        if isinstance(originals, str):
+            originals = [originals]
+        cleaned = tuple(
+            str(surface).strip()
+            for surface in originals
+            if str(surface).strip()
+        )
+        rows.append({"canonical": canonical, "originals": cleaned})
+    return tuple(rows)
+
+
 def _tuple(value: Any) -> tuple:
     if isinstance(value, tuple):
         return value
@@ -261,6 +287,7 @@ def payload_from_dict(obj: dict[str, Any]) -> MonthlyPayload:
                 solution=str(row.get("solution") or ""),
                 insight=_stored_note(row.get("insight")),
                 entity_keys=_tuple(row.get("entity_keys")),
+                procedure_keywords=_keyword_rows(row.get("procedure_keywords")),
                 weeks=_tuple(row.get("weeks")),
                 evidence=_tuple(row.get("evidence")),
                 occurrence_n=int(row.get("occurrence_n") or 1),

@@ -1083,6 +1083,185 @@ def test_merge_two_plain_facts_with_cast_becomes_narration():
     assert entities == {"Alex Chen", "Roommate"}
 
 
+def test_merge_unions_procedure_keyword_canonicals_and_originals():
+    operations = _operations()
+    survivor = {
+        **_block("mem-p-surv"),
+        "type": "procedure",
+        "body": "Obstacle: old; Solution: old fix",
+        "procedure_keywords": [{"canonical": "venue", "originals": ["场馆"]}],
+    }
+    absorbed = {
+        **_block("mem-p-abs"),
+        "type": "procedure",
+        "body": "Obstacle: other; Solution: other fix",
+        "procedure_keywords": [{"canonical": "venue", "originals": ["场地"]}],
+    }
+    merged = operations.apply_operation(
+        {
+            "operation": "merge",
+            "survivor_id": "mem-p-surv",
+            "absorbed_ids": ["mem-p-abs"],
+            "reason": "same booking step",
+            "procedure": {
+                "obstacle": "the booking step was unclear",
+                "solution": "book the venue first",
+                "procedure_keywords": [{"canonical": "venue", "originals": ["场馆"]}],
+            },
+        },
+        [survivor, absorbed],
+    )
+    out = next(block for block in merged if block["id"] == "mem-p-surv")
+    assert out["body"].startswith("Obstacle: the booking step")
+    assert "old fix" not in out["body"]
+    keywords = out["procedure_keywords"]
+    assert len(keywords) == 1
+    assert keywords[0]["canonical"] == "venue"
+    assert keywords[0]["originals"] == ["场馆", "场地"]
+    assert "mem-p-abs" not in {block["id"] for block in merged}
+
+
+def _keyword(canonical: str, originals: list[str] | None = None) -> dict:
+    """One keyword row so merge-cap tests do not rebuild the map shape."""
+    return {"canonical": canonical, "originals": list(originals or [])}
+
+
+def _procedure_cards(survivor_keywords: list[dict], absorbed_keywords: list[dict]):
+    """Two procedure cards whose keyword lists are the merge pool."""
+    survivor = {
+        **_block("mem-p-surv"),
+        "type": "procedure",
+        "importance": 5,
+        "body": "Obstacle: old; Solution: old fix",
+        "procedure_keywords": survivor_keywords,
+    }
+    absorbed = {
+        **_block("mem-p-abs"),
+        "type": "procedure",
+        "importance": 2,
+        "body": "Obstacle: other; Solution: other fix",
+        "procedure_keywords": absorbed_keywords,
+    }
+    return survivor, absorbed
+
+
+def _merge_op(nest_keywords: list[dict]) -> dict:
+    return {
+        "operation": "merge",
+        "survivor_id": "mem-p-surv",
+        "absorbed_ids": ["mem-p-abs"],
+        "reason": "same booking step",
+        "procedure": {
+            "obstacle": "the booking step was unclear",
+            "solution": "book the venue first",
+            "procedure_keywords": nest_keywords,
+        },
+    }
+
+
+def test_merge_keeps_six_procedure_canonicals():
+    """A merge whose cards already have six canonicals must keep all six."""
+    operations = _operations()
+    survivor, absorbed = _procedure_cards(
+        [_keyword(name) for name in ("venue", "book", "remind")],
+        [_keyword(name) for name in ("pay", "seat", "queue")],
+    )
+    op = _merge_op([_keyword(name) for name in ("venue", "book", "remind")])
+    blocks = {block["id"]: block for block in (survivor, absorbed)}
+    assert operations.validate_operation(op, blocks, blocks_by_id=blocks) == []
+    merged = operations.apply_operation(op, [survivor, absorbed])
+    out = next(block for block in merged if block["id"] == "mem-p-surv")
+    assert [row["canonical"] for row in out["procedure_keywords"]] == [
+        "venue",
+        "book",
+        "remind",
+        "pay",
+        "seat",
+        "queue",
+    ]
+
+
+def test_merge_over_six_keeps_the_five_named_canonicals():
+    """More than six canonicals must store the five the merge names, originals included."""
+    operations = _operations()
+    survivor, absorbed = _procedure_cards(
+        [
+            _keyword("venue", ["场馆"]),
+            _keyword("book"),
+            _keyword("remind"),
+            _keyword("pay"),
+        ],
+        [
+            _keyword("venue", ["场地"]),
+            _keyword("seat"),
+            _keyword("queue"),
+            _keyword("cancel"),
+        ],
+    )
+    picked = [_keyword(name) for name in ("venue", "book", "remind", "pay", "seat")]
+    op = _merge_op(picked)
+    blocks = {block["id"]: block for block in (survivor, absorbed)}
+    assert operations.validate_operation(op, blocks, blocks_by_id=blocks) == []
+    merged = operations.apply_operation(op, [survivor, absorbed])
+    out = next(block for block in merged if block["id"] == "mem-p-surv")
+    assert [row["canonical"] for row in out["procedure_keywords"]] == [
+        "venue",
+        "book",
+        "remind",
+        "pay",
+        "seat",
+    ]
+    venue = out["procedure_keywords"][0]
+    assert venue["originals"] == ["场馆", "场地"]
+
+
+def test_merge_over_six_rejects_a_sixth_or_a_new_canonical():
+    """A pool over six must not store six names or a canonical that was not on the cards."""
+    operations = _operations()
+    survivor, absorbed = _procedure_cards(
+        [
+            _keyword("venue", ["场馆"]),
+            _keyword("book"),
+            _keyword("remind"),
+            _keyword("pay"),
+        ],
+        [
+            _keyword("seat"),
+            _keyword("queue"),
+            _keyword("cancel"),
+        ],
+    )
+    blocks = {block["id"]: block for block in (survivor, absorbed)}
+    six = _merge_op(
+        [_keyword(name) for name in ("venue", "book", "remind", "pay", "seat", "queue")]
+    )
+    errors = operations.validate_operation(six, blocks, blocks_by_id=blocks)
+    assert any("exactly 5" in err for err in errors)
+    merged = operations.apply_operation(six, [survivor, absorbed])
+    out = next(block for block in merged if block["id"] == "mem-p-surv")
+    assert [row["canonical"] for row in out["procedure_keywords"]] == [
+        "venue",
+        "book",
+        "remind",
+        "pay",
+    ]
+    invented = _merge_op(
+        [_keyword(name) for name in ("venue", "book", "remind", "pay", "invented")]
+    )
+    invented_errors = operations.validate_operation(
+        invented, blocks, blocks_by_id=blocks
+    )
+    assert any("exactly 5" in err for err in invented_errors)
+    merged_invented = operations.apply_operation(invented, [survivor, absorbed])
+    kept = next(block for block in merged_invented if block["id"] == "mem-p-surv")
+    assert [row["canonical"] for row in kept["procedure_keywords"]] == [
+        "venue",
+        "book",
+        "remind",
+        "pay",
+    ]
+
+
 def test_merge_nested_event_rewrites_body_without_concat():
     operations = _operations()
     survivor = {

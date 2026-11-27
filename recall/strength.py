@@ -221,7 +221,9 @@ def _stamp_month_row(
 
     A later rewrite can reset the row. The daily cards keep the credit, and the
     row's stored strength is recomputed from those cards after this stamp.
-    A missing evidence card is skipped so one bad id cannot abort the turn.
+    Procedure canonicals are copied from those same cards so a month file does
+    not wait for the model to emit them. A missing evidence card is skipped so
+    one bad id cannot abort the turn.
     """
     from monthly_writer import dump_yaml, loads, payload_from_dict
     from .ids import BlockIndex
@@ -276,6 +278,16 @@ def _stamp_month_row(
         ),
         4,
     )
+    if kind == "procedure" and cards:
+        try:
+            from digest.digest_tools import union_procedure_keywords
+        except ImportError:
+            from digest_tools import union_procedure_keywords
+        fresh = union_procedure_keywords(
+            *(card.get("procedure_keywords") for card in cards)
+        )
+        if fresh:
+            target["procedure_keywords"] = fresh
     try:
         body = dump_yaml(payload_from_dict(data))
         path.write_text(body, encoding="utf-8")
