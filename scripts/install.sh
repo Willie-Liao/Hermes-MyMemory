@@ -113,6 +113,7 @@ RSYNC_EXCLUDES=(
   --exclude 'memories/'
   --exclude 'logs/'
   --exclude 'sessions/'
+  --exclude 'RELEASE_NOTES_*.md'
   --exclude '*.db'
   --exclude '*.db-*'
 )
@@ -145,10 +146,8 @@ purge_retired_mymemory_harnesses() {
       -o -name 'test_*20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]*' \
       -o -name 'debug_*20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]*' \
     \) ! -name 'probe_guidance_gate.py' ! -name 'probe_guidance_gate.*.pyc' -delete 2>/dev/null || true
-  rm -f "$dest/weekly/weekly_brief_validate.py" "$dest/weekly/test_weekly_brief_validate.py" \
-    "$dest/digest/test_weekly_span_bridge.py" "$dest/digest/span_weekly.py"
-  # Installed tests with no twin in this pack are retired. Skip dependency
-  # trees and local harness homes so a vendored test_*.py is not treated as ours.
+  # A module or test left on the gateway after it left the pack still gets collected.
+  # Name lists (span_weekly, weekly_brief_validate) went stale as soon as the next file was removed.
   if [[ -n "$pack" && -d "$pack" ]]; then
     local installed rel
     while IFS= read -r -d '' installed; do
@@ -161,7 +160,7 @@ purge_retired_mymemory_harnesses() {
       if [[ ! -f "$pack/$rel" ]]; then
         rm -f "$installed"
       fi
-    done < <(find "$dest" -type f \( -name 'test_*.py' -o -path '*/weekly/ui/src/*.test.ts' \) -print0 2>/dev/null)
+    done < <(find "$dest" -type f \( -name '*.py' -o -path '*/weekly/ui/src/*.test.ts' \) -print0 2>/dev/null)
   fi
   # A retired test is gone only when its bytecode is gone too.
   local cache parent base stem src
@@ -176,76 +175,22 @@ purge_retired_mymemory_harnesses() {
       fi
     done
   done < <(find "$dest" -type d -name '__pycache__' -print0 2>/dev/null)
-  # The 1.1 series is retired. A fixed 22–37 list left 1.1.38 on the gateway.
-  rm -f "$dest"/RELEASE_NOTES_1.1.*.md
+  # Dated notes are repo history. A 1.1-only glob left every later note on the gateway.
+  find "$dest" -maxdepth 1 -type f -name 'RELEASE_NOTES_*.md' -delete 2>/dev/null || true
 }
 purge_retired_mymemory_harnesses "$DEST" "$PACK_ROOT"
 echo "installed: plugins/MyMemory"
 
 install_memory_health_skill() {
   # Hermes loads skills from $HERMES_HOME/skills, not from the plugin tree.
-  # The script stores this skill so an install.sh that arrived without the
-  # rest of the MyMemory tree still writes memory-health-once.
   local src="$PACK_ROOT/skills/memory-health-once/SKILL.md"
   local dest="$HERMES_HOME/skills/memory-health-once"
-  mkdir -p "$dest"
-  if [[ -f "$src" ]]; then
-    cp "$src" "$dest/SKILL.md"
-  else
-    cat > "$dest/SKILL.md" <<'MEMORY_HEALTH_SKILL'
----
-name: memory-health-once
-description: Use for any MyMemory check, like config or one part.
-version: 0.1.0
-author: Hermes Agent
-license: MIT
-platforms: [linux, macos]
-metadata:
-  hermes:
-    tags: [memory, digest, phase2, weekly, logs]
----
-
-# Memory health once
-
-Check the memory pipeline from the log of a real session. Quote a line that is already there. Run an aspect only when that real log has no line for it, and run it once.
-
-## When to use
-
-Load this skill for any MyMemory check. That includes the whole pipeline or one part, such as prefetch, recall, expand, the config memory provider, the plugin manager, the batch, the clock, phase 2, wrap daily, or wrap weekly.
-
-- After a memory change, before claiming that part works.
-
-Do not create a virtual Hermes home, a fixture database, or a fake session. Do not look for `health-fixture`, `this is test`, or any other stand-in transcript. Do not copy `state.db`. Do not start a second run of an aspect that already has a real log line.
-
-## Log first
-
-Read `~/.hermes/logs/memory-digest.log` and `~/.hermes/logs/memory-weekly.log`. Search the phrases below in lines from a real session. A hit means that aspect already ran: quote the line and skip it. `Failed to export span batch code: 404` is a trace export, not a failed check.
-
-| Aspect | A real session shows it ran |
-|---|---|
-| Prefetch, recall, expand | a digest or agent line for prefetch, recall, and expand on this live session |
-| Config memory provider | `memory.provider` in `~/.hermes/config.yaml`. Quote the value. `""` means the provider is unset |
-| Manager | PluginManager has loaded MyMemory and registered `/digest`, `/weekly`, and `/monthly` |
-| Daily, weekly, monthly shape | the `digest-phase1` lane from `/digest` on the past day, and the `weekly` and `monthly` lanes from a real slash, using the provider and model already in config |
-| Batch | one extract of a real session in the digest log |
-| Clock, phase 2 | the live clock's noon merge, with the card count above the 25-card gate |
-| Wrap daily | `## Day wrap-up` in the real daily file for the last day |
-| Wrap weekly | the real week file for the last week |
-
-## Run once if the line is missing
-
-Stay on the live home and the live session. Use the provider and model already set in config for that lane. Do not swap in another model.
-
-- Config: if `memory.provider` is `""`, set it to `MyMemory` and restart the gateway. Quote the value after the restart. Leave every other config key as it is.
-- Manager: check once that PluginManager lists MyMemory and the three slash commands. Quote that result. Recall still follows `memory.provider`.
-- Shape: run the real slash once, in the background, and read the log it writes. Daily is `/digest` for the past day (`/digest YYYY-MM-DD`). Weekly is `/weekly update`. Monthly is `/monthly update`.
-- Batch or clock: create one cron that runs the real digest batch or the digest clock on the live session. Let that cron run once, then quote the new log line.
-- Wrap daily: open the real file for the last day, `memories/staging/daily/YYYY-MM-DD.md`, and quote `## Day wrap-up` when it is there. Do not write a test daily file.
-- Wrap weekly: open the real file for the last week, `memories/staging/weekly/YYYY-Www.md`, and quote what it contains. Do not write a test week file.
-
-After the single run, read the log again and quote the new line. For a wrap, quote the real file. Do not retry a failure in the same turn.
-MEMORY_HEALTH_SKILL
+  if [[ ! -f "$src" ]]; then
+    echo "error: missing $src" >&2
+    return 1
   fi
+  mkdir -p "$dest"
+  cp "$src" "$dest/SKILL.md"
   echo "installed: skills/memory-health-once"
 }
 install_memory_health_skill

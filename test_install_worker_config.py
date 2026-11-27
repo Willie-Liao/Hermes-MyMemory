@@ -41,10 +41,10 @@ def test_install_sh_bash_n():
 
 
 def test_install_drops_cursor_tree_and_dated_test_files(tmp_path: Path):
-    """A gateway copy must not keep dated harnesses, including bytecode rsync will not delete.
+    """A gateway copy must not keep dated harnesses, retired modules, or release notes.
 
-    The guidance probe is the current tool. A blanket probe_*.py exclude would
-    drop it and leave an older install without the file the suite just shipped.
+    rsync will not delete those, and a named list of retired files goes stale.
+    The guidance probe stays because it is still in the pack.
     """
     home = tmp_path / "hermes"
     plugin = home / "plugins" / "MyMemory"
@@ -52,6 +52,8 @@ def test_install_drops_cursor_tree_and_dated_test_files(tmp_path: Path):
     dated_pyc = plugin / "weekly" / "__pycache__" / "test_w38_sunday_evening_patch.cpython-313.pyc"
     calendar_test = plugin / "digest" / "test_2026-07-11_once.py"
     stray_probe = plugin / "digest" / "probe_recall_mimo.py"
+    retired_module = plugin / "digest" / "span_weekly.py"
+    release_note = plugin / "RELEASE_NOTES_1.2.6.md"
     calendar = plugin / ".cursor" / "skills" / "real-llm-test" / "assets" / "daily" / "2026-07-11.md"
     dated.parent.mkdir(parents=True)
     dated.write_text("raise SystemExit('stale week harness')\n", encoding="utf-8")
@@ -60,6 +62,8 @@ def test_install_drops_cursor_tree_and_dated_test_files(tmp_path: Path):
     calendar_test.parent.mkdir(parents=True)
     calendar_test.write_text("raise SystemExit('stale calendar harness')\n", encoding="utf-8")
     stray_probe.write_text("raise SystemExit('stale probe')\n", encoding="utf-8")
+    retired_module.write_text("raise SystemExit('retired module')\n", encoding="utf-8")
+    release_note.write_text("# old note\n", encoding="utf-8")
     calendar.parent.mkdir(parents=True)
     calendar.write_text("# stale dated fixture\n", encoding="utf-8")
     (tmp_path / "bin").mkdir(exist_ok=True)
@@ -72,7 +76,12 @@ def test_install_drops_cursor_tree_and_dated_test_files(tmp_path: Path):
     assert not dated_pyc.exists()
     assert not calendar_test.exists()
     assert not stray_probe.exists()
+    assert not retired_module.exists()
+    assert not release_note.exists()
     assert not calendar.exists()
+    skill = home / "skills" / "memory-health-once" / "SKILL.md"
+    assert skill.is_file()
+    assert "name: memory-health-once" in skill.read_text(encoding="utf-8")
     assert not (plugin / ".cursor").exists()
     assert (plugin / "weekly" / "test_weekly_tidy.py").is_file()
     assert (plugin / "weekly" / "test_sunday_evening_slice.py").is_file()
