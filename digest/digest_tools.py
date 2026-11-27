@@ -83,6 +83,11 @@ MERGE_NEST_KEYS = ("event", "procedure", "decision", "fact")
 _PROCEDURE_KEYWORD_MIN = 3
 _PROCEDURE_KEYWORD_CAP = 6
 _PROCEDURE_KEYWORD_OVERFLOW_KEEP = 5
+_HAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+_CHINESE_PREDICATE_OBJECT = (
+    "Chinese cannot be only a verb; it must be a phrase that contains "
+    "the predicate and the object of that predicate"
+)
 
 
 def _surface_key(surface: str) -> str:
@@ -141,9 +146,11 @@ def _procedure_keyword_errors(bag: Mapping[str, Any]) -> list[str]:
     """Reject a short list or a phrase-length original so recall cannot rank on a sentence.
 
     Three distinct English canonicals are the minimum and six is the ceiling.
-    A longer list turns one procedure into a grab bag of lookup keys. An
-    original that folds onto its canonical is the same string twice. More than
-    4 Chinese characters or 2 English words is a phrase, not a lookup key.
+    A longer list turns one procedure into a grab bag of lookup keys. Chinese
+    text that is a single character has no object for its predicate, so recall
+    would store a bare verb. An original that folds onto its canonical is the
+    same string twice. More than 4 Chinese characters or 2 English words is a
+    sentence, not a lookup key.
     """
     items = bag.get("procedure_keywords")
     if not isinstance(items, list) or len(items) < _PROCEDURE_KEYWORD_MIN:
@@ -164,6 +171,15 @@ def _procedure_keyword_errors(bag: Mapping[str, Any]) -> list[str]:
         if key in seen:
             errors.append("procedure_keywords canonicals must be unique")
             break
+        if (
+            _HAN_RE.findall(canonical)
+            and not re.search(r"[A-Za-z]", canonical)
+            and len(_HAN_RE.findall(canonical)) < 2
+        ):
+            errors.append(
+                "procedure_keywords canonical " + _CHINESE_PREDICATE_OBJECT
+            )
+            break
         seen.add(key)
         originals = item.get("originals")
         if originals is None:
@@ -181,8 +197,13 @@ def _procedure_keyword_errors(bag: Mapping[str, Any]) -> list[str]:
             if _surface_key(text) == key:
                 errors.append("procedure_keywords originals must not repeat the canonical")
                 break
-            han = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", text))
+            han = len(_HAN_RE.findall(text))
             english_words = re.findall(r"[A-Za-z]+", text)
+            if han and not english_words and han < 2:
+                errors.append(
+                    "procedure_keywords originals " + _CHINESE_PREDICATE_OBJECT
+                )
+                break
             if han > 4 or len(english_words) > 2:
                 errors.append(
                     "procedure_keywords originals must be at most "
@@ -206,7 +227,9 @@ def _procedure_keywords_prop(*, merge: bool = False) -> dict[str, Any]:
         "At least 3 and at most 6 task words the user actually used. "
         "canonical is the stable English form. originals are the user's "
         "surfaces for that word, at most 4 Chinese characters and 2 English "
-        "words; leave empty when the user already said the English word."
+        "words; leave empty when the user already said the English word. "
+        + _CHINESE_PREDICATE_OBJECT
+        + "."
     )
     if merge:
         description += (
@@ -229,14 +252,18 @@ def _procedure_keywords_prop(*, merge: bool = False) -> dict[str, Any]:
                 "canonical": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Stable English keyword",
+                    "description": (
+                        "Stable English keyword. " + _CHINESE_PREDICATE_OBJECT + "."
+                    ),
                 },
                 "originals": {
                     "type": "array",
                     "items": {"type": "string", "minLength": 1},
                     "description": (
                         "Exact user surfaces, at most 4 Chinese characters and "
-                        "2 English words; empty when identical to canonical"
+                        "2 English words; empty when identical to canonical. "
+                        + _CHINESE_PREDICATE_OBJECT
+                        + "."
                     ),
                 },
             },

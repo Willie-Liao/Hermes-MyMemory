@@ -1528,3 +1528,24 @@ def test_procedure_keyword_originals_stay_short():
     ]["description"]
     assert "4 Chinese" in description
     assert "2 English" in description
+    assert "only a verb" in description
+    assert "predicate" in description
+    assert "object" in description
+    bare = errors_for(["订"])
+    assert any("only a verb" in err and "predicate" in err and "object" in err for err in bare)
+    assert errors_for(["订场馆"]) == []
+    bare_canonical = digest_tools.validate_worker_tool_args(
+        "procedure",
+        {
+            "obstacle": "notes were scattered",
+            "solution": "use a checklist",
+            "procedure_keywords": [
+                {"canonical": "订", "originals": []},
+                {"canonical": "book", "originals": []},
+                {"canonical": "remind", "originals": []},
+            ],
+            "confidence": "high",
+            "importance": 3,
+        },
+    )
+    assert any("canonical Chinese cannot be only a verb" in err for err in bare_canonical)
