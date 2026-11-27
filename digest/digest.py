@@ -2297,8 +2297,77 @@ def _content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _tracked_daily_fields(content: str) -> dict[str, tuple]:
+    """Snapshot strength and keywords so a wrap-up rewrite does not touch month rows.
+
+    Only those fields are copied onto month procedures. A body or clock edit
+    must not rewrite the month file.
+    """
+    tracked: dict[str, tuple] = {}
+    for _line_no, raw_frontmatter, _body in _frontmatter_blocks(content):
+        try:
+            parsed = yaml.safe_load(raw_frontmatter)
+        except yaml.YAMLError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        block_id = str(parsed.get("id") or "").strip()
+        if not block_id:
+            continue
+        keywords = parsed.get("procedure_keywords")
+        tracked[block_id] = (
+            parsed.get("strength"),
+            parsed.get("recall_n"),
+            parsed.get("importance"),
+            keywords if isinstance(keywords, list) else (),
+        )
+    return tracked
+
+
+def _refresh_months_after_daily_rewrite(daily_path: Path, before: str, after: str) -> None:
+    """Copy a daily strength or keyword edit onto month rows that cite that card.
+
+    Fail-open: a month refresh error must not undo the daily file that just landed.
+    """
+    try:
+        previous = _tracked_daily_fields(before)
+        current = _tracked_daily_fields(after)
+    except Exception:
+        return
+    changed = [
+        block_id
+        for block_id, fields in current.items()
+        if previous.get(block_id) != fields
+    ]
+    changed.extend(block_id for block_id in previous if block_id not in current)
+    if not changed:
+        return
+    try:
+        from recall.strength import refresh_citing_month_rows
+    except ImportError:
+        try:
+            from strength import refresh_citing_month_rows
+        except ImportError:
+            return
+    staging = daily_path.parent.parent
+    for block_id in changed:
+        try:
+            refresh_citing_month_rows(block_id, staging=staging)
+        except Exception:
+            continue
+
+
 def _rewrite_daily_file(daily_path: Path, content: str) -> None:
-    """Atomically replace the day's staging file."""
+    """Atomically replace the day's staging file.
+
+    After the replace, month rows that cite a card whose strength or keywords
+    changed are refreshed. A wrap-up-only rewrite leaves those fields equal and
+    does not touch the month file.
+    """
+    try:
+        previous = daily_path.read_text(encoding="utf-8") if daily_path.is_file() else ""
+    except OSError:
+        previous = ""
     daily_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
         dir=str(daily_path.parent), suffix=".tmp", prefix=".digest_"
@@ -2325,6 +2394,7 @@ def _rewrite_daily_file(daily_path: Path, content: str) -> None:
         except OSError:
             pass
         raise
+    _refresh_months_after_daily_rewrite(daily_path, previous, content)
 
 
 def _staging_output_example() -> str:

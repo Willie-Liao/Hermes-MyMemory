@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { WeekOverview } from './types';
@@ -184,10 +184,24 @@ export function pluginOutcomeError(
 export function runSpawnedPython(
   args: string[],
   input: string,
-  options?: { timeoutMs?: number; env?: NodeJS.ProcessEnv },
+  options?: { timeoutMs?: number; env?: NodeJS.ProcessEnv; sync?: boolean },
 ): Promise<BridgeRunResult> {
   const timeoutMs = options?.timeoutMs ?? BRIDGE_CHILD_TIMEOUT_MS;
   const env = options?.env ?? process.env;
+  // A daily save is synchronous. sync runs the month refresh before the handler returns.
+  if (options?.sync) {
+    const child = spawnSync('python3', args, {
+      env,
+      input,
+      encoding: 'utf8',
+      timeout: timeoutMs,
+    });
+    return Promise.resolve({
+      status: child.status ?? 1,
+      stdout: child.stdout ?? '',
+      stderr: typeof child.stderr === 'string' ? child.stderr : '',
+    });
+  }
   return new Promise((resolve, reject) => {
     const child = spawn('python3', args, {
       env,

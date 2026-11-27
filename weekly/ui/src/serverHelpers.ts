@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { joinHotEntries, readHotFile, splitHotEntries, writeHotFile } from './hotMemory';
-import { resolveHermesHome } from './pluginBridge';
+import { resolveHermesHome, runSpawnedPython } from './pluginBridge';
 import { appendWeeklyUiLog } from './weeklyUiLog';
 import {
   formatMemoryBullet,
@@ -103,6 +103,49 @@ const HERMES_DIR = resolveHermesHome();
 const MEMORIES_DIR = path.join(HERMES_DIR, 'memories');
 const STAGING_DIR = path.join(MEMORIES_DIR, 'staging');
 const DAILY_DIR = path.join(STAGING_DIR, 'daily');
+
+/** Point Python at this plugin so a UI save can refresh month rows that cite the card.
+
+ A missing plugin or a failed child must not undo the daily write that already landed.
+ */
+function refreshCitingMonthRows(dailyId: string): void {
+  const id = dailyId.trim();
+  if (!id) return;
+  const installed = path.join(HERMES_DIR, 'plugins', 'MyMemory');
+  let root = installed;
+  if (!fs.existsSync(path.join(root, 'recall', 'strength.py'))) {
+    let dir = process.cwd();
+    for (;;) {
+      if (fs.existsSync(path.join(dir, 'recall', 'strength.py'))) {
+        root = dir;
+        break;
+      }
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  }
+  const code = [
+    'import os, sys',
+    'sys.path.insert(0, os.environ["MYMEMORY_ROOT"])',
+    'from recall.strength import refresh_citing_month_rows',
+    'refresh_citing_month_rows(os.environ.get("DAILY_ID") or None, staging=os.environ.get("STAGING_ROOT") or None)',
+  ].join('\n');
+  try {
+    void runSpawnedPython(['-c', code], '', {
+      sync: true,
+      timeoutMs: 20_000,
+      env: {
+        ...process.env,
+        MYMEMORY_ROOT: root,
+        DAILY_ID: id,
+        STAGING_ROOT: STAGING_DIR,
+      },
+    });
+  } catch {
+    return;
+  }
+}
 const WEEKLY_DIR = path.join(STAGING_DIR, 'weekly');
 
 // Helper to ensure directories exist
@@ -550,6 +593,7 @@ export function writeMemoryBlock(block: MemoryBlock, oldId?: string) {
   if (!fs.existsSync(filePath)) {
     // Create new daily block file
     fs.writeFileSync(filePath, stringifyMDBlock(block));
+    refreshCitingMonthRows(block.id);
     return;
   }
   
@@ -572,6 +616,8 @@ export function writeMemoryBlock(block: MemoryBlock, oldId?: string) {
     phrase,
   );
   fs.writeFileSync(filePath, updatedContent);
+  refreshCitingMonthRows(block.id);
+  if (oldId && oldId !== block.id) refreshCitingMonthRows(oldId);
 }
 
 /**
@@ -653,6 +699,7 @@ export function insertRawMDBlockAt(
     next.push(normalized);
   }
   fs.writeFileSync(filePath, joinDailyWrapup(joinRawMDBlocks(next), phrase));
+  if (id) refreshCitingMonthRows(id);
 }
 
 // Delete Memory Block from file (raw splice — do not re-stringify siblings)
@@ -679,6 +726,7 @@ export function deleteMemoryBlock(id: string): boolean {
   } else {
     fs.writeFileSync(filePath, joinDailyWrapup(joinRawMDBlocks(next), phrase));
   }
+  refreshCitingMonthRows(id);
   return true;
 }
 

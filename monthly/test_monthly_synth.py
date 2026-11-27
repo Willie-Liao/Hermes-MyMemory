@@ -2318,7 +2318,11 @@ def test_stamp_copies_procedure_keywords_from_daily_evidence(tmp_path, monkeypat
 
 
 def test_guidance_uses_daily_canonicals_when_the_month_row_has_none(tmp_path, monkeypatch):
-    """Ranking reads the cited daily canonicals the same way it recomputes live strength."""
+    """A cited daily canonical still counts when the month row has not stored one yet.
+
+    One hit adds 0.013, so it leads an equal cosine and loses to a cosine that is
+    0.05 higher.
+    """
     from monthly_actions import rank_monthly_guidance
 
     evidence_id = "mem-2026-10-22-procedure-56C6619C7B64"
@@ -2337,54 +2341,518 @@ def test_guidance_uses_daily_canonicals_when_the_month_row_has_none(tmp_path, mo
         "Obstacle: tone; Solution: write the parent note.\n",
         encoding="utf-8",
     )
-    specs = [
-        _key_procedure(0, cosine=0.2, evidence=(evidence_id,), procedure_keywords=()),
-        _key_procedure(1, cosine=0.95),
+    tied = [
+        _key_procedure(0, cosine=0.84, evidence=(evidence_id,), procedure_keywords=()),
+        _key_procedure(1, cosine=0.84),
     ]
-    _write_ranked_month(tmp_path, monkeypatch, specs)
-    hits = rank_monthly_guidance("家长", staging=tmp_path, limit=12)
-    procs = [hit for hit in hits if hit["kind"] == "procedure"]
-    assert procs
-    assert procs[0]["row"].id.endswith("0")
+    _write_ranked_month(tmp_path, monkeypatch, tied)
+    tied_hits = rank_monthly_guidance("家长", staging=tmp_path, limit=12)
+    tied_procs = [hit for hit in tied_hits if hit["kind"] == "procedure"]
+    assert tied_procs[0]["row"].id.endswith("0")
+    ahead = [
+        _key_procedure(0, cosine=0.80, evidence=(evidence_id,), procedure_keywords=()),
+        _key_procedure(1, cosine=0.85),
+    ]
+    _write_ranked_month(tmp_path, monkeypatch, ahead)
+    ahead_hits = rank_monthly_guidance("家长", staging=tmp_path, limit=12)
+    ahead_procs = [hit for hit in ahead_hits if hit["kind"] == "procedure"]
+    assert ahead_procs[0]["row"].id.endswith("1")
 
 
 def test_guidance_keyword_hit_beats_cosine_and_keeps_decisions(tmp_path, monkeypatch):
+    """One canonical adds 0.013. Two and three hits are what pass a 0.05 cosine lead.
+
+    A one-character original is not a hit. Decisions keep their own order.
+    """
     from monthly_actions import rank_monthly_guidance
 
-    venue = (
-        {"canonical": "venue", "originals": ["场馆"]},
-        {"canonical": "book", "originals": []},
-        {"canonical": "remind", "originals": []},
+    one = ({"canonical": "message", "originals": ["消息"]},)
+    two = (
+        {"canonical": "parents", "originals": ["家长"]},
+        {"canonical": "message", "originals": ["消息"]},
     )
+    three = two + ({"canonical": "reminder", "originals": ["提醒"]},)
+    one_char = ({"canonical": "write", "originals": ["写"]},)
     specs = [
         _key_decision(0, cosine=0.99),
-        _key_procedure(0, cosine=0.2, procedure_keywords=venue),
-        _key_procedure(1, cosine=0.95),
+        _key_procedure(0, cosine=0.80, procedure_keywords=one),
+        _key_procedure(1, cosine=0.85),
     ]
     _write_ranked_month(tmp_path, monkeypatch, specs)
-    swapped = rank_monthly_guidance("馆场", staging=tmp_path, limit=12)
-    procs = [hit for hit in swapped if hit["kind"] == "procedure"]
-    assert procs[0]["row"].id.endswith("0")
-    assert any(hit["kind"] == "decision" for hit in swapped)
-    english = rank_monthly_guidance("venue", staging=tmp_path, limit=12)
-    assert [hit for hit in english if hit["kind"] == "procedure"][0]["row"].id.endswith("0")
-    missed = [
-        _key_procedure(
-            2,
-            cosine=0.95,
-            procedure_keywords=venue,
+    one_hit = rank_monthly_guidance("消息", staging=tmp_path, limit=12)
+    procs = [hit for hit in one_hit if hit["kind"] == "procedure"]
+    assert procs[0]["row"].id.endswith("1")
+    assert any(hit["kind"] == "decision" for hit in one_hit)
+    english = rank_monthly_guidance("message", staging=tmp_path, limit=12)
+    assert [hit for hit in english if hit["kind"] == "procedure"][0]["row"].id.endswith("1")
+    _write_ranked_month(
+        tmp_path,
+        monkeypatch,
+        [
+            _key_procedure(0, cosine=0.80, procedure_keywords=two),
+            _key_procedure(1, cosine=0.85),
+        ],
+    )
+    two_hit = rank_monthly_guidance("家长消息", staging=tmp_path, limit=12)
+    assert [hit for hit in two_hit if hit["kind"] == "procedure"][0]["row"].id.endswith("0")
+    _write_ranked_month(
+        tmp_path,
+        monkeypatch,
+        [
+            _key_procedure(0, cosine=0.80, procedure_keywords=three),
+            _key_procedure(1, cosine=0.85),
+        ],
+    )
+    three_hit = rank_monthly_guidance("家长消息提醒", staging=tmp_path, limit=12)
+    assert [hit for hit in three_hit if hit["kind"] == "procedure"][0]["row"].id.endswith("0")
+    _write_ranked_month(
+        tmp_path,
+        monkeypatch,
+        [
+            _key_procedure(0, cosine=0.80, procedure_keywords=one_char),
+            _key_procedure(1, cosine=0.85),
+        ],
+    )
+    short = rank_monthly_guidance("给家长写一个消息", staging=tmp_path, limit=12)
+    assert [hit for hit in short if hit["kind"] == "procedure"][0]["row"].id.endswith("1")
+    phrase = ({"canonical": "field trip", "originals": ["实地考察"]},)
+    _write_ranked_month(
+        tmp_path,
+        monkeypatch,
+        [
+            _key_procedure(0, cosine=0.80, procedure_keywords=phrase),
+            _key_procedure(1, cosine=0.85),
+        ],
+    )
+    one_phrase = rank_monthly_guidance("field trip", staging=tmp_path, limit=12)
+    assert [hit for hit in one_phrase if hit["kind"] == "procedure"][0]["row"].id.endswith("1")
+
+
+def _daily_card(mem_id: str, *, importance: int = 3, keywords: str = "", extra: str = "") -> str:
+    """Write a fence the stamp and the month refresh can both read.
+
+    A card without an id is invisible to BlockIndex, so the month row would keep
+    the stale strength the test is trying to move.
+    """
+    return (
+        "---\n"
+        f"id: {mem_id}\n"
+        "type: procedure\n"
+        f"importance: {importance}\n"
+        f"{keywords}{extra}"
+        "---\n"
+        "Obstacle: tone; Solution: write the note.\n"
+    )
+
+
+def test_daily_stamp_refreshes_month_strength_and_keywords(tmp_path, monkeypatch):
+    """A daily recall must update citing month rows without counting as a month recall."""
+    from datetime import date
+
+    from monthly_schema import MonthlyDecision, MonthlyPayload, MonthlyProcedure, MonthlyRange
+    from monthly_writer import load_month, write_month
+    from recall.ids import BlockIndex
+    from recall.strength import refresh_citing_month_rows, stamp_recall_on_card, strength_value
+
+    monkeypatch.setenv("RECALL_PERSIST_IN_TEST", "1")
+    when = date(2026, 11, 27)
+    staging = tmp_path / "memories" / "staging"
+    cited = "mem-2026-11-03-procedure-56C6619C7B64"
+    other = "mem-2026-11-04-procedure-56C6619C7B65"
+    decision_id = "mem-2026-11-05-decision-56C6619C7B66"
+    keywords = (
+        "procedure_keywords:\n"
+        "  - canonical: parents\n"
+        "    originals:\n"
+        "      - 家长\n"
+    )
+    (staging / "daily" / "2026-11-03.md").write_text(
+        _daily_card(cited, importance=5, keywords=keywords),
+        encoding="utf-8",
+    )
+    (staging / "daily" / "2026-11-04.md").write_text(
+        _daily_card(other, importance=3),
+        encoding="utf-8",
+    )
+    (staging / "daily" / "2026-11-05.md").write_text(
+        _daily_card(decision_id, importance=2),
+        encoding="utf-8",
+    )
+    procedure = MonthlyProcedure(
+        id="mem-2026-11-key-procedure-aaaaaaaaaaaa",
+        problem="parent reply",
+        solution="write the facts",
+        insight="still changes the next time",
+        trigger="a parent needs a written response",
+        evidence=(cited,),
+        strength=0.0,
+        recall_n=0.0,
+    )
+    untouched = MonthlyProcedure(
+        id="mem-2026-11-key-procedure-bbbbbbbbbbbb",
+        problem="other task",
+        solution="leave this row",
+        insight="still changes the next time",
+        trigger="a task that was not recalled",
+        evidence=(other,),
+        procedure_keywords=({"canonical": "untouched", "originals": ["保留"]},),
+        strength=1.25,
+        recall_n=0.0,
+    )
+    decision = MonthlyDecision(
+        id="mem-2026-11-key-decision-cccccccccccc",
+        kind="decision",
+        text="keep the short brief",
+        why_it_matters="still changes the next time",
+        evidence=(decision_id,),
+        strength=0.0,
+        recall_n=4.0,
+        last_recall_at="2026-10-01",
+    )
+    write_month(
+        MonthlyPayload(
+            key="2026-11",
+            range=MonthlyRange(start="2026-11-01", end="2026-11-30"),
+            key_procedures=(procedure, untouched),
+            key_decisions=(decision,),
+        )
+    )
+    assert stamp_recall_on_card(cited, staging=staging, now=when)
+    saved = load_month("2026-11")
+    stamped = saved.key_procedures[0]
+    held = saved.key_procedures[1]
+    assert stamped.recall_n == 0
+    assert stamped.last_recall_at == ""
+    assert [item["canonical"] for item in stamped.procedure_keywords] == ["parents"]
+    card = dict(BlockIndex(staging).get(cited).parsed)
+    assert stamped.strength == round(
+        strength_value(
+            recall_n=0,
+            first_seen=None,
+            importance=stamped.importance,
+            now=when,
+            evidence=[card],
         ),
-        _key_procedure(
-            3,
-            cosine=0.4,
-            procedure_keywords=(
-                {"canonical": "other", "originals": []},
-                {"canonical": "thing", "originals": []},
-                {"canonical": "item", "originals": []},
+        4,
+    )
+    assert held.procedure_keywords[0]["canonical"] == "untouched"
+    assert held.strength == 1.25
+    assert held.recall_n == 0
+    text = (staging / "daily" / "2026-11-03.md").read_text(encoding="utf-8")
+    text = text.replace("canonical: parents", "canonical: message").replace("家长", "消息")
+    (staging / "daily" / "2026-11-03.md").write_text(text, encoding="utf-8")
+    refresh_citing_month_rows(cited, staging=staging, now=when)
+    replaced = load_month("2026-11")
+    assert replaced.key_procedures[0].recall_n == 0
+    assert [item["canonical"] for item in replaced.key_procedures[0].procedure_keywords] == ["message"]
+    assert float(BlockIndex(staging).get(cited).parsed.get("recall_n") or 0) == 1
+    assert stamp_recall_on_card(decision_id, staging=staging, now=when)
+    moved = load_month("2026-11").key_decisions[0]
+    decision_card = dict(BlockIndex(staging).get(decision_id).parsed)
+    assert moved.recall_n == 4
+    assert moved.last_recall_at == "2026-10-01"
+    assert moved.strength == round(
+        strength_value(
+            recall_n=0,
+            first_seen=None,
+            importance=moved.importance,
+            now=when,
+            evidence=[decision_card],
+        ),
+        4,
+    )
+    assert moved.strength != 0
+
+
+def test_month_stamp_refreshes_sibling_after_its_own_write(tmp_path, monkeypatch):
+    """Evidence credit must not refresh until the recalled row is on disk.
+
+    A refresh during the evidence stamp would update the sibling, then the
+    in-memory dump would write that sibling back to the stale snapshot.
+    """
+    from datetime import date
+
+    from monthly_schema import MonthlyPayload, MonthlyProcedure, MonthlyRange
+    from monthly_writer import load_month, write_month
+    from recall.ids import BlockIndex
+    from recall.strength import stamp_recall_on_card
+
+    monkeypatch.setenv("RECALL_PERSIST_IN_TEST", "1")
+    when = date(2026, 11, 27)
+    staging = tmp_path / "memories" / "staging"
+    cited = "mem-2026-11-03-procedure-56C6619C7B64"
+    (staging / "daily" / "2026-11-03.md").write_text(
+        _daily_card(
+            cited,
+            importance=5,
+            keywords=(
+                "procedure_keywords:\n"
+                "  - canonical: parents\n"
+                "    originals:\n"
+                "      - 家长\n"
             ),
         ),
+        encoding="utf-8",
+    )
+    shared = dict(
+        problem="parent reply",
+        solution="write the facts",
+        insight="still changes the next time",
+        trigger="a parent needs a written response",
+        evidence=(cited,),
+        strength=0.0,
+        recall_n=0.0,
+    )
+    recalled = MonthlyProcedure(id="mem-2026-11-key-procedure-aaaaaaaaaaaa", **shared)
+    sibling = MonthlyProcedure(id="mem-2026-11-key-procedure-bbbbbbbbbbbb", **shared)
+    write_month(
+        MonthlyPayload(
+            key="2026-11",
+            range=MonthlyRange(start="2026-11-01", end="2026-11-30"),
+            key_procedures=(recalled, sibling),
+        )
+    )
+    assert stamp_recall_on_card(recalled.id, staging=staging, now=when)
+    saved = load_month("2026-11")
+    assert saved.key_procedures[0].recall_n == 1
+    assert saved.key_procedures[1].recall_n == 0
+    assert saved.key_procedures[1].procedure_keywords[0]["canonical"] == "parents"
+    assert float(BlockIndex(staging).get(cited).parsed.get("recall_n") or 0) == 1
+
+
+def test_digest_keyword_rewrite_refreshes_month_wrapup_does_not(tmp_path, monkeypatch):
+    """A keyword edit must reach the month file. A wrap-up rewrite must not."""
+    from digest.digest import _rewrite_daily_file, join_daily_wrapup
+    from monthly_schema import MonthlyPayload, MonthlyProcedure, MonthlyRange
+    from monthly_writer import load_month, write_month
+
+    monkeypatch.setenv("RECALL_PERSIST_IN_TEST", "1")
+    staging = tmp_path / "memories" / "staging"
+    cited = "mem-2026-11-03-procedure-56C6619C7B64"
+    daily = staging / "daily" / "2026-11-03.md"
+    body = _daily_card(
+        cited,
+        importance=4,
+        keywords=(
+            "procedure_keywords:\n"
+            "  - canonical: parents\n"
+            "    originals:\n"
+            "      - 家长\n"
+        ),
+        extra="recall_n: 2\nfirst_seen: 2026-11-01\nlast_recall_at: 2026-11-20\n",
+    )
+    daily.write_text(body, encoding="utf-8")
+    write_month(
+        MonthlyPayload(
+            key="2026-11",
+            range=MonthlyRange(start="2026-11-01", end="2026-11-30"),
+            key_procedures=(
+                MonthlyProcedure(
+                    id="mem-2026-11-key-procedure-aaaaaaaaaaaa",
+                    problem="keep the november prose",
+                    solution="write the facts",
+                    insight="still changes the next time",
+                    trigger="a parent needs a written response",
+                    evidence=(cited,),
+                    strength=0.0,
+                ),
+            ),
+        )
+    )
+    month_path = staging / "monthly" / "2026-11.md"
+    before = month_path.read_text(encoding="utf-8")
+    _rewrite_daily_file(daily, join_daily_wrapup(body, "closed the parent note"))
+    assert month_path.read_text(encoding="utf-8") == before
+    changed = body.replace("canonical: parents", "canonical: message").replace("家长", "消息")
+    _rewrite_daily_file(daily, changed)
+    saved = load_month("2026-11").key_procedures[0]
+    assert [item["canonical"] for item in saved.procedure_keywords] == ["message"]
+    assert saved.problem == "keep the november prose"
+    assert "parents" not in month_path.read_text(encoding="utf-8")
+
+
+def test_refresh_all_rows_copies_current_daily_union(tmp_path, monkeypatch):
+    """A no-id pass must catch a month up, including one that stored no canonicals."""
+    from datetime import date
+
+    from monthly_schema import MonthlyPayload, MonthlyProcedure, MonthlyRange
+    from monthly_writer import load_month, write_month
+    from recall.ids import BlockIndex
+    from recall.strength import refresh_citing_month_rows, strength_value
+
+    monkeypatch.setenv("RECALL_PERSIST_IN_TEST", "1")
+    when = date(2026, 11, 27)
+    staging = tmp_path / "memories" / "staging"
+    first = "mem-2026-11-03-procedure-56C6619C7B64"
+    second = "mem-2026-11-04-procedure-56C6619C7B65"
+    empty = "mem-2026-11-06-procedure-56C6619C7B67"
+    clock = "recall_n: 3\nfirst_seen: 2026-11-01\nlast_recall_at: 2026-11-20\n"
+    (staging / "daily" / "2026-11-03.md").write_text(
+        _daily_card(
+            first,
+            importance=4,
+            keywords=(
+                "procedure_keywords:\n"
+                "  - canonical: parents\n"
+                "    originals:\n"
+                "      - 家长\n"
+                "  - canonical: message\n"
+                "    originals:\n"
+                "      - 消息\n"
+            ),
+            extra=clock,
+        ),
+        encoding="utf-8",
+    )
+    (staging / "daily" / "2026-11-04.md").write_text(
+        _daily_card(
+            second,
+            importance=4,
+            keywords=(
+                "procedure_keywords:\n"
+                "  - canonical: parents\n"
+                "    originals:\n"
+                "      - 家长\n"
+                "  - canonical: reminder\n"
+                "    originals:\n"
+                "      - 提醒\n"
+            ),
+            extra=clock,
+        ),
+        encoding="utf-8",
+    )
+    (staging / "daily" / "2026-11-06.md").write_text(
+        _daily_card(empty, importance=3),
+        encoding="utf-8",
+    )
+    write_month(
+        MonthlyPayload(
+            key="2026-11",
+            range=MonthlyRange(start="2026-11-01", end="2026-11-30"),
+            key_procedures=(
+                MonthlyProcedure(
+                    id="mem-2026-11-key-procedure-aaaaaaaaaaaa",
+                    problem="keep the november prose",
+                    solution="write the facts",
+                    insight="still changes the next time",
+                    trigger="a parent needs a written response",
+                    evidence=(first, second),
+                    strength=0.0,
+                    recall_n=2.0,
+                    last_recall_at="2026-08-01",
+                ),
+                MonthlyProcedure(
+                    id="mem-2026-11-key-procedure-bbbbbbbbbbbb",
+                    problem="keep the empty prose",
+                    solution="clear the stale canonical",
+                    insight="still changes the next time",
+                    trigger="a task with no keywords left",
+                    evidence=(empty,),
+                    procedure_keywords=({"canonical": "stale", "originals": ["旧词"]},),
+                    strength=2.5,
+                    recall_n=1.0,
+                    last_recall_at="2026-08-01",
+                ),
+            ),
+        )
+    )
+    refresh_citing_month_rows(staging=staging, now=when)
+    saved = load_month("2026-11")
+    filled = saved.key_procedures[0]
+    cleared = saved.key_procedures[1]
+    assert filled.problem == "keep the november prose"
+    assert filled.solution == "write the facts"
+    assert filled.insight == "still changes the next time"
+    assert filled.trigger == "a parent needs a written response"
+    assert filled.recall_n == 2
+    assert filled.last_recall_at == "2026-08-01"
+    assert [item["canonical"] for item in filled.procedure_keywords] == [
+        "parents",
+        "message",
+        "reminder",
     ]
-    _write_ranked_month(tmp_path, monkeypatch, missed)
-    cosine_hits = rank_monthly_guidance("zzzz guidance probe", staging=tmp_path, limit=12)
-    order = [hit["row"].id for hit in cosine_hits if hit["kind"] == "procedure"]
-    assert order[0].endswith("2")
+    store = BlockIndex(staging)
+    cards = [dict(store.get(first).parsed), dict(store.get(second).parsed)]
+    assert filled.strength == round(
+        strength_value(
+            recall_n=0,
+            first_seen=None,
+            importance=filled.importance,
+            now=when,
+            evidence=cards,
+        ),
+        4,
+    )
+    assert cleared.procedure_keywords == ()
+    assert cleared.problem == "keep the empty prose"
+    assert cleared.recall_n == 1
+    assert cleared.strength == 0
+
+
+def test_refresh_is_idle_without_persist_flag(tmp_path, monkeypatch):
+    """Pytest must not write a month file unless the stamp guard is explicitly open."""
+    from monthly_schema import MonthlyPayload, MonthlyProcedure, MonthlyRange
+    from monthly_writer import write_month
+    from recall.strength import refresh_citing_month_rows, stamp_recall_on_card
+
+    monkeypatch.delenv("RECALL_PERSIST_IN_TEST", raising=False)
+    staging = tmp_path / "memories" / "staging"
+    cited = "mem-2026-11-03-procedure-56C6619C7B64"
+    daily = staging / "daily" / "2026-11-03.md"
+    daily.write_text(
+        _daily_card(
+            cited,
+            keywords=(
+                "procedure_keywords:\n"
+                "  - canonical: parents\n"
+                "    originals:\n"
+                "      - 家长\n"
+            ),
+        ),
+        encoding="utf-8",
+    )
+    write_month(
+        MonthlyPayload(
+            key="2026-11",
+            range=MonthlyRange(start="2026-11-01", end="2026-11-30"),
+            key_procedures=(
+                MonthlyProcedure(
+                    id="mem-2026-11-key-procedure-aaaaaaaaaaaa",
+                    problem="parent reply",
+                    solution="write the facts",
+                    insight="still changes the next time",
+                    trigger="a parent needs a written response",
+                    evidence=(cited,),
+                ),
+            ),
+        )
+    )
+    before_month = (staging / "monthly" / "2026-11.md").read_text(encoding="utf-8")
+    before_daily = daily.read_text(encoding="utf-8")
+    assert stamp_recall_on_card(cited, staging=staging) is None
+    refresh_citing_month_rows(cited, staging=staging)
+    assert daily.read_text(encoding="utf-8") == before_daily
+    assert (staging / "monthly" / "2026-11.md").read_text(encoding="utf-8") == before_month
+
+
+def test_refresh_error_does_not_fail_the_daily_stamp(tmp_path, monkeypatch):
+    """A month refresh failure must still return the daily card's ACT-R fields."""
+    from datetime import date
+
+    from recall.strength import stamp_recall_on_card
+
+    monkeypatch.setenv("RECALL_PERSIST_IN_TEST", "1")
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("month refresh failed")
+
+    monkeypatch.setattr("recall.strength.refresh_citing_month_rows", _boom)
+    staging = tmp_path / "memories" / "staging"
+    cited = "mem-2026-11-03-procedure-56C6619C7B64"
+    (staging / "daily" / "2026-11-03.md").write_text(
+        _daily_card(cited, importance=4),
+        encoding="utf-8",
+    )
+    result = stamp_recall_on_card(cited, staging=staging, now=date(2026, 11, 27))
+    assert result is not None
+    assert result["recall_n"] == 1

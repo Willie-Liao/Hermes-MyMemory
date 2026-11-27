@@ -206,6 +206,148 @@ def _month_file(staging: Path | None, month_key: str) -> Path:
     return month_file_path(month_key)
 
 
+def _staging_root(staging: Path | None) -> Path:
+    """Use the caller's staging root so a test refresh cannot write the live month."""
+    if staging is not None:
+        return Path(staging)
+    from monthly_state import monthly_staging_dir
+
+    return monthly_staging_dir().parent
+
+
+def _keyword_signature(value: Any) -> tuple:
+    """Compare keyword rows without caring about list versus tuple from YAML."""
+    if not isinstance(value, (list, tuple)):
+        return ()
+    rows = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        canonical = str(item.get("canonical") or "").strip()
+        originals = item.get("originals") or ()
+        if isinstance(originals, str):
+            originals = [originals]
+        rows.append(
+            (
+                canonical,
+                tuple(str(surface).strip() for surface in originals if str(surface).strip()),
+            )
+        )
+    return tuple(rows)
+
+
+def _fill_row_from_cards(
+    row: dict[str, Any],
+    cards: list[dict[str, Any]],
+    *,
+    procedure: bool,
+    now: date | None,
+) -> bool:
+    """Copy evidence strength and keywords onto one month row without touching its recall counter.
+
+    A daily edit must not look like the month row itself was recalled.
+    """
+    before_strength = row.get("strength")
+    before_importance = row.get("importance")
+    before_keywords = _keyword_signature(row.get("procedure_keywords")) if procedure else ()
+    if cards:
+        importance = math.floor(
+            sum(int(card.get("importance") or 3) for card in cards) / len(cards) + 0.5
+        )
+    else:
+        importance = 3
+    row["importance"] = importance
+    row["strength"] = round(
+        strength_value(
+            recall_n=0.0,
+            first_seen=None,
+            importance=importance,
+            now=now,
+            evidence=cards,
+        ),
+        4,
+    )
+    if procedure:
+        try:
+            from digest.digest_tools import union_procedure_keywords
+        except ImportError:
+            from digest_tools import union_procedure_keywords
+        fresh = union_procedure_keywords(*(card.get("procedure_keywords") for card in cards))
+        if fresh:
+            row["procedure_keywords"] = fresh
+        else:
+            row.pop("procedure_keywords", None)
+    if row.get("strength") != before_strength or row.get("importance") != before_importance:
+        return True
+    if procedure and _keyword_signature(row.get("procedure_keywords")) != before_keywords:
+        return True
+    return False
+
+
+def refresh_citing_month_rows(
+    daily_id: str | None = None,
+    *,
+    staging: Path | None = None,
+    now: date | None = None,
+) -> None:
+    """Rewrite month strength and canonicals from the daily cards those rows cite.
+
+    The month file used to keep the snapshot from the last generate or month-id
+    recall, so a later daily strength or keyword edit never showed up. This does
+    not add recall credit. Fail-open: one bad month file does not abort the daily write.
+    Omit daily_id to refresh every row. After deploy, run that once against the
+    live staging root so months already on disk, including 2026-11, copy the
+    current daily strength and canonicals. Prose on those rows stays as written.
+    """
+    if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("RECALL_PERSIST_IN_TEST"):
+        return
+    wanted = str(daily_id or "").strip()
+    root = _staging_root(staging)
+    monthly = root / "monthly"
+    if not monthly.is_dir():
+        return
+    try:
+        from monthly_writer import dump_yaml, loads, payload_from_dict
+        from .ids import BlockIndex
+    except ImportError:
+        return
+    try:
+        store = BlockIndex(root)
+    except Exception:
+        return
+    for path in sorted(monthly.glob("????-??.md")):
+        try:
+            payload = loads(path.read_text(encoding="utf-8"))
+            data = payload.to_dict()
+        except (OSError, ValueError):
+            continue
+        changed = False
+        for section, procedure in (("key_decisions", False), ("key_procedures", True)):
+            for row in data.get(section) or []:
+                if not isinstance(row, dict):
+                    continue
+                evidence_ids = [
+                    str(item).strip()
+                    for item in (row.get("evidence") or [])
+                    if str(item).strip()
+                ]
+                if wanted and wanted not in evidence_ids:
+                    continue
+                cards = []
+                for evidence_id in evidence_ids:
+                    rec = store.get(evidence_id)
+                    if rec is not None:
+                        cards.append(dict(rec.parsed))
+                if _fill_row_from_cards(row, cards, procedure=procedure, now=now):
+                    changed = True
+        if not changed:
+            continue
+        try:
+            path.write_text(dump_yaml(payload_from_dict(data)), encoding="utf-8")
+        except (OSError, ValueError):
+            continue
+
+
 def _stamp_month_row(
     month_key: str,
     kind: str,
@@ -254,6 +396,7 @@ def _stamp_month_row(
             credit=1.0,
             index=store,
             seen=seen,
+            skip_month_refresh=True,
         )
     cards = []
     for evidence_id in evidence_ids:
@@ -293,6 +436,11 @@ def _stamp_month_row(
         path.write_text(body, encoding="utf-8")
     except (OSError, ValueError):
         return None
+    for evidence_id in evidence_ids:
+        try:
+            refresh_citing_month_rows(evidence_id, staging=staging, now=now)
+        except Exception:
+            continue
     return {key: target.get(key) for key in (*OPTIONAL_FIELDS, "importance")}
 
 
@@ -304,6 +452,7 @@ def stamp_recall_on_card(
     credit: float = 1.0,
     index: Any = None,
     seen: set[str] | None = None,
+    skip_month_refresh: bool = False,
 ) -> dict[str, Any] | None:
     """Persist apply_recall onto the daily card or the monthly key row.
 
@@ -312,6 +461,9 @@ def stamp_recall_on_card(
     index lets one turn stamp many cards without rescanning daily/*.md each time.
     seen skips a daily id already credited in this turn, so two monthly rows
     that cite the same card add 1, not 2.
+    skip_month_refresh is set while a month row is crediting its own evidence,
+    so the citing refresh runs once after that row is written instead of
+    against a half-updated file.
     """
     from .ids import BlockIndex, _FRONTMATTER_RE
 
@@ -370,6 +522,11 @@ def stamp_recall_on_card(
         return None
     if seen is not None:
         seen.add(mem_id)
+    if not skip_month_refresh:
+        try:
+            refresh_citing_month_rows(mem_id, staging=staging, now=now)
+        except Exception:
+            return {key: parsed.get(key) for key in OPTIONAL_FIELDS}
     return {key: parsed.get(key) for key in OPTIONAL_FIELDS}
 
 

@@ -444,12 +444,17 @@ def rank_monthly_guidance(
         return previous[-1]
 
     def _surface_hit(query_key: str, surface_key: str) -> bool:
+        """Ignore a one-character surface so 写 cannot count as a canonical hit.
+
+        The substring test used to run first, and a single character inside the
+        query became a full hit that outranked cosine.
+        """
         if not surface_key or not query_key:
+            return False
+        if len(surface_key) < 2:
             return False
         if surface_key in query_key or query_key == surface_key:
             return True
-        if len(surface_key) < 2:
-            return False
         lengths = {len(surface_key) - 1, len(surface_key), len(surface_key) + 1}
         for length in lengths:
             if length < 2 or length > len(query_key):
@@ -722,8 +727,12 @@ def rank_monthly_guidance(
             _procedure_keyword_hits(q, keywords) if kind == "procedure" else 0
         )
         hit["keyword_n"] = keyword_n
-        hit["keyword_listed"] = bool(keywords) if kind == "procedure" else False
-        if sim >= _GUIDANCE_COS_GATE or keyword_n > 0:
+        if kind == "procedure":
+            # One hit stays under a 0.05 cosine gap. The second and third hits
+            # are where the weight shows up. A fourth hit does not add more.
+            capped = min(int(keyword_n), 3)
+            hit["rank"] = sim + 0.12 * (capped / 3.0) ** 2
+        if sim >= _GUIDANCE_COS_GATE:
             passed.append(hit)
         else:
             below[kind].append(hit)
@@ -841,22 +850,18 @@ def rank_monthly_guidance(
             hit["row"].id,
         )
 
-    procedure_rows = [h for h in passed if h["kind"] == "procedure"] + below["procedure"]
-    any_keyword = any(h.get("keyword_n") for h in procedure_rows)
+    def _procedure_order(hit: dict[str, Any]) -> tuple:
+        """Let a 0.053 keyword add pass a 0.05 cosine lead.
+
+        The shared 0.01 rank bucket ties 0.853 with 0.850, then raw cosine
+        undoes the second hit. Decisions stay on that bucket.
+        """
+        return (-float(hit["rank"]),) + _tie(hit)[1:]
+
     prefs = sorted((h for h in passed if h["kind"] == "decision"), key=_tie)
-    if any_keyword:
-        procs = sorted(
-            (h for h in procedure_rows if h.get("keyword_n")),
-            key=lambda h: (-int(h.get("keyword_n") or 0),) + _tie(h),
-        )
-        below["procedure"] = sorted(
-            (h for h in procedure_rows if not h.get("keyword_listed")),
-            key=_tie,
-        )
-    else:
-        procs = sorted((h for h in passed if h["kind"] == "procedure"), key=_tie)
-    for kind in below:
-        below[kind].sort(key=_tie)
+    procs = sorted((h for h in passed if h["kind"] == "procedure"), key=_procedure_order)
+    below["decision"].sort(key=_tie)
+    below["procedure"].sort(key=_procedure_order)
     limit_n = max(1, int(limit))
     share = max(_GUIDANCE_KIND_FLOOR, min(_GUIDANCE_KIND_SHARE, limit_n // 2))
     chosen = {
@@ -891,19 +896,13 @@ def rank_monthly_guidance(
     _top_up("procedure", "decision")
     _top_up("decision", "procedure")
     chosen["decision"].sort(key=_tie)
-    if any_keyword:
-        chosen["procedure"].sort(
-            key=lambda h: (-int(h.get("keyword_n") or 0),) + _tie(h)
-        )
-    else:
-        chosen["procedure"].sort(key=_tie)
+    chosen["procedure"].sort(key=_procedure_order)
     ordered = chosen["decision"] + chosen["procedure"]
     for hit in ordered:
         hit.pop("spill", None)
         hit.pop("_year", None)
         hit.pop("_mon", None)
         hit.pop("keyword_n", None)
-        hit.pop("keyword_listed", None)
     return ordered[:limit_n]
 
 
